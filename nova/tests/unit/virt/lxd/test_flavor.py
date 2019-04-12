@@ -48,6 +48,11 @@ class ToProfileTest(test.NoDBTestCase):
         self.CONF2.lxd.pool = None
         self.CONF2.lxd.root_dir = ''
 
+        is_snap_lxd_patch = mock.patch('nova.virt.lxd.common.is_snap_lxd')
+        self.patchers.append(is_snap_lxd_patch)
+        self.is_snap_lxd = is_snap_lxd_patch.start()
+        self.is_snap_lxd.return_value = False
+
     def tearDown(self):
         super(ToProfileTest, self).tearDown()
         for patcher in self.patchers:
