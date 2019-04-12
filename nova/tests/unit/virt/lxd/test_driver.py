@@ -682,13 +682,15 @@ class LXDDriverTest(test.NoDBTestCase):
 
         self.client.containers.get.assert_called_once_with(instance.name)
 
+    @mock.patch('nova.virt.lxd.common.is_snap_lxd')
     @mock.patch('nova.virt.lxd.driver.network')
     @mock.patch('pwd.getpwuid', mock.Mock(return_value=mock.Mock(pw_uid=1234)))
     @mock.patch('os.getuid', mock.Mock())
     @mock.patch('os.path.exists', mock.Mock(return_value=True))
     @mock.patch('six.moves.builtins.open')
     @mock.patch.object(driver.utils, 'execute')
-    def test_get_console_output(self, execute, _open, _):
+    def test_get_console_output(self, execute, _open, _, is_snap_lxd):
+        is_snap_lxd.return_value = False
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
