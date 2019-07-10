@@ -1,0 +1,24 @@
+- project:
+    templates:
+      - openstack-python-jobs
+      - openstack-python35-jobs
+      - check-requirements
+      - publish-to-pypi
+    check:
+      jobs:
+        - legacy-tempest-dsvm-lxd-ovs:
+            irrelevant-files:
+              - ^(test-|)requirements.txt$
+              - ^setup.cfg$
+    gate:
+      jobs:
+        - legacy-tempest-dsvm-lxd-ovs:
+            irrelevant-files:
+              - ^(test-|)requirements.txt$
+              - ^setup.cfg$
+    experimental:
+      jobs:
+        - legacy-tempest-dsvm-lxd-linuxbridge:
+            irrelevant-files:
+              - ^(test-|)requirements.txt$
+              - ^setup.cfg$
