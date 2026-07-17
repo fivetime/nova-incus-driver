@@ -10,6 +10,7 @@
     "framework",
     "supported",
     "unverified",
+    "experimental",
     "unsupported",
     "planned"
   ],
@@ -107,16 +108,16 @@
       "owner": "nova+glance+driver",
       "driver_hooks": ["snapshot", "destroy", "spawn"],
       "applicability": "container",
-      "status": "unverified",
-      "evidence": "No current three-node public API E2E"
+      "status": "supported",
+      "evidence": "tools/openstack-incus-bfv-lifecycle-e2e.sh"
     },
     {
       "id": "pause-unpause",
       "owner": "nova+driver",
       "driver_hooks": ["pause", "unpause"],
       "applicability": "container",
-      "status": "unverified",
-      "evidence": "Unit tests only"
+      "status": "supported",
+      "evidence": "tools/openstack-incus-bfv-lifecycle-e2e.sh"
     },
     {
       "id": "suspend-resume",

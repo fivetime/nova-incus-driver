@@ -410,6 +410,32 @@ blocker. The dated evidence below tracks the incremental hardening.
   Config-drive ownership therefore resolves `next`, then `current`, then
   `last_state`.
 
+## BFV pause and shelve
+
+- On 2026-07-18, server
+  `7cbb8e9a-3532-4fb7-b3bc-8e4497bc6b72` passed the public Nova
+  pause/unpause workflow on `incus-node-02`. Nova transitioned
+  `ACTIVE -> PAUSED -> ACTIVE` while Incus transitioned
+  `RUNNING -> FROZEN -> RUNNING`. Fixed IP `10.0.0.16`, readable read-only
+  config-drive contents, and the single root RBD watcher were preserved.
+- BFV server `9d497f51-4c69-49b6-8e8f-820369d10e29` passed two public
+  shelve/unshelve cycles on `incus-node-03`. `SHELVED_OFFLOADED` removed the
+  Incus record and local instance directory, removed the Cinder attachment,
+  and left the root volume `reserved`. Unshelve restored ACTIVE, fixed IP
+  `10.0.0.34`, one Cinder attachment, one Incus owner, and one Ceph watcher.
+- A marker written and immediately verified in `/root/shelve-marker`
+  survived offload and unshelve on the same Cinder RBD. The recreated
+  config-drive remained readable and read-only. Its file digest changed
+  because Nova regenerates metadata including `random_seed`; byte stability
+  is guaranteed for the driver's cold-migration transfer, not for Nova
+  shelve/unshelve.
+- `tools/openstack-incus-bfv-lifecycle-e2e.sh` makes these checks repeatable
+  across a configured compute inventory and cleans its server and root volume.
+  Its clean automated rerun passed with server
+  `c5056251-d1f1-4eaf-ad51-1d033111f174`, root volume
+  `40c5e8c8-6e98-4bb1-9b61-188b0671f711`, owner `incus-node-03`, and fixed IP
+  `10.0.0.54`.
+
 - Re-running DevStack to add Cinder rebuilt the test Nova databases. Three
   retained Incus containers (`instance-00000008`, `instance-00000009`, and
   `instance-0000000a`) therefore no longer have Nova database records. Their
