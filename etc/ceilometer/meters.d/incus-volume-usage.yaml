@@ -1,0 +1,49 @@
+---
+metric:
+  - name: 'volume.read.requests'
+    event_type: 'volume.usage'
+    type: 'cumulative'
+    unit: 'request'
+    volume: $.payload.reads
+    project_id: $.payload.tenant_id
+    resource_id: $.payload.volume_id
+    user_id: $.payload.user_id
+    metadata:
+      instance_id: $.payload.instance_id
+      availability_zone: $.payload.availability_zone
+
+  - name: 'volume.read.bytes'
+    event_type: 'volume.usage'
+    type: 'cumulative'
+    unit: 'B'
+    volume: $.payload.read_bytes
+    project_id: $.payload.tenant_id
+    resource_id: $.payload.volume_id
+    user_id: $.payload.user_id
+    metadata:
+      instance_id: $.payload.instance_id
+      availability_zone: $.payload.availability_zone
+
+  - name: 'volume.write.requests'
+    event_type: 'volume.usage'
+    type: 'cumulative'
+    unit: 'request'
+    volume: $.payload.writes
+    project_id: $.payload.tenant_id
+    resource_id: $.payload.volume_id
+    user_id: $.payload.user_id
+    metadata:
+      instance_id: $.payload.instance_id
+      availability_zone: $.payload.availability_zone
+
+  - name: 'volume.write.bytes'
+    event_type: 'volume.usage'
+    type: 'cumulative'
+    unit: 'B'
+    volume: $.payload.write_bytes
+    project_id: $.payload.tenant_id
+    resource_id: $.payload.volume_id
+    user_id: $.payload.user_id
+    metadata:
+      instance_id: $.payload.instance_id
+      availability_zone: $.payload.availability_zone

@@ -477,9 +477,27 @@ blocker. The dated evidence below tracks the incremental hardening.
   `nova_cell1.volume_usage_cache` contained `curr_reads=2421`,
   `curr_read_bytes=104484864`, `curr_writes=196`, and
   `curr_write_bytes=69935104`, attributed to the correct instance and Cinder
-  volume UUID. The current lab has no Ceilometer services, so notification
-  consumption by Ceilometer remains a deployment-level E2E item rather than a
-  driver gap.
+  volume UUID.
+
+## Ceilometer volume I/O metering
+
+- On 2026-07-18, Ceilometer notification and Gnocchi 4.7 services were
+  deployed on `incus-node-01`; all three computes used
+  `volume_usage_poll_interval=60`. The standard Nova `volume.usage`
+  notification carried the current project/user IDs, instance UUID, Cinder
+  volume UUID, and all four cumulative counters.
+- Ceilometer `stable/2026.1` has two upstream gaps for this Nova notification:
+  its default meters file does not create volume I/O samples, and its Gnocchi
+  `volume` resource mapping does not accept the four metric names. The
+  DevStack plugin now installs a separate declarative meter file and applies
+  a narrowly scoped Ceilometer resource-map patch.
+- A 96 MiB synchronized write inside BFV instance `instance-0000000f`
+  produced a Gnocchi `volume` resource keyed by Cinder UUID
+  `f6f81198-2455-43fc-b00a-83e65f99e74b`. Its project and user ownership
+  matched Keystone, and Gnocchi stored all four metrics:
+  `volume.read.requests=2571`, `volume.read.bytes=103952384`,
+  `volume.write.requests=538`, and
+  `volume.write.bytes=112140288` at the tested archive interval.
 
 - Re-running DevStack to add Cinder rebuilt the test Nova databases. Three
   retained Incus containers (`instance-00000008`, `instance-00000009`, and

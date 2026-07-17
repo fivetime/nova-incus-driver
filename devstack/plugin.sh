@@ -15,6 +15,7 @@ NOVA_INCUS_PLUGIN_DIR=$(readlink -f "$(dirname "${BASH_SOURCE[0]}")")
 GLANCE_CONF_DIR=${GLANCE_CONF_DIR:-/etc/glance}
 GLANCE_API_CONF=${GLANCE_API_CONF:-${GLANCE_CONF_DIR}/glance-api.conf}
 CINDER_CONF=${CINDER_CONF:-/etc/cinder/cinder.conf}
+CEILOMETER_CONF_DIR=${CEILOMETER_CONF_DIR:-/etc/ceilometer}
 
 
 function incus_cli {
@@ -139,6 +140,39 @@ function install_nova_incus {
     sudo rsync -a --delete --chown="${STACK_USER}:${STACK_USER}" \
         "${NOVA_INCUS_DIR}/nova/virt/lxd/" \
         "${NOVA_DIR}/nova/virt/lxd/"
+}
+
+
+function configure_nova_incus_ceilometer {
+    local ceilometer_patch
+    local meter_source
+    local meter_target_dir
+
+    if ! is_service_enabled ceilometer-anotification; then
+        return
+    fi
+
+    meter_source="${NOVA_INCUS_DIR}/etc/ceilometer/meters.d/incus-volume-usage.yaml"
+    meter_target_dir="${CEILOMETER_CONF_DIR}/meters.d"
+    sudo install -d -o "${STACK_USER}" -g "${STACK_USER}" \
+        -m 0755 "${meter_target_dir}"
+    sudo install -o "${STACK_USER}" -g "${STACK_USER}" -m 0644 \
+        "${meter_source}" "${meter_target_dir}/incus-volume-usage.yaml"
+
+    ceilometer_patch="${NOVA_INCUS_DIR}/patches/ceilometer/0001-gnocchi-map-nova-volume-usage-metrics.patch"
+    if [[ ! -d "${CEILOMETER_DIR:-}/.git" ]]; then
+        die $LINENO \
+            "ceilometer-anotification is enabled but CEILOMETER_DIR is unavailable"
+    fi
+    if git -C "${CEILOMETER_DIR}" apply --reverse --check \
+            "${ceilometer_patch}" >/dev/null 2>&1; then
+        echo "Ceilometer already maps Nova volume usage metrics"
+    elif git -C "${CEILOMETER_DIR}" apply --check "${ceilometer_patch}"; then
+        git -C "${CEILOMETER_DIR}" apply "${ceilometer_patch}"
+    else
+        die $LINENO \
+            "Ceilometer volume usage resource mapping patch does not apply cleanly"
+    fi
 }
 
 
@@ -620,6 +654,7 @@ if is_service_enabled nova-incus; then
         install_nova_incus
     elif [[ "$1" == "stack" && "$2" == "post-config" ]]; then
         configure_nova_incus
+        configure_nova_incus_ceilometer
         configure_cinder_linstor
         configure_cinder_ceph
         configure_cinder_ceph_backup

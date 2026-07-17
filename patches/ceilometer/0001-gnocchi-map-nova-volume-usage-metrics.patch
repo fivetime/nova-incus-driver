@@ -1,0 +1,14 @@
+diff --git a/ceilometer/publisher/data/gnocchi_resources.yaml b/ceilometer/publisher/data/gnocchi_resources.yaml
+--- a/ceilometer/publisher/data/gnocchi_resources.yaml
++++ b/ceilometer/publisher/data/gnocchi_resources.yaml
+@@ -237,6 +237,10 @@ resources:
+       snapshot.size:
+       volume.snapshot.size:
+       volume.backup.size:
++      volume.read.requests:
++      volume.read.bytes:
++      volume.write.requests:
++      volume.write.bytes:
+       backup.size:
+       volume.manage_existing.start:
+       volume.manage_existing.end:

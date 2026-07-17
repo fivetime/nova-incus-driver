@@ -943,3 +943,22 @@ cache owns conversion of cumulative counters into notification totals.
 The standardized server diagnostics response still leaves its anonymous disk
 I/O fields null. Use Nova ``volume.usage`` notifications and the associated
 Ceilometer volume meters for billable per-volume I/O.
+
+Ceilometer ``stable/2026.1`` neither defines meters for Nova's
+``volume.usage`` notification nor maps their names to its Gnocchi ``volume``
+resource by default. When
+``ceilometer-anotification`` is enabled, the DevStack plugin installs
+``incus-volume-usage.yaml`` under ``/etc/ceilometer/meters.d``. It publishes
+the following cumulative Gnocchi metrics, keyed by the Cinder volume UUID:
+
+* ``volume.read.requests``
+* ``volume.read.bytes``
+* ``volume.write.requests``
+* ``volume.write.bytes``
+
+The plugin also applies the matching Gnocchi resource-map patch to the
+Ceilometer checkout. Production packaging must install the meter file, carry
+the resource-map patch until it is available upstream, and restart the
+Ceilometer notification agent. Keep the meter type cumulative: Nova's volume
+usage cache handles counter resets and reports lifetime totals across polling
+intervals.
