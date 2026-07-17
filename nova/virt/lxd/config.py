@@ -247,6 +247,25 @@ incus_opts = [
         min=0,
         help="Seconds between destination cold-migration recovery attempts.",
     ),
+    cfg.IntOpt(
+        "configdrive_migration_max_bytes",
+        default=8 * 1024 * 1024,
+        min=1,
+        help=(
+            "Maximum uncompressed config-drive bytes and maximum compressed "
+            "migration payload bytes. Migration is rejected before source "
+            "shutdown when either limit is exceeded."
+        ),
+    ),
+    cfg.IntOpt(
+        "configdrive_migration_max_files",
+        default=512,
+        min=1,
+        help=(
+            "Maximum number of regular files and directories accepted in a "
+            "config-drive cold-migration payload."
+        ),
+    ),
     cfg.BoolOpt(
         "migration_auto_recovery",
         default=False,

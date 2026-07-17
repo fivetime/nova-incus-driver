@@ -16,7 +16,13 @@
 import collections
 import base64
 from contextlib import closing
+import hashlib
 import inspect
+import io
+import os
+import stat
+import tarfile
+import tempfile
 
 import eventlet
 from oslo_config import cfg
@@ -154,6 +160,8 @@ class LXDDriverTest(test.NoDBTestCase):
         self.CONF.incus.migration_address = None
         self.CONF.incus.migration_finish_retries = 3
         self.CONF.incus.migration_finish_retry_interval = 0
+        self.CONF.incus.configdrive_migration_max_bytes = 8 * 1024 * 1024
+        self.CONF.incus.configdrive_migration_max_files = 512
         self.CONF.incus.volume_use_multipath = False
         self.CONF.incus.volume_enforce_multipath = False
         self.CONF.incus.num_volume_scan_tries = 3
@@ -2609,7 +2617,11 @@ class LXDDriverTest(test.NoDBTestCase):
             NotImplementedError, lxd_driver.suspend, ctx, instance)
         self.client.instances.get.assert_not_called()
 
-    def test_migrate_disk_rejects_configdrive_before_shutdown(self):
+    @mock.patch.object(driver, '_pack_configdrive_for_migration',
+                       side_effect=exception.MigrationError(
+                           reason='config-drive too large'))
+    def test_migrate_disk_rejects_invalid_configdrive_before_shutdown(
+            self, pack_configdrive):
         self.CONF.incus.allow_cold_migration = True
         self.CONF.incus.migration_address = 'https://10.224.0.16:8443'
         ctx = context.get_admin_context()
@@ -2619,11 +2631,120 @@ class LXDDriverTest(test.NoDBTestCase):
         lxd_driver.init_host(None)
 
         self.assertRaises(
-            exception.InstanceFaultRollback,
+            exception.MigrationError,
             lxd_driver.migrate_disk_and_power_off,
             ctx, instance, '10.224.0.17', instance.flavor, [])
 
-        self.client.instances.get.assert_not_called()
+        container = self.client.instances.get.return_value
+        pack_configdrive.assert_called_once_with(instance, container)
+        container.stop.assert_not_called()
+
+    def test_configdrive_migration_round_trip(self):
+        instance = mock.Mock()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            instance_dir = os.path.join(temp_dir, 'instance')
+            configdrive_dir = os.path.join(instance_dir, 'configdrive')
+            metadata_dir = os.path.join(
+                configdrive_dir, 'openstack', 'latest')
+            os.makedirs(metadata_dir)
+            metadata_path = os.path.join(metadata_dir, 'meta_data.json')
+            with open(metadata_path, 'wb') as stream:
+                stream.write(b'{"uuid":"instance-uuid"}')
+
+            container = mock.Mock()
+            container.config = {
+                'volatile.idmap.current': jsonutils.dumps([
+                    {'Isuid': True, 'Hostid': 100000},
+                ]),
+            }
+            attributes = mock.Mock(instance_dir=instance_dir)
+            with mock.patch.object(
+                    common, 'InstanceAttributes',
+                    return_value=attributes), mock.patch.object(
+                        driver.privsep_path, 'chown'):
+                payload = driver._pack_configdrive_for_migration(
+                    instance, container)
+                shutil_rmtree = driver.shutil.rmtree
+                shutil_rmtree(configdrive_dir)
+                staging = driver._stage_configdrive_from_migration(
+                    instance, payload)
+                with mock.patch.object(
+                        driver.processutils, 'execute') as execute:
+                    destination = driver._commit_staged_configdrive(
+                        instance, container, staging)
+
+            with open(os.path.join(
+                    destination, 'openstack', 'latest',
+                    'meta_data.json'), 'rb') as stream:
+                self.assertEqual(
+                    b'{"uuid":"instance-uuid"}', stream.read())
+            self.assertEqual(
+                0o400,
+                stat.S_IMODE(os.stat(os.path.join(
+                    destination, 'openstack', 'latest',
+                    'meta_data.json')).st_mode))
+            execute.assert_called_once()
+
+    def test_container_root_host_id_prefers_next_mapping(self):
+        container = mock.Mock()
+        container.config = {
+            'volatile.idmap.current': jsonutils.dumps([
+                {'Isuid': True, 'Hostid': 100000},
+            ]),
+            'volatile.idmap.next': jsonutils.dumps([
+                {'Isuid': True, 'Hostid': 200000},
+            ]),
+        }
+
+        self.assertEqual(
+            200000, driver._container_root_host_id(container))
+
+    def test_configdrive_migration_rejects_symlink(self):
+        instance = mock.Mock()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            instance_dir = os.path.join(temp_dir, 'instance')
+            configdrive_dir = os.path.join(instance_dir, 'configdrive')
+            os.makedirs(configdrive_dir)
+            os.symlink('/etc/passwd', os.path.join(configdrive_dir, 'escape'))
+            container = mock.Mock()
+            container.config = {
+                'volatile.idmap.current': jsonutils.dumps([
+                    {'Isuid': True, 'Hostid': 100000},
+                ]),
+            }
+            with mock.patch.object(
+                    common, 'InstanceAttributes',
+                    return_value=mock.Mock(instance_dir=instance_dir)), \
+                    mock.patch.object(driver.privsep_path, 'chown'):
+                self.assertRaises(
+                    exception.MigrationError,
+                    driver._pack_configdrive_for_migration,
+                    instance, container)
+
+    def test_configdrive_migration_rejects_path_traversal(self):
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode='w:gz') as output:
+            info = tarfile.TarInfo('../escape')
+            info.size = 1
+            output.addfile(info, io.BytesIO(b'x'))
+        raw = archive.getvalue()
+        payload = {
+            'format': 'tar.gz-v1',
+            'size': len(raw),
+            'sha256': hashlib.sha256(raw).hexdigest(),
+            'data': base64.b64encode(raw).decode('ascii'),
+        }
+        instance = mock.Mock()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(
+                    common, 'InstanceAttributes',
+                    return_value=mock.Mock(instance_dir=temp_dir)):
+                self.assertRaises(
+                    exception.MigrationError,
+                    driver._stage_configdrive_from_migration,
+                    instance, payload)
+            self.assertFalse(os.path.exists(os.path.join(
+                temp_dir, 'escape')))
 
     def test_resume_is_rejected_without_memory_checkpoint(self):
         ctx = context.get_admin_context()

@@ -787,12 +787,21 @@ start are one spawn rollback boundary. A failure removes the Incus instance,
 profile, VIF state, and instance directory instead of leaving a guest that Nova
 believes failed.
 
-Cross-host cold migration and resize of an instance whose
-``instance.config_drive`` is set are currently rejected before the source is
-stopped. The migration protocol does not yet transfer injected files and the
-one-time administrator password needed to reproduce the original config-drive;
-silently regenerating an incomplete drive on the destination would violate
-Nova guest-visible semantics.
+Cross-host cold migration and resize transfer the original config-drive
+contents rather than regenerating incomplete metadata without the original
+injected files or one-time administrator password. The source creates a
+``tar.gz-v1`` payload with a declared compressed size and SHA-256 digest. The
+destination validates the encoding, digest, archive paths, entry types, file
+count, compressed bytes, and expanded bytes before it claims target storage.
+It then applies the target container's idmap and publishes the directory with
+an atomic rename. The default limits are 512 entries and 8 MiB; adjust
+``configdrive_migration_max_files`` and
+``configdrive_migration_max_bytes`` only with corresponding RPC and
+``instances_path`` capacity planning.
+
+The config-drive is mounted read-only. Host directories use mode ``0500`` and
+files use ``0400`` under the container root's isolated host UID. Source-host
+contents remain available for revert and are removed only on resize confirm.
 
 Interface hotplug
 -----------------

@@ -387,6 +387,29 @@ blocker. The dated evidence below tracks the incremental hardening.
   source. BFV resize permits both directions because Cinder independently
   owns root capacity, matching Nova's libvirt semantics.
 
+## Config-drive BFV resize
+
+- On 2026-07-17, BFV server
+  `7cbb8e9a-3532-4fb7-b3bc-8e4497bc6b72`
+  (`instance-00000011`) was created with config-drive on `incus-node-03`,
+  resized from `ds512M` to `ds1G` on `incus-node-02`, and confirmed through
+  the public OpenStack API. It returned ACTIVE with fixed IP `10.0.0.16`.
+- The source and destination config-drive manifests had the same SHA-256
+  digest, `6eb6a82d0cd2ea28f14855165e5c1064cfede4918bfee518fa2fffd699325390`.
+  The destination directory was owned by its isolated idmap UID `1196608`;
+  container root could read `openstack/latest/meta_data.json`, while a write
+  failed with `Read-only file system`.
+- The Cinder root RBD remained exactly 5 GiB, retained its Glance RBD snapshot
+  parent, and had exactly one watcher on `incus-node-02`. Resize confirm
+  removed both the source Incus record and the complete source instance
+  directory. The destination kept the same config-drive contents and Neutron
+  address.
+- The E2E exposed an Incus transition detail now covered by a unit contract:
+  before a migrated target starts, `volatile.idmap.current` can still contain
+  the source mapping while `volatile.idmap.next` contains the target mapping.
+  Config-drive ownership therefore resolves `next`, then `current`, then
+  `last_state`.
+
 - Re-running DevStack to add Cinder rebuilt the test Nova databases. Three
   retained Incus containers (`instance-00000008`, `instance-00000009`, and
   `instance-0000000a`) therefore no longer have Nova database records. Their

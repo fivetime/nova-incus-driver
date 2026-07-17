@@ -340,6 +340,210 @@ def _retry_migration_finish_action(action, description, instance):
             eventlet.sleep(CONF.incus.migration_finish_retry_interval)
 
 
+def _configdrive_path(instance):
+    return os.path.join(
+        common.InstanceAttributes(instance).instance_dir, 'configdrive')
+
+
+def _remove_instance_directory(instance):
+    instance_dir = common.InstanceAttributes(instance).instance_dir
+    if not os.path.exists(instance_dir):
+        return
+    privsep_path.chown(
+        instance_dir, uid=os.getuid(), gid=os.getgid(), recursive=True)
+    for root, dirs, files in os.walk(instance_dir, topdown=False):
+        for name in files:
+            os.chmod(os.path.join(root, name), 0o600)
+        for name in dirs:
+            os.chmod(os.path.join(root, name), 0o700)
+        os.chmod(root, 0o700)
+    shutil.rmtree(instance_dir)
+
+
+def _pack_configdrive_for_migration(instance, container):
+    """Return a bounded, authenticated config-drive migration payload."""
+    source = _configdrive_path(instance)
+    if not os.path.isdir(source):
+        raise exception.MigrationError(
+            reason='Instance config-drive directory is missing')
+
+    storage_id = _container_root_host_id(container)
+    privsep_path.chown(
+        source, uid=os.getuid(), gid=os.getgid(), recursive=True)
+    max_bytes = CONF.incus.configdrive_migration_max_bytes
+    max_files = CONF.incus.configdrive_migration_max_files
+    total_bytes = 0
+    entry_count = 0
+    archive = io.BytesIO()
+    try:
+        with tarfile.open(fileobj=archive, mode='w:gz') as output:
+            for root, dirs, files in os.walk(source):
+                dirs.sort()
+                files.sort()
+                relative_root = os.path.relpath(root, source)
+                for name in dirs + files:
+                    path = os.path.join(root, name)
+                    if os.path.islink(path):
+                        raise exception.MigrationError(
+                            reason='Config-drive migration rejects '
+                            'symbolic links')
+                    relative = os.path.normpath(os.path.join(
+                        relative_root, name))
+                    if relative.startswith('..') or os.path.isabs(relative):
+                        raise exception.MigrationError(
+                            reason='Config-drive contains an unsafe path')
+                    entry_count += 1
+                    if entry_count > max_files:
+                        raise exception.MigrationError(
+                            reason='Config-drive exceeds migration file limit')
+
+                    info = output.gettarinfo(path, arcname=relative)
+                    info.uid = 0
+                    info.gid = 0
+                    info.uname = ''
+                    info.gname = ''
+                    if info.isdir():
+                        output.addfile(info)
+                        continue
+                    if not info.isfile():
+                        raise exception.MigrationError(
+                            reason='Config-drive contains a non-regular file')
+                    total_bytes += info.size
+                    if total_bytes > max_bytes:
+                        raise exception.MigrationError(
+                            reason='Config-drive exceeds migration byte limit')
+                    with open(path, 'rb') as stream:
+                        output.addfile(info, stream)
+    finally:
+        privsep_path.chown(
+            source, uid=storage_id, gid=storage_id, recursive=True)
+
+    raw = archive.getvalue()
+    if len(raw) > max_bytes:
+        raise exception.MigrationError(
+            reason='Compressed config-drive exceeds migration byte limit')
+    return {
+        'format': 'tar.gz-v1',
+        'size': len(raw),
+        'sha256': hashlib.sha256(raw).hexdigest(),
+        'data': base64.b64encode(raw).decode('ascii'),
+    }
+
+
+def _stage_configdrive_from_migration(instance, payload):
+    """Validate and extract a config-drive before claiming target storage."""
+    if not isinstance(payload, dict) or payload.get('format') != 'tar.gz-v1':
+        raise exception.MigrationError(
+            reason='Unsupported config-drive migration payload')
+    try:
+        declared_size = int(payload['size'])
+        raw = base64.b64decode(payload['data'], validate=True)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise exception.MigrationError(
+            reason='Invalid config-drive migration encoding: %s' % exc)
+
+    max_bytes = CONF.incus.configdrive_migration_max_bytes
+    if declared_size != len(raw) or len(raw) > max_bytes:
+        raise exception.MigrationError(
+            reason='Config-drive migration payload size is invalid')
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != str(payload.get('sha256', '')):
+        raise exception.MigrationError(
+            reason='Config-drive migration payload checksum mismatch')
+
+    instance_dir = common.InstanceAttributes(instance).instance_dir
+    fileutils.ensure_tree(instance_dir)
+    staging = tempfile.mkdtemp(
+        prefix='.configdrive-migration-', dir=instance_dir)
+    total_bytes = 0
+    entry_count = 0
+    try:
+        with tarfile.open(fileobj=io.BytesIO(raw), mode='r:gz') as archive:
+            for member in archive:
+                entry_count += 1
+                if entry_count > CONF.incus.configdrive_migration_max_files:
+                    raise exception.MigrationError(
+                        reason='Config-drive exceeds migration file limit')
+                normalized = os.path.normpath(member.name)
+                if (normalized in ('', '.') or
+                        normalized.startswith('..') or
+                        os.path.isabs(normalized)):
+                    raise exception.MigrationError(
+                        reason='Config-drive archive contains an unsafe path')
+                if not (member.isdir() or member.isfile()):
+                    raise exception.MigrationError(
+                        reason='Config-drive archive contains an unsafe type')
+
+                destination = os.path.join(staging, normalized)
+                if member.isdir():
+                    os.makedirs(destination, mode=0o700, exist_ok=True)
+                    continue
+                total_bytes += member.size
+                if total_bytes > max_bytes:
+                    raise exception.MigrationError(
+                        reason='Config-drive exceeds migration byte limit')
+                os.makedirs(os.path.dirname(destination), exist_ok=True)
+                source = archive.extractfile(member)
+                if source is None:
+                    raise exception.MigrationError(
+                        reason='Config-drive archive file has no contents')
+                with source, open(destination, 'xb') as output:
+                    shutil.copyfileobj(source, output)
+                os.chmod(destination, 0o400)
+        for root, dirs, _files in os.walk(staging, topdown=False):
+            for name in dirs:
+                os.chmod(os.path.join(root, name), 0o500)
+            os.chmod(root, 0o500)
+        return staging
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+def _prepare_configdrive_migration(instance, transfer):
+    """Validate config-drive mode and stage any transferred content."""
+    payload = transfer.get('configdrive')
+    if bool(payload) != bool(instance.config_drive):
+        raise exception.MigrationError(
+            reason='Source and destination disagree on config-drive mode')
+
+    if payload:
+        return _stage_configdrive_from_migration(instance, payload)
+
+    return None
+
+
+def _container_root_host_id(container):
+    for key in (
+            'volatile.idmap.next',
+            'volatile.idmap.current',
+            'volatile.last_state.idmap'):
+        try:
+            mappings = jsonutils.loads(container.config.get(key, '[]'))
+        except (TypeError, ValueError) as exc:
+            raise exception.MigrationError(
+                reason='Cannot read target container idmap: %s' % exc)
+        for mapping in mappings:
+            if mapping.get('Isuid'):
+                return mapping.get('Hostid', 0)
+    raise exception.MigrationError(
+        reason='Target unprivileged container has no UID idmap')
+
+
+def _commit_staged_configdrive(instance, container, staging):
+    """Apply the target idmap and atomically publish a staged config-drive."""
+    destination = _configdrive_path(instance)
+    if os.path.exists(destination):
+        raise exception.MigrationError(
+            reason='Target config-drive directory already exists')
+    storage_id = _container_root_host_id(container)
+    processutils.execute(
+        'chown', '-R', '%s:%s' % (storage_id, storage_id), staging,
+        run_as_root=True, root_helper=utils.get_root_helper())
+    os.replace(staging, destination)
+    return destination
+
+
 def _profile_device_info(profile, volume_id, device):
     encoded = profile.config.get(_volume_device_info_key(volume_id))
     if encoded:
@@ -1099,12 +1303,7 @@ class LXDDriver(driver.ComputeDriver):
                 self.detach_volume(
                     context, connection_info, instance, mountpoint)
 
-        container_dir = common.InstanceAttributes(instance).instance_dir
-        if os.path.exists(container_dir):
-            privsep_path.chown(
-                container_dir, uid=os.getuid(), gid=os.getgid(),
-                recursive=True)
-            shutil.rmtree(container_dir)
+        _remove_instance_directory(instance)
 
         try:
             self.client.profiles.get(instance.name).delete()
@@ -1596,11 +1795,6 @@ class LXDDriver(driver.ComputeDriver):
                 reason='Incus cold migration is disabled by configuration')
 
         root_bdm = _boot_from_volume(block_device_info)
-        if instance.config_drive:
-            raise exception.InstanceFaultRollback(
-                exception.ResizeError(
-                    reason='Incus cross-host resize cannot yet preserve '
-                    'config-drive contents'))
         if (root_bdm is None and
                 flavor.root_gb < instance.flavor.root_gb):
             raise exception.InstanceFaultRollback(
@@ -1627,6 +1821,10 @@ class LXDDriver(driver.ComputeDriver):
                 raise exception.InstanceFaultRollback(exc) from exc
 
         container = self.client.instances.get(instance.name)
+        configdrive_payload = None
+        if instance.config_drive:
+            configdrive_payload = _pack_configdrive_for_migration(
+                instance, container)
         was_running = container.status != 'Stopped'
         if was_running:
             container.stop(wait=True)
@@ -1681,6 +1879,7 @@ class LXDDriver(driver.ComputeDriver):
             'boot_from_volume': bool(root_bdm),
             'migration_data': migration_data,
             'was_running': was_running,
+            'configdrive': configdrive_payload,
         })
 
     def snapshot(self, context, instance, image_id, update_task_state):
@@ -2001,6 +2200,8 @@ class LXDDriver(driver.ComputeDriver):
         if root_bdm:
             root_volume = _require_bfv_migration_support(
                 self.client, root_bdm)
+        configdrive_staging = _prepare_configdrive_migration(
+            instance, transfer)
 
         profile = None
         container = None
@@ -2019,6 +2220,18 @@ class LXDDriver(driver.ComputeDriver):
                 profile.save(wait=True)
             container = self.client.instances.create(
                 migration_data, wait=True)
+            if configdrive_staging:
+                target_container = self.client.instances.get(instance.name)
+                configdrive_path = _commit_staged_configdrive(
+                    instance, target_container, configdrive_staging)
+                configdrive_staging = None
+                profile.devices['configdrive'] = {
+                    'path': '/config-drive',
+                    'source': configdrive_path,
+                    'type': 'disk',
+                    'readonly': 'true',
+                }
+                profile.save(wait=True)
 
             for bdm in driver.block_device_info_get_mapping(
                     block_device_info):
@@ -2040,6 +2253,8 @@ class LXDDriver(driver.ComputeDriver):
                     'container start', instance)
         except Exception:
             with excutils.save_and_reraise_exception() as error_context:
+                if configdrive_staging:
+                    shutil.rmtree(configdrive_staging, ignore_errors=True)
                 bfv_ownership_uncertain = False
                 if root_bdm is not None and container is None:
                     try:
@@ -2115,6 +2330,13 @@ class LXDDriver(driver.ComputeDriver):
                             instance=instance)
                 if plugged and not retain_bfv_target:
                     self.unplug_vifs(instance, network_info)
+                if not retain_bfv_target:
+                    try:
+                        _remove_instance_directory(instance)
+                    except Exception:
+                        LOG.exception(
+                            'Failed to remove migration target directory',
+                            instance=instance)
 
     def confirm_migration(self, context, migration, instance, network_info):
         container = self.client.instances.get(instance.name)
@@ -2123,6 +2345,7 @@ class LXDDriver(driver.ComputeDriver):
         container.delete(wait=True)
         self.client.profiles.get(instance.name).delete()
         self.unplug_vifs(instance, network_info)
+        _remove_instance_directory(instance)
 
     def finish_revert_migration(self, context, instance, network_info,
                                 migration, block_device_info=None,
@@ -2231,41 +2454,7 @@ class LXDDriver(driver.ComputeDriver):
                 format=CONF.config_drive_format)
 
         container = self.client.instances.get(instance.name)
-        storage_id = 0
-        """
-        Determine UID shift used for container uid mapping
-        Sample JSON config from LXD
-        {
-            "volatile.apply_template": "create",
-            ...
-            "volatile.last_state.idmap": "[
-                {
-                \"Isuid\":true,
-                \"Isgid\":false,
-                \"Hostid\":100000,
-                \"Nsid\":0,
-                \"Maprange\":65536
-                },
-                {
-                \"Isuid\":false,
-                \"Isgid\":true,
-                \"Hostid\":100000,
-                \"Nsid\":0,
-                \"Maprange\":65536
-                }] ",
-            "volatile.tap5fd6808a-7b.name": "eth0"
-        }
-        """
-        container_id_map = jsonutils.loads(
-            container.config['volatile.last_state.idmap'])
-        uid_map = list(filter(lambda id_map: id_map.get("Isuid"),
-                              container_id_map))
-        if uid_map:
-            storage_id = uid_map[0].get("Hostid", 0)
-        else:
-            # privileged containers does not have uid/gid mapping
-            # LXD API return nothing
-            pass
+        storage_id = _container_root_host_id(container)
 
         extra_md = {}
         if admin_password:
@@ -2298,8 +2487,9 @@ class LXDDriver(driver.ComputeDriver):
             try:
                 _, err = processutils.execute('mount',
                                        '-o',
-                                       'loop,uid=%d,gid=%d' % (os.getuid(),
-                                                               os.getgid()),
+                                       ('loop,ro,nosuid,nodev,noexec,'
+                                        'uid=%d,gid=%d') % (
+                                            os.getuid(), os.getgid()),
                                        iso_path, tmpdir,
                                        run_as_root=True,
                                        root_helper=root_helper)
@@ -2313,9 +2503,13 @@ class LXDDriver(driver.ComputeDriver):
                     shutil.copytree(os.path.join(tmpdir, ent),
                                     os.path.join(configdrive_dir, ent))
 
-                processutils.execute('chmod', '-R', '775', configdrive_dir,
-                                     run_as_root=True,
-                                     root_helper=root_helper)
+                for root, dirs, files in os.walk(
+                        configdrive_dir, topdown=False):
+                    for name in files:
+                        os.chmod(os.path.join(root, name), 0o400)
+                    for name in dirs:
+                        os.chmod(os.path.join(root, name), 0o500)
+                    os.chmod(root, 0o500)
                 processutils.execute('chown', '-R',
                               '%s:%s' % (storage_id, storage_id),
                               configdrive_dir, run_as_root=True,

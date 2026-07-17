@@ -187,8 +187,8 @@
       "owner": "nova+driver+guest-image",
       "driver_hooks": ["spawn"],
       "applicability": "container",
-      "status": "partial",
-      "evidence": "Spawn and rebuild expose a read-only directory with rollback on construction failure; cross-host cold migration and resize are explicitly rejected until config-drive contents can be transferred safely"
+      "status": "supported",
+      "evidence": "Spawn and rebuild expose a read-only directory with rollback on construction failure; bounded SHA-256-verified cross-host transfer, target idmap ownership, revert, confirm cleanup, stable Neutron address, and unchanged BFV root capacity passed three-node public API E2E"
     },
     {
       "id": "rescue-unrescue",
