@@ -17,6 +17,12 @@ The concept of 'start-and-pause' does not exist in LXD, so the driver
 creates a veth pair instead, allowing the last mile wiring to be created
 in advance of the actual LXD container being created.
 
+The veth pair is created through ``vif_plug_ovs.linux_net``.  This uses the
+os-vif ``vif_plug`` privsep context and its restricted network capabilities;
+the nova-compute process is not given unrestricted sudo access.  Direct
+``processutils.execute(..., run_as_root=True)`` calls are not supported by
+modern Nova and must not be reintroduced here.
+
 This allows Neutron to complete the underlying VIF plugging at which
 point it will notify Nova and the Nova-LXD driver will create the LXD
 container and wire the pre-created veth pair into its profile.
@@ -57,3 +63,22 @@ The Nova-LXD driver has been validated with:
  - OpenvSwitch (ovs) hybrid bridge ports.
  - OpenvSwitch (ovs) standard ports.
  - Linuxbridge (bridge) ports
+
+The initial modernized target is Neutron ML2/OVN with a standard OVS port.
+For that path os-vif owns the host-side OVS port and its external IDs. Incus
+receives only the peer interface as a physical NIC device.
+
+OVN gateway chassis
+-------------------
+
+Only a chassis with a working provider-network L2 uplink may use
+``enable-chassis-as-gw``. In the supplied DevStack topology the controller has
+that uplink and sets ``ENABLE_CHASSIS_AS_GW=True``. Compute-only nodes set it
+to ``False``. They do not need a local external bridge: tenant traffic reaches
+the selected gateway chassis over the OVN Geneve overlay.
+
+Marking an isolated compute chassis as a gateway can make OVN schedule a
+logical router there. A floating IP may then have correct logical flows but no
+physical path to the provider network. Verify both the chassis options in the
+OVN southbound database and actual provider connectivity before enabling the
+gateway role on additional computes.

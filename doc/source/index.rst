@@ -12,6 +12,7 @@ Contents:
    :maxdepth: 2
 
    usage
+   architecture
    contributing
    exclusive_machine
    vif_wiring
