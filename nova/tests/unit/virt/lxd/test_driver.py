@@ -27,6 +27,7 @@ import tempfile
 import eventlet
 from oslo_config import cfg
 from oslo_serialization import jsonutils
+from oslo_utils import timeutils
 from oslo_utils import units
 from unittest import mock
 from nova import context
@@ -375,9 +376,15 @@ class LXDDriverTest(test.NoDBTestCase):
         self.assertEqual(power_state.SHUTDOWN, info.state)
         container.state.assert_not_called()
 
-    def test_get_diagnostics_reports_only_incus_counters(self):
+    @mock.patch('nova.virt.lxd.driver.timeutils.utcnow')
+    def test_get_diagnostics_reports_only_incus_counters(self, utcnow):
+        utcnow.return_value = timeutils.parse_isotime(
+            '2026-07-18T01:00:42Z')
+        self.client.host_info['api_extensions'].append(
+            'instance_state_started_at')
         state = mock.Mock(
             status_code=100,
+            started_at='2026-07-18T01:00:00Z',
             cpu={'usage': 123456789},
             memory={'total': 2 * units.Gi, 'usage': 768 * units.Mi},
             disk={'root': {'total': 20 * units.Gi}},
@@ -422,6 +429,25 @@ class LXDDriverTest(test.NoDBTestCase):
             'eth0_tx_packets': 6,
         }, result)
         self.assertNotIn('lo_rx', result)
+
+        data = lxd_driver._get_diagnostics_data(instance)
+        self.assertEqual(42, data['uptime'])
+
+    def test_get_diagnostics_omits_uptime_without_server_extension(self):
+        state = mock.Mock(
+            status_code=100, cpu={}, memory={}, disk={}, network={},
+            started_at='2026-07-18T01:00:00Z')
+        container = mock.Mock()
+        container.state.return_value = state
+        self.client.instances.get.return_value = container
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test')
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        data = lxd_driver._get_diagnostics_data(instance)
+
+        self.assertIsNone(data['uptime'])
 
     def test_get_diagnostics_missing_instance(self):
         self.client.instances.get.side_effect = lxdcore_exceptions.NotFound(

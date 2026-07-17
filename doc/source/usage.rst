@@ -911,10 +911,13 @@ For microversion 2.48 and later, ``GET /servers/{uuid}/diagnostics`` reports
 the Incus aggregate CPU time in nanoseconds, memory in MiB, and cumulative
 per-interface packet, byte, error, and drop counters. CPU time is an instance
 aggregate, so the single CPU detail has a null ID while ``num_cpus`` retains
-the Flavor vCPU count. ``uptime`` is null because Incus does not provide a
-reliable last-start timestamp. Disk entries describe the devices but their I/O
-fields are null because Incus does not expose attributable block I/O counters.
-Do not use this endpoint for volume I/O billing.
+the Flavor vCPU count. On servers with the
+``instance_state_started_at`` extension, ``uptime`` is calculated from the
+container PID 1 start time reported by Incus; it therefore resets after a real
+container restart. It is null on older servers rather than being guessed from
+Nova's instance creation time. Disk entries describe the devices but their
+I/O fields are null because Incus does not expose attributable block I/O
+counters. Do not use this endpoint for volume I/O billing.
 
 Microversions before 2.48 receive Nova's legacy flat diagnostics dictionary.
 Its memory values are KiB and its CPU and NIC values are the same Incus

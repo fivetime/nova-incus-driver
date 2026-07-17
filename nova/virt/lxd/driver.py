@@ -46,6 +46,7 @@ from os_brick.initiator import connector
 from oslo_concurrency import processutils
 from oslo_log import log as logging
 from oslo_utils import fileutils
+from oslo_utils import timeutils
 from pylxd import exceptions as lxd_exceptions
 
 from nova.virt.lxd import vif as lxd_vif
@@ -1031,6 +1032,20 @@ class LXDDriver(driver.ComputeDriver):
         memory = state.memory or {}
         networks = state.network or {}
         disks = state.disk or {}
+        uptime = None
+        extensions = self.client.host_info.get('api_extensions', [])
+        started_at = getattr(state, 'started_at', None)
+        if 'instance_state_started_at' in extensions and started_at:
+            try:
+                started_at = timeutils.normalize_time(
+                    timeutils.parse_isotime(started_at))
+                now = timeutils.normalize_time(timeutils.utcnow())
+                uptime = max(
+                    0, int(timeutils.delta_seconds(started_at, now)))
+            except (TypeError, ValueError):
+                LOG.warning(
+                    'Incus returned an invalid started_at value for '
+                    'instance %s: %r', instance.uuid, started_at)
 
         nics = []
         for name, network in sorted(networks.items()):
@@ -1057,6 +1072,7 @@ class LXDDriver(driver.ComputeDriver):
             'memory_used': memory.get('usage'),
             'nics': nics,
             'disk_count': len(disks),
+            'uptime': uptime,
         }
 
     def get_diagnostics(self, instance):
@@ -1097,7 +1113,7 @@ class LXDDriver(driver.ComputeDriver):
             config_drive=configdrive.required_by(instance),
             hypervisor='incus',
             hypervisor_os='linux',
-            uptime=None)
+            uptime=data['uptime'])
         diags.memory_details = objects.MemoryDiagnostics(
             maximum=(data['memory_maximum'] // units.Mi
                      if data['memory_maximum'] is not None else None),

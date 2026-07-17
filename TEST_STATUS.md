@@ -450,10 +450,11 @@ blocker. The dated evidence below tracks the incremental hardening.
   cross-host RPC for BFV server
   `7cbb8e9a-3532-4fb7-b3bc-8e4497bc6b72` on `incus-node-02`.
 - Microversion 2.48 reported `driver=lxd`, `hypervisor=incus`, running state,
-  Flavor vCPU count, aggregate CPU time, runtime memory, and accurate `eth0`
-  counters. Uptime and the root disk's unavailable block I/O fields are null.
-  Microversion 2.47 returned the corresponding legacy CPU, memory, and NIC
-  dictionary.
+  Flavor vCPU count, aggregate CPU time, runtime memory, accurate `eth0`
+  counters, and uptime derived from Incus `started_at`. The tested BFV
+  container returned an uptime of 7013 seconds. The root disk's unavailable
+  block I/O fields are null. Microversion 2.47 returned the corresponding
+  legacy CPU, memory, and NIC dictionary.
 - Diagnostics testing exposed and fixed the pre-existing Flavor conversion
   from Nova MiB to Incus decimal `MB`. New profiles now use `MiB`; the complete
   Python 3.12 suite passed 220 tests with 2 intentional legacy pylxd skips.
