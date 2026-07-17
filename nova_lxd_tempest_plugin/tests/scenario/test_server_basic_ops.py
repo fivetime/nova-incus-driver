@@ -20,8 +20,8 @@ from tempest import exceptions
 from tempest.lib.common.utils import test_utils
 from tempest.lib import decorators
 
-from nova_lxd_tempest_plugin.tests.scenario import manager
 from oslo_serialization import jsonutils
+from tempest.scenario import manager
 
 CONF = config.CONF
 
@@ -51,7 +51,8 @@ class TestServerBasicOps(manager.ScenarioTest):
     def verify_ssh(self, keypair):
         if self.run_ssh:
             # Obtain a floating IP
-            self.fip = self.create_floating_ip(self.instance)['ip']
+            self.fip = self.create_floating_ip(
+                self.instance)['floating_ip_address']
             # Check ssh
             self.ssh_client = self.get_remote_client(
                 ip_address=self.fip,
@@ -81,9 +82,10 @@ class TestServerBasicOps(manager.ScenarioTest):
 
     def verify_metadata_on_config_drive(self):
         if self.run_ssh and CONF.compute_feature_enabled.config_drive:
-            # Verify metadata on config_drive
-            cmd_md = \
-                'cat /var/lib/cloud/data/openstack/latest/meta_data.json'
+            # The Incus driver exposes the unpacked, read-only config drive as
+            # a directory. Do not depend on cloud-init copying it into its
+            # distribution-specific cache.
+            cmd_md = 'cat /config-drive/openstack/latest/meta_data.json'
             result = self.ssh_client.exec_command(cmd_md)
             result = jsonutils.loads(result)
             self.assertIn('meta', result)
@@ -93,9 +95,7 @@ class TestServerBasicOps(manager.ScenarioTest):
 
     def verify_networkdata_on_config_drive(self):
         if self.run_ssh and CONF.compute_feature_enabled.config_drive:
-            # Verify network data on config_drive
-            cmd_md = \
-                'cat /var/lib/cloud/data/openstack/latest/network_data.json'
+            cmd_md = 'cat /config-drive/openstack/latest/network_data.json'
             result = self.ssh_client.exec_command(cmd_md)
             result = jsonutils.loads(result)
             self.assertIn('services', result)
@@ -109,7 +109,7 @@ class TestServerBasicOps(manager.ScenarioTest):
     @utils.services('compute', 'network')
     def test_server_basic_ops(self):
         keypair = self.create_keypair()
-        self.security_group = self._create_security_group()
+        self.security_group = self.create_security_group()
         security_groups = [{'name': self.security_group['name']}]
         self.md = {'meta1': 'data1', 'meta2': 'data2', 'metaN': 'dataN'}
         self.instance = self.create_server(

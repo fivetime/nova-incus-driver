@@ -18,11 +18,14 @@ import os
 from tempest.test_discover import plugins
 
 
-class MyPlugin(plugins.TempestPlugin):
+class NovaIncusTempestPlugin(plugins.TempestPlugin):
     def load_tests(self):
         base_path = os.path.split(os.path.dirname(
             os.path.abspath(__file__)))[0]
-        test_dir = "nova_lxd_tempest_plugin/tests"
+        # Tempest validates the public OpenStack contract. Backend inspection
+        # belongs in driver functional tests and cannot assume a local daemon
+        # in a multi-compute deployment.
+        test_dir = "nova_lxd_tempest_plugin/tests/scenario"
         full_test_dir = os.path.join(base_path, test_dir)
         return full_test_dir, base_path
 
@@ -30,4 +33,4 @@ class MyPlugin(plugins.TempestPlugin):
         pass
 
     def get_opt_lists(self):
-        pass
+        return []

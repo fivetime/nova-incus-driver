@@ -1,5 +1,5 @@
-# Copyright 2013 NEC Corporation
 # Copyright 2016 Canonical Ltd
+# Copyright 2026 OpenStack Incus contributors
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -14,99 +14,160 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-
 from oslo_log import log as logging
+import testtools
 
+from tempest.common import utils
+from tempest.common import waiters
 from tempest import config
 from tempest import exceptions
 from tempest.lib.common.utils import test_utils
-
-from nova_lxd_tempest_plugin.tests.scenario import manager
+from tempest.lib import decorators
+from tempest.scenario import manager
 
 CONF = config.CONF
 LOG = logging.getLogger(__name__)
 
 
-class LXDVolumeScenario(manager.ScenarioTest):
-    """The test suite for attaching volume to an instance
+class IncusVolumeScenario(manager.ScenarioTest):
+    """Validate Cinder data volumes through the public OpenStack APIs."""
 
-    The following is the scenario outline:
-    1. Boot an instance "instance"
-    2. Create a volume "volume1"
-    3. Attach volume1 to instance
-    4. Create a filesystem on volume1
-    5. Mount volume1
-    6. Create a file which timestamp is written in volume1
-    7. Check for file on instnace1
-    7. Unmount volume1
-    8. Detach volume1 from instance1
-    """
+    credentials = ['primary', 'admin']
+    volume_min_microversion = '3.42'
 
     def setUp(self):
-        super(LXDVolumeScenario, self).setUp()
+        super().setUp()
         self.image_ref = CONF.compute.image_ref
         self.flavor_ref = CONF.compute.flavor_ref
-        self.run_ssh = CONF.validation.run_validation
         self.ssh_user = CONF.validation.image_ssh_user
 
     @classmethod
-    def skip_checks(cls):
-        super(LXDVolumeScenario, cls).skip_checks()
+    def setup_clients(cls):
+        super().setup_clients()
+        cls.admin_servers_client = cls.os_admin.servers_client
 
-    def _wait_for_volume_available_on_the_system(self, ip_address,
-                                                 private_key):
-        ssh = self.get_remote_client(ip_address, private_key=private_key)
+    def _wait_for_volume_available_on_the_system(self, ssh):
+        device = '/dev/%s' % CONF.compute.volume_device_name
 
-        def _func():
-            part = ssh.get_partitions()
-            LOG.debug("Partitions: {}".format(part))
-            return CONF.compute.volume_device_name in part
+        def _device_exists():
+            return ssh.exec_command(
+                'test -b %s && echo present || true' % device).strip() == (
+                    'present')
 
-        if not test_utils.call_until_true(_func,
-                                          CONF.compute.build_timeout,
-                                          CONF.compute.build_interval):
-            raise exceptions.TimeoutException
+        if not test_utils.call_until_true(
+                _device_exists, CONF.compute.build_timeout,
+                CONF.compute.build_interval):
+            raise exceptions.TimeoutException(
+                'Timed out waiting for %s in the system container' % device)
+        return device
 
+    def _server_host(self, server_id):
+        server = self.admin_servers_client.show_server(server_id)['server']
+        return server['OS-EXT-SRV-ATTR:host']
+
+    def _mount_fuse_ext4(self, ssh, device, make_filesystem=False):
+        if make_filesystem:
+            ssh.exec_command('sudo mke2fs -F -t ext4 %s' % device)
+        ssh.exec_command('sudo mkdir -p /mnt/cinder-tempest')
+        ssh.exec_command(
+            'sudo fuse2fs -o allow_other %s /mnt/cinder-tempest' % device)
+
+    def _unmount_fuse_ext4(self, ssh):
+        ssh.exec_command('sudo fusermount3 -u /mnt/cinder-tempest')
+
+    @decorators.idempotent_id('44356d4b-3a74-44e0-9719-9e36c3acff50')
+    @decorators.attr(type='smoke')
+    @utils.services('compute', 'network', 'volume')
     def test_volume_attach(self):
+        """Attach, use and detach an ext4 volume without a kernel mount."""
         keypair = self.create_keypair()
-        self.security_group = self._create_security_group()
-        security_groups = [{'name': self.security_group['name']}]
-        self.md = {'meta1': 'data1', 'meta2': 'data2', 'metaN': 'dataN'}
+        security_group = self.create_security_group()
         server = self.create_server(
             image_id=self.image_ref,
             flavor=self.flavor_ref,
             key_name=keypair['name'],
-            security_groups=security_groups,
-            config_drive=CONF.compute_feature_enabled.config_drive,
-            metadata=self.md,
+            security_groups=[{'name': security_group['name']}],
             wait_until='ACTIVE')
-
         volume = self.create_volume()
-
-        # create and add floating IP to server1
-        ip_for_server = self.get_server_ip(server)
-
-        self.nova_volume_attach(server, volume)
-        self._wait_for_volume_available_on_the_system(ip_for_server,
-                                                      keypair['private_key'])
-
-        ssh_client = self.get_remote_client(
-            ip_address=ip_for_server,
-            username=self.ssh_user,
+        ip_address = self.get_server_ip(server)
+        ssh = self.get_remote_client(
+            ip_address=ip_address, username=self.ssh_user,
             private_key=keypair['private_key'])
 
-        ssh_client.exec_command(
-            'sudo /sbin/mke2fs -t ext4 /dev/%s'
-            % CONF.compute.volume_device_name)
-        ssh_client.exec_command(
-            'sudo /bin/mount -t ext4 /dev/%s /mnt'
-            % CONF.compute.volume_device_name)
-        ssh_client.exec_command(
-            'sudo sh -c "date > /mnt/timestamp; sync"')
-        timestamp = ssh_client.exec_command(
-            'test -f /mnt/timestamp && echo ok')
-        ssh_client.exec_command(
-            'sudo /bin/umount /mnt')
-
+        self.nova_volume_attach(server, volume)
+        self.addCleanup(
+            test_utils.call_and_ignore_notfound_exc,
+            self.nova_volume_detach, server, volume)
+        device = self._wait_for_volume_available_on_the_system(ssh)
+        self._mount_fuse_ext4(ssh, device, make_filesystem=True)
+        ssh.exec_command(
+            'echo tempest-volume | sudo tee '
+            '/mnt/cinder-tempest/marker >/dev/null && sync')
+        marker = ssh.exec_command(
+            'cat /mnt/cinder-tempest/marker').strip()
+        self._unmount_fuse_ext4(ssh)
         self.nova_volume_detach(server, volume)
-        self.assertEqual(u'ok\n', timestamp)
+        self.assertEqual('tempest-volume', marker)
+
+    @decorators.idempotent_id('dbcc8145-d69a-44d9-86a0-b29bbf4c19d4')
+    @decorators.attr(type=['multinode', 'slow'])
+    @utils.services('compute', 'network', 'volume')
+    @testtools.skipUnless(CONF.compute_feature_enabled.cold_migration,
+                          'Cold migration not available.')
+    def test_volume_extend_and_cold_migrate(self):
+        """Preserve an attached Cinder volume across cold migration."""
+        if CONF.compute.min_compute_nodes < 2:
+            raise self.skipException('At least two compute nodes are required')
+
+        keypair = self.create_keypair()
+        security_group = self.create_security_group()
+        server = self.create_server(
+            image_id=self.image_ref,
+            flavor=self.flavor_ref,
+            key_name=keypair['name'],
+            security_groups=[{'name': security_group['name']}],
+            wait_until='ACTIVE')
+        volume = self.create_volume(size=1)
+        ip_address = self.get_server_ip(server)
+        ssh = self.get_remote_client(
+            ip_address=ip_address, username=self.ssh_user,
+            private_key=keypair['private_key'])
+        source_host = self._server_host(server['id'])
+
+        self.nova_volume_attach(server, volume)
+        self.addCleanup(
+            test_utils.call_and_ignore_notfound_exc,
+            self.nova_volume_detach, server, volume)
+        device = self._wait_for_volume_available_on_the_system(ssh)
+        self._mount_fuse_ext4(ssh, device, make_filesystem=True)
+        ssh.exec_command(
+            'echo tempest-migration | sudo tee '
+            '/mnt/cinder-tempest/marker >/dev/null && sync')
+
+        self.volumes_client.extend_volume(volume['id'], new_size=2)
+        waiters.wait_for_volume_resource_status(
+            self.volumes_client, volume['id'], 'in-use')
+        size_bytes = int(ssh.exec_command(
+            'sudo blockdev --getsize64 %s' % device).strip())
+        self.assertGreaterEqual(size_bytes, 2 * 1024 ** 3)
+        self._unmount_fuse_ext4(ssh)
+
+        self.admin_servers_client.migrate_server(server['id'])
+        waiters.wait_for_server_status(
+            self.servers_client, server['id'], 'VERIFY_RESIZE')
+        self.servers_client.confirm_resize_server(server['id'])
+        waiters.wait_for_server_status(
+            self.servers_client, server['id'], 'ACTIVE')
+        destination_host = self._server_host(server['id'])
+        self.assertNotEqual(source_host, destination_host)
+
+        ssh = self.get_remote_client(
+            ip_address=ip_address, username=self.ssh_user,
+            private_key=keypair['private_key'])
+        device = self._wait_for_volume_available_on_the_system(ssh)
+        self._mount_fuse_ext4(ssh, device)
+        marker = ssh.exec_command(
+            'cat /mnt/cinder-tempest/marker').strip()
+        self._unmount_fuse_ext4(ssh)
+        self.assertEqual('tempest-migration', marker)
+        self.nova_volume_detach(server, volume)
