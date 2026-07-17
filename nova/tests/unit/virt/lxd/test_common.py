@@ -12,7 +12,7 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-import mock
+from unittest import mock
 
 from nova import context
 from nova import test
@@ -30,7 +30,7 @@ class InstanceAttributesTest(test.NoDBTestCase):
         self.CONF_patcher = mock.patch('nova.virt.lxd.driver.nova.conf.CONF')
         self.CONF = self.CONF_patcher.start()
         self.CONF.instances_path = '/i'
-        self.CONF.lxd.root_dir = '/c'
+        self.CONF.incus.root_dir = '/c'
 
     def tearDown(self):
         super(InstanceAttributesTest, self).tearDown()
@@ -64,7 +64,7 @@ class InstanceAttributesTest(test.NoDBTestCase):
 
         attributes = common.InstanceAttributes(instance)
         self.assertEqual(
-            '/var/log/lxd/instance-00000001/console.log',
+            '/var/log/incus/instance-00000001/console.log',
             attributes.console_path)
 
         is_snap_lxd.return_value = True

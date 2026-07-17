@@ -13,7 +13,7 @@
 #    under the License.
 
 import ddt
-import mock
+from unittest import mock
 import uuid
 
 from nova import context

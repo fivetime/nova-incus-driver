@@ -13,12 +13,17 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+import unittest
 
 import nova.conf
 from nova import exception
 from nova import test
-from pylxd.deprecated import exceptions as lxd_exceptions
+try:
+    from pylxd.deprecated import exceptions as lxd_exceptions
+except ModuleNotFoundError:
+    raise unittest.SkipTest(
+        'Legacy pylxd migration API is outside the initial milestone')
 
 from nova.virt.lxd import driver
 

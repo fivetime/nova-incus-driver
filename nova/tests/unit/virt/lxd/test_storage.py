@@ -12,7 +12,7 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-import mock
+from unittest import mock
 from nova import context
 from nova import test
 from nova.tests.unit import fake_instance
@@ -32,14 +32,14 @@ class TestAttachEphemeral(test.NoDBTestCase):
         self.patchers.append(CONF_patcher)
         self.CONF = CONF_patcher.start()
         self.CONF.instances_path = '/i'
-        self.CONF.lxd.root_dir = '/var/lib/lxd'
+        self.CONF.incus.root_dir = '/var/lib/incus'
 
     def tearDown(self):
         super(TestAttachEphemeral, self).tearDown()
         for patcher in self.patchers:
             patcher.stop()
 
-    @mock.patch.object(storage.utils, 'execute')
+    @mock.patch.object(storage.processutils, 'execute')
     @mock.patch(
         'nova.virt.lxd.storage.driver.block_device_info_get_ephemerals')
     def test_add_ephemerals_with_zfs(
@@ -60,7 +60,7 @@ class TestAttachEphemeral(test.NoDBTestCase):
             '"Maprange":65536}]'
         }
         client = mock.Mock()
-        client.containers.get.return_value = container
+        client.instances.get.return_value = container
 
         storage.attach_ephemeral(
             client, block_device_info, lxd_config, instance)
@@ -81,7 +81,7 @@ class TestAttachEphemeral(test.NoDBTestCase):
 
         self.assertEqual(expected_calls, execute.call_args_list)
 
-    @mock.patch.object(storage.utils, 'execute')
+    @mock.patch.object(storage.processutils, 'execute')
     @mock.patch(
         'nova.virt.lxd.storage.driver.block_device_info_get_ephemerals')
     def test_add_ephemerals_with_btrfs(
@@ -118,7 +118,7 @@ class TestAttachEphemeral(test.NoDBTestCase):
             '"Hostid":165536,"Nsid":0,'
             '"Maprange":65536}]'
         }
-        client.containers.get.return_value = container
+        client.instances.get.return_value = container
 
         storage.attach_ephemeral(
             client, block_device_info, lxd_config, instance)
@@ -130,23 +130,23 @@ class TestAttachEphemeral(test.NoDBTestCase):
         expected_calls = [
             mock.call(
                 'btrfs', 'subvolume', 'create',
-                '/var/lib/lxd/containers/instance-00000001/ephemerals0',
+                '/var/lib/incus/containers/instance-00000001/ephemerals0',
                 run_as_root=True),
             mock.call(
                 'btrfs', 'qgroup', 'limit', '1g',
-                '/var/lib/lxd/containers/instance-00000001/ephemerals0',
+                '/var/lib/incus/containers/instance-00000001/ephemerals0',
                 run_as_root=True),
             mock.call(
                 'chown', '165536',
-                '/var/lib/lxd/containers/instance-00000001/ephemerals0',
+                '/var/lib/incus/containers/instance-00000001/ephemerals0',
                 run_as_root=True)
         ]
         self.assertEqual(expected_calls, execute.call_args_list)
         self.assertEqual(
             profile.devices['ephemerals0']['source'],
-            '/var/lib/lxd/containers/instance-00000001/ephemerals0')
+            '/var/lib/incus/containers/instance-00000001/ephemerals0')
 
-    @mock.patch.object(storage.utils, 'execute')
+    @mock.patch.object(storage.processutils, 'execute')
     @mock.patch(
         'nova.virt.lxd.storage.driver.block_device_info_get_ephemerals')
     def test_ephemeral_with_lvm(
@@ -169,7 +169,7 @@ class TestAttachEphemeral(test.NoDBTestCase):
             '"Maprange":65536}]'
         }
         client = mock.Mock()
-        client.containers.get.return_value = container
+        client.instances.get.return_value = container
 
         storage.attach_ephemeral(
             client, block_device_info, lxd_config, instance)
@@ -198,7 +198,7 @@ class TestAttachEphemeral(test.NoDBTestCase):
 class TestDetachEphemeral(test.NoDBTestCase):
     """Tests for nova.virt.lxd.storage.detach_ephemeral."""
 
-    @mock.patch.object(storage.utils, 'execute')
+    @mock.patch.object(storage.processutils, 'execute')
     @mock.patch(
         'nova.virt.lxd.storage.driver.block_device_info_get_ephemerals')
     def test_remove_ephemeral_with_zfs(
@@ -226,7 +226,7 @@ class TestDetachEphemeral(test.NoDBTestCase):
         ]
         self.assertEqual(expected_calls, execute.call_args_list)
 
-    @mock.patch.object(storage.utils, 'execute')
+    @mock.patch.object(storage.processutils, 'execute')
     @mock.patch(
         'nova.virt.lxd.storage.driver.block_device_info_get_ephemerals')
     def test_remove_ephemeral_with_lvm(

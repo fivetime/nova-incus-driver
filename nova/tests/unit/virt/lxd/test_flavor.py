@@ -12,7 +12,7 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-import mock
+from unittest import mock
 from nova import context
 from nova import exception
 from nova import test
@@ -29,7 +29,7 @@ class ToProfileTest(test.NoDBTestCase):
         super(ToProfileTest, self).setUp()
         self.client = mock.Mock()
         self.client.host_info = {
-            'api_extensions': [],
+            'api_extensions': ['id_map'],
             'environment': {
                 'storage': 'zfs'
             }
@@ -40,18 +40,36 @@ class ToProfileTest(test.NoDBTestCase):
         self.patchers.append(CONF_patcher)
         self.CONF = CONF_patcher.start()
         self.CONF.instances_path = '/i'
-        self.CONF.lxd.root_dir = ''
+        self.CONF.incus.root_dir = ''
 
         CONF_patcher = mock.patch('nova.virt.lxd.flavor.CONF')
         self.patchers.append(CONF_patcher)
         self.CONF2 = CONF_patcher.start()
-        self.CONF2.lxd.pool = None
-        self.CONF2.lxd.root_dir = ''
+        self.CONF2.incus.storage_pool = None
+        self.CONF2.incus.root_dir = ''
+        self.CONF2.incus.minimum_root_disk_gb = 1
+        self.CONF2.incus.default_process_limit = 1024
+        self.CONF2.incus.maximum_process_limit = 65536
+        self.CONF2.incus.allow_instance_swap = False
 
     def tearDown(self):
         super(ToProfileTest, self).tearDown()
         for patcher in self.patchers:
             patcher.stop()
+
+    def assert_profile_created(self, name, expected_config, expected_devices):
+        expected_config.update({
+            'limits.processes': '1024',
+            'security.idmap.isolated': 'True',
+            'security.privileged': 'False',
+        })
+        if 'limits.memory' in expected_config:
+            expected_config['limits.memory.swap'] = 'false'
+        root = expected_devices.get('root', {})
+        if root.get('size') == '0GB':
+            root['size'] = '1GB'
+        create = self.client.profiles.create
+        create.assert_called_once_with(name, expected_config, expected_devices)
 
     def test_to_profile(self):
         """A profile configuration is requested of the LXD client."""
@@ -65,9 +83,6 @@ class ToProfileTest(test.NoDBTestCase):
             'environment.product_name': 'OpenStack Nova',
             'limits.cpu': '1',
             'limits.memory': '0MB',
-            'raw.lxc': (
-                'lxc.console.logfile=/var/log/lxd/{}/console.log\n'.format(
-                    instance.name)),
         }
         expected_devices = {
             'root': {
@@ -79,7 +94,7 @@ class ToProfileTest(test.NoDBTestCase):
 
         flavor.to_profile(self.client, instance, network_info, block_info)
 
-        self.client.profiles.create.assert_called_once_with(
+        self.assert_profile_created(
             instance.name, expected_config, expected_devices)
 
     def test_to_profile_lvm(self):
@@ -95,72 +110,6 @@ class ToProfileTest(test.NoDBTestCase):
             'environment.product_name': 'OpenStack Nova',
             'limits.cpu': '1',
             'limits.memory': '0MB',
-            'raw.lxc': (
-                'lxc.console.logfile=/var/log/lxd/{}/console.log\n'.format(
-                    instance.name)),
-        }
-        expected_devices = {
-            'root': {
-                'path': '/',
-                'type': 'disk'
-            },
-        }
-
-        flavor.to_profile(self.client, instance, network_info, block_info)
-
-        self.client.profiles.create.assert_called_once_with(
-            instance.name, expected_config, expected_devices)
-
-    def test_storage_pools(self):
-        self.client.host_info['api_extensions'].append('storage')
-        self.CONF2.lxd.pool = 'test_pool'
-        ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
-            ctx, name='test', memory_mb=0)
-        network_info = []
-        block_info = []
-        expected_config = {
-            'environment.product_name': 'OpenStack Nova',
-            'limits.cpu': '1',
-            'limits.memory': '0MB',
-            'raw.lxc': (
-                'lxc.console.logfile=/var/log/lxd/{}/console.log\n'.format(
-                    instance.name))
-        }
-        expected_devices = {
-            'root': {
-                'path': '/',
-                'type': 'disk',
-                'pool': 'test_pool',
-            },
-        }
-        flavor.to_profile(self.client, instance, network_info, block_info)
-
-        self.client.profiles.create.assert_called_once_with(
-            instance.name, expected_config, expected_devices)
-
-    def test_to_profile_security(self):
-        self.client.host_info['api_extensions'].append('id_map')
-
-        ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
-            ctx, name='test', memory_mb=0)
-        instance.flavor.extra_specs = {
-            'lxd:nested_allowed': True,
-            'lxd:privileged_allowed': True,
-        }
-        network_info = []
-        block_info = []
-
-        expected_config = {
-            'environment.product_name': 'OpenStack Nova',
-            'limits.cpu': '1',
-            'limits.memory': '0MB',
-            'raw.lxc': (
-                'lxc.console.logfile=/var/log/lxd/{}/console.log\n'.format(
-                    instance.name)),
-            'security.nesting': 'True',
-            'security.privileged': 'True',
         }
         expected_devices = {
             'root': {
@@ -172,12 +121,112 @@ class ToProfileTest(test.NoDBTestCase):
 
         flavor.to_profile(self.client, instance, network_info, block_info)
 
-        self.client.profiles.create.assert_called_once_with(
+        self.assert_profile_created(
             instance.name, expected_config, expected_devices)
 
-    def test_to_profile_idmap(self):
-        self.client.host_info['api_extensions'].append('id_map')
+    def test_storage_pools(self):
+        self.client.host_info['api_extensions'].append('storage')
+        self.CONF2.incus.storage_pool = 'test_pool'
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        network_info = []
+        block_info = []
+        expected_config = {
+            'environment.product_name': 'OpenStack Nova',
+            'limits.cpu': '1',
+            'limits.memory': '0MB'
+        }
+        expected_devices = {
+            'root': {
+                'path': '/',
+                'type': 'disk',
+                'pool': 'test_pool',
+            },
+        }
+        flavor.to_profile(self.client, instance, network_info, block_info)
 
+        self.assert_profile_created(
+            instance.name, expected_config, expected_devices)
+
+    def test_to_profile_rejects_privileged(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        instance.flavor.extra_specs = {
+            'lxd:privileged_allowed': True,
+        }
+
+        self.assertRaises(
+            exception.InvalidConfiguration,
+            flavor.to_profile, self.client, instance, [], [])
+
+    def test_to_profile_rejects_nesting(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        instance.flavor.extra_specs = {'lxd:nested_allowed': True}
+
+        self.assertRaises(
+            exception.InvalidConfiguration,
+            flavor.to_profile, self.client, instance, [], [])
+
+    def test_to_profile_process_limit_extra_spec(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        instance.flavor.extra_specs = {'incus:process_limit': '4096'}
+
+        flavor.to_profile(self.client, instance, [], [])
+
+        config = self.client.profiles.create.call_args.args[1]
+        self.assertEqual('4096', config['limits.processes'])
+
+    def test_to_profile_maps_flavor_swap_to_cgroup_limit(self):
+        self.CONF2.incus.allow_instance_swap = True
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=1024)
+        instance.flavor.swap = 2048
+
+        flavor.to_profile(self.client, instance, [], [])
+
+        config = self.client.profiles.create.call_args.args[1]
+        self.assertEqual('2048MiB', config['limits.memory.swap'])
+
+    def test_to_profile_rejects_swap_when_operator_disables_it(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=1024)
+        instance.flavor.swap = 2048
+
+        self.assertRaises(
+            exception.InvalidConfiguration,
+            flavor.to_profile, self.client, instance, [], [])
+
+    def test_to_profile_rejects_invalid_process_limit(self):
+        ctx = context.get_admin_context()
+        for value in ('0', '-1', 'unlimited', '65537'):
+            instance = fake_instance.fake_instance_obj(
+                ctx, name='test', memory_mb=0)
+            instance.flavor.extra_specs = {'incus:process_limit': value}
+            self.client.profiles.create.reset_mock()
+
+            self.assertRaises(
+                exception.InvalidConfiguration,
+                flavor.to_profile, self.client, instance, [], [])
+
+    def test_to_profile_rejects_process_default_above_ceiling(self):
+        self.CONF2.incus.default_process_limit = 65537
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+
+        self.assertRaises(
+            exception.InvalidConfiguration,
+            flavor.to_profile, self.client, instance, [], [])
+
+    def test_to_profile_idmap(self):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
@@ -192,9 +241,6 @@ class ToProfileTest(test.NoDBTestCase):
             'security.idmap.isolated': 'True',
             'limits.cpu': '1',
             'limits.memory': '0MB',
-            'raw.lxc': (
-                'lxc.console.logfile=/var/log/lxd/{}/console.log\n'.format(
-                    instance.name)),
         }
         expected_devices = {
             'root': {
@@ -206,10 +252,11 @@ class ToProfileTest(test.NoDBTestCase):
 
         flavor.to_profile(self.client, instance, network_info, block_info)
 
-        self.client.profiles.create.assert_called_once_with(
+        self.assert_profile_created(
             instance.name, expected_config, expected_devices)
 
     def test_to_profile_idmap_unsupported(self):
+        self.client.host_info['api_extensions'].remove('id_map')
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
@@ -239,14 +286,11 @@ class ToProfileTest(test.NoDBTestCase):
             'environment.product_name': 'OpenStack Nova',
             'limits.cpu': '1',
             'limits.memory': '0MB',
-            'raw.lxc': (
-                'lxc.console.logfile=/var/log/lxd/{}/console.log\n'.format(
-                    instance.name)),
         }
         expected_devices = {
             'root': {
-                'limits.read': '2MB',
-                'limits.write': '3MB',
+                'limits.read': '3000000B',
+                'limits.write': '4000000B',
                 'path': '/',
                 'size': '0GB',
                 'type': 'disk'
@@ -255,7 +299,7 @@ class ToProfileTest(test.NoDBTestCase):
 
         flavor.to_profile(self.client, instance, network_info, block_info)
 
-        self.client.profiles.create.assert_called_once_with(
+        self.assert_profile_created(
             instance.name, expected_config, expected_devices)
 
     def test_to_profile_quota_extra_specs_iops(self):
@@ -274,9 +318,6 @@ class ToProfileTest(test.NoDBTestCase):
             'environment.product_name': 'OpenStack Nova',
             'limits.cpu': '1',
             'limits.memory': '0MB',
-            'raw.lxc': (
-                'lxc.console.logfile=/var/log/lxd/{}/console.log\n'.format(
-                    instance.name)),
         }
         expected_devices = {
             'root': {
@@ -290,11 +331,10 @@ class ToProfileTest(test.NoDBTestCase):
 
         flavor.to_profile(self.client, instance, network_info, block_info)
 
-        self.client.profiles.create.assert_called_once_with(
+        self.assert_profile_created(
             instance.name, expected_config, expected_devices)
 
-    def test_to_profile_quota_extra_specs_max_bytes(self):
-        """A profile configuration is requested of the LXD client."""
+    def test_to_profile_rejects_quota_total_bytes(self):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
@@ -304,30 +344,11 @@ class ToProfileTest(test.NoDBTestCase):
         network_info = []
         block_info = []
 
-        expected_config = {
-            'environment.product_name': 'OpenStack Nova',
-            'limits.cpu': '1',
-            'limits.memory': '0MB',
-            'raw.lxc': (
-                'lxc.console.logfile=/var/log/lxd/{}/console.log\n'.format(
-                    instance.name)),
-        }
-        expected_devices = {
-            'root': {
-                'limits.max': '5MB',
-                'path': '/',
-                'size': '0GB',
-                'type': 'disk'
-            },
-        }
+        self.assertRaises(
+            exception.InvalidConfiguration,
+            flavor.to_profile, self.client, instance, network_info, block_info)
 
-        flavor.to_profile(self.client, instance, network_info, block_info)
-
-        self.client.profiles.create.assert_called_once_with(
-            instance.name, expected_config, expected_devices)
-
-    def test_to_profile_quota_extra_specs_max_iops(self):
-        """A profile configuration is requested of the LXD client."""
+    def test_to_profile_rejects_quota_total_iops(self):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
@@ -337,30 +358,51 @@ class ToProfileTest(test.NoDBTestCase):
         network_info = []
         block_info = []
 
-        expected_config = {
-            'environment.product_name': 'OpenStack Nova',
-            'limits.cpu': '1',
-            'limits.memory': '0MB',
-            'raw.lxc': (
-                'lxc.console.logfile=/var/log/lxd/{}/console.log\n'.format(
-                    instance.name)),
-        }
-        expected_devices = {
-            'root': {
-                'limits.max': '500iops',
-                'path': '/',
-                'size': '0GB',
-                'type': 'disk'
-            },
+        self.assertRaises(
+            exception.InvalidConfiguration,
+            flavor.to_profile, self.client, instance, network_info, block_info)
+
+    def test_to_profile_rejects_bytes_and_iops_for_same_direction(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        instance.flavor.extra_specs = {
+            'quota:disk_read_bytes_sec': '3000000',
+            'quota:disk_read_iops_sec': '300',
         }
 
-        flavor.to_profile(self.client, instance, network_info, block_info)
+        self.assertRaises(
+            exception.InvalidConfiguration,
+            flavor.to_profile, self.client, instance, [], [])
 
-        self.client.profiles.create.assert_called_once_with(
-            instance.name, expected_config, expected_devices)
+    def test_to_profile_rejects_non_positive_disk_quota(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        instance.flavor.extra_specs = {
+            'quota:disk_write_iops_sec': '0',
+        }
 
-    @mock.patch('nova.virt.lxd.vif._is_no_op_firewall', return_value=False)
-    def test_to_profile_network_config_average(self, _is_no_op_firewall):
+        self.assertRaises(
+            exception.InvalidConfiguration,
+            flavor.to_profile, self.client, instance, [], [])
+
+    def test_disk_qos_limits_accepts_cinder_qos_namespace(self):
+        self.assertEqual({
+            'limits.read': '750iops',
+            'limits.write': '1048576B',
+        }, flavor.disk_qos_limits({
+            'read_iops_sec': '750',
+            'write_bytes_sec': '1048576',
+        }, prefix=''))
+
+    def test_disk_qos_limits_rejects_burst_semantics(self):
+        self.assertRaises(
+            exception.InvalidConfiguration,
+            flavor.disk_qos_limits,
+            {'quota:disk_read_iops_sec_max': '1000'})
+
+    def test_to_profile_network_config_average(self):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
@@ -381,9 +423,6 @@ class ToProfileTest(test.NoDBTestCase):
             'environment.product_name': 'OpenStack Nova',
             'limits.cpu': '1',
             'limits.memory': '0MB',
-            'raw.lxc': (
-                'lxc.console.logfile=/var/log/lxd/{}/console.log\n'.format(
-                    instance.name)),
         }
         expected_devices = {
             'tap0123456789a': {
@@ -403,11 +442,10 @@ class ToProfileTest(test.NoDBTestCase):
 
         flavor.to_profile(self.client, instance, network_info, block_info)
 
-        self.client.profiles.create.assert_called_once_with(
+        self.assert_profile_created(
             instance.name, expected_config, expected_devices)
 
-    @mock.patch('nova.virt.lxd.vif._is_no_op_firewall', return_value=False)
-    def test_to_profile_network_config_peak(self, _is_no_op_firewall):
+    def test_to_profile_network_config_peak(self):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
@@ -428,9 +466,6 @@ class ToProfileTest(test.NoDBTestCase):
             'environment.product_name': 'OpenStack Nova',
             'limits.cpu': '1',
             'limits.memory': '0MB',
-            'raw.lxc': (
-                'lxc.console.logfile=/var/log/lxd/{}/console.log\n'.format(
-                    instance.name)),
         }
         expected_devices = {
             'tap0123456789a': {
@@ -450,12 +485,11 @@ class ToProfileTest(test.NoDBTestCase):
 
         flavor.to_profile(self.client, instance, network_info, block_info)
 
-        self.client.profiles.create.assert_called_once_with(
+        self.assert_profile_created(
             instance.name, expected_config, expected_devices)
 
     @mock.patch('nova.virt.lxd.flavor.driver.block_device_info_get_ephemerals')
     def test_to_profile_ephemeral_storage(self, get_ephemerals):
-        """A profile configuration is requested of the LXD client."""
         get_ephemerals.return_value = [
             {'virtual_name': 'ephemeral1'},
         ]
@@ -466,28 +500,7 @@ class ToProfileTest(test.NoDBTestCase):
         network_info = []
         block_info = []
 
-        expected_config = {
-            'environment.product_name': 'OpenStack Nova',
-            'limits.cpu': '1',
-            'limits.memory': '0MB',
-            'raw.lxc': (
-                'lxc.console.logfile=/var/log/lxd/{}/console.log\n'.format(
-                    instance.name)),
-        }
-        expected_devices = {
-            'root': {
-                'path': '/',
-                'size': '0GB',
-                'type': 'disk'
-            },
-            'ephemeral1': {
-                'type': 'disk',
-                'path': '/mnt',
-                'source': '/i/{}/storage/ephemeral1'.format(instance.name),
-            },
-        }
-
-        flavor.to_profile(self.client, instance, network_info, block_info)
-
-        self.client.profiles.create.assert_called_once_with(
-            instance.name, expected_config, expected_devices)
+        self.assertRaises(
+            exception.InvalidConfiguration,
+            flavor.to_profile,
+            self.client, instance, network_info, block_info)

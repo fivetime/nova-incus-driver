@@ -16,25 +16,29 @@
 import collections
 import base64
 from contextlib import closing
+import inspect
 
 import eventlet
 from oslo_config import cfg
 from oslo_serialization import jsonutils
-import mock
+from oslo_utils import units
+from unittest import mock
 from nova import context
 from nova import exception
-from nova import utils
 from nova import test
 from nova.compute import manager
 from nova.compute import power_state
 from nova.compute import vm_states
 from nova.network import model as network_model
 from nova.tests.unit import fake_instance
+from nova.virt import driver as nova_driver
 from pylxd import exceptions as lxdcore_exceptions
 import six
 
 from nova.virt.lxd import common
 from nova.virt.lxd import driver
+
+ORIGINAL_BRICK_GET_CONNECTOR = driver.brick_get_connector
 
 MockResponse = collections.namedtuple('Response', ['status_code'])
 
@@ -60,10 +64,6 @@ def fake_connection_info(volume, location, iqn, auth=False, transport=None):
             'target_iqn': iqn,
             'target_lun': 1,
             'device_path': dev_path,
-            'qos_specs': {
-                'total_bytes_sec': '102400',
-                'read_iops_sec': '200',
-            }
         }
     }
     if auth:
@@ -71,6 +71,26 @@ def fake_connection_info(volume, location, iqn, auth=False, transport=None):
         ret['data']['auth_username'] = 'foo'
         ret['data']['auth_password'] = 'bar'
     return ret
+
+
+class VolumeConnectionInfoTest(test.NoDBTestCase):
+
+    def test_volume_id_prefers_modern_serial(self):
+        connection_info = {
+            'serial': 'modern-id',
+            'data': {'volume_id': 'legacy-id'},
+        }
+
+        self.assertEqual('modern-id', driver._volume_id(connection_info))
+
+    def test_volume_id_accepts_legacy_data_field(self):
+        self.assertEqual(
+            'legacy-id',
+            driver._volume_id({'data': {'volume_id': 'legacy-id'}}))
+
+    def test_volume_id_rejects_missing_identifier(self):
+        self.assertRaises(
+            exception.InvalidVolume, driver._volume_id, {'data': {}})
 
 
 class GetPowerStateTest(test.NoDBTestCase):
@@ -106,11 +126,13 @@ class LXDDriverTest(test.NoDBTestCase):
     def setUp(self):
         super(LXDDriverTest, self).setUp()
 
-        self.Client_patcher = mock.patch('nova.virt.lxd.driver.pylxd.Client')
+        self.Client_patcher = mock.patch(
+            'nova.virt.lxd.driver.incus_client.get_client')
         self.Client = self.Client_patcher.start()
 
         self.client = mock.Mock()
         self.client.host_info = {
+            'api_extensions': ['id_map'],
             'environment': {
                 'storage': 'zfs',
             }
@@ -125,14 +147,22 @@ class LXDDriverTest(test.NoDBTestCase):
         self.CONF.instances_path = '/path/to/instances'
         self.CONF.my_ip = '0.0.0.0'
         self.CONF.config_drive_format = 'iso9660'
+        self.CONF.incus.storage_pool = None
+        self.CONF.incus.allow_cold_migration = False
+        self.CONF.incus.migration_address = None
+        self.CONF.incus.migration_finish_retries = 3
+        self.CONF.incus.migration_finish_retry_interval = 0
+        self.CONF.incus.volume_use_multipath = False
+        self.CONF.incus.volume_enforce_multipath = False
+        self.CONF.incus.num_volume_scan_tries = 3
 
         # XXX: rockstar (03 Nov 2016) - This should be removed once
         # everything is where it should live.
         CONF2_patcher = mock.patch('nova.virt.lxd.driver.nova.conf.CONF')
         self.patchers.append(CONF2_patcher)
         self.CONF2 = CONF2_patcher.start()
-        self.CONF2.lxd.root_dir = '/lxd'
-        self.CONF2.lxd.pool = None
+        self.CONF2.incus.root_dir = '/lxd'
+        self.CONF2.incus.storage_pool = None
         self.CONF2.instances_path = '/i'
 
         # LXDDriver._after_reboot reads from the database and syncs container
@@ -177,11 +207,36 @@ class LXDDriverTest(test.NoDBTestCase):
         lxd_driver = driver.LXDDriver(None)
         lxd_driver.init_host(None)
 
-        self.Client.assert_called_once_with()
+        self.Client.assert_called_once_with(self.CONF)
         self.assertEqual(self.client, lxd_driver.client)
 
+    def test_capabilities_extend_modern_nova_defaults(self):
+        capabilities = driver.LXDDriver.capabilities
+
+        self.assertTrue(capabilities['supports_attach_interface'])
+        self.assertTrue(capabilities['supports_image_type_raw'])
+        self.assertFalse(capabilities['supports_evacuate'])
+        self.assertTrue(capabilities['supports_extend_volume'])
+        self.assertFalse(capabilities['supports_multiattach'])
+
+    def test_overrides_match_compute_driver_call_signatures(self):
+        def call_signature(method):
+            return [
+                (parameter.name, parameter.kind, parameter.default)
+                for parameter in inspect.signature(method).parameters.values()
+            ]
+
+        for name, implementation in driver.LXDDriver.__dict__.items():
+            base_method = getattr(nova_driver.ComputeDriver, name, None)
+            if not callable(implementation) or not callable(base_method):
+                continue
+            self.assertEqual(
+                call_signature(base_method), call_signature(implementation),
+                'LXDDriver.%s does not match ComputeDriver.%s' %
+                (name, name))
+
     def test_init_host_fail(self):
-        def side_effect():
+        def side_effect(conf):
             raise lxdcore_exceptions.ClientConnectionFailed()
         self.Client.side_effect = side_effect
         self.Client.return_value = None
@@ -190,11 +245,53 @@ class LXDDriverTest(test.NoDBTestCase):
 
         self.assertRaises(exception.HostNotFound, lxd_driver.init_host, None)
 
+    def test_init_host_rejects_invalid_multipath_configuration(self):
+        self.CONF.incus.volume_use_multipath = False
+        self.CONF.incus.volume_enforce_multipath = True
+        lxd_driver = driver.LXDDriver(None)
+
+        self.assertRaises(
+            exception.InvalidConfiguration, lxd_driver.init_host, None)
+
+        self.Client.assert_not_called()
+
+    @mock.patch('nova.virt.lxd.driver.utils.get_root_helper',
+                return_value='sudo nova-rootwrap')
+    @mock.patch('nova.virt.lxd.driver.connector.InitiatorConnector.factory')
+    def test_brick_connector_uses_incus_volume_options(
+            self, factory, get_root_helper):
+        self.CONF.incus.volume_use_multipath = True
+        self.CONF.incus.volume_enforce_multipath = True
+        self.CONF.incus.num_volume_scan_tries = 7
+
+        ORIGINAL_BRICK_GET_CONNECTOR('iscsi')
+
+        factory.assert_called_once_with(
+            'iscsi', 'sudo nova-rootwrap', driver=None,
+            use_multipath=True, device_scan_attempts=7,
+            enforce_multipath=True)
+
+    @mock.patch('nova.virt.lxd.driver.utils.get_root_helper',
+                return_value='sudo nova-rootwrap')
+    @mock.patch('nova.virt.lxd.driver.connector.get_connector_properties')
+    def test_connector_properties_use_incus_multipath_options(
+            self, get_properties, get_root_helper):
+        self.CONF.incus.volume_use_multipath = True
+        self.CONF.incus.volume_enforce_multipath = True
+        self.CONF.my_ip = '192.0.2.10'
+        self.CONF.host = 'compute-01'
+
+        driver.brick_get_connector_properties()
+
+        get_properties.assert_called_once_with(
+            'sudo nova-rootwrap', '192.0.2.10', True, True,
+            host='compute-01')
+
     def test_get_info(self):
         container = mock.Mock()
         container.state.return_value = MockContainerState(
             'Running', {'usage': 4000, 'usage_peak': 4500}, 100)
-        self.client.containers.get.return_value = container
+        self.client.instances.get.return_value = container
 
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
@@ -206,8 +303,21 @@ class LXDDriverTest(test.NoDBTestCase):
 
         self.assertEqual(power_state.RUNNING, info.state)
 
+    def test_get_info_stopped_does_not_query_runtime_state(self):
+        container = mock.Mock(status='Stopped')
+        self.client.instances.get.return_value = container
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        info = lxd_driver.get_info(instance)
+
+        self.assertEqual(power_state.SHUTDOWN, info.state)
+        container.state.assert_not_called()
+
     def test_list_instances(self):
-        self.client.containers.all.return_value = [
+        self.client.instances.all.return_value = [
             MockContainer('mock-instance-1'),
             MockContainer('mock-instance-2'),
         ]
@@ -217,6 +327,36 @@ class LXDDriverTest(test.NoDBTestCase):
         instances = lxd_driver.list_instances()
 
         self.assertEqual(['mock-instance-1', 'mock-instance-2'], instances)
+
+    def test_list_instance_uuids_ignores_unmanaged_instances_and_vms(self):
+        managed = mock.Mock(
+            type='container',
+            config={'user.openstack.uuid': 'managed-uuid'})
+        unmanaged = mock.Mock(type='container', config={})
+        virtual_machine = mock.Mock(
+            type='virtual-machine',
+            config={'user.openstack.uuid': 'vm-uuid'})
+        self.client.instances.all.return_value = [
+            managed, unmanaged, virtual_machine]
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertEqual(['managed-uuid'], lxd_driver.list_instance_uuids())
+
+    def test_incus_cloud_init_config(self):
+        instance = mock.Mock(
+            uuid='instance-uuid',
+            user_data=base64.b64encode(b'#cloud-config\nruncmd: []\n'),
+            key_name='tenant-key',
+            key_data='ssh-ed25519 AAAATEST tenant')
+
+        self.assertEqual({
+            'user.openstack.uuid': 'instance-uuid',
+            'cloud-init.user-data': '#cloud-config\nruncmd: []\n',
+            'user.meta-data': (
+                'public-keys:\n'
+                '  "tenant-key": "ssh-ed25519 AAAATEST tenant"\n'),
+        }, driver._incus_cloud_init_config(instance))
 
     @mock.patch('nova.virt.lxd.driver.IMAGE_API')
     @mock.patch('nova.virt.lxd.driver.lockutils.lock')
@@ -248,10 +388,10 @@ class LXDDriverTest(test.NoDBTestCase):
     def test_spawn(self, configdrive, neutron_failure=None):
         def container_get(*args, **kwargs):
             raise lxdcore_exceptions.LXDAPIException(MockResponse(404))
-        self.client.containers.get.side_effect = container_get
+        self.client.instances.get.side_effect = container_get
         configdrive.return_value = False
         container = mock.Mock()
-        self.client.containers.create.return_value = container
+        self.client.instances.create.return_value = container
 
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
@@ -283,6 +423,134 @@ class LXDDriverTest(test.NoDBTestCase):
         fd.apply_instance_filter.assert_called_once_with(
             instance, network_info)
         container.start.assert_called_once_with(wait=True)
+        self.client.instances.create.assert_called_once_with({
+            'name': instance.name,
+            'type': 'container',
+            'profiles': [self.client.profiles.create.return_value.name],
+            'config': driver._incus_cloud_init_config(instance),
+            'source': {
+                'type': 'image',
+                'alias': instance.image_ref,
+            },
+        }, wait=True)
+
+    def test_spawn_rejects_ephemeral_before_allocating_resources(self):
+        get_ephemerals = driver.driver.block_device_info_get_ephemerals
+        get_ephemerals.return_value = [{'virtual_name': 'ephemeral0'}]
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=512)
+        virtapi = manager.ComputeVirtAPI(mock.MagicMock())
+        lxd_driver = driver.LXDDriver(virtapi)
+        lxd_driver.init_host(None)
+        block_device_info = {'block_device_mapping': []}
+
+        self.assertRaises(
+            exception.InvalidConfiguration,
+            lxd_driver.spawn,
+            ctx, instance, mock.Mock(), [], None, mock.Mock(), [],
+            block_device_info)
+
+        self.client.images.get_by_alias.assert_not_called()
+        self.client.instances.create.assert_not_called()
+        self.vif_driver.plug.assert_not_called()
+        get_ephemerals.assert_called_once_with(block_device_info)
+
+    @mock.patch('nova.virt.configdrive.required_by', return_value=False)
+    def test_spawn_boot_from_cinder_rbd(self, configdrive):
+        def container_get(*args, **kwargs):
+            raise lxdcore_exceptions.LXDAPIException(MockResponse(404))
+
+        volume_id = '8231d2e8-1111-4222-8333-123456789abc'
+        self.client.instances.get.side_effect = container_get
+        self.client.host_info['api_extensions'].append(
+            'storage_driver_cephext')
+        self.CONF.incus.boot_from_volume_storage_pool = 'cinder'
+        bfv_pool = self.client.storage_pools.get.return_value
+        bfv_pool.driver = 'cephext'
+        bfv_pool.config = {'source': 'cinder-volumes'}
+        root_bdm = {
+            'boot_index': 0,
+            'connection_info': {
+                'driver_volume_type': 'rbd',
+                'serial': volume_id,
+                'data': {
+                    'name': 'cinder-volumes/volume-%s' % volume_id,
+                    'volume_id': volume_id,
+                    'access_mode': 'rw',
+                    'qos_specs': {
+                        'read_iops_sec': '700',
+                        'write_bytes_sec': '50000000',
+                    },
+                },
+            },
+        }
+        profile = self.client.profiles.create.return_value
+        profile.devices = {'root': {'type': 'disk', 'path': '/',
+                                    'size': '20GB'}}
+        container = self.client.instances.create.return_value
+
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-bfv', memory_mb=512)
+        image_meta = mock.Mock(disk_format='raw', container_format='bare')
+        lxd_driver = driver.LXDDriver(manager.ComputeVirtAPI(mock.MagicMock()))
+        lxd_driver.init_host(None)
+        lxd_driver.firewall_driver = mock.Mock()
+
+        lxd_driver.spawn(
+            ctx, instance, image_meta, [], None, mock.Mock(), [],
+            {'block_device_mapping': [root_bdm]})
+
+        self.client.images.get_by_alias.assert_not_called()
+        self.client.storage_pools.get.assert_called_with('cinder')
+        self.assertEqual({
+            'type': 'disk',
+            'path': '/',
+            'pool': 'cinder',
+            'initial.ceph.rbd.image_name': 'volume-%s' % volume_id,
+            'limits.read': '700iops',
+            'limits.write': '50000000B',
+        }, profile.devices['root'])
+        profile.save.assert_called()
+        self.client.instances.create.assert_called_once_with({
+            'name': instance.name,
+            'type': 'container',
+            'profiles': [profile.name],
+            'config': driver._incus_cloud_init_config(instance),
+            'source': {'type': 'none'},
+        }, wait=True)
+        container.start.assert_called_once_with(wait=True)
+
+    def test_boot_from_volume_rejects_non_rbd(self):
+        bdm = {'connection_info': {
+            'driver_volume_type': 'iscsi',
+            'data': {'volume_id': '8231d2e8-1111-4222-8333-123456789abc'},
+        }}
+        self.assertRaises(exception.InvalidConfiguration,
+                          driver._cinder_rbd_root, bdm)
+
+    def test_boot_from_volume_rejects_mismatched_rbd_uuid(self):
+        bdm = {'connection_info': {
+            'driver_volume_type': 'rbd',
+            'serial': '8231d2e8-1111-4222-8333-123456789abc',
+            'data': {
+                'name': ('cinder-volumes/volume-'
+                         '9231d2e8-1111-4222-8333-123456789abc'),
+            },
+        }}
+        self.assertRaises(exception.InvalidConfiguration,
+                          driver._cinder_rbd_root, bdm)
+
+    def test_boot_from_volume_rejects_multiple_root_volumes(self):
+        mapping = [{'boot_index': 0}, {'boot_index': '0'}]
+        with mock.patch(
+                'nova.virt.lxd.driver.driver.block_device_info_get_mapping',
+                return_value=mapping):
+            self.assertRaises(
+                exception.InvalidConfiguration,
+                driver._boot_from_volume,
+                {'block_device_mapping': mapping})
 
     def test_spawn_already_exists(self):
         """InstanceExists is raised if the container already exists."""
@@ -309,7 +577,7 @@ class LXDDriverTest(test.NoDBTestCase):
         def container_get(*args, **kwargs):
             raise lxdcore_exceptions.LXDAPIException(MockResponse(404))
 
-        self.client.containers.get.side_effect = container_get
+        self.client.instances.get.side_effect = container_get
         configdrive.return_value = True
 
         ctx = context.get_admin_context()
@@ -344,6 +612,55 @@ class LXDDriverTest(test.NoDBTestCase):
             instance, network_info)
         configdrive.assert_called_once_with(instance)
         lxd_driver.client.profiles.get.assert_called_once_with(instance.name)
+        profile = lxd_driver.client.profiles.get.return_value
+        profile.devices.update.assert_called_once_with({
+            'configdrive': {
+                'path': '/config-drive',
+                'source': lxd_driver._add_configdrive.return_value,
+                'type': 'disk',
+                'readonly': 'True',
+            }
+        })
+        profile.save.assert_called_once_with()
+
+    @mock.patch('nova.virt.lxd.driver.fileutils.ensure_tree')
+    @mock.patch('nova.virt.lxd.driver.os.listdir', return_value=[])
+    @mock.patch('nova.virt.lxd.driver.processutils.execute',
+                return_value=('', ''))
+    @mock.patch('nova.virt.lxd.driver.utils.get_root_helper',
+                return_value='sudo nova-rootwrap')
+    @mock.patch('nova.virt.lxd.driver.configdrive.ConfigDriveBuilder')
+    @mock.patch('nova.virt.lxd.driver.instance_metadata.InstanceMetadata')
+    def test_add_configdrive_uses_modern_instance_metadata_signature(
+            self, instance_metadata_mock, builder_mock, root_helper_mock,
+            execute_mock, listdir_mock, ensure_tree_mock):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        injected_files = [('etc/example', b'content')]
+        network_info = [_VIF]
+        container = self.client.instances.get.return_value
+        container.config = {
+            'volatile.last_state.idmap': jsonutils.dumps([
+                {'Isuid': True, 'Hostid': 100000},
+                {'Isgid': True, 'Hostid': 100000},
+            ])
+        }
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        lxd_driver._add_configdrive(
+            ctx, instance, injected_files, 'secret', network_info)
+
+        instance_metadata_mock.assert_called_once_with(
+            instance, content=injected_files,
+            extra_md={'admin_pass': 'secret'}, network_info=network_info)
+        builder_mock.assert_called_once_with(
+            instance_md=instance_metadata_mock.return_value)
+        self.assertTrue(execute_mock.call_args_list)
+        for call in execute_mock.call_args_list:
+            self.assertEqual('sudo nova-rootwrap',
+                             call.kwargs['root_helper'])
 
     @mock.patch('nova.virt.configdrive.required_by')
     def test_spawn_profile_fail(self, configdrive, neutron_failure=None):
@@ -353,7 +670,7 @@ class LXDDriverTest(test.NoDBTestCase):
 
         def profile_create(*args, **kwargs):
             raise lxdcore_exceptions.LXDAPIException(MockResponse(500))
-        self.client.containers.get.side_effect = container_get
+        self.client.instances.get.side_effect = container_get
         self.client.profiles.create.side_effect = profile_create
         configdrive.return_value = False
         ctx = context.get_admin_context()
@@ -387,8 +704,8 @@ class LXDDriverTest(test.NoDBTestCase):
 
         def container_create(*args, **kwargs):
             raise lxdcore_exceptions.LXDAPIException(MockResponse(500))
-        self.client.containers.get.side_effect = container_get
-        self.client.containers.create.side_effect = container_create
+        self.client.instances.get.side_effect = container_get
+        self.client.instances.create.side_effect = container_create
         configdrive.return_value = False
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
@@ -416,10 +733,10 @@ class LXDDriverTest(test.NoDBTestCase):
     @mock.patch('nova.virt.configdrive.required_by', return_value=False)
     def test_spawn_container_cleanup_fail(self, configdrive):
         """Cleanup is called but also fail when container creation fails."""
-        self.client.containers.get.side_effect = (
+        self.client.instances.get.side_effect = (
             lxdcore_exceptions.LXDAPIException(MockResponse(404)))
         container = mock.Mock()
-        self.client.containers.create.return_value = container
+        self.client.instances.create.return_value = container
 
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
@@ -447,6 +764,7 @@ class LXDDriverTest(test.NoDBTestCase):
             allocations, network_info, block_device_info)
         lxd_driver.cleanup.assert_called_once_with(
             ctx, instance, network_info, block_device_info)
+        container.delete.assert_called_once_with(wait=True)
 
     def test_spawn_container_start_fail(self, neutron_failure=None):
         def container_get(*args, **kwargs):
@@ -455,7 +773,7 @@ class LXDDriverTest(test.NoDBTestCase):
         def side_effect(*args, **kwargs):
             raise lxdcore_exceptions.LXDAPIException(MockResponse(200))
 
-        self.client.containers.get.side_effect = container_get
+        self.client.instances.get.side_effect = container_get
         container = mock.Mock()
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
@@ -471,7 +789,7 @@ class LXDDriverTest(test.NoDBTestCase):
         lxd_driver = driver.LXDDriver(virtapi)
         lxd_driver.init_host(None)
         lxd_driver.cleanup = mock.Mock()
-        lxd_driver.client.containers.create = mock.Mock(
+        lxd_driver.client.instances.create = mock.Mock(
             side_effect=side_effect)
         container.start.side_effect = side_effect
 
@@ -517,7 +835,7 @@ class LXDDriverTest(test.NoDBTestCase):
         def test_spawn(configdrive, plug_vifs):
             def container_get(*args, **kwargs):
                 raise lxdcore_exceptions.LXDAPIException(MockResponse(404))
-            self.client.containers.get.side_effect = container_get
+            self.client.instances.get.side_effect = container_get
             configdrive.return_value = False
 
             ctx = context.get_admin_context()
@@ -537,7 +855,7 @@ class LXDDriverTest(test.NoDBTestCase):
 
         test_spawn()
 
-        if cfg.CONF.vif_plugging_timeout and utils.is_neutron():
+        if cfg.CONF.vif_plugging_timeout:
             prepare.assert_has_calls([
                 mock.call(instance_href, 'network-vif-plugged-vif1'),
                 mock.call(instance_href, 'network-vif-plugged-vif2')])
@@ -547,14 +865,11 @@ class LXDDriverTest(test.NoDBTestCase):
         else:
             self.assertEqual(0, prepare.call_count)
 
-    @mock.patch('nova.utils.is_neutron', return_value=True)
-    def test_spawn_instance_with_network_events(self, is_neutron):
+    def test_spawn_instance_with_network_events(self):
         self.flags(vif_plugging_timeout=0)
         self._test_spawn_instance_with_network_events()
 
-    @mock.patch('nova.utils.is_neutron', return_value=True)
-    def test_spawn_instance_with_events_neutron_failed_nonfatal_timeout(
-            self, is_neutron):
+    def test_spawn_instance_with_events_neutron_failed_nonfatal_timeout(self):
         self.flags(vif_plugging_timeout=0)
         self.flags(vif_plugging_is_fatal=False)
         self._test_spawn_instance_with_network_events(
@@ -564,7 +879,7 @@ class LXDDriverTest(test.NoDBTestCase):
     def test_destroy(self, lock):
         mock_container = mock.Mock()
         mock_container.status = 'Running'
-        self.client.containers.get.return_value = mock_container
+        self.client.instances.get.return_value = mock_container
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
@@ -578,7 +893,7 @@ class LXDDriverTest(test.NoDBTestCase):
 
         lxd_driver.cleanup.assert_called_once_with(
             ctx, instance, network_info, None)
-        lxd_driver.client.containers.get.assert_called_once_with(instance.name)
+        lxd_driver.client.instances.get.assert_called_once_with(instance.name)
         mock_container.stop.assert_called_once_with(wait=True)
         mock_container.delete.assert_called_once_with(wait=True)
 
@@ -602,14 +917,14 @@ class LXDDriverTest(test.NoDBTestCase):
 
         # set up the containers.get to return the stopped container and then
         # the rescued container
-        self.client.containers.get.side_effect = [
+        self.client.instances.get.side_effect = [
             mock_stopped_container, mock_rescued_container]
 
         lxd_driver.destroy(ctx, instance, network_info)
 
         lxd_driver.cleanup.assert_called_once_with(
             ctx, instance, network_info, None)
-        lxd_driver.client.containers.get.assert_has_calls([
+        lxd_driver.client.instances.get.assert_has_calls([
             mock.call(instance.name),
             mock.call('{}-rescue'.format(instance.name))])
         mock_stopped_container.stop.assert_not_called()
@@ -621,7 +936,7 @@ class LXDDriverTest(test.NoDBTestCase):
     def test_destroy_without_instance(self, lock):
         def side_effect(*args, **kwargs):
             raise lxdcore_exceptions.LXDAPIException(MockResponse(404))
-        self.client.containers.get.side_effect = side_effect
+        self.client.instances.get.side_effect = side_effect
 
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
@@ -636,24 +951,22 @@ class LXDDriverTest(test.NoDBTestCase):
         lxd_driver.cleanup.assert_called_once_with(
             ctx, instance, network_info, None)
 
-    @mock.patch('nova.virt.lxd.driver.network')
+    @mock.patch('nova.virt.lxd.driver.neutron')
     @mock.patch('os.path.exists', mock.Mock(return_value=True))
-    @mock.patch('pwd.getpwuid')
+    @mock.patch.object(driver.os, 'getgid', return_value=1001)
+    @mock.patch.object(driver.os, 'getuid', return_value=1001)
     @mock.patch('shutil.rmtree')
-    @mock.patch.object(driver.utils, 'execute')
-    def test_cleanup(self, execute, rmtree, getpwuid, _):
+    @mock.patch.object(driver.privsep_path, 'chown')
+    def test_cleanup(self, chown, rmtree, getuid, getgid, _):
         mock_profile = mock.Mock()
         self.client.profiles.get.return_value = mock_profile
-        pwuid = mock.Mock()
-        pwuid.pw_name = 'user'
-        getpwuid.return_value = pwuid
 
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
         network_info = [_VIF]
         instance_dir = common.InstanceAttributes(instance).instance_dir
-        block_device_info = mock.Mock()
+        block_device_info = {'block_device_mapping': []}
 
         lxd_driver = driver.LXDDriver(None)
         lxd_driver.init_host(None)
@@ -665,10 +978,83 @@ class LXDDriverTest(test.NoDBTestCase):
             instance, network_info[0])
         lxd_driver.firewall_driver.unfilter_instance.assert_called_once_with(
             instance, network_info)
-        execute.assert_called_once_with(
-            'chown', '-R', 'user:user', instance_dir, run_as_root=True)
+        chown.assert_called_once_with(
+            instance_dir, uid=1001, gid=1001, recursive=True)
         rmtree.assert_called_once_with(instance_dir)
         mock_profile.delete.assert_called_once_with()
+
+    @mock.patch.object(driver.storage, 'detach_ephemeral')
+    @mock.patch.object(driver.LXDDriver, 'unplug_vifs')
+    @mock.patch.object(driver.os.path, 'exists', return_value=False)
+    def test_cleanup_disconnects_data_volume_before_profile_delete(
+            self, _exists, _unplug_vifs, _detach_ephemeral):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        connection_info = {
+            'driver_volume_type': 'rbd',
+            'serial': 'data-volume',
+            'data': {'volume_id': 'data-volume'},
+        }
+        block_device_info = {'block_device_mapping': [
+            {
+                'boot_index': 0,
+                'connection_info': {
+                    'driver_volume_type': 'rbd',
+                    'serial': 'root-volume',
+                    'data': {'volume_id': 'root-volume'},
+                },
+                'mount_device': '/dev/sda',
+            },
+            {
+                'boot_index': None,
+                'connection_info': connection_info,
+                'mount_device': '/dev/sdb',
+            },
+        ]}
+        profile = self.client.profiles.get.return_value
+        profile.devices = {'data-volume': {'type': 'unix-block'}}
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+        lxd_driver.firewall_driver = mock.Mock()
+        lxd_driver.detach_volume = mock.Mock()
+
+        lxd_driver.cleanup(
+            ctx, instance, [], block_device_info, destroy_vifs=False)
+
+        lxd_driver.detach_volume.assert_called_once_with(
+            ctx, connection_info, instance, '/dev/sdb')
+        profile.delete.assert_called_once_with()
+
+    @mock.patch.object(driver.storage, 'detach_ephemeral')
+    @mock.patch.object(driver.LXDDriver, 'unplug_vifs')
+    @mock.patch.object(driver.os.path, 'exists', return_value=False)
+    def test_cleanup_retains_profile_when_data_disconnect_fails(
+            self, _exists, _unplug_vifs, _detach_ephemeral):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        connection_info = {
+            'driver_volume_type': 'rbd',
+            'serial': 'data-volume',
+            'data': {'volume_id': 'data-volume'},
+        }
+        block_device_info = {'block_device_mapping': [{
+            'boot_index': None,
+            'connection_info': connection_info,
+            'mount_device': '/dev/sdb',
+        }]}
+        profile = self.client.profiles.get.return_value
+        profile.devices = {'data-volume': {'type': 'unix-block'}}
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+        lxd_driver.firewall_driver = mock.Mock()
+        lxd_driver.detach_volume = mock.Mock(
+            side_effect=RuntimeError('disconnect failed'))
+
+        self.assertRaises(
+            RuntimeError, lxd_driver.cleanup, ctx, instance, [],
+            block_device_info, destroy_vifs=False)
+
+        profile.delete.assert_not_called()
 
     def test_reboot(self):
         ctx = context.get_admin_context()
@@ -680,36 +1066,307 @@ class LXDDriverTest(test.NoDBTestCase):
 
         lxd_driver.reboot(ctx, instance, None, None)
 
-        self.client.containers.get.assert_called_once_with(instance.name)
+        self.client.instances.get.assert_called_once_with(instance.name)
+        self.client.instances.get.return_value.restart.assert_called_once_with(
+            force=True, wait=True)
 
-    @mock.patch('nova.virt.lxd.driver.network')
-    @mock.patch('pwd.getpwuid', mock.Mock(return_value=mock.Mock(pw_uid=1234)))
-    @mock.patch('os.getuid', mock.Mock())
-    @mock.patch('os.path.exists', mock.Mock(return_value=True))
-    @mock.patch('six.moves.builtins.open')
-    @mock.patch.object(driver.utils, 'execute')
-    def test_get_console_output(self, execute, _open, _):
+    def test_cleanup_lingering_bfv_source_record(self):
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test')
+        container = self.client.instances.get.return_value
+        container.status = 'Stopped'
+        container.config = {
+            'user.openstack.uuid': instance.uuid,
+            'volatile.migration.storage_handover': 'committed',
+        }
+        container.devices = {
+            'root': {
+                'initial.ceph.rbd.image_name': 'volume-root',
+                'type': 'disk',
+                'path': '/',
+            },
+        }
+        profile = self.client.profiles.get.return_value
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        result = lxd_driver.cleanup_lingering_instance_resources(instance)
+
+        self.assertTrue(result)
+        container.delete.assert_called_once_with(wait=True)
+        profile.delete.assert_called_once_with()
+
+    def test_cleanup_lingering_bfv_requires_handover_protection(self):
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test')
+        container = self.client.instances.get.return_value
+        container.status = 'Stopped'
+        container.config = {'user.openstack.uuid': instance.uuid}
+        container.devices = {
+            'root': {
+                'initial.ceph.rbd.image_name': 'volume-root',
+                'type': 'disk',
+                'path': '/',
+            },
+        }
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        result = lxd_driver.cleanup_lingering_instance_resources(instance)
+
+        self.assertFalse(result)
+        container.delete.assert_not_called()
+
+    def test_cleanup_lingering_record_rejects_running_instance(self):
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test')
+        container = self.client.instances.get.return_value
+        container.status = 'Running'
+        container.config = {'user.openstack.uuid': instance.uuid}
+        container.devices = {}
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        result = lxd_driver.cleanup_lingering_instance_resources(instance)
+
+        self.assertFalse(result)
+        container.delete.assert_not_called()
+
+    def test_cleanup_lingering_record_rejects_uuid_mismatch(self):
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test')
+        container = self.client.instances.get.return_value
+        container.status = 'Stopped'
+        container.config = {'user.openstack.uuid': 'different'}
+        container.devices = {}
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        result = lxd_driver.cleanup_lingering_instance_resources(instance)
+
+        self.assertFalse(result)
+        container.delete.assert_not_called()
+
+    @mock.patch('nova.virt.lxd.driver.neutron')
+    def test_get_console_output(self, _):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
-        expected_calls = [
-            mock.call(
-                'chown', '1234:1234', '/var/log/lxd/{}/console.log'.format(
-                    instance.name),
-                run_as_root=True),
-            mock.call(
-                'chmod', '755', '/lxd/containers/{}'.format(
-                    instance.name),
-                run_as_root=True),
-        ]
-        _open.return_value.__enter__.return_value = six.BytesIO(b'output')
+        self.client.instances.get.return_value.console_log.return_value = (
+            b'x' * (driver.MAX_CONSOLE_BYTES + 1))
 
         lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
 
         contents = lxd_driver.get_console_output(context, instance)
 
-        self.assertEqual(b'output', contents)
-        self.assertEqual(expected_calls, execute.call_args_list)
+        self.assertEqual(b'x' * driver.MAX_CONSOLE_BYTES, contents)
+        self.client.instances.get.assert_called_once_with(instance.name)
+
+    def test_reboot_starts_stopped_migration_target(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        container = self.client.instances.get.return_value
+        container.status = 'Stopped'
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        lxd_driver.reboot(ctx, instance, None, 'HARD')
+
+        container.start.assert_called_once_with(wait=True)
+        container.restart.assert_not_called()
+
+    @mock.patch('nova.virt.driver.block_device_info_get_mapping')
+    def test_reboot_restores_missing_data_volume_before_start(
+            self, get_mapping):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        root = {'boot_index': 0}
+        data = {
+            'boot_index': 1,
+            'connection_info': {
+                'serial': 'volume-data',
+                'driver_volume_type': 'rbd',
+                'data': {},
+            },
+            'mount_device': '/dev/vdb',
+        }
+        get_mapping.return_value = [root, data]
+        profile = self.client.profiles.get.return_value
+        profile.devices = {}
+        profile.config = {}
+        container = self.client.instances.get.return_value
+        container.status = 'Stopped'
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+        lxd_driver.attach_volume = mock.Mock()
+
+        lxd_driver.reboot(
+            ctx, instance, None, 'HARD', block_device_info={})
+
+        lxd_driver.attach_volume.assert_called_once_with(
+            ctx, data['connection_info'], instance, '/dev/vdb')
+        container.start.assert_called_once_with(wait=True)
+
+    def test_needs_migration_recovery_requires_explicit_marker(self):
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test')
+        container = self.client.instances.get.return_value
+        container.status = 'Stopped'
+        container.config = {
+            'user.openstack.uuid': instance.uuid,
+        }
+        container.devices = {
+            'root': {
+                'initial.ceph.rbd.image_name': 'volume-root',
+                'type': 'disk',
+                'path': '/',
+            },
+        }
+        profile = self.client.profiles.get.return_value
+        profile.config = {}
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertFalse(lxd_driver.needs_migration_recovery(instance))
+        profile.config[driver.MIGRATION_RECOVERY_KEY] = 'true'
+        self.assertTrue(lxd_driver.needs_migration_recovery(instance))
+
+    def test_reboot_clears_migration_recovery_marker(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        container = self.client.instances.get.return_value
+        container.status = 'Stopped'
+        profile = self.client.profiles.get.return_value
+        profile.config = {driver.MIGRATION_RECOVERY_KEY: 'true'}
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+        lxd_driver._reconcile_reboot_data_volumes = mock.Mock()
+        lxd_driver._validate_reboot_vifs = mock.Mock()
+        lxd_driver.plug_vifs = mock.Mock()
+
+        lxd_driver.reboot(ctx, instance, [], 'HARD', {
+            'block_device_mapping': [],
+        })
+
+        self.assertNotIn(driver.MIGRATION_RECOVERY_KEY, profile.config)
+        profile.save.assert_called_once_with(wait=True)
+
+    def test_recover_migration_target_preserves_stopped_state(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        container = self.client.instances.get.return_value
+        container.status = 'Stopped'
+        profile = self.client.profiles.get.return_value
+        profile.config = {driver.MIGRATION_RECOVERY_KEY: 'stopped'}
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+        lxd_driver._reconcile_reboot_data_volumes = mock.Mock()
+        lxd_driver._validate_reboot_vifs = mock.Mock()
+        lxd_driver.plug_vifs = mock.Mock()
+
+        should_run = lxd_driver.recover_migration_target(
+            ctx, instance, [], {'block_device_mapping': []})
+
+        self.assertFalse(should_run)
+        container.start.assert_not_called()
+        container.stop.assert_not_called()
+        self.assertNotIn(driver.MIGRATION_RECOVERY_KEY, profile.config)
+
+    @mock.patch('nova.virt.driver.block_device_info_get_mapping')
+    def test_reboot_rejects_inconsistent_data_volume_before_start(
+            self, get_mapping):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        connection_info = {
+            'serial': 'volume-data',
+            'driver_volume_type': 'rbd',
+            'data': {},
+        }
+        get_mapping.return_value = [{
+            'boot_index': 1,
+            'connection_info': connection_info,
+            'mount_device': '/dev/vdb',
+        }]
+        profile = self.client.profiles.get.return_value
+        profile.devices = {
+            'volume-data': {'type': 'unix-block', 'path': '/dev/vdc'}}
+        profile.config = {
+            driver._volume_device_info_key('volume-data'): '{}'}
+        container = self.client.instances.get.return_value
+        container.status = 'Stopped'
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            exception.InvalidVolume,
+            lxd_driver.reboot,
+            ctx, instance, None, 'HARD', block_device_info={})
+
+        container.start.assert_not_called()
+        container.restart.assert_not_called()
+
+    def test_reboot_repairs_host_vif_before_starting_retained_target(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        device_name = driver.lxd_vif.get_vif_devname(_VIF)
+        profile = self.client.profiles.get.return_value
+        profile.devices = {
+            device_name: {
+                'type': 'nic',
+                'nictype': 'physical',
+                'parent': driver.lxd_vif.get_vif_internal_devname(_VIF),
+                'hwaddr': _VIF['address'],
+            },
+        }
+        profile.config = {}
+        container = self.client.instances.get.return_value
+        container.status = 'Stopped'
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        lxd_driver.reboot(ctx, instance, [_VIF], 'HARD')
+
+        self.vif_driver.plug.assert_called_once_with(instance, _VIF)
+        container.start.assert_called_once_with(wait=True)
+
+    def test_reboot_rejects_stale_vif_profile_before_start(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        profile = self.client.profiles.get.return_value
+        profile.devices = {}
+        profile.config = {}
+        container = self.client.instances.get.return_value
+        container.status = 'Stopped'
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            exception.InterfaceAttachFailed,
+            lxd_driver.reboot,
+            ctx, instance, [_VIF], 'HARD')
+
+        self.vif_driver.plug.assert_not_called()
+        container.start.assert_not_called()
+
+    def test_plug_vifs_rolls_back_partial_wiring(self):
+        instance = mock.sentinel.instance
+        vifs = [dict(_VIF), dict(_VIF, id='second')]
+        self.vif_driver.plug.side_effect = [None, RuntimeError('failed')]
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            RuntimeError, lxd_driver.plug_vifs, instance, vifs)
+
+        self.vif_driver.unplug.assert_called_once_with(instance, vifs[0])
 
     def test_get_host_ip_addr(self):
         lxd_driver = driver.LXDDriver(None)
@@ -717,6 +1374,78 @@ class LXDDriverTest(test.NoDBTestCase):
         result = lxd_driver.get_host_ip_addr()
 
         self.assertEqual('0.0.0.0', result)
+
+    @mock.patch('nova.virt.lxd.driver._host_has_swap', return_value=False)
+    def test_update_provider_tree(self, _host_has_swap):
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.get_available_resource = mock.Mock(return_value={
+            'vcpus': 8,
+            'memory_mb': 16384,
+            'local_gb': 100,
+        })
+        lxd_driver._get_allocation_ratios = mock.Mock(return_value={
+            'VCPU': 4.0,
+            'MEMORY_MB': 1.5,
+            'DISK_GB': 1.0,
+        })
+        lxd_driver._get_reserved_host_disk_gb_from_config = mock.Mock(
+            return_value=2)
+        current = mock.Mock(
+            inventory={}, traits={'CUSTOM_OPERATOR_MANAGED'})
+        provider_tree = mock.Mock()
+        provider_tree.data.return_value = current
+        self.CONF.reserved_host_cpus = 1
+        self.CONF.reserved_host_memory_mb = 512
+
+        lxd_driver.update_provider_tree(provider_tree, 'compute-1')
+
+        provider_tree.update_inventory.assert_called_once_with(
+            'compute-1', {
+                'VCPU': {
+                    'total': 8, 'min_unit': 1, 'max_unit': 8,
+                    'step_size': 1, 'allocation_ratio': 4.0,
+                    'reserved': 1,
+                },
+                'MEMORY_MB': {
+                    'total': 16384, 'min_unit': 1, 'max_unit': 16384,
+                    'step_size': 1, 'allocation_ratio': 1.5,
+                    'reserved': 512,
+                },
+                'DISK_GB': {
+                    'total': 100, 'min_unit': 1, 'max_unit': 100,
+                    'step_size': 1, 'allocation_ratio': 1.0,
+                    'reserved': 2,
+                },
+            })
+        provider_tree.update_traits.assert_called_once_with(
+            'compute-1', {
+                'CUSTOM_INCUS_SYSTEM_CONTAINER',
+                'CUSTOM_OPERATOR_MANAGED',
+            })
+
+    @mock.patch('nova.virt.lxd.driver._host_has_swap', return_value=True)
+    def test_update_provider_tree_reports_swap_trait(self, _host_has_swap):
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.get_available_resource = mock.Mock(return_value={
+            'vcpus': 8, 'memory_mb': 16384, 'local_gb': 100})
+        lxd_driver._get_allocation_ratios = mock.Mock(return_value={
+            'VCPU': 4.0, 'MEMORY_MB': 1.5, 'DISK_GB': 1.0})
+        lxd_driver._get_reserved_host_disk_gb_from_config = mock.Mock(
+            return_value=2)
+        provider_tree = mock.Mock()
+        provider_tree.data.return_value = mock.Mock(
+            inventory={}, traits=set())
+        self.CONF.reserved_host_cpus = 0
+        self.CONF.reserved_host_memory_mb = 0
+        self.CONF.incus.allow_instance_swap = True
+
+        lxd_driver.update_provider_tree(provider_tree, 'compute-1')
+
+        provider_tree.update_traits.assert_called_once_with(
+            'compute-1', {
+                'CUSTOM_INCUS_SWAP',
+                'CUSTOM_INCUS_SYSTEM_CONTAINER',
+            })
 
     def test_attach_interface(self):
         expected = {
@@ -859,7 +1588,7 @@ class LXDDriverTest(test.NoDBTestCase):
 
     def test_migrate_disk_and_power_off(self):
         container = mock.Mock()
-        self.client.containers.get.return_value = container
+        self.client.instances.get.return_value = container
         profile = mock.Mock()
         self.client.profiles.get.return_value = profile
 
@@ -867,51 +1596,341 @@ class LXDDriverTest(test.NoDBTestCase):
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
         dest = '0.0.0.0'
-        flavor = mock.Mock()
+        target_flavor = instance.flavor
         network_info = []
 
         lxd_driver = driver.LXDDriver(None)
         lxd_driver.init_host(None)
 
-        lxd_driver.migrate_disk_and_power_off(
-            ctx, instance, dest, flavor, network_info)
+        self.assertRaises(
+            exception.MigrationError,
+            lxd_driver.migrate_disk_and_power_off,
+            ctx, instance, dest, target_flavor, network_info)
 
-        profile.save.assert_called_once_with()
-        container.stop.assert_called_once_with(wait=True)
+        profile.save.assert_not_called()
+        container.stop.assert_not_called()
 
     def test_migrate_disk_and_power_off_different_host(self):
-        """Migrating to a different host only shuts down the container."""
         container = mock.Mock()
-        self.client.containers.get.return_value = container
+        container.status = 'Running'
+        container.generate_migration_data.return_value = {
+            'name': 'test',
+            'source': {
+                'type': 'migration',
+                'operation': 'http+unix://incus/1.0/operations/op-id',
+                'secrets': {'0': 'secret'},
+            },
+        }
+        self.client.instances.get.return_value = container
+        self.CONF.incus.allow_cold_migration = True
+        self.CONF.incus.migration_address = 'https://10.224.0.16:8443'
 
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
         dest = '0.0.0.1'
-        flavor = mock.Mock()
+        flavor = instance.flavor
         network_info = []
 
         lxd_driver = driver.LXDDriver(None)
         lxd_driver.init_host(None)
 
-        lxd_driver.migrate_disk_and_power_off(
-            ctx, instance, dest, flavor, network_info)
+        result = jsonutils.loads(lxd_driver.migrate_disk_and_power_off(
+            ctx, instance, dest, flavor, network_info))
 
-        self.assertEqual(0, self.client.profiles.get.call_count)
+        self.assertEqual('incus-pull-v1', result['format'])
+        self.assertFalse(result['boot_from_volume'])
+        self.assertTrue(result['was_running'])
+        self.assertEqual(
+            'https://10.224.0.16:8443/1.0/operations/op-id',
+            result['migration_data']['source']['operation'])
+        self.assertEqual(
+            [instance.name], result['migration_data']['profiles'])
         container.stop.assert_called_once_with(wait=True)
+        container.generate_migration_data.assert_called_once_with(live=False)
 
-    @mock.patch('nova.virt.lxd.driver.network')
-    @mock.patch('os.major')
-    @mock.patch('os.minor')
-    @mock.patch('os.stat')
+    def test_bfv_migration_requires_shared_ceph_extension(self):
+        volume_id = '8231d2e8-1111-4222-8333-123456789abc'
+        root_bdm = {
+            'connection_info': {
+                'driver_volume_type': 'rbd',
+                'serial': volume_id,
+                'data': {
+                    'name': 'cinder-volumes/volume-%s' % volume_id,
+                    'access_mode': 'rw',
+                },
+            },
+        }
+        self.client.host_info['api_extensions'].append(
+            'storage_driver_cephext')
+
+        self.assertRaises(
+            exception.MigrationError,
+            driver._require_bfv_migration_support,
+            self.client, root_bdm)
+
+        self.client.storage_pools.get.assert_not_called()
+
+    def test_bfv_migration_validates_cephext_pool(self):
+        volume_id = '8231d2e8-1111-4222-8333-123456789abc'
+        root_bdm = {
+            'connection_info': {
+                'driver_volume_type': 'rbd',
+                'serial': volume_id,
+                'data': {
+                    'name': 'cinder-volumes/volume-%s' % volume_id,
+                    'access_mode': 'rw',
+                },
+            },
+        }
+        self.client.host_info['api_extensions'].extend([
+            'migration_shared_ceph_storage',
+            'storage_driver_cephext',
+        ])
+        self.CONF.incus.boot_from_volume_storage_pool = 'cinder'
+        pool = self.client.storage_pools.get.return_value
+        pool.driver = 'cephext'
+        pool.config = {'source': 'cinder-volumes'}
+
+        self.assertEqual(
+            ('cinder-volumes', 'volume-%s' % volume_id),
+            driver._require_bfv_migration_support(self.client, root_bdm))
+
+    def test_migrate_disk_failure_restarts_source(self):
+        container = mock.Mock(status='Running')
+        container.generate_migration_data.side_effect = RuntimeError(
+            'migration operation failed')
+        self.client.instances.get.return_value = container
+        self.CONF.incus.allow_cold_migration = True
+        self.CONF.incus.migration_address = 'https://10.224.0.16:8443'
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            RuntimeError,
+            lxd_driver.migrate_disk_and_power_off,
+            ctx, instance, '10.224.0.17', instance.flavor, [])
+
+        container.stop.assert_called_once_with(wait=True)
+        container.start.assert_called_once_with(wait=True)
+
+    @mock.patch.object(driver, '_preflight_bfv_migration_destination')
+    @mock.patch.object(driver, '_require_bfv_migration_support')
+    @mock.patch.object(driver, '_boot_from_volume')
+    @mock.patch('nova.virt.driver.block_device_info_get_mapping')
+    def test_migrate_disk_detaches_only_data_volumes(
+            self, get_mapping, boot_from_volume, require_bfv, preflight):
+        container = mock.Mock(status='Running')
+        container.generate_migration_data.return_value = {
+            'source': {
+                'operation': 'http+unix://incus/1.0/operations/op-id',
+            },
+        }
+        self.client.instances.get.return_value = container
+        self.CONF.incus.allow_cold_migration = True
+        self.CONF.incus.migration_address = 'https://10.224.0.16:8443'
+        connection_info = {'driver_volume_type': 'local', 'data': {
+            'volume_id': 'volume-id'}}
+        root_bdm = {
+            'boot_index': 0,
+            'connection_info': mock.sentinel.root_connection,
+            'mount_device': '/dev/sda',
+        }
+        boot_from_volume.return_value = root_bdm
+        require_bfv.return_value = ('cinder-volumes', 'volume-root')
+        get_mapping.return_value = [root_bdm, {
+            'connection_info': connection_info,
+            'mount_device': '/dev/vdb',
+        }]
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+        lxd_driver.detach_volume = mock.Mock()
+
+        lxd_driver.migrate_disk_and_power_off(
+            ctx, instance, '10.224.0.17',
+            instance.flavor, [], block_device_info={})
+
+        lxd_driver.detach_volume.assert_called_once_with(
+            ctx, connection_info, instance, '/dev/vdb')
+        require_bfv.assert_called_once_with(self.client, root_bdm)
+        preflight.assert_called_once_with('10.224.0.17', 'cinder-volumes')
+
+    @mock.patch.object(driver, '_preflight_bfv_migration_destination')
+    @mock.patch.object(driver, '_require_bfv_migration_support')
+    @mock.patch.object(driver, '_boot_from_volume')
+    def test_migrate_bfv_unreachable_destination_does_not_stop_source(
+            self, boot_from_volume, require_bfv, preflight):
+        root_bdm = {'boot_index': 0}
+        boot_from_volume.return_value = root_bdm
+        require_bfv.return_value = ('cinder-volumes', 'volume-root')
+        preflight.side_effect = exception.MigrationError(
+            reason='destination is unreachable')
+        self.CONF.incus.allow_cold_migration = True
+        self.CONF.incus.migration_address = 'https://10.224.0.16:8443'
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        error = self.assertRaises(
+            exception.InstanceFaultRollback,
+            lxd_driver.migrate_disk_and_power_off,
+            ctx, instance, '10.224.0.17', instance.flavor, [],
+            block_device_info={})
+
+        self.assertIsInstance(error.inner_exception, exception.MigrationError)
+        require_bfv.assert_called_once_with(self.client, root_bdm)
+        preflight.assert_called_once_with('10.224.0.17', 'cinder-volumes')
+        self.client.instances.get.assert_not_called()
+
+    @mock.patch.object(driver.incus_client,
+                       'get_migration_preflight_client')
+    @mock.patch.object(driver.socket, 'create_connection')
+    def test_bfv_destination_readiness_preflight(self, connect, get_remote):
+        self.CONF.incus.boot_from_volume_storage_pool = 'cinder-bfv'
+        self.CONF.incus.migration_port = 8443
+        self.CONF.incus.migration_preflight_timeout = 5
+        self.CONF.incus.migration_preflight_project = 'nova-preflight'
+        self.CONF.incus.migration_preflight_server_names = {
+            '10.224.0.17': 'compute-2.example.test'}
+        self.CONF.incus.migration_preflight_tls_ca = '/etc/nova/default.crt'
+        self.CONF.incus.migration_preflight_tls_ca_by_server = {
+            '10.224.0.17': '/etc/nova/compute-2.crt'}
+        remote = get_remote.return_value
+        remote.host_info = {'api_extensions': [
+            'migration_shared_ceph_storage', 'storage_driver_cephext']}
+        remote.projects.get.return_value.config = {
+            'user.openstack.preflight_protocol': '1',
+            'user.openstack.bfv_pool': 'cinder-bfv',
+            'user.openstack.cinder_rbd_pool': 'cinder-volumes',
+        }
+        remote.storage_pools.get.return_value.driver = 'cephext'
+
+        driver._preflight_bfv_migration_destination(
+            '10.224.0.17', 'cinder-volumes')
+
+        connect.assert_called_once_with(
+            ('10.224.0.17', 8443), timeout=5)
+        get_remote.assert_called_once_with(
+            'https://compute-2.example.test:8443',
+            verify='/etc/nova/compute-2.crt')
+        remote.projects.get.assert_called_once_with('nova-preflight')
+        remote.storage_pools.get.assert_called_once_with('cinder-bfv')
+
+    @mock.patch.object(driver.incus_client,
+                       'get_migration_preflight_client')
+    @mock.patch.object(driver.socket, 'create_connection')
+    def test_bfv_destination_preflight_rejects_missing_extension(
+            self, connect, get_remote):
+        get_remote.return_value.host_info = {'api_extensions': [
+            'storage_driver_cephext']}
+
+        self.assertRaisesRegex(
+            exception.MigrationError,
+            'missing API extensions: migration_shared_ceph_storage',
+            driver._preflight_bfv_migration_destination,
+            'compute-2.example.test', 'cinder-volumes')
+
+    @mock.patch.object(driver.incus_client,
+                       'get_migration_preflight_client')
+    @mock.patch.object(driver.socket, 'create_connection')
+    def test_bfv_destination_preflight_rejects_cinder_pool_mismatch(
+            self, connect, get_remote):
+        self.CONF.incus.boot_from_volume_storage_pool = 'cinder-bfv'
+        remote = get_remote.return_value
+        remote.host_info = {'api_extensions': [
+            'migration_shared_ceph_storage', 'storage_driver_cephext']}
+        remote.projects.get.return_value.config = {
+            'user.openstack.preflight_protocol': '1',
+            'user.openstack.bfv_pool': 'cinder-bfv',
+            'user.openstack.cinder_rbd_pool': 'wrong-pool',
+        }
+
+        self.assertRaisesRegex(
+            exception.MigrationError,
+            'destination Cinder RBD pool does not match root volume',
+            driver._preflight_bfv_migration_destination,
+            'compute-2.example.test', 'cinder-volumes')
+
+    @mock.patch('nova.virt.driver.block_device_info_get_mapping')
+    def test_migrate_disk_volume_failure_restores_source(self, get_mapping):
+        container = mock.Mock(status='Running')
+        container.generate_migration_data.return_value = {
+            'source': {
+                'operation': 'http+unix://incus/1.0/operations/op-id',
+            },
+        }
+        self.client.instances.get.return_value = container
+        self.CONF.incus.allow_cold_migration = True
+        self.CONF.incus.migration_address = 'https://10.224.0.16:8443'
+        first = {'driver_volume_type': 'local', 'data': {
+            'volume_id': 'first'}}
+        second = {'driver_volume_type': 'local', 'data': {
+            'volume_id': 'second'}}
+        get_mapping.return_value = [
+            {'connection_info': first, 'mount_device': '/dev/vdb'},
+            {'connection_info': second, 'mount_device': '/dev/vdc'},
+        ]
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+        lxd_driver.detach_volume = mock.Mock(
+            side_effect=[None, RuntimeError('disconnect failed')])
+        lxd_driver.attach_volume = mock.Mock()
+
+        self.assertRaises(
+            RuntimeError, lxd_driver.migrate_disk_and_power_off,
+            ctx, instance, '10.224.0.17',
+            instance.flavor, [], block_device_info={})
+
+        lxd_driver.attach_volume.assert_called_once_with(
+            ctx, first, instance, '/dev/vdb')
+        container.start.assert_called_once_with(wait=True)
+
+    def test_migrate_disk_rejects_non_https_address_before_shutdown(self):
+        self.CONF.incus.allow_cold_migration = True
+        self.CONF.incus.migration_address = 'http://10.224.0.16:8443'
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            exception.InvalidConfiguration,
+            lxd_driver.migrate_disk_and_power_off,
+            ctx, instance, '10.224.0.17', instance.flavor, [])
+
+        self.client.instances.get.assert_not_called()
+
+    def test_migrate_disk_rejects_rootfs_shrink_before_shutdown(self):
+        self.CONF.incus.allow_cold_migration = True
+        self.CONF.incus.migration_address = 'https://10.224.0.16:8443'
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        instance.flavor.root_gb = 20
+        smaller_flavor = mock.Mock(root_gb=10)
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            exception.InstanceFaultRollback,
+            lxd_driver.migrate_disk_and_power_off,
+            ctx, instance, '10.224.0.17', smaller_flavor, [])
+
+        self.client.instances.get.assert_not_called()
+
     @mock.patch('os.path.realpath')
-    def test_attach_volume(self, realpath, stat, minor, major, _):
+    def test_attach_volume(self, realpath):
         profile = mock.Mock()
+        profile.devices = {}
+        profile.config = {}
         self.client.profiles.get.return_value = profile
         realpath.return_value = '/dev/sdc'
-        stat.return_value.st_rdev = 2080
-        minor.return_value = 32
-        major.return_value = 8
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
@@ -919,24 +1938,283 @@ class LXDDriverTest(test.NoDBTestCase):
             {'id': 1, 'name': 'volume-00000001'},
             '10.0.2.15:3260', 'iqn.2010-10.org.openstack:volume-00000001',
             auth=True)
+        connection_info['data']['qos_specs'] = {
+            'read_iops_sec': '500',
+            'write_bytes_sec': '1048576',
+        }
+        self.client.host_info['api_extensions'].append('unix_block_limits')
         mountpoint = '/dev/sdd'
 
-        driver.brick_get_connector = mock.MagicMock()
-        driver.brick_get_connector_properties = mock.MagicMock()
+        volume_connector = mock.Mock()
+        volume_connector.connect_volume.return_value = {'path': '/dev/disk/x'}
+        driver.brick_get_connector = mock.Mock(return_value=volume_connector)
         lxd_driver = driver.LXDDriver(None)
         lxd_driver.init_host(None)
-        # driver.brick_get_connector = mock.MagicMock()
-        # lxd_driver.storage_driver.connect_volume = mock.MagicMock()
         lxd_driver.attach_volume(
             ctx, connection_info, instance, mountpoint, None, None, None)
 
         lxd_driver.client.profiles.get.assert_called_once_with(instance.name)
-        # driver.brick_get_connector.connect_volume.assert_called_once_with(
-        #     connection_info['data'])
-        profile.save.assert_called_once_with()
+        volume_connector.connect_volume.assert_called_once_with(
+            connection_info['data'])
+        self.assertEqual({
+            '1': {
+                'path': '/dev/sdd',
+                'required': 'true',
+                'source': '/dev/sdc',
+                'type': 'unix-block',
+                'limits.read': '500iops',
+                'limits.write': '1048576B',
+            },
+        }, profile.devices)
+        self.assertEqual(
+            {'path': '/dev/disk/x'},
+            jsonutils.loads(profile.config['user.openstack.volume.1']))
+        profile.save.assert_called_once_with(wait=True)
+
+    @mock.patch('os.path.realpath', return_value='/dev/sdc')
+    def test_attach_volume_rolls_back_host_connection(self, realpath):
+        profile = mock.Mock()
+        profile.devices = {}
+        profile.config = {}
+        profile.save.side_effect = RuntimeError('Incus API failed')
+        self.client.profiles.get.return_value = profile
+        volume_connector = mock.Mock()
+        device_info = {'path': '/dev/sdc'}
+        volume_connector.connect_volume.return_value = device_info
+        driver.brick_get_connector = mock.Mock(return_value=volume_connector)
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'},
+            '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            RuntimeError, lxd_driver.attach_volume,
+            context.get_admin_context(), connection_info, instance,
+            '/dev/sdd')
+
+        volume_connector.disconnect_volume.assert_called_once_with(
+            connection_info['data'], device_info)
+
+    def test_attach_encrypted_volume_is_rejected_before_connect(self):
+        volume_connector = mock.Mock()
+        driver.brick_get_connector = mock.Mock(return_value=volume_connector)
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'},
+            '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            exception.VolumeEncryptionNotSupported,
+            lxd_driver.attach_volume,
+            context.get_admin_context(), connection_info, instance,
+            '/dev/sdd', encryption={'provider': 'luks'})
+
+        volume_connector.connect_volume.assert_not_called()
+
+    def test_attach_read_only_volume_is_rejected_before_connect(self):
+        volume_connector = mock.Mock()
+        driver.brick_get_connector = mock.Mock(return_value=volume_connector)
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'}, '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        connection_info['data']['access_mode'] = 'ro'
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            exception.InvalidVolume, lxd_driver.attach_volume,
+            context.get_admin_context(), connection_info, instance,
+            '/dev/sdd')
+
+        volume_connector.connect_volume.assert_not_called()
+
+    def test_attach_volume_rejects_non_device_mountpoint_before_connect(self):
+        volume_connector = mock.Mock()
+        driver.brick_get_connector = mock.Mock(return_value=volume_connector)
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'},
+            '10.0.2.15', 'iqn.2010-10.org.openstack:volume-00000001')
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            exception.InvalidVolume, lxd_driver.attach_volume,
+            context.get_admin_context(), connection_info, instance,
+            '/etc/tenant-volume')
+
+        driver.brick_get_connector.assert_not_called()
+
+    def test_attach_volume_rejects_special_device_before_connect(self):
+        volume_connector = mock.Mock()
+        driver.brick_get_connector = mock.Mock(return_value=volume_connector)
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'},
+            '10.0.2.15', 'iqn.2010-10.org.openstack:volume-00000001')
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            exception.InvalidVolume, lxd_driver.attach_volume,
+            context.get_admin_context(), connection_info, instance,
+            '/dev/null')
+
+        driver.brick_get_connector.assert_not_called()
+
+    def test_attach_volume_rejects_qos_before_connect(self):
+        driver.brick_get_connector = mock.Mock()
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'},
+            '10.0.2.15', 'iqn.2010-10.org.openstack:volume-00000001')
+        connection_info['data']['qos_specs'] = {'read_iops_sec': '500'}
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            exception.InvalidVolume, lxd_driver.attach_volume,
+            context.get_admin_context(), connection_info, instance,
+            '/dev/vdb')
+
+        self.client.profiles.get.assert_not_called()
+        driver.brick_get_connector.assert_not_called()
+
+    def test_data_volume_qos_maps_with_server_extension(self):
+        self.assertEqual({
+            'limits.read': '500iops',
+            'limits.write': '1048576B',
+        }, driver._data_volume_qos({
+            'data': {'qos_specs': {
+                'read_iops_sec': '500',
+                'write_bytes_sec': '1048576',
+            }},
+        }, ['unix_block_limits']))
+
+    def test_attach_volume_rejects_duplicate_mountpoint_before_connect(self):
+        profile = mock.Mock()
+        profile.config = {}
+        profile.devices = {
+            'existing-volume': {
+                'path': '/dev/sdd',
+                'source': '/dev/dm-0',
+                'type': 'unix-block',
+            },
+        }
+        self.client.profiles.get.return_value = profile
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'},
+            '10.0.2.15', 'iqn.2010-10.org.openstack:volume-00000001')
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        with mock.patch(
+                'nova.virt.lxd.driver.brick_get_connector') as get_connector:
+            self.assertRaises(
+                exception.DevicePathInUse, lxd_driver.attach_volume,
+                context.get_admin_context(), connection_info,
+                fake_instance.fake_instance_obj(
+                    context.get_admin_context(), name='test'),
+                '/dev/sdd')
+
+        get_connector.assert_not_called()
+
+    def test_attach_volume_rejects_duplicate_volume_before_connect(self):
+        profile = mock.Mock()
+        profile.config = {}
+        profile.devices = {
+            '1': {
+                'path': '/dev/sdc',
+                'source': '/dev/dm-0',
+                'type': 'unix-block',
+            },
+        }
+        self.client.profiles.get.return_value = profile
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'},
+            '10.0.2.15', 'iqn.2010-10.org.openstack:volume-00000001')
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        with mock.patch(
+                'nova.virt.lxd.driver.brick_get_connector') as get_connector:
+            self.assertRaises(
+                exception.InvalidVolume, lxd_driver.attach_volume,
+                context.get_admin_context(), connection_info,
+                fake_instance.fake_instance_obj(
+                    context.get_admin_context(), name='test'),
+                '/dev/sdd')
+
+        get_connector.assert_not_called()
+
+    @mock.patch('os.path.realpath', return_value='/var/lib/tenant-volume')
+    def test_attach_volume_rejects_non_device_connector_path(self, realpath):
+        profile = mock.Mock()
+        profile.devices = {}
+        profile.config = {}
+        self.client.profiles.get.return_value = profile
+        volume_connector = mock.Mock()
+        device_info = {'path': '/var/lib/tenant-volume'}
+        volume_connector.connect_volume.return_value = device_info
+        driver.brick_get_connector = mock.Mock(return_value=volume_connector)
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'},
+            '10.0.2.15', 'iqn.2010-10.org.openstack:volume-00000001')
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            exception.InvalidVolume, lxd_driver.attach_volume,
+            context.get_admin_context(), connection_info, instance,
+            '/dev/sdd')
+
+        volume_connector.disconnect_volume.assert_called_once_with(
+            connection_info['data'], device_info)
+
+    def test_attach_volume_without_device_path_disconnects(self):
+        profile = mock.Mock()
+        profile.devices = {}
+        profile.config = {}
+        self.client.profiles.get.return_value = profile
+        volume_connector = mock.Mock()
+        device_info = {}
+        volume_connector.connect_volume.return_value = device_info
+        driver.brick_get_connector = mock.Mock(return_value=volume_connector)
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'},
+            '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            exception.InvalidVolume, lxd_driver.attach_volume,
+            context.get_admin_context(), connection_info, instance,
+            '/dev/sdd')
+
+        volume_connector.disconnect_volume.assert_called_once_with(
+            connection_info['data'], device_info)
 
     def test_detach_volume(self):
         profile = mock.Mock()
+        profile.config = {}
         profile.devices = {
             'eth0': {
                 'name': 'eth0',
@@ -948,8 +2226,9 @@ class LXDDriverTest(test.NoDBTestCase):
                 'path': '/',
                 'type': 'disk'
             },
-            1: {
+            '1': {
                 'path': '/dev/sdc',
+                'source': '/dev/drbd1000',
                 'type': 'unix-block'
             },
         }
@@ -980,19 +2259,229 @@ class LXDDriverTest(test.NoDBTestCase):
         lxd_driver = driver.LXDDriver(None)
         lxd_driver.init_host(None)
 
-        driver.brick_get_connector = mock.MagicMock()
-        driver.brick_get_connector_properties = mock.MagicMock()
+        volume_connector = mock.Mock()
+        driver.brick_get_connector = mock.Mock(return_value=volume_connector)
         lxd_driver.detach_volume(ctx, connection_info, instance,
                                  mountpoint, None)
 
         lxd_driver.client.profiles.get.assert_called_once_with(instance.name)
 
         self.assertEqual(expected, profile.devices)
-        profile.save.assert_called_once_with()
+        profile.save.assert_called_once_with(wait=True)
+        volume_connector.disconnect_volume.assert_called_once_with(
+            connection_info['data'], {'path': '/dev/drbd1000'})
+
+    def test_detach_volume_restores_profile_on_disconnect_failure(self):
+        device = {
+            'path': '/dev/sdc',
+            'source': '/dev/drbd1000',
+            'type': 'unix-block',
+        }
+        profile = mock.Mock()
+        profile.devices = {'1': device}
+        profile.config = {}
+        self.client.profiles.get.return_value = profile
+        volume_connector = mock.Mock()
+        volume_connector.disconnect_volume.side_effect = RuntimeError(
+            'disconnect failed')
+        driver.brick_get_connector = mock.Mock(return_value=volume_connector)
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'}, '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            RuntimeError, lxd_driver.detach_volume,
+            ctx, connection_info, instance, '/dev/sdc')
+
+        self.assertEqual({'1': device}, profile.devices)
+        self.assertEqual(2, profile.save.call_count)
+
+    def test_detach_volume_uses_persisted_connector_device_info(self):
+        profile = mock.Mock()
+        profile.devices = {'1': {
+            'path': '/dev/sdc',
+            'source': '/dev/rbd0',
+            'type': 'unix-block',
+        }}
+        device_info = {
+            'path': '/dev/rbd0',
+            'type': 'block',
+            'conf': '/run/os-brick/volume.conf',
+        }
+        profile.config = {
+            'user.openstack.volume.1': jsonutils.dumps(device_info),
+        }
+        self.client.profiles.get.return_value = profile
+        volume_connector = mock.Mock()
+        driver.brick_get_connector = mock.Mock(return_value=volume_connector)
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'}, '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        lxd_driver.detach_volume(
+            ctx, connection_info, instance, '/dev/sdc')
+
+        volume_connector.disconnect_volume.assert_called_once_with(
+            connection_info['data'], device_info)
+        self.assertNotIn('user.openstack.volume.1', profile.config)
+
+    @mock.patch('os.path.realpath', return_value='/dev/drbd1001')
+    def test_swap_volume(self, realpath):
+        profile = mock.Mock()
+        profile.config = {}
+        profile.devices = {
+            '1': {
+                'path': '/dev/sdd',
+                'required': 'true',
+                'source': '/dev/drbd1000',
+                'type': 'unix-block',
+            },
+        }
+        self.client.profiles.get.return_value = profile
+        old_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'}, '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        new_info = fake_connection_info(
+            {'id': 2, 'name': 'volume-00000002'}, '10.0.2.16:3260',
+            'iqn.2010-10.org.openstack:volume-00000002')
+        old_connector = mock.Mock()
+        new_connector = mock.Mock()
+        new_connector.connect_volume.return_value = {
+            'path': '/dev/disk/by-id/new'}
+        driver.brick_get_connector = mock.Mock(
+            side_effect=[new_connector, old_connector])
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        lxd_driver.swap_volume(
+            context.get_admin_context(), old_info, new_info, instance,
+            '/dev/sdd', 2)
+
+        self.assertNotIn('1', profile.devices)
+        self.assertEqual('/dev/drbd1001', profile.devices['2']['source'])
+        profile.save.assert_called_once_with(wait=True)
+        old_connector.disconnect_volume.assert_called_once_with(
+            old_info['data'], {'path': '/dev/drbd1000'})
+        new_connector.disconnect_volume.assert_not_called()
+
+    @mock.patch('os.path.realpath', return_value='/dev/drbd1001')
+    def test_swap_volume_rolls_back_new_connection(self, realpath):
+        old_device = {
+            'path': '/dev/sdd',
+            'source': '/dev/drbd1000',
+            'type': 'unix-block',
+        }
+        profile = mock.Mock()
+        profile.devices = {'1': old_device}
+        profile.config = {}
+        profile.save.side_effect = RuntimeError('Incus API failed')
+        self.client.profiles.get.return_value = profile
+        old_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'}, '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        new_info = fake_connection_info(
+            {'id': 2, 'name': 'volume-00000002'}, '10.0.2.16:3260',
+            'iqn.2010-10.org.openstack:volume-00000002')
+        new_connector = mock.Mock()
+        new_device_info = {'path': '/dev/drbd1001'}
+        new_connector.connect_volume.return_value = new_device_info
+        driver.brick_get_connector = mock.Mock(return_value=new_connector)
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            RuntimeError, lxd_driver.swap_volume,
+            context.get_admin_context(), old_info, new_info, instance,
+            '/dev/sdd', 0)
+
+        self.assertEqual({'1': old_device}, profile.devices)
+        new_connector.disconnect_volume.assert_called_once_with(
+            new_info['data'], new_device_info)
+
+    def test_swap_volume_rejects_read_only_replacement(self):
+        connection_info = {'driver_volume_type': 'rbd', 'data': {
+            'volume_id': 'new-id', 'access_mode': 'ro'}}
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        with mock.patch(
+                'nova.virt.lxd.driver.brick_get_connector') as get_connector:
+            self.assertRaises(
+                exception.InvalidVolume, lxd_driver.swap_volume,
+                context.get_admin_context(),
+                {'driver_volume_type': 'rbd', 'data': {
+                    'volume_id': 'old-id'}},
+                connection_info,
+                fake_instance.fake_instance_obj(
+                    context.get_admin_context(), name='test'),
+                '/dev/vdb', 0)
+
+        get_connector.assert_not_called()
+
+    def test_extend_volume(self):
+        volume_connector = mock.Mock()
+        volume_connector.extend_volume.return_value = 2 * units.Gi
+        driver.brick_get_connector = mock.Mock(return_value=volume_connector)
+        connection_info = {'driver_volume_type': 'rbd', 'data': {
+            'volume_id': 'volume-id', 'name': 'volumes/volume-id'}}
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        lxd_driver.extend_volume(
+            ctx, connection_info, instance, 2 * units.Gi)
+
+        volume_connector.extend_volume.assert_called_once_with(
+            connection_info['data'])
+
+    def test_extend_volume_rejects_stale_size(self):
+        volume_connector = mock.Mock()
+        volume_connector.extend_volume.return_value = units.Gi
+        driver.brick_get_connector = mock.Mock(return_value=volume_connector)
+        connection_info = {'driver_volume_type': 'rbd', 'data': {
+            'volume_id': 'volume-id'}}
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            exception.VolumeExtendFailed, lxd_driver.extend_volume,
+            context.get_admin_context(), connection_info,
+            fake_instance.fake_instance_obj(
+                context.get_admin_context(), name='test'),
+            2 * units.Gi)
+
+    def test_extend_volume_maps_not_implemented(self):
+        volume_connector = mock.Mock()
+        volume_connector.extend_volume.side_effect = NotImplementedError
+        driver.brick_get_connector = mock.Mock(return_value=volume_connector)
+        connection_info = {'driver_volume_type': 'unsupported', 'data': {
+            'volume_id': 'volume-id'}}
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            exception.ExtendVolumeNotSupported, lxd_driver.extend_volume,
+            context.get_admin_context(), connection_info,
+            fake_instance.fake_instance_obj(
+                context.get_admin_context(), name='test'),
+            2 * units.Gi)
 
     def test_pause(self):
         container = mock.Mock()
-        self.client.containers.get.return_value = container
+        self.client.instances.get.return_value = container
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
@@ -1002,12 +2491,12 @@ class LXDDriverTest(test.NoDBTestCase):
 
         lxd_driver.pause(instance)
 
-        self.client.containers.get.assert_called_once_with(instance.name)
+        self.client.instances.get.assert_called_once_with(instance.name)
         container.freeze.assert_called_once_with(wait=True)
 
     def test_unpause(self):
         container = mock.Mock()
-        self.client.containers.get.return_value = container
+        self.client.instances.get.return_value = container
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
@@ -1017,12 +2506,12 @@ class LXDDriverTest(test.NoDBTestCase):
 
         lxd_driver.unpause(instance)
 
-        self.client.containers.get.assert_called_once_with(instance.name)
+        self.client.instances.get.assert_called_once_with(instance.name)
         container.unfreeze.assert_called_once_with(wait=True)
 
     def test_suspend(self):
         container = mock.Mock()
-        self.client.containers.get.return_value = container
+        self.client.instances.get.return_value = container
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
@@ -1032,12 +2521,12 @@ class LXDDriverTest(test.NoDBTestCase):
 
         lxd_driver.suspend(ctx, instance)
 
-        self.client.containers.get.assert_called_once_with(instance.name)
+        self.client.instances.get.assert_called_once_with(instance.name)
         container.freeze.assert_called_once_with(wait=True)
 
     def test_resume(self):
         container = mock.Mock()
-        self.client.containers.get.return_value = container
+        self.client.instances.get.return_value = container
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
@@ -1047,7 +2536,7 @@ class LXDDriverTest(test.NoDBTestCase):
 
         lxd_driver.resume(ctx, instance, None, None)
 
-        self.client.containers.get.assert_called_once_with(instance.name)
+        self.client.instances.get.assert_called_once_with(instance.name)
         container.unfreeze.assert_called_once_with(wait=True)
 
     def test_resume_state_on_host_boot(self):
@@ -1056,7 +2545,7 @@ class LXDDriverTest(test.NoDBTestCase):
         state.memory = dict({'usage': 0, 'usage_peak': 0})
         state.status_code = 102
         container.state.return_value = state
-        self.client.containers.get.return_value = container
+        self.client.instances.get.return_value = container
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
@@ -1064,89 +2553,38 @@ class LXDDriverTest(test.NoDBTestCase):
         lxd_driver = driver.LXDDriver(None)
         lxd_driver.init_host(None)
 
-        lxd_driver.resume_state_on_host_boot(ctx, instance, None, None)
+        lxd_driver.resume_state_on_host_boot(ctx, instance, None, None, None)
         container.start.assert_called_once_with(wait=True)
 
-    def test_rescue(self):
-        profile = mock.Mock()
-        profile.devices = {
-            'root': {
-                'type': 'disk',
-                'path': '/',
-                'size': '1GB'
-            }
-        }
-        container = mock.Mock()
-        self.client.profiles.get.return_value = profile
-        self.client.containers.get.return_value = container
+    def test_rescue_is_rejected_without_storage_native_implementation(self):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
-        profile.name = instance.name
-        network_info = [_VIF]
-        image_meta = mock.Mock()
-        rescue_password = mock.Mock()
-        rescue = '%s-rescue' % instance.name
-
         lxd_driver = driver.LXDDriver(None)
         lxd_driver.init_host(None)
 
-        lxd_driver.rescue(
-            ctx, instance, network_info, image_meta, rescue_password)
+        self.assertRaises(
+            NotImplementedError, lxd_driver.rescue, ctx, instance, [_VIF],
+            mock.Mock(), mock.Mock(), {}, [])
+        self.client.instances.get.assert_not_called()
+        self.client.profiles.get.assert_not_called()
 
-        lxd_driver.client.containers.get.assert_called_once_with(instance.name)
-        container.rename.assert_called_once_with(rescue, wait=True)
-        lxd_driver.client.profiles.get.assert_called_once_with(instance.name)
-        lxd_driver.client.containers.create.assert_called_once_with(
-            {'name': instance.name, 'profiles': [profile.name],
-             'source': {'type': 'image', 'alias': None},
-             }, wait=True)
-
-        self.assertTrue('rescue' in profile.devices)
-
-    def test_unrescue(self):
-        container = mock.Mock()
-        container.status = 'Running'
-        self.client.containers.get.return_value = container
-        profile = mock.Mock()
-        profile.devices = {
-            'root': {
-                'type': 'disk',
-                'path': '/',
-                'size': '1GB'
-            },
-            'rescue': {
-                'source': '/path',
-                'path': '/mnt',
-                'type': 'disk'
-            }
-        }
-        self.client.profiles.get.return_value = profile
-
+    def test_unrescue_is_rejected(self):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
-        network_info = [_VIF]
-        rescue = '%s-rescue' % instance.name
-
         lxd_driver = driver.LXDDriver(None)
         lxd_driver.init_host(None)
 
-        lxd_driver.unrescue(instance, network_info)
-
-        container.stop.assert_called_once_with(wait=True)
-        container.delete.assert_called_once_with(wait=True)
-        lxd_driver.client.profiles.get.assert_called_once_with(instance.name)
-        profile.save.assert_called_once_with()
-        lxd_driver.client.containers.get.assert_called_with(rescue)
-        container.rename.assert_called_once_with(instance.name, wait=True)
-        container.start.assert_called_once_with(wait=True)
-        self.assertTrue('rescue' not in profile.devices)
+        self.assertRaises(
+            NotImplementedError, lxd_driver.unrescue, ctx, instance)
+        self.client.instances.get.assert_not_called()
+        self.client.profiles.get.assert_not_called()
 
     def test_power_off(self):
         container = mock.Mock()
         container.status = 'Running'
-        self.client.containers.get.return_value = container
+        self.client.instances.get.return_value = container
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
@@ -1155,13 +2593,13 @@ class LXDDriverTest(test.NoDBTestCase):
         lxd_driver.init_host(None)
         lxd_driver.power_off(instance)
 
-        self.client.containers.get.assert_called_once_with(instance.name)
+        self.client.instances.get.assert_called_once_with(instance.name)
         container.stop.assert_called_once_with(wait=True)
 
     def test_power_on(self):
         container = mock.Mock()
         container.status = 'Stopped'
-        self.client.containers.get.return_value = container
+        self.client.instances.get.return_value = container
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
@@ -1170,15 +2608,16 @@ class LXDDriverTest(test.NoDBTestCase):
         lxd_driver.init_host(None)
         lxd_driver.power_on(ctx, instance, None)
 
-        self.client.containers.get.assert_called_once_with(instance.name)
+        self.client.instances.get.assert_called_once_with(instance.name)
         container.start.assert_called_once_with(wait=True)
 
     @mock.patch('socket.gethostname', mock.Mock(return_value='fake_hostname'))
     @mock.patch('os.statvfs', return_value=mock.Mock(
         f_blocks=131072000, f_bsize=8192, f_bavail=65536000))
-    @mock.patch('nova.virt.lxd.driver.open')
-    @mock.patch.object(driver.utils, 'execute')
+    @mock.patch('builtins.open')
+    @mock.patch.object(driver.processutils, 'execute')
     def test_get_available_resource(self, execute, open, statvfs):
+        self.CONF.host = 'fake_hostname'
         expected = {
             'cpu_info': {
                 "features": "fake flag goes here",
@@ -1237,7 +2676,7 @@ class LXDDriverTest(test.NoDBTestCase):
 
         self.assertEqual(expected, value)
 
-    @mock.patch.object(driver.utils, 'execute')
+    @mock.patch.object(driver.processutils, 'execute')
     def test__get_zpool_info(self, execute):
         # first test with a zpool; should make 3 calls to execute
         execute.side_effect = [
@@ -1265,10 +2704,26 @@ class LXDDriverTest(test.NoDBTestCase):
         }
         self.assertEqual(expected, driver._get_zpool_info('lxd/dataset'))
 
+    def test__get_storage_pool_info(self):
+        resources = mock.Mock()
+        resources.space = {'total': 30 * units.Gi, 'used': 10 * units.Gi}
+        pool = self.client.storage_pools.get.return_value
+        pool.resources.get.return_value = resources
+
+        result = driver._get_storage_pool_info(self.client, 'tenant-rootfs')
+
+        self.assertEqual({
+            'total': 30 * units.Gi,
+            'used': 10 * units.Gi,
+            'available': 20 * units.Gi,
+        }, result)
+        self.client.storage_pools.get.assert_called_once_with('tenant-rootfs')
+
     @mock.patch('socket.gethostname', mock.Mock(return_value='fake_hostname'))
-    @mock.patch('nova.virt.lxd.driver.open')
-    @mock.patch.object(driver.utils, 'execute')
+    @mock.patch('builtins.open')
+    @mock.patch.object(driver.processutils, 'execute')
     def test_get_available_resource_zfs(self, execute, open):
+        self.CONF.host = 'fake_hostname'
         expected = {
             'cpu_info': {
                 "features": "fake flag goes here",
@@ -1393,7 +2848,7 @@ class LXDDriverTest(test.NoDBTestCase):
         firewall.unfilter_instance.assert_called_once_with(
             instance, network_info)
 
-    @mock.patch.object(driver.utils, 'execute')
+    @mock.patch.object(driver.processutils, 'execute')
     def test_get_host_uptime(self, execute):
         expected = '00:00:00 up 0 days, 0:00 , 0 users, load average: 0'
         execute.return_value = (expected, 'stderr')
@@ -1404,8 +2859,8 @@ class LXDDriverTest(test.NoDBTestCase):
         self.assertEqual(expected, result)
 
     @mock.patch('nova.virt.lxd.driver.psutil.cpu_times')
-    @mock.patch('nova.virt.lxd.driver.open')
-    @mock.patch.object(driver.utils, 'execute')
+    @mock.patch('builtins.open')
+    @mock.patch.object(driver.processutils, 'execute')
     def test_get_host_cpu_stats(self, execute, open, cpu_times):
         cpu_times.return_value = [
             '1', 'b', '2', '3', '4'
@@ -1429,13 +2884,10 @@ class LXDDriverTest(test.NoDBTestCase):
 
         self.assertEqual(expected, result)
 
-    def test_get_volume_connector(self):
-        expected = {
-            'host': 'fakehost',
-            'initiator': 'fake',
-            'ip': self.CONF.my_block_storage_ip
-        }
-
+    @mock.patch('nova.virt.lxd.driver.brick_get_connector_properties')
+    def test_get_volume_connector(self, get_connector_properties):
+        expected = {'host': 'compute-01', 'ip': '192.0.2.10'}
+        get_connector_properties.return_value = expected
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
@@ -1444,11 +2896,10 @@ class LXDDriverTest(test.NoDBTestCase):
         result = lxd_driver.get_volume_connector(instance)
 
         self.assertEqual(expected, result)
+        get_connector_properties.assert_called_once_with()
 
-    @mock.patch('nova.virt.lxd.driver.socket.gethostname')
-    def test_get_available_nodes(self, gethostname):
-        gethostname.return_value = 'nova-lxd'
-
+    def test_get_available_nodes(self):
+        self.CONF.host = 'nova-lxd'
         expected = ['nova-lxd']
 
         lxd_driver = driver.LXDDriver(None)
@@ -1467,9 +2918,11 @@ class LXDDriverTest(test.NoDBTestCase):
         ]
 
         container = mock.Mock()
-        self.client.containers.get.return_value = container
+        self.client.instances.get.return_value = container
+        instance_snapshot = mock.Mock()
+        container.snapshots.create.return_value = instance_snapshot
         image = mock.Mock()
-        container.publish.return_value = image
+        instance_snapshot.publish.return_value = image
         data = mock.Mock()
         image.export.return_value = data
         ctx = context.get_admin_context()
@@ -1494,6 +2947,41 @@ class LXDDriverTest(test.NoDBTestCase):
                 'disk_format': 'raw',
                 'container_format': 'bare'},
             data)
+        data.close.assert_called_once_with()
+        image.delete.assert_called_once_with(wait=True)
+        instance_snapshot.delete.assert_called_once_with(wait=True)
+        container.snapshots.create.assert_called_once_with(
+            'nova-{}'.format(image_id), wait=True)
+
+    @mock.patch('nova.virt.lxd.driver.IMAGE_API')
+    @mock.patch('nova.virt.lxd.driver.lockutils.lock')
+    def test_snapshot_upload_failure_cleans_temporary_resources(
+            self, lock, IMAGE_API):
+        container = mock.Mock(status='Running')
+        instance_snapshot = mock.Mock()
+        image = mock.Mock()
+        data = mock.Mock()
+        container.snapshots.create.return_value = instance_snapshot
+        instance_snapshot.publish.return_value = image
+        image.export.return_value = data
+        self.client.instances.get.return_value = container
+        IMAGE_API.get.return_value = {'name': 'snapshot'}
+        IMAGE_API.update.side_effect = RuntimeError('upload failed')
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            RuntimeError, lxd_driver.snapshot, ctx, instance, 'image-id',
+            mock.Mock())
+
+        data.close.assert_called_once_with()
+        image.delete.assert_called_once_with(wait=True)
+        instance_snapshot.delete.assert_called_once_with(wait=True)
+        container.stop.assert_not_called()
+        container.start.assert_not_called()
 
     def test_finish_revert_migration(self):
         ctx = context.get_admin_context()
@@ -1502,13 +2990,416 @@ class LXDDriverTest(test.NoDBTestCase):
         network_info = []
 
         container = mock.Mock()
-        self.client.containers.get.return_value = container
+        container.status = 'Stopped'
+        self.client.instances.get.return_value = container
+        migration = mock.Mock(
+            source_compute='compute', dest_compute='compute')
 
         lxd_driver = driver.LXDDriver(None)
         lxd_driver.init_host(None)
 
-        lxd_driver.finish_revert_migration(ctx, instance, network_info)
+        lxd_driver.finish_revert_migration(
+            ctx, instance, network_info, migration)
 
+        container.start.assert_called_once_with(wait=True)
+        self.vif_driver.plug.assert_not_called()
+
+    @mock.patch.object(driver, '_require_bfv_migration_support')
+    @mock.patch.object(driver, '_boot_from_volume')
+    @mock.patch('nova.virt.driver.block_device_info_get_mapping')
+    def test_finish_revert_migration_attaches_only_data_volumes(
+            self, get_mapping, boot_from_volume, require_bfv):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        container = mock.Mock(status='Stopped')
+        self.client.instances.get.return_value = container
+        migration = mock.Mock(
+            source_compute='source', dest_compute='destination')
+        root_bdm = {
+            'boot_index': 0,
+            'connection_info': mock.sentinel.root_connection,
+            'mount_device': '/dev/sda',
+        }
+        data_connection = {'driver_volume_type': 'local'}
+        data_bdm = {
+            'boot_index': 1,
+            'connection_info': data_connection,
+            'mount_device': '/dev/vdb',
+        }
+        boot_from_volume.return_value = root_bdm
+        get_mapping.return_value = [root_bdm, data_bdm]
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+        lxd_driver.attach_volume = mock.Mock()
+
+        lxd_driver.finish_revert_migration(
+            ctx, instance, [], migration, block_device_info={}, power_on=True)
+
+        lxd_driver.attach_volume.assert_called_once_with(
+            ctx, data_connection, instance, '/dev/vdb')
+        require_bfv.assert_called_once_with(self.client, root_bdm)
+        container.start.assert_called_once_with(wait=True)
+
+    @mock.patch.object(driver, '_require_bfv_migration_support')
+    @mock.patch.object(driver, '_boot_from_volume')
+    @mock.patch('nova.virt.driver.block_device_info_get_mapping',
+                return_value=[])
+    def test_finish_revert_migration_marks_failed_bfv_owner(
+            self, get_mapping, boot_from_volume, require_bfv):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        boot_from_volume.return_value = {'boot_index': 0}
+        container = mock.Mock(status='Stopped')
+        container.start.side_effect = RuntimeError('start failed')
+        self.client.instances.get.return_value = container
+        profile = self.client.profiles.get.return_value
+        profile.config = {}
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        lxd_driver.finish_revert_migration(
+            ctx, instance, [], mock.Mock(), block_device_info={},
+            power_on=True)
+
+        self.assertEqual(
+            self.CONF.incus.migration_finish_retries,
+            container.start.call_count)
+        self.assertEqual(
+            'running', profile.config[driver.MIGRATION_RECOVERY_KEY])
+        profile.save.assert_called_once_with(wait=True)
+
+    @mock.patch.object(driver.flavor, 'to_profile')
+    def test_finish_migration_same_host(self, to_profile):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        migration = mock.Mock(
+            source_compute='compute', dest_compute='compute')
+        container = mock.Mock()
+        self.client.instances.create.return_value = container
+        self.CONF.incus.allow_cold_migration = True
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        disk_info = jsonutils.dumps({
+            'format': 'incus-pull-v1',
+            'migration_data': {
+                'name': instance.name,
+                'source': {'type': 'migration'},
+            },
+            'was_running': True,
+        })
+        lxd_driver.finish_migration(
+            ctx, migration, instance, disk_info, [], mock.Mock(), True, {},
+            block_device_info=None, power_on=True)
+
+        to_profile.assert_called_once_with(
+            self.client, instance, [], None)
+        self.client.instances.create.assert_called_once_with(
+            {'name': instance.name, 'source': {'type': 'migration'}},
+            wait=True)
+        container.start.assert_called_once_with(wait=True)
+
+    @mock.patch.object(driver.flavor, 'to_profile')
+    def test_finish_migration_create_failure_rolls_back(self, to_profile):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        migration = mock.Mock(
+            source_compute='source', dest_compute='destination')
+        network_info = [mock.sentinel.vif]
+        profile = to_profile.return_value
+        self.client.instances.create.side_effect = RuntimeError(
+            'destination pull failed')
+        self.CONF.incus.allow_cold_migration = True
+        disk_info = jsonutils.dumps({
+            'format': 'incus-pull-v1',
+            'migration_data': {
+                'name': instance.name,
+                'source': {'type': 'migration'},
+            },
+        })
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            RuntimeError,
+            lxd_driver.finish_migration,
+            ctx, migration, instance, disk_info, network_info, mock.Mock(),
+            True, {}, block_device_info=None, power_on=True)
+
+        self.vif_driver.plug.assert_called_once_with(
+            instance, mock.sentinel.vif)
+        self.vif_driver.unplug.assert_called_once_with(
+            instance, mock.sentinel.vif)
+        profile.delete.assert_called_once_with()
+
+    @mock.patch.object(driver, '_require_bfv_migration_support')
+    @mock.patch.object(driver, '_boot_from_volume')
+    @mock.patch('nova.virt.driver.block_device_info_get_mapping',
+                return_value=[])
+    @mock.patch.object(driver.flavor, 'to_profile')
+    def test_finish_migration_retains_claimed_bfv_target_on_start_failure(
+            self, to_profile, get_mapping, boot_from_volume, require_bfv):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        migration = mock.Mock(
+            source_compute='source', dest_compute='destination')
+        root_bdm = {'boot_index': 0}
+        boot_from_volume.return_value = root_bdm
+        profile = to_profile.return_value
+        profile.config = {}
+        container = self.client.instances.create.return_value
+        container.start.side_effect = RuntimeError('target start failed')
+        self.CONF.incus.allow_cold_migration = True
+        disk_info = jsonutils.dumps({
+            'format': 'incus-pull-v1',
+            'boot_from_volume': True,
+            'migration_data': {
+                'name': instance.name,
+                'source': {'type': 'migration'},
+            },
+        })
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        lxd_driver.finish_migration(
+            ctx, migration, instance, disk_info, [mock.sentinel.vif],
+            mock.Mock(), True, {}, block_device_info={}, power_on=True)
+
+        require_bfv.assert_called_once_with(self.client, root_bdm)
+        self.assertEqual(3, container.start.call_count)
+        self.assertEqual(
+            'running',
+            profile.config[driver.MIGRATION_RECOVERY_KEY])
+        profile.save.assert_called()
+        container.delete.assert_not_called()
+        profile.delete.assert_not_called()
+        self.vif_driver.unplug.assert_not_called()
+
+    @mock.patch.object(driver, '_require_bfv_migration_support')
+    @mock.patch.object(driver, '_boot_from_volume')
+    @mock.patch('nova.virt.driver.block_device_info_get_mapping',
+                return_value=[])
+    @mock.patch.object(driver.flavor, 'to_profile')
+    def test_finish_migration_retries_transient_marker_failure(
+            self, to_profile, get_mapping, boot_from_volume, require_bfv):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        boot_from_volume.return_value = {'boot_index': 0}
+        profile = to_profile.return_value
+        profile.config = {}
+        profile.save.side_effect = [RuntimeError('database busy'), None]
+        container = self.client.instances.create.return_value
+        container.start.side_effect = RuntimeError('target start failed')
+        self.CONF.incus.allow_cold_migration = True
+        disk_info = jsonutils.dumps({
+            'format': 'incus-pull-v1',
+            'boot_from_volume': True,
+            'migration_data': {
+                'name': instance.name,
+                'source': {'type': 'migration'},
+            },
+        })
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        lxd_driver.finish_migration(
+            ctx, mock.Mock(), instance, disk_info, [mock.sentinel.vif],
+            mock.Mock(), True, {}, block_device_info={}, power_on=True)
+
+        self.assertEqual(2, profile.save.call_count)
+        self.assertEqual(
+            'running', profile.config[driver.MIGRATION_RECOVERY_KEY])
+        container.delete.assert_not_called()
+        profile.delete.assert_not_called()
+        self.vif_driver.unplug.assert_not_called()
+
+    @mock.patch.object(driver, '_require_bfv_migration_support')
+    @mock.patch.object(driver, '_boot_from_volume')
+    @mock.patch('nova.virt.driver.block_device_info_get_mapping',
+                return_value=[])
+    @mock.patch.object(driver.flavor, 'to_profile')
+    def test_finish_migration_marker_failure_reraises_start_failure(
+            self, to_profile, get_mapping, boot_from_volume, require_bfv):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        root_bdm = {'boot_index': 0}
+        boot_from_volume.return_value = root_bdm
+        profile = to_profile.return_value
+        profile.save.side_effect = RuntimeError('database unavailable')
+        container = self.client.instances.create.return_value
+        container.start.side_effect = RuntimeError('target start failed')
+        self.CONF.incus.allow_cold_migration = True
+        disk_info = jsonutils.dumps({
+            'format': 'incus-pull-v1',
+            'boot_from_volume': True,
+            'migration_data': {
+                'name': instance.name,
+                'source': {'type': 'migration'},
+            },
+        })
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            RuntimeError,
+            lxd_driver.finish_migration,
+            ctx, mock.Mock(), instance, disk_info, [mock.sentinel.vif],
+            mock.Mock(), True, {}, block_device_info={}, power_on=True)
+
+        container.delete.assert_not_called()
+        profile.delete.assert_not_called()
+        self.vif_driver.unplug.assert_not_called()
+        self.assertEqual(
+            self.CONF.incus.migration_finish_retries,
+            profile.save.call_count)
+
+    @mock.patch.object(driver, '_require_bfv_migration_support')
+    @mock.patch.object(driver, '_boot_from_volume')
+    @mock.patch('nova.virt.driver.block_device_info_get_mapping',
+                return_value=[])
+    @mock.patch.object(driver.flavor, 'to_profile')
+    def test_finish_migration_retries_transient_target_start_failure(
+            self, to_profile, get_mapping, boot_from_volume, require_bfv):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        migration = mock.Mock(
+            source_compute='source', dest_compute='destination')
+        root_bdm = {'boot_index': 0}
+        boot_from_volume.return_value = root_bdm
+        container = self.client.instances.create.return_value
+        container.start.side_effect = [
+            RuntimeError('transient target start failure'), None]
+        self.CONF.incus.allow_cold_migration = True
+        disk_info = jsonutils.dumps({
+            'format': 'incus-pull-v1',
+            'boot_from_volume': True,
+            'migration_data': {
+                'name': instance.name,
+                'source': {'type': 'migration'},
+            },
+        })
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        lxd_driver.finish_migration(
+            ctx, migration, instance, disk_info, [mock.sentinel.vif],
+            mock.Mock(), True, {}, block_device_info={}, power_on=True)
+
+        self.assertEqual(2, container.start.call_count)
+        self.client.instances.get.assert_not_called()
+        to_profile.return_value.delete.assert_not_called()
+        self.vif_driver.unplug.assert_not_called()
+
+    @mock.patch.object(driver, '_require_bfv_migration_support')
+    @mock.patch.object(driver, '_boot_from_volume')
+    @mock.patch.object(driver.flavor, 'to_profile')
+    def test_finish_migration_recovers_bfv_target_after_create_timeout(
+            self, to_profile, boot_from_volume, require_bfv):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        migration = mock.Mock(
+            source_compute='source', dest_compute='destination')
+        root_bdm = {'boot_index': 0}
+        boot_from_volume.return_value = root_bdm
+        profile = to_profile.return_value
+        profile.config = {}
+        claimed_container = mock.Mock()
+        self.client.instances.create.side_effect = RuntimeError(
+            'response timed out after server accepted create')
+        self.client.instances.get.return_value = claimed_container
+        self.CONF.incus.allow_cold_migration = True
+        disk_info = jsonutils.dumps({
+            'format': 'incus-pull-v1',
+            'boot_from_volume': True,
+            'migration_data': {
+                'name': instance.name,
+                'source': {'type': 'migration'},
+            },
+        })
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        lxd_driver.finish_migration(
+            ctx, migration, instance, disk_info, [mock.sentinel.vif],
+            mock.Mock(), True, {}, block_device_info={}, power_on=True)
+
+        self.client.instances.get.assert_called_once_with(instance.name)
+        self.assertEqual(
+            'running',
+            profile.config[driver.MIGRATION_RECOVERY_KEY])
+        claimed_container.delete.assert_not_called()
+        profile.delete.assert_not_called()
+        self.vif_driver.unplug.assert_not_called()
+
+    def test_finish_migration_rejects_bfv_mode_mismatch(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        migration = mock.Mock(
+            source_compute='source', dest_compute='destination')
+        self.CONF.incus.allow_cold_migration = True
+        disk_info = jsonutils.dumps({
+            'format': 'incus-pull-v1',
+            'boot_from_volume': True,
+            'migration_data': {
+                'name': instance.name,
+                'source': {'type': 'migration'},
+            },
+        })
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            exception.MigrationError,
+            lxd_driver.finish_migration,
+            ctx, migration, instance, disk_info, [], mock.Mock(), True, {},
+            block_device_info=None, power_on=True)
+
+        self.client.instances.create.assert_not_called()
+
+    @mock.patch.object(driver, '_require_bfv_migration_support')
+    @mock.patch.object(driver, '_boot_from_volume')
+    @mock.patch('nova.virt.driver.block_device_info_get_mapping')
+    @mock.patch.object(driver.flavor, 'to_profile')
+    def test_finish_migration_attaches_only_data_volumes(
+            self, to_profile, get_mapping, boot_from_volume, require_bfv):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        migration = mock.Mock(
+            source_compute='source', dest_compute='destination')
+        container = self.client.instances.create.return_value
+        root_bdm = {
+            'boot_index': 0,
+            'connection_info': mock.sentinel.root_connection,
+            'mount_device': '/dev/sda',
+        }
+        data_connection = {'driver_volume_type': 'local'}
+        data_bdm = {
+            'boot_index': 1,
+            'connection_info': data_connection,
+            'mount_device': '/dev/vdb',
+        }
+        boot_from_volume.return_value = root_bdm
+        get_mapping.return_value = [root_bdm, data_bdm]
+        self.CONF.incus.allow_cold_migration = True
+        disk_info = jsonutils.dumps({
+            'format': 'incus-pull-v1',
+            'boot_from_volume': True,
+            'migration_data': {
+                'name': instance.name,
+                'source': {'type': 'migration'},
+            },
+        })
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+        lxd_driver.attach_volume = mock.Mock()
+
+        lxd_driver.finish_migration(
+            ctx, migration, instance, disk_info, [], mock.Mock(), True, {},
+            block_device_info={}, power_on=True)
+
+        lxd_driver.attach_volume.assert_called_once_with(
+            ctx, data_connection, instance, '/dev/vdb')
+        require_bfv.assert_called_once_with(self.client, root_bdm)
         container.start.assert_called_once_with(wait=True)
 
     def test_check_can_live_migrate_destination(self):
@@ -1518,32 +3409,43 @@ class LXDDriverTest(test.NoDBTestCase):
         src_compute_info = mock.Mock()
         dst_compute_info = mock.Mock()
 
-        def container_get(*args, **kwargs):
-            raise lxdcore_exceptions.LXDAPIException(MockResponse(404))
-        self.client.containers.get.side_effect = container_get
-
         lxd_driver = driver.LXDDriver(None)
         lxd_driver.init_host(None)
 
-        retval = lxd_driver.check_can_live_migrate_destination(
+        self.assertRaises(
+            exception.MigrationPreCheckError,
+            lxd_driver.check_can_live_migrate_destination,
             ctx, instance, src_compute_info, dst_compute_info)
 
-        self.assertIsInstance(retval, driver.LXDLiveMigrateData)
+    def test_live_migration_is_always_rejected(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            exception.MigrationError,
+            lxd_driver.live_migration,
+            ctx, instance, 'destination', mock.Mock(), mock.Mock())
 
     def test_confirm_migration(self):
-        migration = mock.Mock()
+        ctx = context.get_admin_context()
+        migration = mock.Mock(
+            source_compute='compute', dest_compute='compute')
         instance = fake_instance.fake_instance_obj(
-            context.get_admin_context, name='test', memory_mb=0)
+            ctx, name='test', memory_mb=0)
         network_info = []
         profile = mock.Mock()
         container = mock.Mock()
+        container.status = 'Stopped'
         self.client.profiles.get.return_value = profile
-        self.client.containers.get.return_value = container
+        self.client.instances.get.return_value = container
 
         lxd_driver = driver.LXDDriver(None)
         lxd_driver.init_host(None)
 
-        lxd_driver.confirm_migration(migration, instance, network_info)
+        lxd_driver.confirm_migration(
+            ctx, migration, instance, network_info)
 
         profile.delete.assert_called_once_with()
         container.delete.assert_called_once_with(wait=True)
@@ -1553,7 +3455,7 @@ class LXDDriverTest(test.NoDBTestCase):
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
         container = mock.Mock()
-        self.client.containers.get.return_value = container
+        self.client.instances.get.return_value = container
 
         lxd_driver = driver.LXDDriver(None)
         lxd_driver.init_host(None)
