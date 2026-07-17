@@ -460,6 +460,26 @@ blocker. The dated evidence below tracks the incremental hardening.
   Python 3.12 suite passed 220 tests with 2 intentional legacy pylxd skips.
   Existing instances retain their prior configured limit until an explicit
   lifecycle operation reapplies their Flavor.
+- Incus 7.2 already exports container cgroup v2 `io.stat` counters through
+  `/1.0/metrics`. For BFV root volume
+  `bb10c287-05c5-4ef0-b165-7473a9e8dbfe`, `block_stats` returned
+  `[2409, 103727104, 166, 2715648, 0]` before a 64 MiB synchronized write and
+  `[2411, 103800832, 174, 69824512, 0]` after the metrics cache refreshed.
+  The write-byte increase was exactly 67,108,864 bytes.
+- A temporary 1 GiB Ceph data volume was attached through the public Nova API
+  as `/dev/sdb`. After real filesystem I/O, the driver mapped its profile
+  source to `rbd2` and returned 55 reads/1,110,016 read bytes and 161
+  writes/34,242,560 written bytes. `get_all_volume_usage` attributed those
+  counters to the correct Cinder UUID. The test volume was detached and
+  deleted.
+- With `volume_usage_poll_interval=15` on all three computes, Nova's native
+  `_poll_volume_usage` periodic task ran without errors. For the same BFV root,
+  `nova_cell1.volume_usage_cache` contained `curr_reads=2421`,
+  `curr_read_bytes=104484864`, `curr_writes=196`, and
+  `curr_write_bytes=69935104`, attributed to the correct instance and Cinder
+  volume UUID. The current lab has no Ceilometer services, so notification
+  consumption by Ceilometer remains a deployment-level E2E item rather than a
+  driver gap.
 
 - Re-running DevStack to add Cinder rebuilt the test Nova databases. Three
   retained Incus containers (`instance-00000008`, `instance-00000009`, and

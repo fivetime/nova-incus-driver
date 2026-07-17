@@ -181,8 +181,8 @@
       "owner": "nova+driver",
       "driver_hooks": ["get_instance_diagnostics", "block_stats", "get_all_volume_usage"],
       "applicability": "container",
-      "status": "partial",
-      "evidence": "Standard and legacy diagnostics expose accurate aggregate CPU, memory and NIC counters through an explicit Nova lxd enum compatibility patch. Incus does not expose per-device I/O request/byte counters attributable to Cinder volume IDs, so block_stats and get_all_volume_usage remain unsupported"
+      "status": "supported",
+      "evidence": "Public Nova diagnostics E2E plus BFV root and hot-plugged Ceph data-volume io.stat delta E2E. block_stats and get_all_volume_usage map validated RBD devices to Cinder UUIDs; generic diagnostics disk fields remain null because that schema has no disk identifier"
     },
     {
       "id": "config-drive-metadata-keypair-userdata",

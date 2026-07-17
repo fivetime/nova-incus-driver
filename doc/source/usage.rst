@@ -921,6 +921,25 @@ counters. Do not use this endpoint for volume I/O billing.
 
 Microversions before 2.48 receive Nova's legacy flat diagnostics dictionary.
 Its memory values are KiB and its CPU and NIC values are the same Incus
-cumulative counters. Per-volume ``block_stats`` and
-``get_all_volume_usage`` remain unsupported until Incus exposes reliable
-per-device counters.
+cumulative counters.
+
+Volume I/O telemetry
+--------------------
+
+Set Nova's ``[DEFAULT] volume_usage_poll_interval`` to a positive number to
+enable native ``volume.usage`` polling. The DevStack plugin defaults
+``INCUS_VOLUME_USAGE_POLL_INTERVAL`` to 60 seconds. The driver reads Incus'
+cgroup v2 disk metrics and returns cumulative read/write requests and bytes
+for both BFV roots and hot-plugged Cinder data volumes.
+
+The compute host must expose the same ``/dev`` RBD mappings to nova-compute
+and the Podman-hosted Incus daemon. RBD links must retain Cinder's
+``volume-<uuid>`` naming. A missing, ambiguous, or incomplete mapping is
+skipped rather than attributed to the wrong tenant. Incus caches metrics for
+several seconds, so validation must wait for a refresh after generating I/O.
+Counters can reset when an instance restarts or migrates; Nova's volume usage
+cache owns conversion of cumulative counters into notification totals.
+
+The standardized server diagnostics response still leaves its anonymous disk
+I/O fields null. Use Nova ``volume.usage`` notifications and the associated
+Ceilometer volume meters for billable per-volume I/O.

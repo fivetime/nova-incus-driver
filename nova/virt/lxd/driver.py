@@ -17,6 +17,7 @@ from __future__ import absolute_import
 
 import base64
 import errno
+import glob
 import io
 import os
 import platform
@@ -47,6 +48,7 @@ from oslo_concurrency import processutils
 from oslo_log import log as logging
 from oslo_utils import fileutils
 from oslo_utils import timeutils
+from prometheus_client import parser as prometheus_parser
 from pylxd import exceptions as lxd_exceptions
 
 from nova.virt.lxd import vif as lxd_vif
@@ -317,6 +319,76 @@ def _serialize_device_info(device_info):
         raise exception.InvalidVolume(
             reason='os-brick device information is not serializable: %s' %
             exc)
+
+
+def _disk_metric_device(profile, instance, disk_id):
+    """Map a Nova disk ID to the host block name used by Incus metrics."""
+    normalized = str(disk_id).removeprefix('/dev/')
+    for device in profile.devices.values():
+        if device.get('type') != 'unix-block':
+            continue
+        if str(device.get('path', '')).removeprefix('/dev/') != normalized:
+            continue
+        source = os.path.realpath(device.get('source', ''))
+        _validate_block_device_path(source, 'Incus volume metric source')
+        return os.path.basename(source)
+
+    root_device = str(
+        getattr(instance, 'root_device_name', '') or '').removeprefix('/dev/')
+    if normalized != root_device:
+        return None
+
+    root = profile.devices.get('root', {})
+    image_name = root.get('initial.ceph.rbd.image_name')
+    if not image_name or not _CINDER_RBD_IMAGE_RE.fullmatch(image_name):
+        return None
+    candidates = glob.glob('/dev/rbd/*/%s' % image_name)
+    if len(candidates) != 1:
+        LOG.warning(
+            'Expected one mapped RBD device for root volume %(image)s, '
+            'found %(count)d',
+            {'image': image_name, 'count': len(candidates)},
+            instance=instance)
+        return None
+    source = os.path.realpath(candidates[0])
+    _validate_block_device_path(source, 'Incus BFV metric source')
+    return os.path.basename(source)
+
+
+def _incus_disk_metrics(client, instance_name):
+    """Return cumulative cgroup block counters keyed by host device name."""
+    response = client.api.metrics.get(is_api=False)
+    wanted = {
+        'incus_disk_read_bytes_total': 'rd_bytes',
+        'incus_disk_reads_completed_total': 'rd_req',
+        'incus_disk_written_bytes_total': 'wr_bytes',
+        'incus_disk_writes_completed_total': 'wr_req',
+    }
+    metrics = {}
+    for family in prometheus_parser.text_string_to_metric_families(
+            response.text):
+        for sample in family.samples:
+            field = wanted.get(sample.name)
+            if field is None or sample.labels.get('name') != instance_name:
+                continue
+            device = sample.labels.get('device')
+            if not device:
+                continue
+            metrics.setdefault(device, {})[field] = int(sample.value)
+    return metrics
+
+
+def _nova_block_stats(counters):
+    if not counters or set(counters) != {
+            'rd_req', 'rd_bytes', 'wr_req', 'wr_bytes'}:
+        return None
+    return [
+        counters['rd_req'],
+        counters['rd_bytes'],
+        counters['wr_req'],
+        counters['wr_bytes'],
+        0,
+    ]
 
 
 def _retry_migration_finish_action(action, description, instance):
@@ -1137,6 +1209,72 @@ class LXDDriver(driver.ComputeDriver):
                 tx_drop=nic['tx_drop'],
                 tx_packets=nic['tx_packets'])
         return diags
+
+    def block_stats(self, instance, disk_id):
+        """Return cumulative cgroup v2 counters for a Cinder block device."""
+        try:
+            profile = self.client.profiles.get(instance.name)
+            metric_device = _disk_metric_device(
+                profile, instance, disk_id)
+            if metric_device is None:
+                return None
+            counters = _incus_disk_metrics(
+                self.client, instance.name).get(metric_device)
+        except lxd_exceptions.NotFound:
+            LOG.info(
+                'Cannot get block stats for missing instance %s',
+                instance.name, instance=instance)
+            return None
+
+        stats = _nova_block_stats(counters)
+        if stats is None:
+            LOG.warning(
+                'Incus metrics are incomplete for instance %(instance)s '
+                'device %(device)s',
+                {'instance': instance.name, 'device': metric_device},
+                instance=instance)
+        return stats
+
+    def get_all_volume_usage(self, context, compute_host_bdms):
+        """Return Cinder volume counters in Nova's polling format."""
+        usage = []
+        for instance_bdms in compute_host_bdms:
+            instance = instance_bdms['instance']
+            try:
+                profile = self.client.profiles.get(instance.name)
+                disk_metrics = _incus_disk_metrics(
+                    self.client, instance.name)
+            except lxd_exceptions.NotFound:
+                LOG.info(
+                    'Skipping volume usage for missing instance %s',
+                    instance.name, instance=instance)
+                continue
+            for bdm in instance_bdms['instance_bdms']:
+                metric_device = _disk_metric_device(
+                    profile, instance, bdm['device_name'])
+                if metric_device is None:
+                    continue
+                stats = _nova_block_stats(
+                    disk_metrics.get(metric_device))
+                if stats is None:
+                    LOG.warning(
+                        'Incus metrics are incomplete for instance '
+                        '%(instance)s device %(device)s',
+                        {
+                            'instance': instance.name,
+                            'device': metric_device,
+                        },
+                        instance=instance)
+                    continue
+                usage.append({
+                    'volume': bdm['volume_id'],
+                    'instance': instance,
+                    'rd_req': stats[0],
+                    'rd_bytes': stats[1],
+                    'wr_req': stats[2],
+                    'wr_bytes': stats[3],
+                })
+        return usage
 
     def list_instances(self):
         """Return a list of all instance names."""

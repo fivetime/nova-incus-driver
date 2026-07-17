@@ -281,6 +281,8 @@ function configure_nova_incus {
         iniset "${nova_target}" os_vif_ovs ovsdb_connection \
             unix:/var/run/openvswitch/db.sock
         iniset "${nova_target}" DEFAULT force_config_drive False
+        iniset "${nova_target}" DEFAULT volume_usage_poll_interval \
+            "${INCUS_VOLUME_USAGE_POLL_INTERVAL}"
         iniset "${nova_target}" incus endpoint /var/lib/incus/unix.socket
         iniset "${nova_target}" incus project "${INCUS_PROJECT}"
         iniset "${nova_target}" incus root_dir /var/lib/incus

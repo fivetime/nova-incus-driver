@@ -476,6 +476,128 @@ class LXDDriverTest(test.NoDBTestCase):
         finally:
             driver.obj_fields.HypervisorDriver = original
 
+    def test_incus_disk_metrics_parses_only_requested_instance(self):
+        self.client.api.metrics.get.return_value = mock.Mock(text='''
+# TYPE incus_disk_read_bytes_total counter
+incus_disk_read_bytes_total{device="rbd1",name="test"} 4096
+incus_disk_reads_completed_total{device="rbd1",name="test"} 3
+incus_disk_written_bytes_total{device="rbd1",name="test"} 8192
+incus_disk_writes_completed_total{device="rbd1",name="test"} 4
+incus_disk_read_bytes_total{device="rbd2",name="other"} 999
+''')
+
+        result = driver._incus_disk_metrics(self.client, 'test')
+
+        self.assertEqual({
+            'rbd1': {
+                'rd_bytes': 4096,
+                'rd_req': 3,
+                'wr_bytes': 8192,
+                'wr_req': 4,
+            },
+        }, result)
+        self.client.api.metrics.get.assert_called_once_with(is_api=False)
+
+    @mock.patch('nova.virt.lxd.driver.os.path.realpath',
+                return_value='/dev/rbd3')
+    def test_disk_metric_device_maps_data_volume(self, realpath):
+        profile = mock.Mock(devices={
+            'volume-id': {
+                'type': 'unix-block',
+                'path': '/dev/vdb',
+                'source': '/dev/disk/by-path/volume-id',
+            },
+        })
+        instance = mock.Mock(root_device_name='/dev/vda')
+
+        result = driver._disk_metric_device(profile, instance, 'vdb')
+
+        self.assertEqual('rbd3', result)
+        realpath.assert_called_once_with('/dev/disk/by-path/volume-id')
+
+    @mock.patch('nova.virt.lxd.driver.os.path.realpath',
+                return_value='/dev/rbd4')
+    @mock.patch('nova.virt.lxd.driver.glob.glob')
+    def test_disk_metric_device_maps_bfv_root(self, glob, realpath):
+        volume_id = '8231d2e8-1111-2222-3333-444444444444'
+        path = '/dev/rbd/cinder/volume-%s' % volume_id
+        glob.return_value = [path]
+        profile = mock.Mock(devices={
+            'root': {
+                'type': 'disk',
+                'path': '/',
+                'initial.ceph.rbd.image_name': 'volume-%s' % volume_id,
+            },
+        })
+        instance = mock.Mock(root_device_name='/dev/vda')
+
+        result = driver._disk_metric_device(profile, instance, '/dev/vda')
+
+        self.assertEqual('rbd4', result)
+        realpath.assert_called_once_with(path)
+
+    @mock.patch('nova.virt.lxd.driver._incus_disk_metrics')
+    @mock.patch('nova.virt.lxd.driver._disk_metric_device',
+                return_value='rbd1')
+    def test_block_stats(self, metric_device, disk_metrics):
+        disk_metrics.return_value = {
+            'rbd1': {
+                'rd_req': 3,
+                'rd_bytes': 4096,
+                'wr_req': 4,
+                'wr_bytes': 8192,
+            },
+        }
+        profile = mock.Mock()
+        self.client.profiles.get.return_value = profile
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test')
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        result = lxd_driver.block_stats(instance, 'vda')
+
+        self.assertEqual([3, 4096, 4, 8192, 0], result)
+        metric_device.assert_called_once_with(profile, instance, 'vda')
+
+    @mock.patch('nova.virt.lxd.driver._incus_disk_metrics')
+    @mock.patch('nova.virt.lxd.driver._disk_metric_device',
+                return_value='rbd1')
+    def test_get_all_volume_usage(self, metric_device, disk_metrics):
+        disk_metrics.return_value = {
+            'rbd1': {
+                'rd_req': 3,
+                'rd_bytes': 4096,
+                'wr_req': 4,
+                'wr_bytes': 8192,
+            },
+        }
+        profile = mock.Mock()
+        self.client.profiles.get.return_value = profile
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test')
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        result = lxd_driver.get_all_volume_usage(None, [{
+            'instance': instance,
+            'instance_bdms': [{
+                'device_name': '/dev/vda',
+                'volume_id': 'volume-id',
+            }],
+        }])
+
+        self.assertEqual([{
+            'volume': 'volume-id',
+            'instance': instance,
+            'rd_req': 3,
+            'rd_bytes': 4096,
+            'wr_req': 4,
+            'wr_bytes': 8192,
+        }], result)
+        metric_device.assert_called_once_with(profile, instance, '/dev/vda')
+        disk_metrics.assert_called_once_with(self.client, instance.name)
+
     def test_list_instances(self):
         self.client.instances.all.return_value = [
             MockContainer('mock-instance-1'),

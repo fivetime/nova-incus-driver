@@ -142,11 +142,16 @@ is accepted upstream.
 Incus diagnostics provide truthful aggregate CPU time, memory, and per-NIC
 cumulative counters. Uptime is derived from the
 ``instance_state_started_at`` extension, which reports the current container
-PID 1 start time, and is left unset when that capability is absent. The Incus
-state API exposes disk capacity but not per-device I/O requests or bytes
-attributable to a Cinder volume. Disk diagnostic entries therefore leave I/O
-fields unset, and ``block_stats`` and ``get_all_volume_usage`` remain
-unsupported. Returning false zeroes would corrupt telemetry and billing.
+PID 1 start time, and is left unset when that capability is absent.
+
+Per-volume telemetry uses Incus' Prometheus metrics endpoint, which exports
+cgroup v2 ``io.stat`` read/write byte and request counters by host block
+device. The driver maps a data volume through the profile's validated
+``unix-block`` source, and maps a BFV root through the unique
+``/dev/rbd/<pool>/volume-<uuid>`` link. ``block_stats`` and
+``get_all_volume_usage`` then return Nova's native cumulative Cinder counters.
+The generic diagnostics disk list still leaves I/O fields unset because that
+API has no disk identifier with which to express the volume association.
 
 Incus configures the LXC console as an in-memory ring buffer and bounded disk
 log. With Ubuntu Noble liblxc, its ``auto`` value is 128 KiB for each. The
