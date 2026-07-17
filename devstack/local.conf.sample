@@ -1,29 +1,118 @@
 [[local|localrc]]
 
-# Set the HOST_IP and FLAT_INTERFACE if automatique detection is
-# unreliable
-#HOST_IP=
-#FLAT_INTERFACE=
-
-DATABASE_PASSWORD=password
-RABBIT_PASSWORD=password
-SERVICE_PASSWORD=password
-SERVICE_TOKEN=password
 ADMIN_PASSWORD=password
+DATABASE_PASSWORD=$ADMIN_PASSWORD
+RABBIT_PASSWORD=$ADMIN_PASSWORD
+SERVICE_PASSWORD=$ADMIN_PASSWORD
 
-# run the services you want to use
-ENABLED_SERVICES=rabbit,mysql,key
-ENABLED_SERVICES+=,g-api,g-reg
-ENABLED_SERVICES+=,n-cpu,n-api,n-crt,n-obj,n-cond,n-sch,n-novnc,n-cauth,placement-api,placement-client
-ENABLED_SERVICES+=,neutron,q-svc,q-agt,q-dhcp,q-meta,q-l3
-ENABLED_SERVICES+=,cinder,c-sch,c-api,c-vol
-ENABLED_SERVICES+=,horizon
+LOGFILE=$DEST/logs/stack.sh.log
+MYSQL_GATHER_PERFORMANCE=False
+USE_SYSTEMD=True
 
-# disabled services
-disable_service n-net
+# The first integration milestone validates IPv4 tenant networking. IPv6 is
+# enabled only after a separate OVN and host-route validation pass.
+IP_VERSION=4
 
-# enable nova-lxd
-enable_plugin nova-lxd https://git.openstack.org/openstack/nova-lxd
-# You should enable the following if you use lxd 3.0.
-# In addition, this setting requires zfs >= 0.7.0.
-#LXD_BACKEND_DRIVER=zfs
+# Neutron ML2/OVN owns all tenant network state and cross-node networking.
+Q_AGENT=ovn
+Q_ML2_PLUGIN_MECHANISM_DRIVERS=ovn
+Q_ML2_PLUGIN_TYPE_DRIVERS=local,flat,vlan,geneve
+Q_ML2_TENANT_NETWORK_TYPE=geneve
+
+# This controller owns the provider-network bridge and is therefore eligible
+# to host OVN gateway routers. Set this to False on any chassis without a real
+# provider L2 uplink.
+ENABLE_CHASSIS_AS_GW=True
+
+enable_plugin neutron https://opendev.org/openstack/neutron stable/2026.1
+enable_service q-svc ovn-northd ovn-controller q-ovn-agent
+disable_service q-agt q-l3 q-dhcp q-meta
+
+# The plugin keeps lxd.LXDDriver as a transitional Nova import path while all
+# runtime API calls use Incus.
+enable_plugin openstack-incus \
+    https://github.com/fivetime/openstack-incus.git master
+enable_service nova-incus
+
+INCUS_POOL_NAME=default
+INCUS_PROJECT=nova
+INCUS_STORAGE_DRIVER=lvm
+INCUS_STORAGE_SIZE=20GiB
+INCUS_MIN_VERSION=7.0
+INCUS_DEFAULT_PROCESS_LIMIT=1024
+INCUS_MAXIMUM_PROCESS_LIMIT=65536
+
+# Optional Cinder RBD root-volume claim pool. The CephX account must be the
+# same least-privilege account used by the configured Cinder RBD backend.
+# INCUS_BFV_POOL_NAME=cinder-bfv
+# INCUS_BFV_CEPH_POOL=cinder-volumes-rbd-pool
+# INCUS_BFV_CEPH_USER=cinder
+# INCUS_BFV_CEPH_CLUSTER_NAME=ceph
+# For production-like BFV performance, configure Glance with an RBD store in
+# the same Ceph cluster and set show_image_direct_url=True. The Cinder CephX
+# client needs read-only access to the Glance pool so its RBD driver can clone
+# raw Glance snapshots instead of downloading and rewriting the whole image.
+INCUS_VOLUME_USE_MULTIPATH=False
+INCUS_VOLUME_ENFORCE_MULTIPATH=False
+INCUS_NUM_VOLUME_SCAN_TRIES=3
+
+# The LVM configuration above creates a loop-backed development pool. For a
+# production Ceph rootfs pool, use an existing dedicated OSD pool instead:
+# INCUS_POOL_NAME=incus-ceph
+# INCUS_STORAGE_DRIVER=ceph
+# INCUS_STORAGE_SOURCE=incus-rootfs
+# INCUS_CEPH_CLUSTER_NAME=ceph
+# Set this only on additional independent Incus compute nodes that intentionally
+# share the same Incus-owned OSD pool. Never reuse a Cinder or unrelated pool.
+# INCUS_CEPH_FORCE_REUSE=True
+
+# The default topology has no safe Cinder data backend.
+disable_service cinder c-sch c-api c-vol
+
+# To install only the Cinder v3 API and scheduler for control-plane
+# integration testing, replace the line above with the following. Volume
+# creation will fail until c-vol is configured with dedicated storage.
+# enable_service cinder c-sch c-api
+# disable_service c-vol
+
+# Enable c-vol only after configuring Cinder Ceph or another production-like
+# backend. Never use a loop-backed LVM volume group on a compute system disk
+# as evidence of tenant storage isolation or migration support.
+# For an already deployed LINSTOR cluster, enable c-vol and set:
+# INCUS_CINDER_LINSTOR_CONTROLLER=10.224.0.18
+# INCUS_CINDER_LINSTOR_STORAGE_POOL=linstor-pool
+# INCUS_CINDER_LINSTOR_REPLICA_COUNT=3
+# INCUS_CINDER_LINSTOR_DOWNSIZE_FACTOR=0
+# For an existing production-like Ceph cluster, configure Cinder instead with
+# a dedicated pool and a pre-provisioned /etc/ceph/ceph.client.cinder.keyring:
+# INCUS_CINDER_CEPH_POOL=cinder-volumes
+# INCUS_CINDER_CEPH_USER=cinder
+# INCUS_CINDER_CEPH_CONF=/etc/ceph/ceph.conf
+# INCUS_CINDER_CEPH_CLUSTER_NAME=ceph
+# INCUS_CINDER_CEPH_BACKEND_NAME=ceph
+# To enable API backup and restore, also enable c-bak and provision a separate
+# backup pool plus a pool-scoped CephX client before stacking:
+# enable_service c-bak
+# INCUS_CINDER_BACKUP_CEPH_POOL=cinder-backups
+# INCUS_CINDER_BACKUP_CEPH_USER=cinder-backup
+# INCUS_CINDER_BACKUP_CEPH_CONF=/etc/ceph/ceph.conf
+# For a two-compute Tempest job with Cinder volume and migration coverage:
+# INCUS_TEMPEST_BUILD_IMAGE=True
+# INCUS_TEMPEST_MIN_COMPUTE_NODES=2
+# INCUS_ALLOW_COLD_MIGRATION=True
+# INCUS_MIGRATION_AUTO_RECOVERY=True
+# INCUS_MIGRATION_RECOVERY_INTERVAL=60
+# INCUS_TEMPEST_ENABLE_EXPERIMENTAL_COLD_MIGRATION=True
+# INCUS_TEMPEST_FLAVOR_REF=d1
+# INCUS_TEMPEST_FLAVOR_REF_ALT=d2
+
+[[post-config|$NOVA_CONF]]
+[DEFAULT]
+allow_resize_to_same_host = False
+
+[scheduler]
+discover_hosts_in_cells_interval = 2
+
+[[post-config|/$Q_PLUGIN_CONF_FILE]]
+[ml2]
+project_network_types = geneve

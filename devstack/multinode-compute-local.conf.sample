@@ -1,0 +1,84 @@
+[[local|localrc]]
+
+# Copy this file to a Noble compute node and change HOST_IP as needed.
+HOST_IP=10.224.0.17
+SERVICE_HOST=10.224.0.16
+MYSQL_HOST=$SERVICE_HOST
+RABBIT_HOST=$SERVICE_HOST
+GLANCE_SERVICE_HOST=$SERVICE_HOST
+
+ADMIN_PASSWORD=password
+DATABASE_PASSWORD=$ADMIN_PASSWORD
+RABBIT_PASSWORD=$ADMIN_PASSWORD
+SERVICE_PASSWORD=$ADMIN_PASSWORD
+
+LOGFILE=$DEST/logs/stack.sh.log
+MYSQL_GATHER_PERFORMANCE=False
+IP_VERSION=4
+
+ENABLED_SERVICES=n-cpu,placement-client,ovs-vswitchd,ovsdb-server,ovn-controller,q-ovn-agent,nova-incus
+
+Q_AGENT=ovn
+Q_ML2_PLUGIN_MECHANISM_DRIVERS=ovn
+Q_ML2_PLUGIN_TYPE_DRIVERS=local,flat,vlan,geneve
+Q_ML2_TENANT_NETWORK_TYPE=geneve
+OVN_SB_REMOTE=tcp:$SERVICE_HOST:6642
+OVN_NB_REMOTE=tcp:$SERVICE_HOST:6641
+
+# This compute node has no provider L2 uplink. Tenant traffic still crosses
+# nodes over Geneve, while floating-IP and external routing stay on a chassis
+# whose br-ex is connected to the provider network.
+ENABLE_CHASSIS_AS_GW=False
+
+# All chassis connected to one OVN control plane must run a compatible OVN/OVS
+# release. Noble's distro packages (OVN 24.03/OVS 3.3) are too old for the
+# Ubuntu 26.04 controller packages used by the initial target environment.
+OVN_BUILD_FROM_SOURCE=True
+OVN_BRANCH=branch-26.03
+OVS_BRANCH=branch-3.7
+
+enable_plugin neutron https://opendev.org/openstack/neutron stable/2026.1
+enable_plugin openstack-incus \
+    file:///opt/openstack-incus-stage test-multinode
+enable_service nova-incus
+
+INCUS_PYTHON_SDK_REPO=file:///opt/incus-python-sdk-stage
+INCUS_PYTHON_SDK_BRANCH=test-multinode
+
+# Development-only rootfs pool. Replace this with the dedicated Ceph pool
+# settings from local.conf.sample before persistence or migration validation.
+INCUS_POOL_NAME=default
+INCUS_PROJECT=nova
+INCUS_STORAGE_DRIVER=dir
+INCUS_MIN_VERSION=7.0
+INCUS_DEFAULT_PROCESS_LIMIT=1024
+INCUS_MAXIMUM_PROCESS_LIMIT=65536
+
+# Required on every BFV-capable compute node. The named Incus pool must use
+# the cephext driver and point at the same Cinder RBD pool on every node.
+# INCUS_BFV_POOL_NAME=cinder-bfv
+
+# Enable only after configuring an Incus HTTPS listener reachable exclusively
+# by the compute network. Production migration requires the Ceph pool above.
+INCUS_ALLOW_COLD_MIGRATION=False
+# INCUS_MIGRATION_ADDRESS=https://$HOST_IP:8443
+# BFV production-style preflight requires a restricted TLS identity trusted by
+# every destination and exact server-certificate verification.
+# INCUS_MIGRATION_PREFLIGHT_TLS_CERT=/etc/nova/incus-preflight/client.crt
+# INCUS_MIGRATION_PREFLIGHT_TLS_KEY=/etc/nova/incus-preflight/client.key
+# INCUS_MIGRATION_PREFLIGHT_TLS_CA=/etc/nova/incus-preflight/default-server.crt
+# INCUS_MIGRATION_PREFLIGHT_PROJECT=nova-preflight
+# INCUS_MIGRATION_PREFLIGHT_SERVER_NAMES=192.0.2.10:compute-1,192.0.2.11:compute-2
+# INCUS_MIGRATION_PREFLIGHT_TLS_CA_BY_SERVER=192.0.2.10:/etc/nova/incus-preflight/compute-1.crt,192.0.2.11:/etc/nova/incus-preflight/compute-2.crt
+
+disable_service cinder c-sch c-api c-vol
+
+NOVA_VNC_ENABLED=False
+
+[[post-config|$NOVA_CONF]]
+[DEFAULT]
+host=incus-node-02
+allow_resize_to_same_host=False
+
+[scheduler]
+discover_hosts_in_cells_interval=2

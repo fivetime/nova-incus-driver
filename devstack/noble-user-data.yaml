@@ -1,0 +1,12 @@
+#cloud-config
+package_update: true
+packages:
+  - jq
+  - openssh-server
+write_files:
+  - path: /etc/openstack-incus-persistent
+    permissions: '0644'
+    content: |
+      created-by=cloud-init
+runcmd:
+  - [sh, -c, 'echo ready > /var/lib/openstack-incus-cloud-init-ready']

@@ -1,5 +1,6 @@
 include AUTHORS
 include ChangeLog
+include setup.py
 exclude .gitignore
 exclude .gitreview
 
