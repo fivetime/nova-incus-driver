@@ -17,12 +17,12 @@ from oslo_log import log as logging
 
 from nova import conf
 from nova import exception
-from nova import utils
 from nova.network import model as network_model
 from nova.network import os_vif_util
 from nova.privsep import linux_net
 
 import os_vif
+from vif_plug_ovs import linux_net as ovs_linux_net
 
 
 CONF = conf.CONF
@@ -43,26 +43,12 @@ def get_vif_internal_devname(vif):
 
 
 def _create_veth_pair(dev1_name, dev2_name, mtu=None):
-    """Create a pair of veth devices with the specified names,
-    deleting any previous devices with those names.
-    """
-    for dev in [dev1_name, dev2_name]:
-        linux_net.delete_net_dev(dev)
-
-    utils.execute('ip', 'link', 'add', dev1_name, 'type', 'veth', 'peer',
-                  'name', dev2_name, run_as_root=True)
-
-    for dev in [dev1_name, dev2_name]:
-        utils.execute('ip', 'link', 'set', dev, 'up', run_as_root=True)
-        linux_net.set_device_mtu(dev, mtu)
+    """Create a veth pair through os-vif's constrained privsep context."""
+    ovs_linux_net.create_veth_pair(dev1_name, dev2_name, mtu)
 
 
 def _add_bridge_port(bridge, dev):
-    utils.execute('brctl', 'addif', bridge, dev, run_as_root=True)
-
-
-def _is_no_op_firewall():
-    return CONF.firewall_driver == "nova.virt.firewall.NoopFirewallDriver"
+    processutils.execute('brctl', 'addif', bridge, dev, run_as_root=True)
 
 
 def _is_ovs_vif_port(vif):
@@ -76,7 +62,8 @@ def _get_bridge_config(vif):
 
 
 def _get_ovs_config(vif):
-    if not _is_no_op_firewall() or vif.is_hybrid_plug_enabled():
+    is_hybrid = getattr(vif, 'is_hybrid_plug_enabled', lambda: False)
+    if is_hybrid():
         return {
             'bridge': ('qbr{}'.format(vif['id']))[:network_model.NIC_NAME_LEN],
             'mac_address': vif['address']}
@@ -93,7 +80,7 @@ def _get_tap_config(vif):
 def _ovs_vsctl(args):
     full_args = ['ovs-vsctl', '--timeout=%s' % CONF.ovs_vsctl_timeout] + args
     try:
-        return utils.execute(*full_args, run_as_root=True)
+        return processutils.execute(*full_args, run_as_root=True)
     except Exception as e:
         LOG.error("Unable to execute %(cmd)s. Exception: %(exception)s",
                   {'cmd': full_args, 'exception': e})
@@ -149,32 +136,19 @@ def get_config(vif):
 # VIF_TYPE_OVS = 'ovs'
 # VIF_TYPE_BRIDGE = 'bridge'
 def _post_plug_wiring_veth_and_bridge(instance, vif):
-    """Wire/plug the virtual interface for the instance into the bridge that
-    lxd is using.
+    """Create the veth pair before os-vif wires its host-side device.
 
     :param instance: the instance to plug into the bridge
     :type instance: ???
     :param vif: the virtual interface to plug into the bridge
     :type vif: :class:`nova.network.model.VIF`
     """
-    config = get_config(vif)
     network = vif.get('network')
     mtu = network.get_meta('mtu') if network else None
     v1_name = get_vif_devname(vif)
     v2_name = get_vif_internal_devname(vif)
     if not linux_net.device_exists(v1_name):
         _create_veth_pair(v1_name, v2_name, mtu)
-        if _is_ovs_vif_port(vif):
-            # NOTE(jamespage): wire tap device directly to ovs bridge
-            _create_ovs_vif_port(vif['network']['bridge'],
-                                 v1_name,
-                                 vif['id'],
-                                 vif['address'],
-                                 instance.uuid,
-                                 mtu)
-        else:
-            # NOTE(jamespage): wire tap device linux bridge
-            _add_bridge_port(config['bridge'], v1_name)
     else:
         linux_net.set_device_mtu(v1_name, mtu)
 
@@ -225,11 +199,7 @@ def _post_unplug_wiring_delete_veth(instance, vif):
     """
     v1_name = get_vif_devname(vif)
     try:
-        if _is_ovs_vif_port(vif):
-            _delete_ovs_vif_port(vif['network']['bridge'],
-                                 v1_name, True)
-        else:
-            linux_net.delete_net_dev(v1_name)
+        linux_net.delete_net_dev(v1_name)
     except processutils.ProcessExecutionError:
         LOG.exception("Failed to delete veth for vif {}".foramt(vif),
                       instance=instance)
@@ -277,7 +247,13 @@ class LXDGenericVifDriver(object):
         vif_type = vif['type']
         instance_info = os_vif_util.nova_to_osvif_instance(instance)
 
-        # Try os-vif codepath first
+        # The device must exist before os-vif can attach it to an OVS or
+        # Linux bridge. Incus receives the peer through its physical NIC.
+        _post_plug_wiring(instance, vif)
+
+        # os-vif exclusively owns host bridge and OVS port configuration.
+        if vif_type == network_model.VIF_TYPE_OVS:
+            vif['delegate_create'] = True
         vif_obj = os_vif_util.nova_to_osvif_vif(vif)
         if vif_obj is not None:
             os_vif.plug(vif_obj, instance_info)
@@ -290,10 +266,13 @@ class LXDGenericVifDriver(object):
                 )
             func(instance, vif)
 
-        _post_plug_wiring(instance, vif)
-
     def unplug(self, instance, vif):
         vif_type = vif['type']
+        if vif_type == network_model.VIF_TYPE_BINDING_FAILED:
+            LOG.warning(
+                'Skipping unplug for Neutron binding-failed VIF %(vif)s',
+                {'vif': vif.get('id')}, instance=instance)
+            return
         instance_info = os_vif_util.nova_to_osvif_instance(instance)
 
         # Try os-vif codepath first

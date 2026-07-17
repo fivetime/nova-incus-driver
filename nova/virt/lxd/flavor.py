@@ -12,15 +12,12 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-import os
-
 from nova import exception
 from nova import i18n
 from nova.virt import driver
 from oslo_config import cfg
 from oslo_utils import units
 
-from nova.virt.lxd import common
 from nova.virt.lxd import vif
 
 _ = i18n._
@@ -28,28 +25,36 @@ CONF = cfg.CONF
 
 
 def _base_config(instance, _):
-    instance_attributes = common.InstanceAttributes(instance)
-    return {
-        'environment.product_name': 'OpenStack Nova',
-        'raw.lxc': 'lxc.console.logfile={}\n'.format(
-            instance_attributes.console_path),
-    }
+    return {'environment.product_name': 'OpenStack Nova'}
 
 
 def _nesting(instance, _):
     if instance.flavor.extra_specs.get('lxd:nested_allowed'):
-        return {'security.nesting': 'True'}
+        raise exception.InvalidConfiguration(
+            'Nested containers are not supported by the Incus Nova driver')
 
 
 def _security(instance, _):
     if instance.flavor.extra_specs.get('lxd:privileged_allowed'):
-        return {'security.privileged': 'True'}
+        raise exception.InvalidConfiguration(
+            'Privileged containers are not supported by the Incus Nova '
+            'driver')
+    return {'security.privileged': 'False'}
 
 
 def _memory(instance, _):
     mem = instance.memory_mb
     if mem >= 0:
-        return {'limits.memory': '{}MB'.format(mem)}
+        swap_mb = int(instance.flavor.swap or 0)
+        if swap_mb and not CONF.incus.allow_instance_swap:
+            raise exception.InvalidConfiguration(
+                'Flavor requests swap but [incus] allow_instance_swap is '
+                'disabled')
+        return {
+            'limits.memory': '{}MB'.format(mem),
+            'limits.memory.swap': (
+                '{}MiB'.format(swap_mb) if swap_mb else 'false'),
+        }
 
 
 def _cpu(instance, _):
@@ -59,14 +64,34 @@ def _cpu(instance, _):
 
 
 def _isolated(instance, client):
-    lxd_isolated = instance.flavor.extra_specs.get('lxd:isolated')
-    if lxd_isolated:
-        extensions = client.host_info.get('api_extensions', [])
-        if 'id_map' in extensions:
-            return {'security.idmap.isolated': 'True'}
-        else:
-            msg = _("Host does not support isolated instances")
-            raise exception.NovaException(msg)
+    extensions = client.host_info.get('api_extensions', [])
+    if 'id_map' not in extensions:
+        msg = _("Host does not support isolated instance idmaps")
+        raise exception.NovaException(msg)
+    return {'security.idmap.isolated': 'True'}
+
+
+def _processes(instance, _):
+    default_limit = CONF.incus.default_process_limit
+    maximum_limit = CONF.incus.maximum_process_limit
+    if default_limit > maximum_limit:
+        raise exception.InvalidConfiguration(
+            '[incus] default_process_limit must not exceed '
+            'maximum_process_limit')
+
+    value = instance.flavor.extra_specs.get(
+        'incus:process_limit', default_limit)
+    try:
+        process_limit = int(value)
+    except (TypeError, ValueError):
+        raise exception.InvalidConfiguration(
+            'Flavor extra spec incus:process_limit must be a positive '
+            'integer')
+    if process_limit < 1 or process_limit > maximum_limit:
+        raise exception.InvalidConfiguration(
+            'Flavor extra spec incus:process_limit must be between 1 and '
+            '{}'.format(maximum_limit))
+    return {'limits.processes': str(process_limit)}
 
 
 _CONFIG_FILTER_MAP = [
@@ -76,83 +101,85 @@ _CONFIG_FILTER_MAP = [
     _memory,
     _cpu,
     _isolated,
+    _processes,
 ]
 
 
-def _root(instance, client, *_):
+def disk_qos_limits(specs, prefix='quota:disk_'):
+    """Translate an OpenStack disk QoS mapping without changing semantics."""
+    total_keys = (prefix + 'total_iops_sec', prefix + 'total_bytes_sec')
+    unsupported_keys = total_keys + tuple(
+        prefix + key for key in (
+            'read_bytes_sec_max', 'read_iops_sec_max',
+            'write_bytes_sec_max', 'write_iops_sec_max',
+            'total_bytes_sec_max', 'total_iops_sec_max', 'size_iops_sec'))
+    if any(key in specs for key in unsupported_keys):
+        raise exception.InvalidConfiguration(
+            'Incus cannot preserve total or burst disk QoS semantics')
+
+    limits = {}
+    for direction in ('read', 'write'):
+        iops_key = '{}{}_iops_sec'.format(prefix, direction)
+        bytes_key = '{}{}_bytes_sec'.format(prefix, direction)
+        if iops_key in specs and bytes_key in specs:
+            raise exception.InvalidConfiguration(
+                'Incus accepts either IOPS or bytes/s for disk {}, not '
+                'both'.format(direction))
+
+        key = iops_key if iops_key in specs else bytes_key
+        if key not in specs:
+            continue
+
+        try:
+            value = int(specs[key])
+        except (TypeError, ValueError):
+            raise exception.InvalidConfiguration(
+                '{} must be a positive integer'.format(key))
+        if value <= 0:
+            raise exception.InvalidConfiguration(
+                '{} must be a positive integer'.format(key))
+
+        suffix = 'iops' if key == iops_key else 'B'
+        limits['limits.{}'.format(direction)] = '{}{}'.format(value, suffix)
+
+    return limits
+
+
+def _root(instance, client, *_args):
     """Configure the root disk."""
     device = {'type': 'disk', 'path': '/'}
 
-    # we don't do quotas if the CONF.lxd.pool is set and is dir or lvm, or if
-    # the environment['storage'] is dir or lvm.
-    if CONF.lxd.pool:
+    # A managed block or copy-on-write pool must enforce the Nova root disk
+    # allocation. The dir backend cannot provide this isolation.
+    if CONF.incus.storage_pool:
         extensions = client.host_info.get('api_extensions', [])
         if 'storage' in extensions:
-            device['pool'] = CONF.lxd.pool
-            storage_type = client.storage_pools.get(CONF.lxd.pool).driver
+            device['pool'] = CONF.incus.storage_pool
+            storage_type = client.storage_pools.get(
+                CONF.incus.storage_pool).driver
         else:
             msg = _("Host does not have storage pool support")
             raise exception.NovaException(msg)
     else:
         storage_type = client.host_info['environment']['storage']
 
-    if storage_type in ['btrfs', 'zfs']:
-        device['size'] = '{}GB'.format(instance.root_gb)
+    if storage_type in ['btrfs', 'ceph', 'lvm', 'zfs']:
+        root_gb = max(instance.root_gb, CONF.incus.minimum_root_disk_gb)
+        device['size'] = '{}GB'.format(root_gb)
 
         specs = instance.flavor.extra_specs
 
-        # Bytes and iops are not separate config options in a container
-        # profile - we let Bytes take priority over iops if both are set.
-        # Align all limits to MiB/s, which should be a sensible middle road.
-        if specs.get('quota:disk_read_iops_sec'):
-            device['limits.read'] = '{}iops'.format(
-                specs['quota:disk_read_iops_sec'])
-        if specs.get('quota:disk_write_iops_sec'):
-            device['limits.write'] = '{}iops'.format(
-                specs['quota:disk_write_iops_sec'])
-
-        if specs.get('quota:disk_read_bytes_sec'):
-            device['limits.read'] = '{}MB'.format(
-                int(specs['quota:disk_read_bytes_sec']) // units.Mi)
-        if specs.get('quota:disk_write_bytes_sec'):
-            device['limits.write'] = '{}MB'.format(
-                int(specs['quota:disk_write_bytes_sec']) // units.Mi)
-
-        minor_quota_defined = ('limits.write' in device or
-                               'limits.read' in device)
-        if specs.get('quota:disk_total_iops_sec') and not minor_quota_defined:
-            device['limits.max'] = '{}iops'.format(
-                specs['quota:disk_total_iops_sec'])
-        if specs.get('quota:disk_total_bytes_sec') and not minor_quota_defined:
-            device['limits.max'] = '{}MB'.format(
-                int(specs['quota:disk_total_bytes_sec']) // units.Mi)
+        device.update(disk_qos_limits(specs))
 
     return {'root': device}
 
 
 def _ephemeral_storage(instance, client, __, block_info):
-    instance_attributes = common.InstanceAttributes(instance)
     ephemeral_storage = driver.block_device_info_get_ephemerals(block_info)
     if ephemeral_storage:
-        devices = {}
-        for ephemeral in ephemeral_storage:
-            ephemeral_src = os.path.join(
-                instance_attributes.storage_path,
-                ephemeral['virtual_name'])
-            device = {
-                'path': '/mnt',
-                'source': ephemeral_src,
-                'type': 'disk',
-            }
-            if CONF.lxd.pool:
-                extensions = client.host_info.get('api_extensions', [])
-                if 'storage' in extensions:
-                    device['pool'] = CONF.lxd.pool
-                else:
-                    msg = _("Host does not have storage pool support")
-                    raise exception.NovaException(msg)
-            devices[ephemeral['virtual_name']] = device
-        return devices
+        raise exception.InvalidConfiguration(
+            'Nova ephemeral disks are disabled until they can be backed by '
+            'quota-controlled Incus storage volumes')
 
 
 def _network(instance, _, network_info, __):

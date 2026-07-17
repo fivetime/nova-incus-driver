@@ -27,12 +27,12 @@ def InstanceAttributes(instance):
     if is_snap_lxd():
         prefix = '/var/snap/lxd/common/lxd/logs'
     else:
-        prefix = '/var/log/lxd'
+        prefix = '/var/log/incus'
     instance_dir = os.path.join(conf.CONF.instances_path, instance.name)
     console_path = os.path.join(prefix, instance.name, 'console.log')
     storage_path = os.path.join(instance_dir, 'storage')
     container_path = os.path.join(
-        conf.CONF.lxd.root_dir, 'containers', instance.name)
+        conf.CONF.incus.root_dir, 'containers', instance.name)
     return _InstanceAttributes(
         instance_dir, console_path, storage_path, container_path)
 

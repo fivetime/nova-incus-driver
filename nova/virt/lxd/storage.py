@@ -14,11 +14,11 @@
 #    under the License.
 import os
 
+from oslo_concurrency import processutils
 from oslo_config import cfg
 from oslo_utils import fileutils
 from nova import exception
 from nova import i18n
-from nova import utils
 from nova.virt import driver
 
 from nova.virt.lxd import common
@@ -34,7 +34,7 @@ def attach_ephemeral(client, block_device_info, lxd_config, instance):
     if ephemeral_storage:
         storage_driver = lxd_config['environment']['storage']
 
-        container = client.containers.get(instance.name)
+        container = client.instances.get(instance.name)
         container_id_map = container.config[
             'volatile.last_state.idmap'].split(',')
         storage_id = container_id_map[2].split(':')[1]
@@ -52,9 +52,9 @@ def attach_ephemeral(client, block_device_info, lxd_config, instance):
                 try:
                     zfs_pool = lxd_config['config']['storage.zfs_pool_name']
                 except KeyError:
-                    zfs_pool = CONF.lxd.pool
+                    zfs_pool = CONF.incus.storage_pool
 
-                utils.execute(
+                processutils.execute(
                     'zfs', 'create',
                     '-o', 'mountpoint=%s' % storage_dir,
                     '-o', 'quota=%sG' % instance.ephemeral_gb,
@@ -71,10 +71,10 @@ def attach_ephemeral(client, block_device_info, lxd_config, instance):
                 profile.devices[storage_name]['source'] = storage_dir
                 profile.save()
 
-                utils.execute(
+                processutils.execute(
                     'btrfs', 'subvolume', 'create', storage_dir,
                     run_as_root=True)
-                utils.execute(
+                processutils.execute(
                     'btrfs', 'qgroup', 'limit',
                     '%sg' % instance.ephemeral_gb, storage_dir,
                     run_as_root=True)
@@ -89,18 +89,18 @@ def attach_ephemeral(client, block_device_info, lxd_config, instance):
                 cmd = (
                     'lvcreate', '-L', '%sG' % instance.ephemeral_gb,
                     '-n', lvm_volume, lvm_pool)
-                utils.execute(*cmd, run_as_root=True, attempts=3)
+                processutils.execute(*cmd, run_as_root=True, attempts=3)
 
-                utils.execute('mkfs', '-t', 'ext4',
+                processutils.execute('mkfs', '-t', 'ext4',
                               lvm_path, run_as_root=True)
                 cmd = ('mount', '-t', 'ext4', lvm_path, storage_dir)
-                utils.execute(*cmd, run_as_root=True)
+                processutils.execute(*cmd, run_as_root=True)
             else:
                 reason = _("Unsupport LXD storage detected. Supported"
                            " storage drivers are zfs and btrfs.")
                 raise exception.NovaException(reason)
 
-            utils.execute(
+            processutils.execute(
                 'chown', storage_id,
                 storage_dir, run_as_root=True)
 
@@ -122,9 +122,9 @@ def detach_ephemeral(client, block_device_info, lxd_config, instance):
                 try:
                     zfs_pool = lxd_config['config']['storage.zfs_pool_name']
                 except KeyError:
-                    zfs_pool = CONF.lxd.pool
+                    zfs_pool = CONF.incus.storage_pool
 
-                utils.execute(
+                processutils.execute(
                     'zfs', 'destroy',
                     '%s/%s-ephemeral' % (zfs_pool, instance.name),
                     run_as_root=True)
@@ -134,5 +134,6 @@ def detach_ephemeral(client, block_device_info, lxd_config, instance):
                 lvm_path = '/dev/%s/%s-%s' % (
                     lvm_pool, instance.name, ephemeral['virtual_name'])
 
-                utils.execute('umount', lvm_path, run_as_root=True)
-                utils.execute('lvremove', '-f', lvm_path, run_as_root=True)
+                processutils.execute('umount', lvm_path, run_as_root=True)
+                processutils.execute(
+                    'lvremove', '-f', lvm_path, run_as_root=True)
