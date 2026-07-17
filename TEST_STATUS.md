@@ -369,6 +369,24 @@ blocker. The dated evidence below tracks the incremental hardening.
   checks and audit scripts must use `--project nova` or `--all-projects`;
   querying the default project alone produces a false "instance not found".
 
+## BFV Flavor resize
+
+- On 2026-07-17, BFV server
+  `1f6cf422-4a9e-4f62-a3c5-21ed36817d67` was resized and confirmed from
+  Flavor `ds512M` (`root_gb=5`, RAM 512 MiB) to `ds1G` (`root_gb=10`,
+  RAM 1024 MiB). It moved from `incus-node-03` to `incus-node-02` and
+  returned ACTIVE with fixed IP `10.0.0.25`.
+- The root Cinder RBD remained exactly 5368709120 bytes before and after the
+  resize. Flavor `root_gb` is intentionally ignored for BFV capacity; only a
+  separate Cinder extend operation may change that volume.
+- The rootfs marker and filesystem identifier `78ca08dac04f118b` were
+  preserved. The destination expanded root device used the `cinder-bfv`
+  `cephext` pool and contained no `size` key. Ceph reported exactly one
+  watcher, on `incus-node-02`.
+- Local-root resize still rejects a smaller `root_gb` before stopping the
+  source. BFV resize permits both directions because Cinder independently
+  owns root capacity, matching Nova's libvirt semantics.
+
 - Re-running DevStack to add Cinder rebuilt the test Nova databases. Three
   retained Incus containers (`instance-00000008`, `instance-00000009`, and
   `instance-0000000a`) therefore no longer have Nova database records. Their

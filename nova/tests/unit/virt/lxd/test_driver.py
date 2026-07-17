@@ -1795,13 +1795,15 @@ class LXDDriverTest(test.NoDBTestCase):
         }]
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
+        instance.flavor.root_gb = 20
+        smaller_flavor = mock.Mock(root_gb=10)
         lxd_driver = driver.LXDDriver(None)
         lxd_driver.init_host(None)
         lxd_driver.detach_volume = mock.Mock()
 
         lxd_driver.migrate_disk_and_power_off(
             ctx, instance, '10.224.0.17',
-            instance.flavor, [], block_device_info={})
+            smaller_flavor, [], block_device_info={})
 
         lxd_driver.detach_volume.assert_called_once_with(
             ctx, connection_info, instance, '/dev/vdb')
@@ -3303,8 +3305,15 @@ class LXDDriverTest(test.NoDBTestCase):
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         root_bdm = {'boot_index': 0}
         boot_from_volume.return_value = root_bdm
+        require_bfv.return_value = ('cinder-volumes', 'volume-root')
         profile = to_profile.return_value
-        profile.save.side_effect = RuntimeError('database unavailable')
+        profile.devices = {}
+        profile.save.side_effect = [
+            None,
+            RuntimeError('database unavailable'),
+            RuntimeError('database unavailable'),
+            RuntimeError('database unavailable'),
+        ]
         container = self.client.instances.create.return_value
         container.start.side_effect = RuntimeError('target start failed')
         self.CONF.incus.allow_cold_migration = True
@@ -3329,7 +3338,7 @@ class LXDDriverTest(test.NoDBTestCase):
         profile.delete.assert_not_called()
         self.vif_driver.unplug.assert_not_called()
         self.assertEqual(
-            self.CONF.incus.migration_finish_retries,
+            self.CONF.incus.migration_finish_retries + 1,
             profile.save.call_count)
 
     @mock.patch.object(driver, '_require_bfv_migration_support')
@@ -3446,9 +3455,16 @@ class LXDDriverTest(test.NoDBTestCase):
         migration = mock.Mock(
             source_compute='source', dest_compute='destination')
         container = self.client.instances.create.return_value
+        volume_id = '8231d2e8-1111-4222-8333-123456789abc'
         root_bdm = {
             'boot_index': 0,
-            'connection_info': mock.sentinel.root_connection,
+            'connection_info': {
+                'driver_volume_type': 'rbd',
+                'serial': volume_id,
+                'data': {
+                    'name': 'cinder-volumes/volume-%s' % volume_id,
+                },
+            },
             'mount_device': '/dev/sda',
         }
         data_connection = {'driver_volume_type': 'local'}
@@ -3458,8 +3474,13 @@ class LXDDriverTest(test.NoDBTestCase):
             'mount_device': '/dev/vdb',
         }
         boot_from_volume.return_value = root_bdm
+        require_bfv.return_value = (
+            'cinder-volumes', 'volume-%s' % volume_id)
         get_mapping.return_value = [root_bdm, data_bdm]
+        profile = to_profile.return_value
+        profile.devices = {'root': {'size': '10GB'}}
         self.CONF.incus.allow_cold_migration = True
+        self.CONF.incus.boot_from_volume_storage_pool = 'cinder'
         disk_info = jsonutils.dumps({
             'format': 'incus-pull-v1',
             'boot_from_volume': True,
@@ -3480,6 +3501,8 @@ class LXDDriverTest(test.NoDBTestCase):
             ctx, data_connection, instance, '/dev/vdb')
         require_bfv.assert_called_once_with(self.client, root_bdm)
         container.start.assert_called_once_with(wait=True)
+        self.assertEqual('cinder', profile.devices['root']['pool'])
+        self.assertNotIn('size', profile.devices['root'])
 
     def test_check_can_live_migrate_destination(self):
         ctx = context.get_admin_context()

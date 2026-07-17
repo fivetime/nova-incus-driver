@@ -199,6 +199,27 @@ def _cinder_rbd_root(bdm):
     return ceph_pool, image_name
 
 
+def _bfv_root_device(instance, root_bdm, root_volume):
+    """Build a Cinder-owned root device without Flavor size semantics."""
+    flavor_limits = flavor.disk_qos_limits(instance.flavor.extra_specs)
+    qos_specs = ((root_bdm.get('connection_info') or {}).get(
+        'data') or {}).get('qos_specs') or {}
+    volume_limits = flavor.disk_qos_limits(qos_specs, prefix='')
+    if flavor_limits and volume_limits:
+        raise exception.InvalidConfiguration(
+            'A BFV root cannot combine Flavor disk quota and '
+            'Cinder volume QoS')
+
+    device = {
+        'type': 'disk',
+        'path': '/',
+        'pool': CONF.incus.boot_from_volume_storage_pool,
+        'initial.ceph.rbd.image_name': root_volume[1],
+    }
+    device.update(volume_limits or flavor_limits)
+    return device
+
+
 def _require_bfv_migration_support(client, root_bdm):
     """Validate that an Incus endpoint can hand over a Cinder root RBD."""
     root_volume = _cinder_rbd_root(root_bdm)
@@ -855,19 +876,8 @@ class LXDDriver(driver.ComputeDriver):
 
         root_bdm = _boot_from_volume(block_device_info)
         root_volume = None
-        bfv_root_limits = None
         if root_bdm:
             root_volume = _cinder_rbd_root(root_bdm)
-            flavor_limits = flavor.disk_qos_limits(
-                instance.flavor.extra_specs)
-            qos_specs = ((root_bdm.get('connection_info') or {}).get(
-                'data') or {}).get('qos_specs') or {}
-            volume_limits = flavor.disk_qos_limits(qos_specs, prefix='')
-            if flavor_limits and volume_limits:
-                raise exception.InvalidConfiguration(
-                    'A BFV root cannot combine Flavor disk quota and '
-                    'Cinder volume QoS')
-            bfv_root_limits = volume_limits or flavor_limits
             bfv_pool_name = CONF.incus.boot_from_volume_storage_pool
             if not bfv_pool_name:
                 raise exception.InvalidConfiguration(
@@ -938,14 +948,8 @@ class LXDDriver(driver.ComputeDriver):
             profile = flavor.to_profile(
                 self.client, instance, network_info, block_device_info)
             if root_volume:
-                root_device = {
-                    'type': 'disk',
-                    'path': '/',
-                    'pool': CONF.incus.boot_from_volume_storage_pool,
-                    'initial.ceph.rbd.image_name': root_volume[1],
-                }
-                root_device.update(bfv_root_limits)
-                profile.devices['root'] = root_device
+                profile.devices['root'] = _bfv_root_device(
+                    instance, root_bdm, root_volume)
                 profile.save()
         except lxd_exceptions.LXDAPIException:
             with excutils.save_and_reraise_exception():
@@ -1591,7 +1595,9 @@ class LXDDriver(driver.ComputeDriver):
             raise exception.MigrationError(
                 reason='Incus cold migration is disabled by configuration')
 
-        if flavor.root_gb < instance.flavor.root_gb:
+        root_bdm = _boot_from_volume(block_device_info)
+        if (root_bdm is None and
+                flavor.root_gb < instance.flavor.root_gb):
             raise exception.InstanceFaultRollback(
                 exception.ResizeError(
                     reason='Incus root filesystems cannot be resized down'))
@@ -1604,7 +1610,6 @@ class LXDDriver(driver.ComputeDriver):
             raise exception.InvalidConfiguration(
                 '[incus] migration_address must be an HTTPS origin')
 
-        root_bdm = _boot_from_volume(block_device_info)
         if root_bdm:
             root_volume = _require_bfv_migration_support(
                 self.client, root_bdm)
@@ -1987,8 +1992,10 @@ class LXDDriver(driver.ComputeDriver):
             raise exception.MigrationError(
                 reason='Source and destination disagree on Incus BFV '
                 'migration mode')
+        root_volume = None
         if root_bdm:
-            _require_bfv_migration_support(self.client, root_bdm)
+            root_volume = _require_bfv_migration_support(
+                self.client, root_bdm)
 
         profile = None
         container = None
@@ -2001,6 +2008,10 @@ class LXDDriver(driver.ComputeDriver):
             plugged = True
             profile = flavor.to_profile(
                 self.client, instance, network_info, block_device_info)
+            if root_volume:
+                profile.devices['root'] = _bfv_root_device(
+                    instance, root_bdm, root_volume)
+                profile.save(wait=True)
             container = self.client.instances.create(
                 migration_data, wait=True)
 
