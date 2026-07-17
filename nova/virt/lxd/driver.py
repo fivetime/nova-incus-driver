@@ -1413,7 +1413,16 @@ class LXDDriver(driver.ComputeDriver):
         See `nova.virt.driver.Computedriver.detach_volume` for
         more information.
         """
-        profile = self.client.profiles.get(instance.name)
+        try:
+            profile = self.client.profiles.get(instance.name)
+        except lxd_exceptions.NotFound:
+            if mountpoint != getattr(instance, 'root_device_name', None):
+                raise
+            # Nova destroys the Incus guest and profile before detaching a
+            # BFV root for Cinder reimage. The cephext root was already
+            # unmounted and never used the os-brick data-volume path.
+            _cinder_rbd_root({'connection_info': connection_info})
+            return
         volume_id = _volume_id(connection_info)
         device = profile.devices.get(volume_id)
         metadata_key = _volume_device_info_key(volume_id)

@@ -314,6 +314,61 @@ blocker. The dated evidence below tracks the incremental hardening.
 
 ## Current test-environment state notes
 
+## BFV failed-host evacuation
+
+- On 2026-07-17, server `31159ba2-2c52-4ead-98c5-a06ca934178b`
+  was booted from Cinder RBD volume
+  `f6f81198-2455-43fc-b00a-83e65f99e74b` on `incus-node-01`.
+  A rootfs marker was persisted, the source compute and Incus daemon were
+  stopped, the remaining LXC monitor and KRBD mapping were explicitly fenced,
+  and Nova evacuated the server to `incus-node-03`.
+- Nova created a new Cinder attachment, rebound the same Neutron port, claimed
+  the existing RBD through `cephext`, and completed the Placement evacuation
+  claim. After an API start, the marker, fixed address `10.0.0.47`, and ACTIVE
+  port were intact. Ceph reported exactly one watcher on `incus-node-03`.
+- Restarting the source Incus and nova-compute caused Nova's standard
+  `_destroy_evacuated_instances` path to remove the stale source Incus record
+  and source allocation. The target remained ACTIVE and the external RBD was
+  untouched. This relies on `cephext.DeleteVolume` releasing only the local
+  claim record; Cinder remains the external image owner.
+- Stopping or killing the Podman container is **not fencing**. The host LXC
+  monitor, mount namespace, KRBD mapping, and Ceph watcher survived the Podman
+  daemon container. Production evacuation still requires power fencing or an
+  equivalent host-level STONITH implementation and must verify that the source
+  has no RBD watcher before starting Nova evacuation. The test used explicit
+  monitor termination, unmount, and KRBD unmap only because the controller
+  shared the source test VM.
+- The server was observed as stopped after the controlled source teardown, so
+  Nova correctly restored SHUTOFF on the target. OSC `server evacuate --wait`
+  continued polling for ACTIVE even though evacuation had completed. Release
+  automation must poll for a terminal task state and the requested/original
+  power state instead of assuming every successful evacuation ends ACTIVE.
+
+## BFV shelve and explicit root-volume reimage
+
+- On 2026-07-17, shelving a BFV server reached `SHELVED_OFFLOADED`, removed
+  its Incus instance record and Ceph watcher, and left the Cinder attachment
+  reserved. Unshelving recreated the server on `incus-node-03` with the same
+  rootfs marker and fixed IP, completed the Cinder attachment, and produced
+  exactly one target RBD watcher.
+- Nova compute API microversion 2.93 correctly rejected an implicit BFV
+  rebuild. An explicit
+  `server rebuild --reimage-boot-volume --image ubuntu-noble-incus-bfv-rbd`
+  reimaged the Cinder root volume and returned the server to ACTIVE on the
+  same host with fixed IP `10.0.0.25`.
+- The pre-rebuild `/root/rebuild-marker` was absent afterwards, as required
+  for a destructive reimage. The root filesystem was mounted from
+  `/dev/rbd0[/rootfs]`, Cinder reported one attached root volume, and Ceph
+  reported exactly one watcher on `incus-node-03`.
+- Nova's default reimage transaction destroys the Incus instance and profile
+  before it calls the driver's root-volume detach hook. That detach must be
+  idempotent only for a validated Cinder RBD root at
+  `instance.root_device_name`; missing profiles for data-volume detach remain
+  errors. Unit coverage enforces both sides of this boundary.
+- Incus instances managed by Nova are in the `nova` Incus project. Operational
+  checks and audit scripts must use `--project nova` or `--all-projects`;
+  querying the default project alone produces a false "instance not found".
+
 - Re-running DevStack to add Cinder rebuilt the test Nova databases. Three
   retained Incus containers (`instance-00000008`, `instance-00000009`, and
   `instance-0000000a`) therefore no longer have Nova database records. Their

@@ -2320,6 +2320,41 @@ class LXDDriverTest(test.NoDBTestCase):
         volume_connector.disconnect_volume.assert_called_once_with(
             connection_info['data'], {'path': '/dev/drbd1000'})
 
+    def test_detach_missing_profile_is_idempotent_for_bfv_root(self):
+        volume_id = '8231d2e8-1111-4222-8333-123456789abc'
+        connection_info = {
+            'driver_volume_type': 'rbd',
+            'serial': volume_id,
+            'data': {
+                'name': 'cinder-volumes/volume-%s' % volume_id,
+            },
+        }
+        instance = mock.Mock(
+            name='instance-00000001', root_device_name='/dev/sda')
+        self.client.profiles.get.side_effect = lxdcore_exceptions.NotFound(
+            mock.Mock())
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.client = self.client
+
+        lxd_driver.detach_volume(
+            mock.sentinel.context, connection_info, instance, '/dev/sda')
+
+        self.client.profiles.get.assert_called_once_with(instance.name)
+
+    def test_detach_missing_profile_does_not_hide_data_volume(self):
+        instance = mock.Mock(
+            name='instance-00000001', root_device_name='/dev/sda')
+        self.client.profiles.get.side_effect = lxdcore_exceptions.NotFound(
+            mock.Mock())
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.client = self.client
+
+        self.assertRaises(
+            lxdcore_exceptions.NotFound, lxd_driver.detach_volume,
+            mock.sentinel.context,
+            {'driver_volume_type': 'rbd', 'data': {}},
+            instance, '/dev/sdb')
+
     def test_detach_volume_restores_profile_on_disconnect_failure(self):
         device = {
             'path': '/dev/sdc',
