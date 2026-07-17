@@ -1,14 +1,34 @@
 diff --git a/ceilometer/publisher/data/gnocchi_resources.yaml b/ceilometer/publisher/data/gnocchi_resources.yaml
 --- a/ceilometer/publisher/data/gnocchi_resources.yaml
 +++ b/ceilometer/publisher/data/gnocchi_resources.yaml
-@@ -237,6 +237,10 @@ resources:
+@@ -18,6 +18,15 @@ archive_policies:
+     definition:
+       - granularity: 5 minutes
+         timespan: 30 days
++  - name: ceilometer-volume-io
++    aggregation_methods:
++      - mean
++      - rate:mean
++      - rate:sum
++    back_window: 0
++    definition:
++      - granularity: 5 minutes
++        timespan: 30 days
+   - name: ceilometer-high
+     aggregation_methods:
+       - mean
+@@ -237,6 +237,14 @@ resources:
        snapshot.size:
        volume.snapshot.size:
        volume.backup.size:
 +      volume.read.requests:
++        archive_policy_name: ceilometer-volume-io
 +      volume.read.bytes:
++        archive_policy_name: ceilometer-volume-io
 +      volume.write.requests:
++        archive_policy_name: ceilometer-volume-io
 +      volume.write.bytes:
++        archive_policy_name: ceilometer-volume-io
        backup.size:
        volume.manage_existing.start:
        volume.manage_existing.end:

@@ -498,6 +498,31 @@ blocker. The dated evidence below tracks the incremental hardening.
   `volume.read.requests=2571`, `volume.read.bytes=103952384`,
   `volume.write.requests=538`, and
   `volume.write.bytes=112140288` at the tested archive interval.
+- A subsequent hard reboot reset the container's cgroup counters. Nova
+  detected the lower values and moved the pre-reboot current counters into
+  `tot_*`; cumulative write bytes increased monotonically from `112214016`
+  to `147578880` after another 32 MiB synchronized write. Restarting
+  `nova-compute` alone did not reset or duplicate the counters.
+- Cold migration of the same BFV instance from `incus-node-02` to
+  `incus-node-03` followed by a 48 MiB synchronized write preserved both the
+  Cinder UUID and the cumulative series. Nova moved the source counters into
+  totals and reported `201699328` cumulative write bytes on the destination.
+- The lab's OVN Northbound database had been recreated by the interrupted
+  Ceilometer DevStack run while the restored Neutron SQL database retained
+  the authoritative networks. This made the migrated port DOWN despite
+  correct veth and OVS wiring. After backing up both OVN databases,
+  `neutron-ovn-db-sync-util --ovn-neutron_sync_mode repair` reconstructed the
+  logical state; the port became ACTIVE, DHCP restored `10.0.0.25`, and
+  cross-node traffic to `10.0.0.16` and `10.0.0.30` passed.
+- The four cumulative metrics use the dedicated `ceilometer-volume-io`
+  archive policy with `mean`, `rate:mean`, and `rate:sum`. DevStack's global
+  Gnocchi archive-policy override is removed so the resource mapping can
+  select that policy. Billing must query `rate:sum` for billable I/O in each
+  five-minute window; `rate:mean` is a trend and plain `mean` is the average
+  cumulative counter value. A controlled 20 MiB synchronized write in a new
+  window produced exactly `20971520` for `volume.write.bytes` with
+  `rate:sum`; the corresponding write-request increase was 14 and an idle
+  window returned zero.
 
 - Re-running DevStack to add Cinder rebuilt the test Nova databases. Three
   retained Incus containers (`instance-00000008`, `instance-00000009`, and

@@ -147,6 +147,7 @@ function configure_nova_incus_ceilometer {
     local ceilometer_patch
     local meter_source
     local meter_target_dir
+    local pipeline_file
 
     if ! is_service_enabled ceilometer-anotification; then
         return
@@ -158,6 +159,19 @@ function configure_nova_incus_ceilometer {
         -m 0755 "${meter_target_dir}"
     sudo install -o "${STACK_USER}" -g "${STACK_USER}" -m 0644 \
         "${meter_source}" "${meter_target_dir}/incus-volume-usage.yaml"
+
+    # Ceilometer's DevStack plugin globally forces every Gnocchi metric onto
+    # one archive policy. Remove that test-only override so the resource map
+    # can select the rate-enabled policy for cumulative volume counters.
+    for pipeline_file in \
+            "${CEILOMETER_CONF_DIR}/pipeline.yaml" \
+            "${CEILOMETER_CONF_DIR}/event_pipeline.yaml"; do
+        if [[ -f "${pipeline_file}" ]]; then
+            sudo sed -i -E \
+                's#gnocchi://[?]archive_policy=[^&]+&filter_project=service#gnocchi://?filter_project=service#g' \
+                "${pipeline_file}"
+        fi
+    done
 
     ceilometer_patch="${NOVA_INCUS_DIR}/patches/ceilometer/0001-gnocchi-map-nova-volume-usage-metrics.patch"
     if [[ ! -d "${CEILOMETER_DIR:-}/.git" ]]; then

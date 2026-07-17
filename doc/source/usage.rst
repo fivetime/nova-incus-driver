@@ -957,8 +957,14 @@ the following cumulative Gnocchi metrics, keyed by the Cinder volume UUID:
 * ``volume.write.bytes``
 
 The plugin also applies the matching Gnocchi resource-map patch to the
-Ceilometer checkout. Production packaging must install the meter file, carry
-the resource-map patch until it is available upstream, and restart the
-Ceilometer notification agent. Keep the meter type cumulative: Nova's volume
-usage cache handles counter resets and reports lifetime totals across polling
-intervals.
+Ceilometer checkout and removes DevStack's global ``archive_policy`` publisher
+override. That override would otherwise ignore all per-metric policy choices.
+Production packaging must install the meter file, carry the resource-map
+patch until it is available upstream, and restart the Ceilometer notification
+agent. Keep the meter type cumulative: Nova's volume usage cache handles
+counter resets and reports lifetime totals across polling intervals. The
+resource mapping assigns the dedicated ``ceilometer-volume-io`` policy. It
+retains ``mean``, ``rate:mean``, and ``rate:sum`` at five-minute granularity.
+Billing should consume ``rate:sum`` for the counter increase in an archive
+window. ``rate:mean`` is useful for trends, while plain ``mean`` is only the
+average cumulative counter value inside that window.
