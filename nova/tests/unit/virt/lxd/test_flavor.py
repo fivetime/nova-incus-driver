@@ -82,7 +82,7 @@ class ToProfileTest(test.NoDBTestCase):
         expected_config = {
             'environment.product_name': 'OpenStack Nova',
             'limits.cpu': '1',
-            'limits.memory': '0MB',
+            'limits.memory': '0MiB',
         }
         expected_devices = {
             'root': {
@@ -109,7 +109,7 @@ class ToProfileTest(test.NoDBTestCase):
         expected_config = {
             'environment.product_name': 'OpenStack Nova',
             'limits.cpu': '1',
-            'limits.memory': '0MB',
+            'limits.memory': '0MiB',
         }
         expected_devices = {
             'root': {
@@ -135,7 +135,7 @@ class ToProfileTest(test.NoDBTestCase):
         expected_config = {
             'environment.product_name': 'OpenStack Nova',
             'limits.cpu': '1',
-            'limits.memory': '0MB'
+            'limits.memory': '0MiB'
         }
         expected_devices = {
             'root': {
@@ -192,6 +192,7 @@ class ToProfileTest(test.NoDBTestCase):
         flavor.to_profile(self.client, instance, [], [])
 
         config = self.client.profiles.create.call_args.args[1]
+        self.assertEqual('1024MiB', config['limits.memory'])
         self.assertEqual('2048MiB', config['limits.memory.swap'])
 
     def test_to_profile_rejects_swap_when_operator_disables_it(self):
@@ -240,7 +241,7 @@ class ToProfileTest(test.NoDBTestCase):
             'environment.product_name': 'OpenStack Nova',
             'security.idmap.isolated': 'True',
             'limits.cpu': '1',
-            'limits.memory': '0MB',
+            'limits.memory': '0MiB',
         }
         expected_devices = {
             'root': {
@@ -285,7 +286,7 @@ class ToProfileTest(test.NoDBTestCase):
         expected_config = {
             'environment.product_name': 'OpenStack Nova',
             'limits.cpu': '1',
-            'limits.memory': '0MB',
+            'limits.memory': '0MiB',
         }
         expected_devices = {
             'root': {
@@ -317,7 +318,7 @@ class ToProfileTest(test.NoDBTestCase):
         expected_config = {
             'environment.product_name': 'OpenStack Nova',
             'limits.cpu': '1',
-            'limits.memory': '0MB',
+            'limits.memory': '0MiB',
         }
         expected_devices = {
             'root': {
@@ -422,7 +423,7 @@ class ToProfileTest(test.NoDBTestCase):
         expected_config = {
             'environment.product_name': 'OpenStack Nova',
             'limits.cpu': '1',
-            'limits.memory': '0MB',
+            'limits.memory': '0MiB',
         }
         expected_devices = {
             'tap0123456789a': {
@@ -465,7 +466,7 @@ class ToProfileTest(test.NoDBTestCase):
         expected_config = {
             'environment.product_name': 'OpenStack Nova',
             'limits.cpu': '1',
-            'limits.memory': '0MB',
+            'limits.memory': '0MiB',
         }
         expected_devices = {
             'tap0123456789a': {

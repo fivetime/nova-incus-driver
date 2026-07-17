@@ -1,0 +1,45 @@
+From: OpenStack Incus maintainers <openstack-incus@example.invalid>
+Subject: [PATCH] diagnostics: Add the LXD driver identifier
+
+The standardized diagnostics response uses a closed enum for the virt
+driver. External system-container drivers cannot return truthful diagnostics
+because neither "lxd" nor "incus" is accepted. Add the existing Nova
+hypervisor type name "lxd" to the object field, response schema and API
+reference.
+
+diff --git a/nova/objects/fields.py b/nova/objects/fields.py
+--- a/nova/objects/fields.py
++++ b/nova/objects/fields.py
+@@ -850,8 +850,9 @@ class HypervisorDriver(BaseNovaEnum):
+     VMWAREAPI = "vmwareapi"
+     IRONIC = "ironic"
+     HYPERV = "hyperv"
++    LXD = "lxd"
+ 
+-    ALL = (LIBVIRT, XENAPI, VMWAREAPI, IRONIC, HYPERV)
++    ALL = (LIBVIRT, XENAPI, VMWAREAPI, IRONIC, HYPERV, LXD)
+ 
+ 
+ class PointerModelType(BaseNovaEnum):
+diff --git a/nova/api/openstack/compute/schemas/server_diagnostics.py b/nova/api/openstack/compute/schemas/server_diagnostics.py
+--- a/nova/api/openstack/compute/schemas/server_diagnostics.py
++++ b/nova/api/openstack/compute/schemas/server_diagnostics.py
+@@ -74,6 +74,7 @@ index_response_v248 = {
+                 'libvirt',
+                 'vmwareapi',
+                 'xenapi',
++                'lxd',
+             ],
+         },
+         'hypervisor': {'type': ['string', 'null']},
+diff --git a/api-ref/source/parameters.yaml b/api-ref/source/parameters.yaml
+--- a/api-ref/source/parameters.yaml
++++ b/api-ref/source/parameters.yaml
+@@ -2475,6 +2475,7 @@ driver_diagnostics:
+     - ``xenapi``
+     - ``vmwareapi``
+     - ``ironic``
++    - ``lxd``
+   in: body
+   required: true
+   type: string

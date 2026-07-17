@@ -130,13 +130,21 @@ Without this bind mount, Nova can build the config-drive directory on the
 host but Incus correctly rejects the disk device because its source is not
 visible inside the daemon container.
 
-The modern Nova ``Diagnostics`` object currently restricts its ``driver``
-field to a fixed list that does not include Incus. The driver must not report
-itself as libvirt merely to pass that schema. ``get_instance_diagnostics``
-therefore remains unavailable until Nova accepts an ``incus`` driver value.
-Per-volume I/O usage also remains unavailable until Incus counters can be
-reliably attributed to individual Cinder volume IDs; returning false zeroes
-would corrupt telemetry and billing.
+The modern Nova ``Diagnostics`` object restricts its ``driver`` field to a
+fixed list. This repository carries
+``patches/nova/0001-diagnostics-add-lxd-driver.patch`` to add the existing
+``lxd`` hypervisor identifier to the object field, API schema, and API
+reference. The DevStack plugin applies that small compatibility patch
+explicitly and fails if it no longer applies; the driver never identifies
+itself as libvirt. This remains a Nova integration dependency until the value
+is accepted upstream.
+
+Incus diagnostics provide truthful aggregate CPU time, memory, and per-NIC
+cumulative counters. The Incus state API exposes disk capacity but not
+per-device I/O requests or bytes attributable to a Cinder volume. Disk
+diagnostic entries therefore leave I/O fields unset, and ``block_stats`` and
+``get_all_volume_usage`` remain unsupported. Returning false zeroes would
+corrupt telemetry and billing.
 
 Incus configures the LXC console as an in-memory ring buffer and bounded disk
 log. With Ubuntu Noble liblxc, its ``auto`` value is 128 KiB for each. The

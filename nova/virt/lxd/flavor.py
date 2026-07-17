@@ -51,7 +51,7 @@ def _memory(instance, _):
                 'Flavor requests swap but [incus] allow_instance_swap is '
                 'disabled')
         return {
-            'limits.memory': '{}MB'.format(mem),
+            'limits.memory': '{}MiB'.format(mem),
             'limits.memory.swap': (
                 '{}MiB'.format(swap_mb) if swap_mb else 'false'),
         }

@@ -1019,6 +1019,109 @@ class LXDDriver(driver.ComputeDriver):
         return hardware.InstanceInfo(
             state=_get_power_state(state.status_code))
 
+    def _get_diagnostics_data(self, instance):
+        """Return accurately attributable counters from the Incus state API."""
+        try:
+            container = self.client.instances.get(instance.name)
+        except lxd_exceptions.NotFound:
+            raise exception.InstanceNotFound(instance_id=instance.uuid)
+
+        state = container.state()
+        cpu = state.cpu or {}
+        memory = state.memory or {}
+        networks = state.network or {}
+        disks = state.disk or {}
+
+        nics = []
+        for name, network in sorted(networks.items()):
+            if network.get('type') == 'loopback':
+                continue
+            counters = network.get('counters') or {}
+            nics.append({
+                'name': name,
+                'mac_address': network.get('hwaddr') or None,
+                'rx_octets': counters.get('bytes_received'),
+                'rx_errors': counters.get('errors_received'),
+                'rx_drop': counters.get('packets_dropped_inbound'),
+                'rx_packets': counters.get('packets_received'),
+                'tx_octets': counters.get('bytes_sent'),
+                'tx_errors': counters.get('errors_sent'),
+                'tx_drop': counters.get('packets_dropped_outbound'),
+                'tx_packets': counters.get('packets_sent'),
+            })
+
+        return {
+            'state': _get_power_state(state.status_code),
+            'cpu_time': cpu.get('usage'),
+            'memory_maximum': memory.get('total'),
+            'memory_used': memory.get('usage'),
+            'nics': nics,
+            'disk_count': len(disks),
+        }
+
+    def get_diagnostics(self, instance):
+        """Return legacy pre-2.48 diagnostics without synthetic disk I/O."""
+        data = self._get_diagnostics_data(instance)
+        output = {}
+        if data['cpu_time'] is not None:
+            output['cpu0_time'] = data['cpu_time']
+        if data['memory_maximum'] is not None:
+            output['memory'] = data['memory_maximum'] // units.Ki
+        if data['memory_used'] is not None:
+            output['memory-used'] = data['memory_used'] // units.Ki
+        for nic in data['nics']:
+            prefix = nic['name']
+            for source, suffix in (
+                    ('rx_octets', 'rx'),
+                    ('rx_errors', 'rx_errors'),
+                    ('rx_drop', 'rx_drop'),
+                    ('rx_packets', 'rx_packets'),
+                    ('tx_octets', 'tx'),
+                    ('tx_errors', 'tx_errors'),
+                    ('tx_drop', 'tx_drop'),
+                    ('tx_packets', 'tx_packets')):
+                if nic[source] is not None:
+                    output['%s_%s' % (prefix, suffix)] = nic[source]
+        return output
+
+    def get_instance_diagnostics(self, instance):
+        """Return the standardized diagnostics object for Incus containers."""
+        if not hasattr(obj_fields.HypervisorDriver, 'LXD'):
+            raise NotImplementedError(
+                'Nova must include the lxd diagnostics driver identifier')
+
+        data = self._get_diagnostics_data(instance)
+        diags = objects.Diagnostics(
+            state=power_state.STATE_MAP[data['state']],
+            driver=obj_fields.HypervisorDriver.LXD,
+            config_drive=configdrive.required_by(instance),
+            hypervisor='incus',
+            hypervisor_os='linux',
+            uptime=None)
+        diags.memory_details = objects.MemoryDiagnostics(
+            maximum=(data['memory_maximum'] // units.Mi
+                     if data['memory_maximum'] is not None else None),
+            used=(data['memory_used'] // units.Mi
+                  if data['memory_used'] is not None else None))
+        if data['cpu_time'] is not None:
+            # Incus reports one cgroup aggregate rather than per-vCPU time.
+            diags.add_cpu(id=None, time=data['cpu_time'])
+        diags.num_cpus = instance.vcpus
+        for _index in range(data['disk_count']):
+            diags.add_disk()
+        for nic in data['nics']:
+            diags.add_nic(
+                mac_address=nic['mac_address'],
+                rx_octets=nic['rx_octets'],
+                rx_errors=nic['rx_errors'],
+                rx_drop=nic['rx_drop'],
+                rx_packets=nic['rx_packets'],
+                tx_octets=nic['tx_octets'],
+                tx_errors=nic['tx_errors'],
+                tx_drop=nic['tx_drop'],
+                tx_packets=nic['tx_packets'])
+        return diags
+
     def list_instances(self):
         """Return a list of all instance names."""
         return [instance.name

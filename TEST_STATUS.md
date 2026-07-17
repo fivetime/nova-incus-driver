@@ -443,6 +443,23 @@ blocker. The dated evidence below tracks the incremental hardening.
   `40c5e8c8-6e98-4bb1-9b61-188b0671f711`, owner `incus-node-03`, and fixed IP
   `10.0.0.54`.
 
+## Instance diagnostics
+
+- On 2026-07-18, the explicit Nova diagnostics compatibility patch was
+  applied on all three nodes and the public Nova API returned HTTP 200 through
+  cross-host RPC for BFV server
+  `7cbb8e9a-3532-4fb7-b3bc-8e4497bc6b72` on `incus-node-02`.
+- Microversion 2.48 reported `driver=lxd`, `hypervisor=incus`, running state,
+  Flavor vCPU count, aggregate CPU time, runtime memory, and accurate `eth0`
+  counters. Uptime and the root disk's unavailable block I/O fields are null.
+  Microversion 2.47 returned the corresponding legacy CPU, memory, and NIC
+  dictionary.
+- Diagnostics testing exposed and fixed the pre-existing Flavor conversion
+  from Nova MiB to Incus decimal `MB`. New profiles now use `MiB`; the complete
+  Python 3.12 suite passed 220 tests with 2 intentional legacy pylxd skips.
+  Existing instances retain their prior configured limit until an explicit
+  lifecycle operation reapplies their Flavor.
+
 - Re-running DevStack to add Cinder rebuilt the test Nova databases. Three
   retained Incus containers (`instance-00000008`, `instance-00000009`, and
   `instance-0000000a`) therefore no longer have Nova database records. Their

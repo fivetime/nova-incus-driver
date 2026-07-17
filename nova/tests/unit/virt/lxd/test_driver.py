@@ -375,6 +375,81 @@ class LXDDriverTest(test.NoDBTestCase):
         self.assertEqual(power_state.SHUTDOWN, info.state)
         container.state.assert_not_called()
 
+    def test_get_diagnostics_reports_only_incus_counters(self):
+        state = mock.Mock(
+            status_code=100,
+            cpu={'usage': 123456789},
+            memory={'total': 2 * units.Gi, 'usage': 768 * units.Mi},
+            disk={'root': {'total': 20 * units.Gi}},
+            network={
+                'lo': {'type': 'loopback', 'counters': {}},
+                'eth0': {
+                    'type': 'broadcast',
+                    'hwaddr': '00:16:3e:12:34:56',
+                    'counters': {
+                        'bytes_received': 100,
+                        'errors_received': 1,
+                        'packets_dropped_inbound': 2,
+                        'packets_received': 3,
+                        'bytes_sent': 200,
+                        'errors_sent': 4,
+                        'packets_dropped_outbound': 5,
+                        'packets_sent': 6,
+                    },
+                },
+            })
+        container = mock.Mock()
+        container.state.return_value = state
+        self.client.instances.get.return_value = container
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test')
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        result = lxd_driver.get_diagnostics(instance)
+
+        self.assertEqual({
+            'cpu0_time': 123456789,
+            'memory': 2 * units.Mi,
+            'memory-used': 768 * units.Ki,
+            'eth0_rx': 100,
+            'eth0_rx_errors': 1,
+            'eth0_rx_drop': 2,
+            'eth0_rx_packets': 3,
+            'eth0_tx': 200,
+            'eth0_tx_errors': 4,
+            'eth0_tx_drop': 5,
+            'eth0_tx_packets': 6,
+        }, result)
+        self.assertNotIn('lo_rx', result)
+
+    def test_get_diagnostics_missing_instance(self):
+        self.client.instances.get.side_effect = lxdcore_exceptions.NotFound(
+            MockResponse(404))
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test')
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            exception.InstanceNotFound,
+            lxd_driver.get_diagnostics, instance)
+
+    def test_get_instance_diagnostics_requires_nova_compatibility_patch(self):
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test')
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        original = driver.obj_fields.HypervisorDriver
+        driver.obj_fields.HypervisorDriver = mock.Mock(spec=[])
+        try:
+            self.assertRaisesRegex(
+                NotImplementedError, 'lxd diagnostics driver identifier',
+                lxd_driver.get_instance_diagnostics, instance)
+        finally:
+            driver.obj_fields.HypervisorDriver = original
+
     def test_list_instances(self):
         self.client.instances.all.return_value = [
             MockContainer('mock-instance-1'),

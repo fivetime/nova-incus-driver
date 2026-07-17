@@ -116,6 +116,21 @@ function install_nova_incus {
     setup_pyproject_develop "${INCUS_PYTHON_SDK_DIR}"
     setup_develop "${NOVA_INCUS_DIR}"
 
+    if is_true "${INCUS_APPLY_NOVA_DIAGNOSTICS_PATCH}"; then
+        local diagnostics_patch
+        diagnostics_patch="${NOVA_INCUS_DIR}/patches/nova/0001-diagnostics-add-lxd-driver.patch"
+        if grep -q 'LXD = "lxd"' "${NOVA_DIR}/nova/objects/fields.py" && \
+                grep -q "'lxd'," \
+                    "${NOVA_DIR}/nova/api/openstack/compute/schemas/server_diagnostics.py"; then
+            echo "Nova diagnostics already accepts the lxd driver"
+        elif git -C "${NOVA_DIR}" apply --check "${diagnostics_patch}"; then
+            git -C "${NOVA_DIR}" apply "${diagnostics_patch}"
+        else
+            die $LINENO \
+                "Nova diagnostics compatibility patch does not apply cleanly"
+        fi
+    fi
+
     # Nova's source checkout is a regular Python package, so an editable
     # external distribution cannot extend nova.virt with another namespace
     # path. Keep this repository authoritative and deploy its driver package

@@ -9,6 +9,7 @@
   "status_values": [
     "framework",
     "supported",
+    "partial",
     "unverified",
     "experimental",
     "unsupported",
@@ -180,8 +181,8 @@
       "owner": "nova+driver",
       "driver_hooks": ["get_instance_diagnostics", "block_stats", "get_all_volume_usage"],
       "applicability": "container",
-      "status": "planned",
-      "evidence": "Incus exposes accurate aggregate CPU, memory and NIC counters, but Nova stable/2026.1 Diagnostics rejects an incus/lxd driver enum and Incus state does not expose per-device I/O request/byte counters attributable to Cinder volume IDs; do not mislabel the driver as libvirt or synthesize block usage"
+      "status": "partial",
+      "evidence": "Standard and legacy diagnostics expose accurate aggregate CPU, memory and NIC counters through an explicit Nova lxd enum compatibility patch. Incus does not expose per-device I/O request/byte counters attributable to Cinder volume IDs, so block_stats and get_all_volume_usage remain unsupported"
     },
     {
       "id": "config-drive-metadata-keypair-userdata",
