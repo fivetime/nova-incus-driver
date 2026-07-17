@@ -782,6 +782,18 @@ the system container. Tempest validates ``openstack/latest/meta_data.json`` and
 cloud-init, but tests and applications must not depend on cloud-init's private
 ``/var/lib/cloud`` cache layout.
 
+Config-drive construction, profile attachment, firewall setup, and container
+start are one spawn rollback boundary. A failure removes the Incus instance,
+profile, VIF state, and instance directory instead of leaving a guest that Nova
+believes failed.
+
+Cross-host cold migration and resize of an instance whose
+``instance.config_drive`` is set are currently rejected before the source is
+stopped. The migration protocol does not yet transfer injected files and the
+one-time administrator password needed to reproduce the original config-drive;
+silently regenerating an incomplete drive on the destination would violate
+Nova guest-visible semantics.
+
 Interface hotplug
 -----------------
 

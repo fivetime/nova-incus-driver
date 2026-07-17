@@ -187,8 +187,8 @@
       "owner": "nova+driver+guest-image",
       "driver_hooks": ["spawn"],
       "applicability": "container",
-      "status": "unverified",
-      "evidence": "Public API reached ACTIVE with config_drive=True after a read-only instances_path bind; guest SSH validation remains open"
+      "status": "partial",
+      "evidence": "Spawn and rebuild expose a read-only directory with rollback on construction failure; cross-host cold migration and resize are explicitly rejected until config-drive contents can be transferred safely"
     },
     {
       "id": "rescue-unrescue",

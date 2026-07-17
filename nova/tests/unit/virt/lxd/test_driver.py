@@ -125,6 +125,7 @@ class LXDDriverTest(test.NoDBTestCase):
 
     def setUp(self):
         super(LXDDriverTest, self).setUp()
+        self.flags(force_config_drive=False)
 
         self.Client_patcher = mock.patch(
             'nova.virt.lxd.driver.incus_client.get_client')
@@ -147,6 +148,7 @@ class LXDDriverTest(test.NoDBTestCase):
         self.CONF.instances_path = '/path/to/instances'
         self.CONF.my_ip = '0.0.0.0'
         self.CONF.config_drive_format = 'iso9660'
+        self.CONF.force_config_drive = False
         self.CONF.incus.storage_pool = None
         self.CONF.incus.allow_cold_migration = False
         self.CONF.incus.migration_address = None
@@ -667,7 +669,7 @@ class LXDDriverTest(test.NoDBTestCase):
                 'path': '/config-drive',
                 'source': lxd_driver._add_configdrive.return_value,
                 'type': 'disk',
-                'readonly': 'True',
+                'readonly': 'true',
             }
         })
         profile.save.assert_called_once_with()
@@ -2605,6 +2607,22 @@ class LXDDriverTest(test.NoDBTestCase):
 
         self.assertRaises(
             NotImplementedError, lxd_driver.suspend, ctx, instance)
+        self.client.instances.get.assert_not_called()
+
+    def test_migrate_disk_rejects_configdrive_before_shutdown(self):
+        self.CONF.incus.allow_cold_migration = True
+        self.CONF.incus.migration_address = 'https://10.224.0.16:8443'
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        instance.config_drive = True
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        self.assertRaises(
+            exception.InstanceFaultRollback,
+            lxd_driver.migrate_disk_and_power_off,
+            ctx, instance, '10.224.0.17', instance.flavor, [])
+
         self.client.instances.get.assert_not_called()
 
     def test_resume_is_rejected_without_memory_checkpoint(self):

@@ -973,28 +973,28 @@ class LXDDriver(driver.ComputeDriver):
                 self.cleanup(
                     context, instance, network_info, block_device_info)
 
-        lxd_config = self.client.host_info
-        storage.attach_ephemeral(
-            self.client, block_device_info, lxd_config, instance)
-        if configdrive.required_by(instance):
-            configdrive_path = self._add_configdrive(
-                context, instance,
-                injected_files, admin_password,
-                network_info)
-
-            profile = self.client.profiles.get(instance.name)
-            config_drive = {
-                'configdrive': {
-                    'path': '/config-drive',
-                    'source': configdrive_path,
-                    'type': 'disk',
-                    'readonly': 'True',
-                }
-            }
-            profile.devices.update(config_drive)
-            profile.save()
-
         try:
+            lxd_config = self.client.host_info
+            storage.attach_ephemeral(
+                self.client, block_device_info, lxd_config, instance)
+            if configdrive.required_by(instance):
+                configdrive_path = self._add_configdrive(
+                    context, instance,
+                    injected_files, admin_password,
+                    network_info)
+
+                profile = self.client.profiles.get(instance.name)
+                config_drive = {
+                    'configdrive': {
+                        'path': '/config-drive',
+                        'source': configdrive_path,
+                        'type': 'disk',
+                        'readonly': 'true',
+                    }
+                }
+                profile.devices.update(config_drive)
+                profile.save()
+
             self.firewall_driver.setup_basic_filtering(
                 instance, network_info)
             self.firewall_driver.instance_filter(
@@ -1005,7 +1005,7 @@ class LXDDriver(driver.ComputeDriver):
 
             self.firewall_driver.apply_instance_filter(
                 instance, network_info)
-        except lxd_exceptions.LXDAPIException:
+        except Exception:
             with excutils.save_and_reraise_exception():
                 try:
                     container.delete(wait=True)
@@ -1596,6 +1596,11 @@ class LXDDriver(driver.ComputeDriver):
                 reason='Incus cold migration is disabled by configuration')
 
         root_bdm = _boot_from_volume(block_device_info)
+        if instance.config_drive:
+            raise exception.InstanceFaultRollback(
+                exception.ResizeError(
+                    reason='Incus cross-host resize cannot yet preserve '
+                    'config-drive contents'))
         if (root_bdm is None and
                 flavor.root_gb < instance.flavor.root_gb):
             raise exception.InstanceFaultRollback(
