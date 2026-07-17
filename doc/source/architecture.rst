@@ -118,6 +118,25 @@ under ``/var/log`` or change ownership and permissions on Incus host paths.
 The generated config drive is the only driver-created host directory exposed
 to an instance, and it is attached read-only. A tenant root process must not
 be able to write through ``/config-drive`` into Nova's ``instances_path``.
+When incusd itself runs in Podman, the daemon container must receive Nova's
+configured ``instances_path`` at the identical absolute path and read-only.
+For the DevStack default this is:
+
+.. code-block:: ini
+
+   Volume=/opt/stack/data/nova/instances:/opt/stack/data/nova/instances:ro
+
+Without this bind mount, Nova can build the config-drive directory on the
+host but Incus correctly rejects the disk device because its source is not
+visible inside the daemon container.
+
+The modern Nova ``Diagnostics`` object currently restricts its ``driver``
+field to a fixed list that does not include Incus. The driver must not report
+itself as libvirt merely to pass that schema. ``get_instance_diagnostics``
+therefore remains unavailable until Nova accepts an ``incus`` driver value.
+Per-volume I/O usage also remains unavailable until Incus counters can be
+reliably attributed to individual Cinder volume IDs; returning false zeroes
+would corrupt telemetry and billing.
 
 Incus configures the LXC console as an in-memory ring buffer and bounded disk
 log. With Ubuntu Noble liblxc, its ``auto`` value is 128 KiB for each. The

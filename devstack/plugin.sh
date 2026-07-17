@@ -453,7 +453,10 @@ function configure_cinder_ceph_backup {
 
 
 function init_nova_incus {
+    local current_store
+    local expected_store
     local image_file
+    local image_id
     local image_name
 
     echo_summary "Registering the DevStack system-container test image"
@@ -467,8 +470,31 @@ function init_nova_incus {
             -O "${TOP_DIR}/files/${image_file}"
     fi
 
-    if ! openstack --os-cloud=devstack-admin image show "${image_name}" \
-            >/dev/null 2>&1; then
+    expected_store=$(iniget "${GLANCE_API_CONF}" glance_store default_store)
+    image_id=$(openstack --os-cloud=devstack-admin image show "${image_name}" \
+        -f value -c id 2>/dev/null || true)
+    if [[ -n "${image_id}" ]]; then
+        current_store=$(openstack --os-cloud=devstack-admin image show \
+            "${image_id}" -f json |
+            python3 -c 'import json, sys
+data = json.load(sys.stdin)
+url = data.get("properties", {}).get("direct_url", "")
+print(url.partition("://")[0])')
+        if [[ -n "${expected_store}" && "${current_store}" != "${expected_store}" ]]; then
+            echo_summary "Replacing ${image_name}: Glance store changed from ${current_store:-unknown} to ${expected_store}"
+            # A stale image can be impossible to delete after its store
+            # driver has been disabled. Remove the canonical name first so
+            # subsequent name lookup is deterministic, then clean it up on a
+            # best-effort basis.
+            openstack --os-cloud=devstack-admin image set \
+                --name "${image_name}-stale-${image_id}" "${image_id}"
+            openstack --os-cloud=devstack-admin image delete \
+                "${image_id}" || true
+            image_id=
+        fi
+    fi
+
+    if [[ -z "${image_id}" ]]; then
         openstack --os-cloud=devstack-admin \
             --os-region-name="${REGION_NAME}" image create "${image_name}" \
             --public --container-format bare --disk-format raw \

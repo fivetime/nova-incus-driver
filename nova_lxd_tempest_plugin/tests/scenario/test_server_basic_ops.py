@@ -15,6 +15,7 @@
 #    under the License.
 
 from tempest.common import utils
+from tempest.common import waiters
 from tempest import config
 from tempest import exceptions
 from tempest.lib.common.utils import test_utils
@@ -50,9 +51,9 @@ class TestServerBasicOps(manager.ScenarioTest):
 
     def verify_ssh(self, keypair):
         if self.run_ssh:
-            # Obtain a floating IP
-            self.fip = self.create_floating_ip(
-                self.instance)['floating_ip_address']
+            if not getattr(self, 'fip', None):
+                self.fip = self.create_floating_ip(
+                    self.instance)['floating_ip_address']
             # Check ssh
             self.ssh_client = self.get_remote_client(
                 ip_address=self.fip,
@@ -104,6 +105,27 @@ class TestServerBasicOps(manager.ScenarioTest):
             # TODO(clarkb) construct network_data from known network
             # instance info and do direct comparison.
 
+    def verify_lifecycle_actions(self):
+        server_id = self.instance['id']
+
+        self.servers_client.reboot_server(server_id, type='HARD')
+        waiters.wait_for_server_status(
+            self.servers_client, server_id, 'ACTIVE')
+
+        self.servers_client.pause_server(server_id)
+        waiters.wait_for_server_status(
+            self.servers_client, server_id, 'PAUSED')
+        self.servers_client.unpause_server(server_id)
+        waiters.wait_for_server_status(
+            self.servers_client, server_id, 'ACTIVE')
+
+        self.servers_client.stop_server(server_id)
+        waiters.wait_for_server_status(
+            self.servers_client, server_id, 'SHUTOFF')
+        self.servers_client.start_server(server_id)
+        waiters.wait_for_server_status(
+            self.servers_client, server_id, 'ACTIVE')
+
     @decorators.idempotent_id('7fff3fb3-91d8-4fd0-bd7d-0204f1f180ba')
     @decorators.attr(type='smoke')
     @utils.services('compute', 'network')
@@ -124,4 +146,6 @@ class TestServerBasicOps(manager.ScenarioTest):
         self.verify_metadata()
         self.verify_metadata_on_config_drive()
         self.verify_networkdata_on_config_drive()
+        self.verify_lifecycle_actions()
+        self.verify_ssh(keypair)
         self.servers_client.delete_server(self.instance['id'])

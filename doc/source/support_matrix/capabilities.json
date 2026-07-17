@@ -1,0 +1,218 @@
+{
+  "schema_version": 1,
+  "target": {
+    "openstack": "stable/2026.1",
+    "python": "3.12",
+    "incus": "7.x",
+    "instance_type": "system-container"
+  },
+  "status_values": [
+    "framework",
+    "supported",
+    "unverified",
+    "unsupported",
+    "planned"
+  ],
+  "capabilities": [
+    {
+      "id": "server-lifecycle",
+      "owner": "nova+driver",
+      "driver_hooks": ["spawn", "destroy", "power_on", "power_off", "reboot"],
+      "applicability": "container",
+      "status": "supported",
+      "evidence": "tools/openstack-incus-e2e.sh"
+    },
+    {
+      "id": "server-show-list-events-tags-metadata",
+      "owner": "nova",
+      "driver_hooks": ["get_info", "list_instance_uuids"],
+      "applicability": "container",
+      "status": "framework",
+      "evidence": "Nova API and ComputeManager"
+    },
+    {
+      "id": "scheduling-quotas-aggregates-az-server-groups",
+      "owner": "nova+placement",
+      "driver_hooks": ["update_provider_tree", "get_available_resource"],
+      "applicability": "container",
+      "status": "framework",
+      "evidence": "tools/openstack-incus-fleet-preflight.sh"
+    },
+    {
+      "id": "neutron-ovn-networking",
+      "owner": "neutron+nova+driver",
+      "driver_hooks": ["plug_vifs", "unplug_vifs"],
+      "applicability": "container",
+      "status": "supported",
+      "evidence": "tools/openstack-incus-e2e.sh"
+    },
+    {
+      "id": "interface-hotplug",
+      "owner": "neutron+nova+driver",
+      "driver_hooks": ["attach_interface", "detach_interface"],
+      "applicability": "container",
+      "status": "supported",
+      "evidence": "tools/openstack-incus-interface-e2e.sh"
+    },
+    {
+      "id": "tagged-interface",
+      "owner": "nova+driver",
+      "driver_hooks": ["attach_interface"],
+      "applicability": "container",
+      "status": "unsupported",
+      "evidence": "supports_tagged_attach_interface=false"
+    },
+    {
+      "id": "cinder-data-volume",
+      "owner": "cinder+nova+driver",
+      "driver_hooks": ["attach_volume", "detach_volume", "swap_volume", "extend_volume"],
+      "applicability": "container",
+      "status": "supported",
+      "evidence": "nova_lxd_tempest_plugin.tests.scenario.test_volume_ops"
+    },
+    {
+      "id": "cinder-bfv",
+      "owner": "cinder+nova+driver+incus-fork",
+      "driver_hooks": ["spawn", "destroy"],
+      "applicability": "container",
+      "status": "supported",
+      "evidence": "tools/openstack-incus-bfv-migration-e2e.sh"
+    },
+    {
+      "id": "encrypted-readonly-multiattach-volume",
+      "owner": "cinder+nova+driver",
+      "driver_hooks": ["attach_volume"],
+      "applicability": "product-policy",
+      "status": "unsupported",
+      "evidence": "driver validation and supports_multiattach=false"
+    },
+    {
+      "id": "snapshot-to-glance",
+      "owner": "nova+glance+driver",
+      "driver_hooks": ["snapshot"],
+      "applicability": "container",
+      "status": "supported",
+      "evidence": "tools/openstack-incus-snapshot-e2e.sh"
+    },
+    {
+      "id": "rebuild",
+      "owner": "nova+driver",
+      "driver_hooks": ["destroy", "spawn"],
+      "applicability": "container",
+      "status": "supported",
+      "evidence": "Nova _rebuild_default_impl and tools/openstack-incus-e2e.sh"
+    },
+    {
+      "id": "shelve-unshelve",
+      "owner": "nova+glance+driver",
+      "driver_hooks": ["snapshot", "destroy", "spawn"],
+      "applicability": "container",
+      "status": "unverified",
+      "evidence": "No current three-node public API E2E"
+    },
+    {
+      "id": "pause-unpause",
+      "owner": "nova+driver",
+      "driver_hooks": ["pause", "unpause"],
+      "applicability": "container",
+      "status": "unverified",
+      "evidence": "Unit tests only"
+    },
+    {
+      "id": "suspend-resume",
+      "owner": "nova+driver",
+      "driver_hooks": ["suspend", "resume"],
+      "applicability": "requires-memory-checkpoint",
+      "status": "unsupported",
+      "evidence": "Incus freeze does not release instance memory"
+    },
+    {
+      "id": "cold-migrate-resize",
+      "owner": "nova+driver+incus-fork",
+      "driver_hooks": ["migrate_disk_and_power_off", "finish_migration", "confirm_migration", "finish_revert_migration"],
+      "applicability": "container",
+      "status": "supported",
+      "evidence": "tools/openstack-incus-bfv-migration-e2e.sh"
+    },
+    {
+      "id": "live-migration",
+      "owner": "nova+driver",
+      "driver_hooks": ["check_can_live_migrate_destination", "check_can_live_migrate_source", "live_migration"],
+      "applicability": "workload-dependent-criu",
+      "status": "unsupported",
+      "evidence": "Explicit MigrationPreCheckError"
+    },
+    {
+      "id": "evacuate-bfv",
+      "owner": "nova+cinder+neutron+driver+incus-fork",
+      "driver_hooks": ["spawn"],
+      "applicability": "shared-ceph-bfv-only",
+      "status": "planned",
+      "evidence": "Requires fencing and source-host-down E2E"
+    },
+    {
+      "id": "evacuate-local-root",
+      "owner": "nova+driver",
+      "driver_hooks": ["spawn"],
+      "applicability": "local-root",
+      "status": "unsupported",
+      "evidence": "Root data is unavailable when the source host is down"
+    },
+    {
+      "id": "console-log",
+      "owner": "nova+driver",
+      "driver_hooks": ["get_console_output"],
+      "applicability": "container",
+      "status": "supported",
+      "evidence": "Bounded to MAX_CONSOLE_BYTES"
+    },
+    {
+      "id": "graphical-console",
+      "owner": "nova+driver",
+      "driver_hooks": ["get_vnc_console", "get_spice_console", "get_mks_console"],
+      "applicability": "vm-only",
+      "status": "unsupported",
+      "evidence": "Not applicable to system containers"
+    },
+    {
+      "id": "diagnostics-telemetry",
+      "owner": "nova+driver",
+      "driver_hooks": ["get_instance_diagnostics", "block_stats", "get_all_volume_usage"],
+      "applicability": "container",
+      "status": "planned",
+      "evidence": "Nova Diagnostics rejects an incus driver enum; per-volume Incus I/O counters are not yet attributable to Cinder volume IDs"
+    },
+    {
+      "id": "config-drive-metadata-keypair-userdata",
+      "owner": "nova+driver+guest-image",
+      "driver_hooks": ["spawn"],
+      "applicability": "container",
+      "status": "unverified",
+      "evidence": "Public API reached ACTIVE with config_drive=True after a read-only instances_path bind; guest SSH validation remains open"
+    },
+    {
+      "id": "rescue-unrescue",
+      "owner": "nova+driver",
+      "driver_hooks": ["rescue", "unrescue"],
+      "applicability": "requires-storage-native-root-attachment",
+      "status": "unsupported",
+      "evidence": "Explicit NotImplementedError"
+    },
+    {
+      "id": "guest-kernel-crash-dump",
+      "owner": "driver",
+      "driver_hooks": ["trigger_crash_dump"],
+      "applicability": "unsafe-shared-host-kernel",
+      "status": "unsupported",
+      "evidence": "System containers share the host kernel"
+    },
+    {
+      "id": "vm-firmware-vtpm-secure-boot-pci-numa-accelerators",
+      "owner": "nova+driver",
+      "driver_hooks": [],
+      "applicability": "vm-only",
+      "status": "unsupported",
+      "evidence": "Not applicable to the system-container-only product"
+    }
+  ]
+}

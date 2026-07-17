@@ -2509,9 +2509,7 @@ class LXDDriverTest(test.NoDBTestCase):
         self.client.instances.get.assert_called_once_with(instance.name)
         container.unfreeze.assert_called_once_with(wait=True)
 
-    def test_suspend(self):
-        container = mock.Mock()
-        self.client.instances.get.return_value = container
+    def test_suspend_is_rejected_without_memory_checkpoint(self):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
@@ -2519,14 +2517,11 @@ class LXDDriverTest(test.NoDBTestCase):
         lxd_driver = driver.LXDDriver(None)
         lxd_driver.init_host(None)
 
-        lxd_driver.suspend(ctx, instance)
+        self.assertRaises(
+            NotImplementedError, lxd_driver.suspend, ctx, instance)
+        self.client.instances.get.assert_not_called()
 
-        self.client.instances.get.assert_called_once_with(instance.name)
-        container.freeze.assert_called_once_with(wait=True)
-
-    def test_resume(self):
-        container = mock.Mock()
-        self.client.instances.get.return_value = container
+    def test_resume_is_rejected_without_memory_checkpoint(self):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
@@ -2534,10 +2529,10 @@ class LXDDriverTest(test.NoDBTestCase):
         lxd_driver = driver.LXDDriver(None)
         lxd_driver.init_host(None)
 
-        lxd_driver.resume(ctx, instance, None, None)
-
-        self.client.instances.get.assert_called_once_with(instance.name)
-        container.unfreeze.assert_called_once_with(wait=True)
+        self.assertRaises(
+            NotImplementedError, lxd_driver.resume,
+            ctx, instance, None, None)
+        self.client.instances.get.assert_not_called()
 
     def test_resume_state_on_host_boot(self):
         container = mock.Mock()

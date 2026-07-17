@@ -1692,21 +1692,15 @@ class LXDDriver(driver.ComputeDriver):
         container.unfreeze(wait=True)
 
     def suspend(self, context, instance):
-        """Suspend container.
-
-        See `nova.virt.driver.ComputeDriver.suspend` for more
-        information.
-        """
-        self.pause(instance)
+        raise NotImplementedError(
+            'Incus freeze does not satisfy Nova suspend semantics because '
+            'it does not release instance memory')
 
     def resume(self, context, instance, network_info, block_device_info=None,
                share_info=None):
-        """Resume container.
-
-        See `nova.virt.driver.ComputeDriver.resume` for more
-        information.
-        """
-        self.unpause(instance)
+        raise NotImplementedError(
+            'Incus suspend and resume require a reliable container '
+            'checkpoint implementation')
 
     def resume_state_on_host_boot(self, context, instance, network_info,
                                   share_info, block_device_info=None):
