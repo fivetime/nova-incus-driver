@@ -8,6 +8,11 @@ FLAVOR=${FLAVOR:-c1}
 NETWORK=${NETWORK:-private}
 SERVER=${SERVER:-incus-e2e-$RANDOM}
 TIMEOUT=${TIMEOUT:-90}
+INCUS_PROJECT=${INCUS_PROJECT:-nova}
+
+incus_nova() {
+    incus --project "$INCUS_PROJECT" "$@"
+}
 
 wait_status() {
     local expected=$1
@@ -42,14 +47,14 @@ fixed_ip=$(openstack port show "$port_id" -f json -c fixed_ips |
     python3 -c 'import ast,json,sys; value=json.load(sys.stdin)["fixed_ips"]; value=ast.literal_eval(value) if isinstance(value,str) else value; print(value[0]["ip_address"])')
 instance_name=
 while IFS= read -r name; do
-    if [[ "$(incus config get "$name" user.openstack.uuid 2>/dev/null || true)" == "$server_id" ]]; then
+    if [[ "$(incus_nova config get "$name" user.openstack.uuid 2>/dev/null || true)" == "$server_id" ]]; then
         instance_name=$name
         break
     fi
-done < <(incus list --format csv -c n)
+done < <(incus_nova list --format csv -c n)
 [[ -n "$instance_name" ]]
 
-incus exec "$instance_name" -- wget -qO- -T 10 \
+incus_nova exec "$instance_name" -- wget -qO- -T 10 \
     http://169.254.169.254/openstack/latest/meta_data.json |
     python3 -c 'import json,sys; expected=sys.argv[1]; assert json.load(sys.stdin)["uuid"] == expected' "$server_id"
 
@@ -58,7 +63,7 @@ iface=$(ovs-vsctl --data=bare --no-heading --columns=name find Interface \
 [[ -n "$iface" ]]
 [[ "$(ovs-vsctl get Interface "$iface" external_ids:ovn-installed)" == '"true"' ]]
 
-incus exec "$instance_name" -- sh -c \
+incus_nova exec "$instance_name" -- sh -c \
     "printf '%s\n' '$server_id' > /root/openstack-incus-e2e && sync"
 openstack server stop "$SERVER"
 wait_status SHUTOFF
@@ -66,13 +71,13 @@ openstack server start "$SERVER"
 wait_status ACTIVE
 openstack server reboot --hard "$SERVER"
 wait_status ACTIVE
-[[ "$(incus exec "$instance_name" -- cat /root/openstack-incus-e2e)" == "$server_id" ]]
+[[ "$(incus_nova exec "$instance_name" -- cat /root/openstack-incus-e2e)" == "$server_id" ]]
 
 # Rebuild must replace the rootfs while preserving the Neutron attachment.
 openstack server rebuild --image "$IMAGE" "$SERVER" >/dev/null
 wait_status ACTIVE
 [[ "$(openstack port list --server "$server_id" -f value -c ID)" == "$port_id" ]]
-! incus exec "$instance_name" -- test -e /root/openstack-incus-e2e
+! incus_nova exec "$instance_name" -- test -e /root/openstack-incus-e2e
 iface=$(ovs-vsctl --data=bare --no-heading --columns=name find Interface \
     "external_ids:iface-id=$port_id")
 [[ -n "$iface" ]]
@@ -86,7 +91,7 @@ while openstack server show "$server_id" >/dev/null 2>&1; do
     sleep 2
 done
 
-! incus list --format csv -c n | grep -Fxq "$instance_name"
+! incus_nova list --format csv -c n | grep -Fxq "$instance_name"
 ! openstack port show "$port_id" >/dev/null 2>&1
 ! ovs-vsctl --data=bare --no-heading --columns=name find Interface \
     "external_ids:iface-id=$port_id" | grep -q .

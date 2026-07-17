@@ -8,6 +8,8 @@ set +o xtrace
 NOVA_CONF_DIR=${NOVA_CONF_DIR:-/etc/nova}
 NOVA_CONF=${NOVA_CONF:-${NOVA_CONF_DIR}/nova.conf}
 NOVA_INCUS_DIR=${NOVA_INCUS_DIR:-${DEST}/openstack-incus}
+# Retained for compatibility with external DevStack hooks that source this file.
+# shellcheck disable=SC2034
 NOVA_INCUS_PLUGIN_DIR=$(readlink -f "$(dirname "${BASH_SOURCE[0]}")")
 
 GLANCE_CONF_DIR=${GLANCE_CONF_DIR:-/etc/glance}
@@ -64,8 +66,7 @@ function configure_zabbly_incus_repo {
     install_package ca-certificates curl gpg
     curl -fsSL https://pkgs.zabbly.com/key.asc | \
         gpg --dearmor | sudo tee "${keyring}" >/dev/null
-    echo "deb [arch=${arch} signed-by=${keyring}] "\
-"https://pkgs.zabbly.com/incus/stable ${codename} main" | \
+    echo "deb [arch=${arch} signed-by=${keyring}] https://pkgs.zabbly.com/incus/stable ${codename} main" | \
         sudo tee /etc/apt/sources.list.d/zabbly-incus-stable.list >/dev/null
     apt_get_update
 }
@@ -144,6 +145,23 @@ function configure_nova_incus_storage {
             -c features.profiles=false
     fi
 
+    if [[ -n "${INCUS_BFV_POOL_NAME}" ]]; then
+        if ! incus_cli project show \
+                "${INCUS_MIGRATION_PREFLIGHT_PROJECT}" >/dev/null 2>&1; then
+            incus_cli project create "${INCUS_MIGRATION_PREFLIGHT_PROJECT}" \
+                -c features.images=false \
+                -c features.profiles=true
+        fi
+        incus_cli project set "${INCUS_MIGRATION_PREFLIGHT_PROJECT}" \
+            features.profiles=true \
+            restricted=true \
+            limits.containers=0 \
+            limits.virtual-machines=0 \
+            user.openstack.preflight_protocol=1 \
+            "user.openstack.bfv_pool=${INCUS_BFV_POOL_NAME}" \
+            "user.openstack.cinder_rbd_pool=${INCUS_BFV_CEPH_POOL}"
+    fi
+
     if ! incus_cli storage show "${INCUS_POOL_NAME}" >/dev/null 2>&1; then
         storage_args=(
             storage create "${INCUS_POOL_NAME}" "${INCUS_STORAGE_DRIVER}"
@@ -182,8 +200,7 @@ function configure_nova_incus_storage {
                     storage_args+=("source=${INCUS_STORAGE_SOURCE}")
                 else
                     storage_args+=("size=${INCUS_STORAGE_SIZE}")
-                    warn "Creating loop-backed ${INCUS_STORAGE_DRIVER} "\
-"storage for development only"
+                    warn "Creating loop-backed ${INCUS_STORAGE_DRIVER} storage for development only"
                 fi
                 ;;
         esac
@@ -234,61 +251,72 @@ function configure_nova_incus {
             "${Q_ML2_TENANT_NETWORK_TYPE}"
     fi
 
-    # Keep the established import path during the incremental modernization.
-    iniset "${NOVA_CONF}" DEFAULT compute_driver lxd.LXDDriver
-    iniset "${NOVA_CONF}" os_vif_ovs ovsdb_connection \
-        unix:/var/run/openvswitch/db.sock
-    iniset "${NOVA_CONF}" DEFAULT force_config_drive False
-    iniset "${NOVA_CONF}" incus endpoint /var/lib/incus/unix.socket
-    iniset "${NOVA_CONF}" incus project "${INCUS_PROJECT}"
-    iniset "${NOVA_CONF}" incus root_dir /var/lib/incus
-    iniset "${NOVA_CONF}" incus storage_pool "${INCUS_POOL_NAME}"
-    if [[ -n "${INCUS_BFV_POOL_NAME}" ]]; then
-        iniset "${NOVA_CONF}" incus boot_from_volume_storage_pool \
-            "${INCUS_BFV_POOL_NAME}"
+    # DevStack copies NOVA_CONF to NOVA_CPU_CONF before starting nova-compute.
+    # Write both so plugin settings remain correct in every phase and on
+    # repeat stack runs.
+    local nova_target
+    local nova_targets=("${NOVA_CONF}")
+    if [[ -n "${NOVA_CPU_CONF:-}" && "${NOVA_CPU_CONF}" != "${NOVA_CONF}" ]]; then
+        nova_targets+=("${NOVA_CPU_CONF}")
     fi
-    iniset "${NOVA_CONF}" incus default_process_limit \
-        "${INCUS_DEFAULT_PROCESS_LIMIT}"
-    iniset "${NOVA_CONF}" incus maximum_process_limit \
-        "${INCUS_MAXIMUM_PROCESS_LIMIT}"
-    iniset "${NOVA_CONF}" incus volume_use_multipath \
-        "${INCUS_VOLUME_USE_MULTIPATH}"
-    iniset "${NOVA_CONF}" incus volume_enforce_multipath \
-        "${INCUS_VOLUME_ENFORCE_MULTIPATH}"
-    iniset "${NOVA_CONF}" incus num_volume_scan_tries \
-        "${INCUS_NUM_VOLUME_SCAN_TRIES}"
-    iniset "${NOVA_CONF}" incus allow_cold_migration \
-        "${INCUS_ALLOW_COLD_MIGRATION}"
-    iniset "${NOVA_CONF}" incus migration_auto_recovery \
-        "${INCUS_MIGRATION_AUTO_RECOVERY}"
-    iniset "${NOVA_CONF}" incus migration_recovery_interval \
-        "${INCUS_MIGRATION_RECOVERY_INTERVAL}"
-    if [[ -n "${INCUS_MIGRATION_ADDRESS}" ]]; then
-        iniset "${NOVA_CONF}" incus migration_address \
-            "${INCUS_MIGRATION_ADDRESS}"
-    fi
-    if [[ -n "${INCUS_MIGRATION_PREFLIGHT_TLS_CERT}" ]]; then
-        iniset "${NOVA_CONF}" incus migration_preflight_tls_cert \
-            "${INCUS_MIGRATION_PREFLIGHT_TLS_CERT}"
-    fi
-    if [[ -n "${INCUS_MIGRATION_PREFLIGHT_TLS_KEY}" ]]; then
-        iniset "${NOVA_CONF}" incus migration_preflight_tls_key \
-            "${INCUS_MIGRATION_PREFLIGHT_TLS_KEY}"
-    fi
-    if [[ -n "${INCUS_MIGRATION_PREFLIGHT_TLS_CA}" ]]; then
-        iniset "${NOVA_CONF}" incus migration_preflight_tls_ca \
-            "${INCUS_MIGRATION_PREFLIGHT_TLS_CA}"
-    fi
-    iniset "${NOVA_CONF}" incus migration_preflight_project \
-        "${INCUS_MIGRATION_PREFLIGHT_PROJECT}"
-    if [[ -n "${INCUS_MIGRATION_PREFLIGHT_SERVER_NAMES}" ]]; then
-        iniset "${NOVA_CONF}" incus migration_preflight_server_names \
-            "${INCUS_MIGRATION_PREFLIGHT_SERVER_NAMES}"
-    fi
-    if [[ -n "${INCUS_MIGRATION_PREFLIGHT_TLS_CA_BY_SERVER}" ]]; then
-        iniset "${NOVA_CONF}" incus migration_preflight_tls_ca_by_server \
-            "${INCUS_MIGRATION_PREFLIGHT_TLS_CA_BY_SERVER}"
-    fi
+
+    for nova_target in "${nova_targets[@]}"; do
+        # Keep the established import path during incremental modernization.
+        iniset "${nova_target}" DEFAULT compute_driver lxd.LXDDriver
+        iniset "${nova_target}" os_vif_ovs ovsdb_connection \
+            unix:/var/run/openvswitch/db.sock
+        iniset "${nova_target}" DEFAULT force_config_drive False
+        iniset "${nova_target}" incus endpoint /var/lib/incus/unix.socket
+        iniset "${nova_target}" incus project "${INCUS_PROJECT}"
+        iniset "${nova_target}" incus root_dir /var/lib/incus
+        iniset "${nova_target}" incus storage_pool "${INCUS_POOL_NAME}"
+        if [[ -n "${INCUS_BFV_POOL_NAME}" ]]; then
+            iniset "${nova_target}" incus boot_from_volume_storage_pool \
+                "${INCUS_BFV_POOL_NAME}"
+        fi
+        iniset "${nova_target}" incus default_process_limit \
+            "${INCUS_DEFAULT_PROCESS_LIMIT}"
+        iniset "${nova_target}" incus maximum_process_limit \
+            "${INCUS_MAXIMUM_PROCESS_LIMIT}"
+        iniset "${nova_target}" incus volume_use_multipath \
+            "${INCUS_VOLUME_USE_MULTIPATH}"
+        iniset "${nova_target}" incus volume_enforce_multipath \
+            "${INCUS_VOLUME_ENFORCE_MULTIPATH}"
+        iniset "${nova_target}" incus num_volume_scan_tries \
+            "${INCUS_NUM_VOLUME_SCAN_TRIES}"
+        iniset "${nova_target}" incus allow_cold_migration \
+            "${INCUS_ALLOW_COLD_MIGRATION}"
+        iniset "${nova_target}" incus migration_auto_recovery \
+            "${INCUS_MIGRATION_AUTO_RECOVERY}"
+        iniset "${nova_target}" incus migration_recovery_interval \
+            "${INCUS_MIGRATION_RECOVERY_INTERVAL}"
+        if [[ -n "${INCUS_MIGRATION_ADDRESS}" ]]; then
+            iniset "${nova_target}" incus migration_address \
+                "${INCUS_MIGRATION_ADDRESS}"
+        fi
+        if [[ -n "${INCUS_MIGRATION_PREFLIGHT_TLS_CERT}" ]]; then
+            iniset "${nova_target}" incus migration_preflight_tls_cert \
+                "${INCUS_MIGRATION_PREFLIGHT_TLS_CERT}"
+        fi
+        if [[ -n "${INCUS_MIGRATION_PREFLIGHT_TLS_KEY}" ]]; then
+            iniset "${nova_target}" incus migration_preflight_tls_key \
+                "${INCUS_MIGRATION_PREFLIGHT_TLS_KEY}"
+        fi
+        if [[ -n "${INCUS_MIGRATION_PREFLIGHT_TLS_CA}" ]]; then
+            iniset "${nova_target}" incus migration_preflight_tls_ca \
+                "${INCUS_MIGRATION_PREFLIGHT_TLS_CA}"
+        fi
+        iniset "${nova_target}" incus migration_preflight_project \
+            "${INCUS_MIGRATION_PREFLIGHT_PROJECT}"
+        if [[ -n "${INCUS_MIGRATION_PREFLIGHT_SERVER_NAMES}" ]]; then
+            iniset "${nova_target}" incus migration_preflight_server_names \
+                "${INCUS_MIGRATION_PREFLIGHT_SERVER_NAMES}"
+        fi
+        if [[ -n "${INCUS_MIGRATION_PREFLIGHT_TLS_CA_BY_SERVER}" ]]; then
+            iniset "${nova_target}" incus migration_preflight_tls_ca_by_server \
+                "${INCUS_MIGRATION_PREFLIGHT_TLS_CA_BY_SERVER}"
+        fi
+    done
 
     if is_service_enabled glance; then
         iniset "${GLANCE_API_CONF}" DEFAULT disk_formats \

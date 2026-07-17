@@ -6,7 +6,9 @@ set -euo pipefail
 IMAGE=${IMAGE:?Set IMAGE to a raw rootfs-directory Glance image}
 FLAVOR=${FLAVOR:-m1.small}
 NETWORK=${NETWORK:-private}
+INCUS_PROJECT=${INCUS_PROJECT:-nova}
 VOLUME_SIZE=${VOLUME_SIZE:-2}
+VOLUME_TYPE=${VOLUME_TYPE:-ceph}
 SOURCE_HOST=${SOURCE_HOST:-incus-node-01}
 DEST_HOST=${DEST_HOST:-incus-node-02}
 SOURCE_SSH=${SOURCE_SSH:-root@10.224.0.16}
@@ -54,7 +56,12 @@ incus() {
     shift
     local command_line
     printf -v command_line '%q ' "$@"
-    remote "$host" "podman exec incus incus $command_line"
+    if [[ "${1:-}" == query ]]; then
+        remote "$host" "podman exec incus incus $command_line"
+    else
+        remote "$host" \
+            "podman exec incus incus --project $(printf '%q' "$INCUS_PROJECT") $command_line"
+    fi
 }
 
 fail() {
@@ -196,8 +203,9 @@ cleanup() {
             "data_volume=$data_volume_id" >&2
         return
     fi
-    [[ -n "$server_id" ]] && \
+    if [[ -n "$server_id" ]]; then
         openstack server delete --wait "$server_id" >/dev/null 2>&1 || true
+    fi
     if [[ -n "$volume_id" ]]; then
         wait_value available volume_status >/dev/null 2>&1 || true
         openstack volume delete "$volume_id" >/dev/null 2>&1 || true
@@ -225,8 +233,8 @@ for host in "$SOURCE_SSH" "$DEST_SSH"; do
         fail "$host cinder-bfv pool is not cephext"
 done
 
-volume_id=$(openstack volume create --image "$IMAGE" --size "$VOLUME_SIZE" \
-    --bootable -f value -c id "${NAME}-root")
+volume_id=$(openstack volume create --type "$VOLUME_TYPE" --image "$IMAGE" \
+    --size "$VOLUME_SIZE" --bootable -f value -c id "${NAME}-root")
 wait_value available volume_status
 
 server_id=$(openstack --os-compute-api-version 2.74 server create \
@@ -237,7 +245,7 @@ instance_name=$(openstack server show "$server_id" -f value \
     -c OS-EXT-SRV-ATTR:instance_name)
 port_id=$(openstack port list --server "$server_id" -f value -c ID)
 if [[ "$TEST_DATA_VOLUME_RECOVERY" == true ]]; then
-    data_volume_id=$(openstack volume create --size 1 \
+    data_volume_id=$(openstack volume create --type "$VOLUME_TYPE" --size 1 \
         -f value -c id "${NAME}-data")
     wait_value available openstack volume show "$data_volume_id" \
         -f value -c status

@@ -13,29 +13,17 @@ digest/revision pair.
 
 ## Dedicated test topology
 
-- `root@10.224.0.16` (`incus-node-01`) is the current DevStack controller and
-  first Incus compute node. It currently runs Ubuntu 26.04 and Python 3.14.
-  The already-running DevStack nova-compute remains registered under its old
-  startup-time host name `ubuntu`; reconcile that record when deploying the
-  multinode topology rather than restarting it blindly.
+- `root@10.224.0.21` (`incus-node-01`) is the DevStack controller and first
+  Incus compute node. It runs Ubuntu Noble 24.04 and Python 3.12.
 - `root@10.224.0.17` (`incus-node-02`) is the second Incus compute node. It
-  runs Ubuntu 24.04, has 16 CPUs, 31 GiB RAM, and one 400 GB system disk.
-- `root@10.224.0.18` (`linstor-node-03`) runs the LINSTOR controller and a
-  diskful satellite. It runs Ubuntu 26.04 with kernel 7.0, has 16 CPUs,
-  30 GiB RAM, a 200 GB system disk, and a dedicated 1 TiB `/dev/vdb`.
+  runs Ubuntu Noble 24.04 and Python 3.12.
+- `root@10.224.0.22` (`incus-node-03`) is the third Incus compute node. It
+  runs Ubuntu Noble 24.04 and Python 3.12.
 - Stable hostnames and `/etc/hosts` self-resolution are configured on all
   three nodes as shown above.
-- `.16` and `.18` currently run Ubuntu 26.04 with system Python 3.14; `.17`
-  runs Ubuntu Noble 24.04 with Python 3.12. The three-node topology therefore
-  proves mixed-version compatibility, not the required three-node target
-  baseline. Unit tests on `.16` use an isolated Python 3.12 environment, but
-  that does not replace full Noble host validation. Production release remains
-  blocked until the complete multi-node suite passes on Noble/Python 3.12
-  computes.
-- `.16` uses `incus-ceph` backed by `incus-rootfs-rbd-pool` and `.17` uses
-  `incus-ceph-node02` backed by `incus-rootfs-node02-rbd-pool`; Nova points to
-  the corresponding local definition. Each pool has a distinct least-privilege
-  CephX client.
+- All three nodes run independent, non-clustered Incus 7.2 daemons and expose
+  migration HTTPS only on their management address. Nova, Placement and
+  Neutron/OVN own placement and tenant networking.
 - Remote unit-test runs must set `INCUS_SDK_PATH=/opt/incus-python-sdk-src`
   (the synchronized SDK path); the default sibling path remains correct for
   local checkouts.
@@ -70,29 +58,33 @@ digest/revision pair.
 ### Approved image and preflight evidence
 
 - The approved test image is
-  `ghcr.io/fivetime/incus@sha256:25b9975c9d3524bdf75c90f2fc499ceea591f82cc06b67073c92aed92ba9f025`,
+  `ghcr.io/fivetime/incus@sha256:cc8b71093395ca89d4d5d885b84e861d75dcb2de38d7220e68f1cdee239bd72d`,
   built from Incus fork revision
-  `0f5cc4c41f0da3973a9d220d10b0f0f8daadda19`. Treat both values as release
+  `5adcaca1ad383362bb824a15845ecd4a85f24ba5`. Treat both values as release
   evidence, not permanent configuration; each release must approve a new
   digest/revision pair and run both production preflight scripts.
-- On 2026-07-17 `.17` passed every `tools/openstack-incus-production-preflight.sh`
-  check using image manifest digest
-  `sha256:25b9975c9d3524bdf75c90f2fc499ceea591f82cc06b67073c92aed92ba9f025`
-  from fork revision `0f5cc4c41f0da3973a9d220d10b0f0f8daadda19`.
-- All three test Quadlets now use that immutable digest and bind Incus HTTPS
-  only to their `10.224.0.x` management address. Migration client keys are
-  `stack:stack 0600`; every trusted client is restricted to the zero-instance
-  `nova-preflight` project. The complete BFV E2E passed after these changes.
+- On 2026-07-17 all three Noble nodes passed every
+  `tools/openstack-incus-production-preflight.sh` check using that digest and
+  revision. The image includes the minimal `aa-exec`, so the result does not
+  depend on a runtime container hotfix.
+- All three Quadlets use the immutable digest and bind Incus HTTPS only to
+  their management address. The migration client key is
+  `root:incus-admin 0640`; every trusted client is restricted to the
+  zero-instance `nova-preflight` project.
 - `tools/openstack-incus-fleet-preflight.sh` passed all cross-node driver,
   Nova, Placement, OVN, Cinder, migration-address, image, and Incus capability
-  checks on 2026-07-17. Its only failures were the documented Ubuntu/Python
-  baseline mismatches on `.16` and `.18`.
+  checks on 2026-07-17 across `.21`, `.17`, and `.22`. Driver hashes were
+  identical and all three nova-compute and OVN controller services were
+  enabled and up.
+- After the immutable-image rollout, the complete BFV E2E passed between
+  `.21` and `.17`: rejected destination preflight, shared-Ceph zero-copy
+  migration, confirm, hard-reboot recovery, reverse migration, revert, data
+  volume cleanup, and final resource cleanup.
 
 ## Baseline and unit tests
 
-- The target-baseline gate last passed on 2026-07-17 on `.17` with Python
-  3.12: `tox -e py312` ran 161 tests (159 passed, 2 intentional legacy skips,
-  0 failed), and `tox -e pep8` passed.
+- The target-baseline gate last passed on 2026-07-17 on `.21` with Python
+  3.12: `tox -e py312` and `tox -e pep8` both completed with exit code 0.
 
 ## Root-disk QoS (data volumes)
 

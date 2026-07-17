@@ -72,6 +72,15 @@ for command_name in podman jq findmnt crudini; do
     check_command "$command_name"
 done
 
+for container_command in aa-exec apparmor_parser ceph incus incusd lxcfs rbd; do
+    if podman exec "$INCUS_CONTAINER" sh -c \
+            "command -v '$container_command'" >/dev/null 2>&1; then
+        pass "container:$container_command"
+    else
+        fail "container:$container_command" "not installed in Incus image"
+    fi
+done
+
 # shellcheck disable=SC1091
 source /etc/os-release
 check_equal "operating system" Ubuntu "${NAME:-}"
@@ -211,6 +220,19 @@ done
 project_restricted=$(jq -r \
     '(.metadata.config // .config).restricted // empty' <<<"$project_json")
 check_equal "preflight project restricted" true "$project_restricted"
+check_equal "preflight protocol" 1 \
+    "$(jq -r '(.metadata.config // .config)
+        ["user.openstack.preflight_protocol"] // empty' <<<"$project_json")"
+check_equal "preflight BFV pool" "$BFV_POOL" \
+    "$(jq -r '(.metadata.config // .config)
+        ["user.openstack.bfv_pool"] // empty' <<<"$project_json")"
+preflight_cinder_pool=$(jq -r '(.metadata.config // .config)
+    ["user.openstack.cinder_rbd_pool"] // empty' <<<"$project_json")
+if [[ -n "$preflight_cinder_pool" ]]; then
+    pass "preflight Cinder RBD pool" "$preflight_cinder_pool"
+else
+    fail "preflight Cinder RBD pool" "missing"
+fi
 
 pool_json=$(podman exec "$INCUS_CONTAINER" incus query \
     "/1.0/storage-pools/$BFV_POOL" 2>/dev/null)
@@ -252,13 +274,22 @@ else
 fi
 
 compute_user=$(systemctl show "$NOVA_SERVICE" -p User --value 2>/dev/null)
+compute_group=$(systemctl show "$NOVA_SERVICE" -p Group --value 2>/dev/null)
 preflight_key=$(crudini --get "$NOVA_CONFIG" incus \
     migration_preflight_tls_key 2>/dev/null)
 if [[ -n "$preflight_key" && -f "$preflight_key" ]]; then
     key_owner=$(stat -c '%U' "$preflight_key")
+    key_group=$(stat -c '%G' "$preflight_key")
     key_mode=$(stat -c '%a' "$preflight_key")
-    check_equal "migration TLS key owner" "$compute_user" "$key_owner"
-    check_equal "migration TLS key mode" 600 "$key_mode"
+    if [[ "$key_owner" == "$compute_user" && "$key_mode" == 600 ]] ||
+            [[ "$key_owner" == root && "$key_group" == "$compute_group" &&
+              "$key_mode" == 640 ]]; then
+        pass "migration TLS private key" \
+            "$key_owner:$key_group mode=$key_mode"
+    else
+        fail "migration TLS private key" \
+            "expected $compute_user:* 600 or root:$compute_group 640; actual=$key_owner:$key_group $key_mode"
+    fi
 else
     fail "migration TLS private key" "not configured or missing"
 fi
