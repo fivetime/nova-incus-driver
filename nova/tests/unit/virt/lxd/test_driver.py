@@ -219,6 +219,55 @@ class LXDDriverTest(test.NoDBTestCase):
         self.assertTrue(capabilities['supports_extend_volume'])
         self.assertFalse(capabilities['supports_multiattach'])
 
+    def test_capabilities_enable_bfv_evacuate_per_driver(self):
+        self.CONF.incus.allow_bfv_evacuate = True
+
+        lxd_driver = driver.LXDDriver(None)
+
+        self.assertTrue(lxd_driver.capabilities['supports_evacuate'])
+        self.assertFalse(driver.LXDDriver.capabilities['supports_evacuate'])
+
+    def test_rebuild_non_evacuate_delegates_to_nova(self):
+        lxd_driver = driver.LXDDriver(None)
+
+        self.assertRaises(
+            NotImplementedError, lxd_driver.rebuild,
+            None, mock.Mock(), mock.Mock(), [], None, {}, [], mock.Mock(),
+            mock.Mock())
+
+    def test_rebuild_evacuate_disabled(self):
+        lxd_driver = driver.LXDDriver(None)
+
+        self.assertRaises(
+            exception.InstanceEvacuateNotSupported, lxd_driver.rebuild,
+            None, mock.Mock(), mock.Mock(), [], None, {}, [], mock.Mock(),
+            mock.Mock(), evacuate=True, block_device_info={})
+
+    def test_rebuild_evacuate_rejects_local_root(self):
+        self.CONF.incus.allow_bfv_evacuate = True
+        lxd_driver = driver.LXDDriver(None)
+
+        self.assertRaises(
+            exception.InstanceEvacuateNotSupported, lxd_driver.rebuild,
+            None, mock.Mock(), mock.Mock(), [], None, {}, [], mock.Mock(),
+            mock.Mock(), evacuate=True, block_device_info={})
+
+    @mock.patch.object(driver, '_require_bfv_migration_support')
+    def test_rebuild_bfv_evacuate_delegates_to_nova(self, require_support):
+        self.CONF.incus.allow_bfv_evacuate = True
+        root_bdm = {'boot_index': 0, 'connection_info': {}}
+        block_device_info = {'block_device_mapping': [root_bdm]}
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.client = self.client
+
+        self.assertRaises(
+            NotImplementedError, lxd_driver.rebuild,
+            None, mock.Mock(), mock.Mock(), [], None, {}, [], mock.Mock(),
+            mock.Mock(), evacuate=True,
+            block_device_info=block_device_info)
+
+        require_support.assert_called_once_with(self.client, root_bdm)
+
     def test_overrides_match_compute_driver_call_signatures(self):
         def call_signature(method):
             return [

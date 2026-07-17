@@ -147,6 +147,16 @@ incus_opts = [
             "release tests pass on every production compute pair."
         ),
     ),
+    cfg.BoolOpt(
+        "allow_bfv_evacuate",
+        default=False,
+        help=(
+            "Allow Nova evacuation only for instances whose root disk is a "
+            "Cinder RBD volume claimed through a cephext storage pool. The "
+            "operator must provide external fencing that proves the source "
+            "compute cannot access the volume before evacuation starts."
+        ),
+    ),
     cfg.StrOpt(
         "migration_address",
         default=None,

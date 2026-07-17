@@ -93,6 +93,13 @@ implementing changes.
   host-rootfs bind mount; a future rescue design must attach the retained
   Incus-managed root volume through storage-pool-native APIs and work with the
   production Ceph RBD rootfs backend.
+- Failed-host evacuation is an operator-gated BFV-only capability. Keep
+  ``[incus] allow_bfv_evacuate`` disabled unless an external STONITH or power
+  fencing system proves the source host cannot access Ceph before Nova starts
+  evacuation. Nova's service-down test is not fencing. The destination has no
+  host-local Incus record before spawn, so shared Ceph must not be represented
+  by returning true from ``instance_on_disk``. Local/image-backed pet roots
+  must always reject evacuation because their data is unavailable.
 
 ## Modernization Policy
 

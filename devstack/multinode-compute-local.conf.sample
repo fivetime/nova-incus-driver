@@ -61,6 +61,7 @@ INCUS_MAXIMUM_PROCESS_LIMIT=65536
 # Enable only after configuring an Incus HTTPS listener reachable exclusively
 # by the compute network. Production migration requires the Ceph pool above.
 INCUS_ALLOW_COLD_MIGRATION=False
+INCUS_ALLOW_BFV_EVACUATE=False
 # INCUS_MIGRATION_ADDRESS=https://$HOST_IP:8443
 # BFV production-style preflight requires a restricted TLS identity trusted by
 # every destination and exact server-certificate verification.

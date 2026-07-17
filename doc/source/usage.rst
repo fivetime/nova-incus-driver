@@ -671,7 +671,21 @@ The script verifies bidirectional migration API reachability, rootfs marker
 preservation, fixed-IP retention, confirm source deletion, revert source
 recovery, and final Incus, Neutron port, and OVS interface cleanup.
 
-Live migration and evacuation from a failed source host are not supported.
+Live migration is not supported. BFV evacuation is experimental and disabled
+by default. Enable it only after integrating an external STONITH or power
+fencing system that proves the failed source cannot access Ceph::
+
+    [incus]
+    allow_bfv_evacuate = true
+
+Nova's service-down check is only a soft prerequisite and is not fencing.
+Evacuation accepts exactly one ``boot_index=0`` Cinder RBD root, validates the
+destination ``cephext`` pool and Incus handover extensions, then delegates
+Placement, Cinder attachment, Neutron rebinding, and spawn to Nova's default
+rebuild workflow. Local/image-backed roots are rejected to preserve pet data.
+Shared Ceph does not make ``instance_on_disk`` true on a destination whose
+host-local Incus database has no instance record.
+
 Rescue and unrescue are also disabled. The legacy implementation depended on
 binding a directory from the compute host into a rescue container, which is
 not valid for an Incus-managed Ceph or LVM root volume and violates the host

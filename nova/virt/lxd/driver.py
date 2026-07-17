@@ -732,6 +732,11 @@ class LXDDriver(driver.ComputeDriver):
     def __init__(self, virtapi):
         super(LXDDriver, self).__init__(virtapi)
 
+        # Capabilities are consumed per compute service. Never mutate the
+        # class dictionary when applying a host-local operator policy.
+        self.capabilities = dict(type(self).capabilities)
+        self.capabilities['supports_evacuate'] = (
+            CONF.incus.allow_bfv_evacuate)
         self.client = None  # Initialized by init_host
         self.host = NOVA_CONF.host
         self.network_api = neutron.API()
@@ -806,6 +811,29 @@ class LXDDriver(driver.ComputeDriver):
             if instance_uuid:
                 uuids.append(instance_uuid)
         return uuids
+
+    def rebuild(self, context, instance, image_meta, injected_files,
+                admin_password, allocations, bdms, detach_block_devices,
+                attach_block_devices, network_info=None,
+                evacuate=False, block_device_info=None,
+                preserve_ephemeral=False, accel_uuids=None,
+                reimage_boot_volume=False):
+        """Gate evacuation, then delegate orchestration to Nova's fallback."""
+        if not evacuate:
+            raise NotImplementedError()
+        if not CONF.incus.allow_bfv_evacuate:
+            raise exception.InstanceEvacuateNotSupported()
+
+        root_bdm = _boot_from_volume(block_device_info)
+        if root_bdm is None:
+            raise exception.InstanceEvacuateNotSupported()
+
+        _require_bfv_migration_support(self.client, root_bdm)
+
+        # ComputeManager catches this and executes _rebuild_default_impl,
+        # which owns the Placement, Cinder attachment, Neutron and spawn
+        # transaction. The driver must not duplicate that framework logic.
+        raise NotImplementedError()
 
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, allocations, network_info=None,

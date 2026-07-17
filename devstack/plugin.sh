@@ -286,6 +286,8 @@ function configure_nova_incus {
             "${INCUS_NUM_VOLUME_SCAN_TRIES}"
         iniset "${nova_target}" incus allow_cold_migration \
             "${INCUS_ALLOW_COLD_MIGRATION}"
+        iniset "${nova_target}" incus allow_bfv_evacuate \
+            "${INCUS_ALLOW_BFV_EVACUATE}"
         iniset "${nova_target}" incus migration_auto_recovery \
             "${INCUS_MIGRATION_AUTO_RECOVERY}"
         iniset "${nova_target}" incus migration_recovery_interval \

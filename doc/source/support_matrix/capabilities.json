@@ -145,15 +145,15 @@
     {
       "id": "evacuate-bfv",
       "owner": "nova+cinder+neutron+driver+incus-fork",
-      "driver_hooks": ["spawn"],
+      "driver_hooks": ["rebuild", "spawn"],
       "applicability": "shared-ceph-bfv-only",
-      "status": "planned",
-      "evidence": "Requires fencing and source-host-down E2E"
+      "status": "experimental",
+      "evidence": "Default-off BFV gate and unit contract; external fencing and source-host-down E2E required"
     },
     {
       "id": "evacuate-local-root",
       "owner": "nova+driver",
-      "driver_hooks": ["spawn"],
+      "driver_hooks": ["rebuild"],
       "applicability": "local-root",
       "status": "unsupported",
       "evidence": "Root data is unavailable when the source host is down"
