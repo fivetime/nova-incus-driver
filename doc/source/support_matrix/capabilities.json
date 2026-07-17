@@ -181,7 +181,7 @@
       "driver_hooks": ["get_instance_diagnostics", "block_stats", "get_all_volume_usage"],
       "applicability": "container",
       "status": "planned",
-      "evidence": "Nova Diagnostics rejects an incus driver enum; per-volume Incus I/O counters are not yet attributable to Cinder volume IDs"
+      "evidence": "Incus exposes accurate aggregate CPU, memory and NIC counters, but Nova stable/2026.1 Diagnostics rejects an incus/lxd driver enum and Incus state does not expose per-device I/O request/byte counters attributable to Cinder volume IDs; do not mislabel the driver as libvirt or synthesize block usage"
     },
     {
       "id": "config-drive-metadata-keypair-userdata",

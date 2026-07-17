@@ -7,13 +7,19 @@ COMPUTE_NODES=${COMPUTE_NODES:?Set host=ssh-target comma-separated nodes}
 SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute audit key}
 EXPECTED_INCUS_IMAGE_DIGEST=${EXPECTED_INCUS_IMAGE_DIGEST:?Set approved digest}
 EXPECTED_INCUS_REVISION=${EXPECTED_INCUS_REVISION:?Set approved source revision}
-REMOTE_SOURCE=${REMOTE_SOURCE:-/opt/openstack-incus-src}
 REMOTE_DRIVER=${REMOTE_DRIVER:-/opt/stack/nova/nova/virt/lxd}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+HOST_PREFLIGHT=${HOST_PREFLIGHT:-$SCRIPT_DIR/openstack-incus-production-preflight.sh}
 
 SSH=(ssh -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=no)
 failures=0
 reference_driver_hash=
 declare -A seen_addresses=()
+
+if [[ ! -r "$HOST_PREFLIGHT" ]]; then
+    echo "FAIL host preflight script is not readable: $HOST_PREFLIGHT" >&2
+    exit 1
+fi
 
 pass() {
     printf 'PASS %-38s %s\n' "$1" "${2:-}"
@@ -43,7 +49,7 @@ for node in "${nodes[@]}"; do
     if remote "$target" \
             "EXPECTED_INCUS_IMAGE_DIGEST='$EXPECTED_INCUS_IMAGE_DIGEST' \
              EXPECTED_INCUS_REVISION='$EXPECTED_INCUS_REVISION' \
-             bash '$REMOTE_SOURCE/tools/openstack-incus-production-preflight.sh'"; then
+             bash -s" <"$HOST_PREFLIGHT"; then
         pass "$host host preflight"
     else
         fail "$host host preflight" "strict audit failed"

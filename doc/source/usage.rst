@@ -366,6 +366,11 @@ synchronization, and independently bounded ``/var/lib/incus`` and
 ``/var/log/incus`` filesystems. A missing expected digest or source revision is
 a failure; a mutable ``:alpine-novm`` tag is never sufficient evidence.
 
+The migration private key can instead be ``root:<nova-compute-group> 0640``.
+In that layout the audit also requires the compute service's Incus group to
+contain exactly the configured service user, so the group-readable key does
+not become a shared operator credential.
+
 After every compute passes the host audit, run the cross-compute audit from a
 controller with OpenStack administrator credentials::
 
@@ -378,9 +383,12 @@ controller with OpenStack administrator credentials::
 The fleet audit fails on driver drift, duplicate migration addresses, disabled
 or down Nova computes, missing Placement inventory or the system-container
 trait, dead OVN controllers, or unavailable Cinder Ceph backend and scheduler.
-It invokes the strict host audit on every node. Run it before enabling a new
-compute, after upgrades, and as a scheduled compliance check. Any failure is a
-release or admission blocker; do not maintain an allow-list of ignored checks.
+It streams its adjacent ``openstack-incus-production-preflight.sh`` to every
+node and executes that exact content through ``bash -s``. Remote checkouts are
+therefore not trusted and cannot silently run an older audit policy. Run it
+before enabling a new compute, after upgrades, and as a scheduled compliance
+check. Any failure is a release or admission blocker; do not maintain an
+allow-list of ignored checks.
 
 Release distributions must be built with the version explicitly pinned because
 the modernized repository retains historical ``nova-lxd`` Git tags::

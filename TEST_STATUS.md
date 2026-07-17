@@ -76,6 +76,13 @@ digest/revision pair.
   checks on 2026-07-17 across `.21`, `.17`, and `.22`. Driver hashes were
   identical and all three nova-compute and OVN controller services were
   enabled and up.
+- On 2026-07-18, the fleet audit initially produced false TLS-key permission
+  failures because node-local copies of the host audit were older than the
+  orchestrator. The fleet audit now streams its own adjacent host-preflight
+  script to each node through SSH instead of executing a remote checkout.
+  The revised audit passed all checks across `.21`, `.17`, and `.22` while the
+  nodes still had the older copies, proving the audit policy is supplied by
+  the trusted orchestrator.
 - After the immutable-image rollout, the complete BFV E2E passed between
   `.21` and `.17`: rejected destination preflight, shared-Ceph zero-copy
   migration, confirm, hard-reboot recovery, reverse migration, revert, data
