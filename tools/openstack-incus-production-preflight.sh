@@ -13,6 +13,7 @@ INCUS_CONTAINER=${INCUS_CONTAINER:-incus}
 INCUS_SERVICE=${INCUS_SERVICE:-incus-podman.service}
 NOVA_SERVICE=${NOVA_SERVICE:-devstack@n-cpu.service}
 NOVA_CONFIG=${NOVA_CONFIG:-/etc/nova/nova-cpu.conf}
+INCUS_SHARE_MOUNT_ROOT=${INCUS_SHARE_MOUNT_ROOT:-/opt/stack/data/nova/instances/incus-shares}
 BFV_POOL=${BFV_POOL:-cinder-bfv}
 PREFLIGHT_PROJECT=${PREFLIGHT_PROJECT:-nova-preflight}
 MIN_FREE_PERCENT=${MIN_FREE_PERCENT:-20}
@@ -169,6 +170,25 @@ if [[ "$quadlet_image" == *@sha256:* ]]; then
 else
     fail "Quadlet immutable image" \
         "Image= must use an immutable @sha256 reference"
+fi
+
+manila_enabled=$(crudini --get "$NOVA_CONFIG" incus enable_manila_shares \
+    2>/dev/null || true)
+if [[ "${manila_enabled,,}" == "true" ]]; then
+    share_mount=$(podman inspect "$INCUS_CONTAINER" --format '{{json .Mounts}}' |
+        jq -c --arg path "$INCUS_SHARE_MOUNT_ROOT" \
+            '.[] | select(.Source == $path and .Destination == $path)')
+    if [[ -z "$share_mount" ]]; then
+        fail "Manila Incus mount" \
+            "$INCUS_SHARE_MOUNT_ROOT is not passed into incusd"
+    elif jq -e '.RW == true and
+            (.Propagation == "rslave" or .Propagation == "rshared")' \
+            <<<"$share_mount" >/dev/null; then
+        pass "Manila Incus mount" "rw,$(jq -r .Propagation <<<"$share_mount")"
+    else
+        fail "Manila Incus mount" \
+            "must be rw with rslave or rshared propagation"
+    fi
 fi
 
 incus_version=$(podman exec "$INCUS_CONTAINER" incus version 2>/dev/null |

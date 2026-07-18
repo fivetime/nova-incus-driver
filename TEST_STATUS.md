@@ -92,6 +92,31 @@ digest/revision pair.
 
 - The target-baseline gate last passed on 2026-07-17 on `.21` with Python
   3.12: `tox -e py312` and `tox -e pep8` both completed with exit code 0.
+- On 2026-07-18 the post-Manila and interactive-console targeted suites
+  passed on `.21`: all 173 `test_driver` tests and all four `test_console`
+  tests passed. The signature audit caught and removed an extra `share_info`
+  argument from `spawn()`, restoring an exact stable/2026.1
+  `ComputeDriver.spawn` contract.
+
+## Manila share lifecycle
+
+- Manila stable/2026.1 was deployed on `.21` with an LVM-backed NFS share.
+  Nova compute API microversion 2.97 attached share
+  `50d66111-edaf-44a4-80e7-7bf51c0d1c51` to an Incus instance on `.17`.
+  The mapping reached `inactive`, server start changed it to `active`, and
+  Manila installed an `rw` IP access rule for the compute host.
+- The first run exposed two deployment requirements now enforced by the
+  plugin and production preflight: every compute needs a complete `[manila]`
+  keystoneauth group, and a Podman-hosted incusd needs the dedicated
+  `incus-shares` subtree at the same path with `rw,rslave` propagation. The
+  parent Nova `instances_path` remains read-only.
+- After correction, the container saw a real `rw,nosuid,nodev` NFS mount,
+  wrote `MANILA_E2E_20260718`, and the same data was read from the Manila
+  backend. Stop plus API detach removed the Nova mapping, Manila access rule,
+  Incus device, host mount, and staging directory.
+- `tools/openstack-incus-manila-e2e.sh` repeated the complete attach, start,
+  guest write, stop, detach, and cleanup workflow and returned `PASS` on
+  2026-07-18.
 
 ## Root-disk QoS (data volumes)
 
@@ -221,8 +246,9 @@ hardening.
   success, the driver queries the instance name: an existing target is retained,
   an explicit 404 permits cleanup, and a failed ownership query is treated as
   uncertain and therefore non-destructive.
-- Cold migration remains experimental while post-claim failure injection is
-  incomplete. On 2026-07-17 the BFV source added a destination TCP/8443
+- At this checkpoint cold migration still remained experimental while
+  post-claim failure injection was incomplete. On 2026-07-17 the BFV source
+  added a destination TCP/8443
   preflight before reading or stopping the Incus instance. An unreachable
   destination is raised as `InstanceFaultRollback` so Nova preserves the
   original ACTIVE state. Real `.17 -> .18` traffic rejection proved the source
@@ -754,6 +780,35 @@ hardening.
   The final Python 3.12 regression passed 247 tests with 2 intentional legacy
   pylxd skips; pep8, all shell syntax checks, capability JSON validation and
   the warning-as-error documentation build passed.
+- On 2026-07-19, the current Python 3.12 regression passed all 261 collected
+  tests: 259 passed and the same 2 legacy pylxd migration/session tests were
+  intentionally skipped. Flake8, all Bash syntax checks, capability JSON
+  validation, ``git diff --check``, and the warning-as-error Sphinx build
+  passed.
+- Tempest's ``test_server_basic_ops`` passed against the public Nova API.
+  The two stock volume scenario tests skipped because SSH validation is
+  deliberately disabled in this lab; dedicated project E2E tests remain the
+  authority for Cinder data-volume and BFV behavior. The DevStack Tempest
+  feature flags now advertise the verified change-password, pause, and
+  console-output operations while explicitly disabling unsupported suspend,
+  rescue, and upstream serial-console scenarios.
+- The Nova 2.97 Manila share API was exercised end to end with the Manila LVM
+  NFS backend: attach mounted the share inside a running Incus system
+  container and detach removed it. The automated
+  ``tools/openstack-incus-manila-e2e.sh`` gate passed. All Incus Quadlets now
+  expose the dedicated Nova share staging directory as ``rw,rslave`` while
+  retaining the parent instances path as read-only.
+- The final three-node fleet audit initially rejected a missing migration
+  recovery/TLS configuration on ``incus-node-01`` and different driver hashes
+  on ``incus-node-02`` and ``incus-node-03``. After restoring the controller
+  compute settings, synchronizing the authoritative driver tree, and
+  restarting all three compute services, the complete audit passed. All
+  nodes now report driver hash
+  ``185719734fe282f8cc645d89d42d93cca21e00588b744892534175a8d02bcd1d``,
+  Incus 7.2 image digest ``sha256:cc8b7109...239bd72d``, revision
+  ``5adcaca1...f24ba5``, current admission tokens, enabled/up Nova services,
+  live OVN controllers, valid Placement inventories and traits, and the
+  enabled/up Cinder Ceph backend.
 
 - Re-running DevStack to add Cinder rebuilt the test Nova databases. Three
   retained Incus containers (`instance-00000008`, `instance-00000009`, and

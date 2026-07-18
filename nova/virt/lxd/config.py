@@ -280,6 +280,15 @@ incus_opts = [
         min=10,
         help="Seconds between post-claim BFV target recovery scans.",
     ),
+    cfg.BoolOpt(
+        "enable_manila_shares",
+        default=False,
+        help=(
+            "Enable NFS and CephFS Manila shares through host mounts exposed "
+            "at /mnt/manila/<tag> in system containers. Requires the Nova "
+            "Incus share capability patch and mount helpers on every compute."
+        ),
+    ),
 ]
 
 

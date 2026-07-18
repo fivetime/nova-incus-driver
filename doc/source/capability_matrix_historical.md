@@ -207,7 +207,9 @@ getty 输出送到 `/dev/console`(systemd/openrc 默认如此)。镜像流水线
 ### E. 按产品需求再定(高级能力边界)
 
 `rescue`/`unrescue`(当前 REJECT,未来需 storage-pool-native rootfs)、`get_serial_console`、
-`set_admin_password`、`mount_share`/`umount_share`(Manila)、config-drive 已实现待验证。
+`set_admin_password`、`mount_share`/`umount_share` (Manila) 和 config-drive
+均已实现并完成真实 API E2E。Manila 验证覆盖 Nova 2.97 映射、Manila
+access rule、Podman mount propagation、容器内读写以及完整卸载清理。
 
 ### F. `swap_volume` —— REJECT(数据安全,待冷交换协议)
 

@@ -23,6 +23,7 @@ baselines when developing and testing this project:
 - OVN: `C:\MyProjects\IaasProjects\OpenStack\ovn`
 - Placement: `C:\MyProjects\OpenSource\placement`
 - Cinder: `C:\MyProjects\OpenSource\cinder`
+- Manila: `C:\MyProjects\OpenSource\openstack\manila`
 - os-brick: `C:\MyProjects\OpenSource\openstack\os-brick`
 - Glance: `C:\MyProjects\OpenSource\glance`
 - OpenStack requirements: `C:\MyProjects\OpenSource\openstack\requirements`

@@ -14,6 +14,7 @@ Contents:
    usage
    architecture
    api_contract
+   production_readiness
    contributing
    exclusive_machine
    vif_wiring

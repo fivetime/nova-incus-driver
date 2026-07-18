@@ -264,9 +264,11 @@ ownership have dedicated end-to-end coverage.
 Cold migration
 --------------
 
-Cold migration is disabled by default and remains experimental. Image-backed
-roots use Incus pull data transfer. Cinder BFV roots instead use the fork's
-shared-Ceph handover to claim the same authoritative RBD without copying it.
+Cold migration is disabled by default as an operator safety gate. It is a
+supported capability after the BFV migration release matrix passes on every
+enabled compute pair. Image-backed roots use Incus pull data transfer and are
+intended only for development. Cinder BFV roots use the fork's shared-Ceph
+handover to claim the same authoritative RBD without copying it.
 Both paths retain the stopped source record until Nova confirms the operation.
 On confirm, the source record and profile are deleted; an explicit Nova revert
 performs the reverse BFV handover and restores Cinder and Neutron ownership
@@ -291,9 +293,9 @@ revert the staged migration through Nova. Active data-volume attach failure,
 active container-start failure, stopped-instance data-volume failure, and
 reverse-revert data-volume failure have passed real fault injection and
 cleanup. The marker preserves ``running`` versus ``stopped`` so recovery does
-not power on a SHUTOFF instance. Production enablement still requires this
-suite to pass on every compute pair and an operator runbook for the
-fail-closed case where the durable marker itself cannot be written.
+not power on a SHUTOFF instance. Production enablement requires this suite to
+pass on every compute pair and the fail-closed recovery procedure in
+:doc:`production_readiness` to be accepted by operations.
 
 Fail-closed BFV recovery
 ------------------------

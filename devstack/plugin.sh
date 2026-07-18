@@ -140,6 +140,20 @@ function install_nova_incus {
         fi
     fi
 
+    if is_true "${INCUS_APPLY_NOVA_MANILA_SHARE_PATCH}"; then
+        local manila_share_patch
+        manila_share_patch="${NOVA_INCUS_DIR}/patches/nova/0002-hardware-accept-incus-manila-share-trait.patch"
+        if grep -q "'CUSTOM_INCUS_MANILA_SHARE' in trait_info.traits" \
+                "${NOVA_DIR}/nova/virt/hardware.py"; then
+            echo "Nova already accepts the Incus Manila share trait"
+        elif git -C "${NOVA_DIR}" apply --check "${manila_share_patch}"; then
+            git -C "${NOVA_DIR}" apply "${manila_share_patch}"
+        else
+            die $LINENO \
+                "Nova Incus Manila share patch does not apply cleanly"
+        fi
+    fi
+
     # Nova's source checkout is a regular Python package, so an editable
     # external distribution cannot extend nova.virt with another namespace
     # path. Keep this repository authoritative and deploy its driver package
@@ -365,6 +379,25 @@ function configure_nova_incus {
             "${INCUS_MIGRATION_AUTO_RECOVERY}"
         iniset "${nova_target}" incus migration_recovery_interval \
             "${INCUS_MIGRATION_RECOVERY_INTERVAL}"
+        iniset "${nova_target}" incus enable_manila_shares \
+            "${INCUS_ENABLE_MANILA_SHARES}"
+        if [[ "${INCUS_ENABLE_MANILA_SHARES,,}" == "true" ]]; then
+            # Nova's Manila adapter uses its own keystoneauth group. The
+            # Manila DevStack plugin configures this on the controller only,
+            # so write it explicitly for every remote nova-compute as well.
+            iniset "${nova_target}" manila auth_type password
+            iniset "${nova_target}" manila auth_url "${KEYSTONE_SERVICE_URI}"
+            iniset "${nova_target}" manila username nova
+            iniset "${nova_target}" manila password "${SERVICE_PASSWORD}"
+            iniset "${nova_target}" manila project_name \
+                "${SERVICE_PROJECT_NAME}"
+            iniset "${nova_target}" manila user_domain_name \
+                "${SERVICE_DOMAIN_NAME}"
+            iniset "${nova_target}" manila project_domain_name \
+                "${SERVICE_DOMAIN_NAME}"
+            iniset "${nova_target}" manila interface internal
+            iniset "${nova_target}" manila service_type shared-file-system
+        fi
         if [[ -n "${INCUS_MIGRATION_ADDRESS}" ]]; then
             iniset "${nova_target}" incus migration_address \
                 "${INCUS_MIGRATION_ADDRESS}"
@@ -643,6 +676,15 @@ function test_config_nova_incus {
     iniset "${TEMPEST_CONFIG}" compute-feature-enabled shelve False
     iniset "${TEMPEST_CONFIG}" compute-feature-enabled resize True
     iniset "${TEMPEST_CONFIG}" compute-feature-enabled config_drive True
+    iniset "${TEMPEST_CONFIG}" compute-feature-enabled change_password True
+    iniset "${TEMPEST_CONFIG}" compute-feature-enabled pause True
+    iniset "${TEMPEST_CONFIG}" compute-feature-enabled suspend False
+    iniset "${TEMPEST_CONFIG}" compute-feature-enabled rescue False
+    iniset "${TEMPEST_CONFIG}" compute-feature-enabled console_output True
+    # Tempest's only serial-console test is coupled to live migration, which
+    # system containers deliberately reject. The project serial E2E validates
+    # Nova token issuance, serialproxy and authenticated login independently.
+    iniset "${TEMPEST_CONFIG}" compute-feature-enabled serial_console False
     # The baseline topology delivers metadata through the read-only config
     # drive. Enable this only after deploying and validating OVN metadata
     # agents and the 169.254.169.254 path.

@@ -1,0 +1,20 @@
+From: OpenStack Incus maintainers <openstack-incus@example.invalid>
+Subject: [PATCH] hardware: Accept an Incus Manila share transport
+
+Nova's server-share API currently treats virtiofs as the only possible
+transport. System containers expose the same Manila attachment through a
+restricted Incus disk bind mount and must not advertise the virtiofs trait.
+Accept the driver-specific trait without weakening the existing libvirt
+checks.
+
+diff --git a/nova/virt/hardware.py b/nova/virt/hardware.py
+--- a/nova/virt/hardware.py
++++ b/nova/virt/hardware.py
+@@ -3063,6 +3063,7 @@ def check_shares_supported(context, instance):
+     trait_info = client.get_provider_traits(context, host.uuid)
+ 
+     if not (
++        'CUSTOM_INCUS_MANILA_SHARE' in trait_info.traits or
+         (
+             'COMPUTE_STORAGE_VIRTIO_FS' in trait_info.traits and
+             'COMPUTE_MEM_BACKING_FILE' in trait_info.traits

@@ -130,6 +130,20 @@ Without this bind mount, Nova can build the config-drive directory on the
 host but Incus correctly rejects the disk device because its source is not
 visible inside the daemon container.
 
+When Manila shares are enabled, Nova mounts each export below the dedicated
+``incus-shares`` subtree. That subtree must also be passed to incusd at the
+same absolute path with recursive mount propagation:
+
+.. code-block:: ini
+
+   Volume=/opt/stack/data/nova/instances/incus-shares:/opt/stack/data/nova/instances/incus-shares:rw,rslave
+
+The more-specific bind overrides the read-only parent only for Manila staging.
+``rslave`` is required because NFS or CephFS mounts created later by
+nova-compute must propagate into the already-running incusd container. Do not
+make the complete ``instances_path`` writable: that would unnecessarily expose
+config drives and other Nova host state to the privileged daemon container.
+
 The modern Nova ``Diagnostics`` object restricts its ``driver`` field to a
 fixed list. This repository carries
 ``patches/nova/0001-diagnostics-add-lxd-driver.patch`` to add the existing

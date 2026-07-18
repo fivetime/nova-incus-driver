@@ -166,6 +166,9 @@ class LXDDriverTest(test.NoDBTestCase):
         self.CONF.incus.volume_use_multipath = False
         self.CONF.incus.volume_enforce_multipath = False
         self.CONF.incus.num_volume_scan_tries = 3
+        self.CONF.incus.enable_manila_shares = False
+        self.CONF.serial_console.enabled = False
+        self.CONF.serial_console.proxyclient_address = '127.0.0.1'
 
         # XXX: rockstar (03 Nov 2016) - This should be removed once
         # everything is where it should live.
@@ -229,6 +232,14 @@ class LXDDriverTest(test.NoDBTestCase):
         self.assertFalse(capabilities['supports_evacuate'])
         self.assertTrue(capabilities['supports_extend_volume'])
         self.assertFalse(capabilities['supports_multiattach'])
+        self.assertFalse(capabilities['supports_bfv_rescue'])
+        self.assertFalse(capabilities['supports_device_tagging'])
+        self.assertFalse(capabilities['supports_tagged_attach_interface'])
+        self.assertFalse(capabilities['supports_tagged_attach_volume'])
+        self.assertFalse(capabilities['supports_vtpm'])
+        self.assertFalse(capabilities['supports_secure_boot'])
+        self.assertFalse(capabilities['supports_accelerators'])
+        self.assertFalse(capabilities['supports_virtio_fs'])
 
     def test_capabilities_enable_bfv_evacuate_per_driver(self):
         self.CONF.incus.allow_bfv_evacuate = True
@@ -3479,6 +3490,197 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             ctx, instance, network_info, migration)
 
         container.start.assert_called_once_with(wait=True)
+
+    def test_get_vcpus_used_counts_only_nova_owned_records(self):
+        owned = mock.Mock(
+            name='owned',
+            expanded_config={
+                'user.openstack.uuid': '00000000-0000-0000-0000-000000000001',
+                'limits.cpu': '4',
+            })
+        owned.name = 'instance-owned'
+        stopped = mock.Mock(
+            name='stopped',
+            expanded_config={
+                'user.openstack.uuid': '00000000-0000-0000-0000-000000000002',
+                'limits.cpu': '2',
+            })
+        stopped.name = 'instance-stopped'
+        foreign = mock.Mock(
+            name='foreign',
+            expanded_config={'limits.cpu': '32'})
+        foreign.name = 'operator-container'
+        malformed = mock.Mock(
+            name='malformed',
+            expanded_config={
+                'user.openstack.uuid': '00000000-0000-0000-0000-000000000003',
+                'limits.cpu': '0-3',
+            })
+        malformed.name = 'instance-malformed'
+        self.client.instances.all.return_value = [
+            owned, stopped, foreign, malformed]
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.client = self.client
+
+        self.assertEqual(6, lxd_driver._get_vcpus_used())
+
+    def test_set_admin_password_uses_stdin_and_image_admin_user(self):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-password',
+            image_meta=mock.Mock(properties={'os_admin_user': 'ubuntu'}))
+        container = self.client.instances.get.return_value
+        container.execute.return_value = mock.Mock(
+            exit_code=0, stdout='', stderr='')
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.client = self.client
+
+        lxd_driver.set_admin_password(instance, 's3cret:with-colon')
+
+        container.execute.assert_called_once_with(
+            ['chpasswd'],
+            stdin_payload='ubuntu:s3cret:with-colon\n',
+            user=0,
+            group=0)
+
+    def test_set_admin_password_rejects_newline(self):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-password',
+            image_meta=mock.Mock(properties={}))
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.client = self.client
+
+        self.assertRaises(
+            exception.InstancePasswordSetFailed,
+            lxd_driver.set_admin_password,
+            instance,
+            'unsafe\npassword')
+        self.client.instances.get.assert_not_called()
+
+    def test_set_admin_password_rejects_guest_without_chpasswd(self):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-password',
+            image_meta=mock.Mock(properties={}))
+        container = self.client.instances.get.return_value
+        container.execute.return_value = mock.Mock(
+            exit_code=127, stdout='', stderr='not found')
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.client = self.client
+
+        self.assertRaises(
+            exception.SetAdminPasswdNotSupported,
+            lxd_driver.set_admin_password,
+            instance,
+            'secret')
+
+    @mock.patch.object(driver.lxd_console, 'SerialConsoleBroker')
+    def test_get_serial_console_reuses_instance_broker(self, broker_factory):
+        self.CONF.serial_console.enabled = True
+        self.CONF.serial_console.proxyclient_address = '192.0.2.10'
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-console')
+        container = self.client.instances.get.return_value
+        container.status = 'Running'
+        broker_factory.return_value.port = 10001
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.client = self.client
+
+        first = lxd_driver.get_serial_console(None, instance)
+        second = lxd_driver.get_serial_console(None, instance)
+
+        self.assertEqual('192.0.2.10', first.host)
+        self.assertEqual(10001, first.port)
+        self.assertIs(first.__class__, second.__class__)
+        broker_factory.assert_called_once_with('192.0.2.10', container)
+
+    def test_get_serial_console_rejects_stopped_instance(self):
+        self.CONF.serial_console.enabled = True
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-console')
+        self.client.instances.get.return_value.status = 'Stopped'
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.client = self.client
+
+        self.assertRaises(
+            exception.InstanceNotRunning,
+            lxd_driver.get_serial_console, None, instance)
+
+    @mock.patch.object(driver.os.path, 'ismount', return_value=False)
+    @mock.patch.object(driver.privsep_fs, 'mount')
+    def test_mount_nfs_share_stages_incus_device(self, mount, ismount):
+        ismount.side_effect = [False, True]
+        self.CONF.incus.enable_manila_shares = True
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            share_proto='NFS')
+        profile = self.client.profiles.get.return_value
+        profile.devices = {}
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.client = self.client
+
+        lxd_driver.mount_share(None, instance, share)
+
+        mount_path = driver._share_mount_path(instance, share)
+        mount.assert_called_once_with(
+            'nfs', share.export_location, mount_path,
+            ['-o', 'nosuid,nodev'])
+        self.assertEqual({
+            'type': 'disk',
+            'source': mount_path,
+            'path': '/mnt/manila/project-data',
+            'readonly': 'false',
+            'recursive': 'true',
+        }, profile.devices[driver._share_device_name(share)])
+        profile.save.assert_called_once_with(wait=True)
+
+    @mock.patch.object(driver.os.path, 'ismount', return_value=True)
+    @mock.patch.object(driver.privsep_fs, 'umount')
+    @mock.patch.object(driver.os, 'rmdir')
+    def test_umount_share_removes_device_before_host_mount(
+            self, rmdir, umount, ismount):
+        self.CONF.incus.enable_manila_shares = True
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            share_proto='NFS')
+        profile = self.client.profiles.get.return_value
+        profile.devices = {
+            driver._share_device_name(share): {'type': 'disk'}}
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.client = self.client
+
+        self.assertFalse(lxd_driver.umount_share(None, instance, share))
+
+        self.assertNotIn(driver._share_device_name(share), profile.devices)
+        profile.save.assert_called_once_with(wait=True)
+        umount.assert_called_once_with(
+            driver._share_mount_path(instance, share))
+
+    def test_mount_share_disabled_is_explicitly_rejected(self):
+        self.CONF.incus.enable_manila_shares = False
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        share = mock.Mock(share_proto='NFS')
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.client = self.client
+
+        self.assertRaises(
+            exception.ShareProtocolNotSupported,
+            lxd_driver.mount_share, None, instance, share)
         self.vif_driver.plug.assert_not_called()
         self.vif_driver.unplug.assert_not_called()
 

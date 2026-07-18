@@ -37,10 +37,12 @@ from contextlib import closing
 
 from nova import exception
 from nova import i18n
+from nova.console import type as console_type
 from nova.image import glance
 from nova.network import neutron
 from nova.network import model as network_model
 from nova import objects
+from nova.privsep import fs as privsep_fs
 from nova.privsep import path as privsep_path
 from nova.virt import driver
 from os_brick.initiator import connector
@@ -54,6 +56,7 @@ from pylxd import exceptions as lxd_exceptions
 from nova.virt.lxd import vif as lxd_vif
 from nova.virt.lxd import client as incus_client
 from nova.virt.lxd import common
+from nova.virt.lxd import console as lxd_console
 from nova.virt.lxd import flavor
 from nova.virt.lxd import storage
 
@@ -83,6 +86,7 @@ NOVA_CONF = nova.conf.CONF
 ACCEPTABLE_IMAGE_FORMATS = {'raw', 'root-tar', 'squashfs'}
 INCUS_SYSTEM_CONTAINER_TRAIT = 'CUSTOM_INCUS_SYSTEM_CONTAINER'
 INCUS_SWAP_TRAIT = 'CUSTOM_INCUS_SWAP'
+INCUS_MANILA_SHARE_TRAIT = 'CUSTOM_INCUS_MANILA_SHARE'
 MIGRATION_RECOVERY_KEY = 'user.openstack.recovery_required'
 BASE_DIR = os.path.join(
     CONF.instances_path, CONF.image_cache.subdirectory_name)
@@ -93,6 +97,10 @@ _VOLUME_MOUNTPOINT_RE = re.compile(
 _CINDER_RBD_IMAGE_RE = re.compile(
     r'^volume-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-'
     r'[0-9a-f]{4}-[0-9a-f]{12})$')
+_SHARE_ID_RE = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-'
+    r'[0-9a-f]{4}-[0-9a-f]{12}$')
+_SHARE_TAG_RE = re.compile(r'^[A-Za-z0-9-]{1,255}$')
 
 
 def _validate_block_device_path(path, description):
@@ -434,6 +442,30 @@ def _remove_instance_directory(instance):
             os.chmod(os.path.join(root, name), 0o700)
         os.chmod(root, 0o700)
     shutil.rmtree(instance_dir)
+
+
+def _share_mount_path(instance, share_mapping):
+    if not _SHARE_ID_RE.fullmatch(share_mapping.share_id):
+        raise exception.ShareMountError(
+            share_id=share_mapping.share_id,
+            server_id=instance.uuid,
+            reason='share ID is not a canonical UUID')
+    return os.path.join(
+        CONF.instances_path, 'incus-shares', instance.uuid,
+        share_mapping.share_id)
+
+
+def _share_device_name(share_mapping):
+    return 'manila-' + share_mapping.share_id
+
+
+def _share_guest_path(share_mapping):
+    if not _SHARE_TAG_RE.fullmatch(share_mapping.tag):
+        raise exception.ShareMountError(
+            share_id=share_mapping.share_id,
+            server_id=share_mapping.instance_uuid,
+            reason='share tag contains unsupported characters')
+    return '/mnt/manila/' + share_mapping.tag
 
 
 def _pack_configdrive_for_migration(instance, container):
@@ -1024,8 +1056,19 @@ class LXDDriver(driver.ComputeDriver):
 
     capabilities = dict(
         driver.ComputeDriver.capabilities,
+        has_imagecache=False,
         supports_attach_interface=True,
+        supports_device_tagging=False,
+        supports_tagged_attach_interface=False,
+        supports_tagged_attach_volume=False,
         supports_extend_volume=True,
+        supports_multiattach=False,
+        supports_bfv_rescue=False,
+        supports_vtpm=False,
+        supports_secure_boot=False,
+        supports_accelerators=False,
+        supports_virtio_fs=False,
+        supports_mem_backing_file=False,
         supports_image_type_raw=True,
         supports_migrate_to_same_host=False,
     )
@@ -1043,6 +1086,7 @@ class LXDDriver(driver.ComputeDriver):
         self.network_api = neutron.API()
         self.vif_driver = lxd_vif.LXDGenericVifDriver()
         self.firewall_driver = _NeutronFirewallDriver()
+        self._serial_consoles = {}
 
     def init_host(self, host):
         """Initialize the driver on the host.
@@ -1072,14 +1116,14 @@ class LXDDriver(driver.ComputeDriver):
     def cleanup_host(self, host):
         """Clean up the host.
 
-        `nova.virt.ComputeDriver` defines this method. It is overridden
-        here to be explicit that there is nothing to be done, as
-        `init_host` does not create any resources that would need to be
-        cleaned up.
+        `nova.virt.ComputeDriver` defines this method.
 
         See `nova.virt.driver.ComputeDriver.cleanup_host` for more
         information.
         """
+        for broker in self._serial_consoles.values():
+            broker.close()
+        self._serial_consoles.clear()
 
     def get_info(self, instance, use_cache=True):
         """Return an InstanceInfo object for the instance."""
@@ -1500,6 +1544,9 @@ class LXDDriver(driver.ComputeDriver):
         information.
         """
         lock_path = os.path.join(CONF.instances_path, 'locks')
+        broker = self._serial_consoles.pop(instance.uuid, None)
+        if broker is not None:
+            broker.close()
 
         with lockutils.lock(
                 lock_path, external=True,
@@ -1827,6 +1874,22 @@ class LXDDriver(driver.ComputeDriver):
         """
         container = self.client.instances.get(instance.name)
         return container.console_log()[-MAX_CONSOLE_BYTES:]
+
+    def get_serial_console(self, context, instance):
+        """Return a token-protected Nova serialproxy backend."""
+        if not CONF.serial_console.enabled:
+            raise exception.ConsoleTypeUnavailable(console_type='serial')
+        container = self.client.instances.get(instance.name)
+        if container.status != 'Running':
+            raise exception.InstanceNotRunning(instance_id=instance.uuid)
+        broker = self._serial_consoles.get(instance.uuid)
+        if broker is None:
+            broker = lxd_console.SerialConsoleBroker(
+                CONF.serial_console.proxyclient_address, container)
+            self._serial_consoles[instance.uuid] = broker
+        return console_type.ConsoleSerial(
+            host=CONF.serial_console.proxyclient_address,
+            port=broker.port)
 
     def get_host_ip_addr(self):
         return CONF.my_ip
@@ -2241,9 +2304,148 @@ class LXDDriver(driver.ComputeDriver):
         See 'nova.virt.drvier.ComputeDriver.power_on` for more
         information.
         """
+        profile = self.client.profiles.get(instance.name)
+        self._attach_share_devices(profile, instance, share_info)
         container = self.client.instances.get(instance.name)
         if container.status != 'Running':
             container.start(wait=True)
+
+    def _attach_share_devices(self, profile, instance, share_info):
+        changed = False
+        for share_mapping in share_info or []:
+            mount_path = _share_mount_path(instance, share_mapping)
+            if not os.path.ismount(mount_path):
+                raise exception.ShareMountError(
+                    share_id=share_mapping.share_id,
+                    server_id=instance.uuid,
+                    reason='host share mount is absent')
+            device_name = _share_device_name(share_mapping)
+            expected = {
+                'type': 'disk',
+                'source': mount_path,
+                'path': _share_guest_path(share_mapping),
+                'readonly': 'false',
+                'recursive': 'true',
+            }
+            current = profile.devices.get(device_name)
+            if current is not None and current != expected:
+                raise exception.ShareMountError(
+                    share_id=share_mapping.share_id,
+                    server_id=instance.uuid,
+                    reason='Incus share device conflicts with existing state')
+            if current is None:
+                profile.devices[device_name] = expected
+                changed = True
+        if changed:
+            profile.save(wait=True)
+
+    def mount_share(self, context, instance, share_mapping):
+        """Mount an approved Manila export and stage its Incus disk device."""
+        if not CONF.incus.enable_manila_shares:
+            raise exception.ShareProtocolNotSupported(
+                share_proto=share_mapping.share_proto)
+        mount_path = _share_mount_path(instance, share_mapping)
+        fileutils.ensure_tree(mount_path, mode=0o700)
+        mounted = os.path.ismount(mount_path)
+        secret_path = None
+        try:
+            if not mounted:
+                options = ['-o', 'nosuid,nodev']
+                if (share_mapping.share_proto ==
+                        obj_fields.ShareMappingProto.NFS):
+                    fstype = 'nfs'
+                elif (share_mapping.share_proto ==
+                      obj_fields.ShareMappingProto.CEPHFS):
+                    if (not share_mapping.access_to or
+                            not share_mapping.access_key):
+                        raise exception.ShareMountError(
+                            share_id=share_mapping.share_id,
+                            server_id=instance.uuid,
+                            reason='CephFS credentials are missing')
+                    fstype = 'ceph'
+                    fd, secret_path = tempfile.mkstemp(
+                        prefix='.ceph-secret-',
+                        dir=os.path.dirname(mount_path))
+                    try:
+                        os.fchmod(fd, 0o600)
+                        os.write(fd, share_mapping.access_key.encode('utf-8'))
+                    finally:
+                        os.close(fd)
+                    options = [
+                        '-o',
+                        'nosuid,nodev,name=%s,secretfile=%s' %
+                        (share_mapping.access_to, secret_path),
+                    ]
+                else:
+                    raise exception.ShareProtocolNotSupported(
+                        share_proto=share_mapping.share_proto)
+                privsep_fs.mount(
+                    fstype, share_mapping.export_location,
+                    mount_path, options)
+
+            try:
+                profile = self.client.profiles.get(instance.name)
+            except lxd_exceptions.LXDAPIException as exc:
+                if exc.response.status_code == 404:
+                    return
+                raise
+            self._attach_share_devices(profile, instance, [share_mapping])
+        except (exception.ShareMountError,
+                exception.ShareProtocolNotSupported):
+            raise
+        except Exception as exc:
+            if not mounted and os.path.ismount(mount_path):
+                try:
+                    privsep_fs.umount(mount_path)
+                except Exception:
+                    LOG.exception(
+                        'Failed to roll back Manila share mount',
+                        instance=instance)
+            raise exception.ShareMountError(
+                share_id=share_mapping.share_id,
+                server_id=instance.uuid,
+                reason=exc)
+        finally:
+            if secret_path:
+                try:
+                    os.unlink(secret_path)
+                except FileNotFoundError:
+                    pass
+
+    def umount_share(self, context, instance, share_mapping):
+        """Remove the Incus share device before unmounting the host export."""
+        if not CONF.incus.enable_manila_shares:
+            raise exception.ShareProtocolNotSupported(
+                share_proto=share_mapping.share_proto)
+        try:
+            profile = self.client.profiles.get(instance.name)
+        except lxd_exceptions.LXDAPIException as exc:
+            if exc.response.status_code == 404:
+                profile = None
+            else:
+                raise
+
+        if profile is not None:
+            device_name = _share_device_name(share_mapping)
+            if device_name in profile.devices:
+                profile.devices.pop(device_name)
+                profile.save(wait=True)
+
+        mount_path = _share_mount_path(instance, share_mapping)
+        try:
+            if os.path.ismount(mount_path):
+                privsep_fs.umount(mount_path)
+            if os.path.isdir(mount_path):
+                os.rmdir(mount_path)
+            instance_share_dir = os.path.dirname(mount_path)
+            if os.path.isdir(instance_share_dir):
+                os.rmdir(instance_share_dir)
+            return False
+        except Exception as exc:
+            raise exception.ShareUmountError(
+                share_id=share_mapping.share_id,
+                server_id=instance.uuid,
+                reason=exc)
 
     def get_available_resource(self, nodename):
         """Aggregate all available system resources.
@@ -2300,7 +2502,7 @@ class LXDDriver(driver.ComputeDriver):
             'memory_mb_used': local_memory_info['used'] // units.Mi,
             'local_gb': local_disk_info['total'] // units.Gi,
             'local_gb_used': local_disk_info['used'] // units.Gi,
-            'vcpus_used': 0,
+            'vcpus_used': self._get_vcpus_used(),
             'hypervisor_type': 'lxd',
             'hypervisor_version': '011',
             'cpu_info': jsonutils.dumps(cpu_info),
@@ -2319,6 +2521,66 @@ class LXDDriver(driver.ComputeDriver):
         }
 
         return data
+
+    def _get_vcpus_used(self):
+        """Return vCPUs assigned to Nova-owned Incus instance records."""
+        used = 0
+        try:
+            containers = self.client.instances.all()
+        except Exception:
+            LOG.exception('Failed to audit Incus vCPU usage')
+            return 0
+
+        for container in containers:
+            config = getattr(container, 'expanded_config', None)
+            if config is None:
+                config = getattr(container, 'config', {})
+            if not config.get('user.openstack.uuid'):
+                continue
+            value = config.get('limits.cpu')
+            if value is None:
+                LOG.warning(
+                    'Nova-owned Incus instance %s has no limits.cpu',
+                    container.name)
+                continue
+            try:
+                used += int(value)
+            except (TypeError, ValueError):
+                LOG.warning(
+                    'Cannot account non-numeric limits.cpu=%r for Incus '
+                    'instance %s', value, container.name)
+        return used
+
+    def set_admin_password(self, instance, new_pass):
+        """Set the image-declared admin account password through Incus exec."""
+        if not isinstance(new_pass, str) or any(
+                character in new_pass for character in ('\x00', '\r', '\n')):
+            raise exception.InstancePasswordSetFailed(
+                instance=instance.uuid,
+                reason='password contains an unsupported control character')
+
+        image_meta = getattr(instance, 'image_meta', None)
+        properties = (
+            getattr(image_meta, 'properties', {}) if image_meta else {})
+        username = properties.get('os_admin_user') or 'root'
+        if (not isinstance(username, str) or not username or
+                any(character in username
+                    for character in ('\x00', '\r', '\n', ':'))):
+            raise exception.SetAdminPasswdNotSupported()
+
+        container = self.client.instances.get(instance.name)
+        result = container.execute(
+            ['chpasswd'],
+            stdin_payload='%s:%s\n' % (username, new_pass),
+            user=0,
+            group=0)
+        if result.exit_code == 127:
+            raise exception.SetAdminPasswdNotSupported()
+        if result.exit_code != 0:
+            raise exception.InstancePasswordSetFailed(
+                instance=instance.uuid,
+                reason='guest password utility failed with exit code %d' %
+                       result.exit_code)
 
     def update_provider_tree(self, provider_tree, nodename, allocations=None):
         """Report Incus compute and managed rootfs capacity to Placement."""
@@ -2357,6 +2619,10 @@ class LXDDriver(driver.ComputeDriver):
             traits.add(INCUS_SWAP_TRAIT)
         else:
             traits.discard(INCUS_SWAP_TRAIT)
+        if CONF.incus.enable_manila_shares:
+            traits.add(INCUS_MANILA_SHARE_TRAIT)
+        else:
+            traits.discard(INCUS_MANILA_SHARE_TRAIT)
         provider_tree.update_traits(nodename, traits)
 
     def refresh_instance_security_rules(self, instance):
