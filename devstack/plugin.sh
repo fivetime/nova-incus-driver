@@ -379,6 +379,10 @@ function configure_nova_incus {
             "${INCUS_MIGRATION_AUTO_RECOVERY}"
         iniset "${nova_target}" incus migration_recovery_interval \
             "${INCUS_MIGRATION_RECOVERY_INTERVAL}"
+        iniset "${nova_target}" incus migration_finish_retries \
+            "${INCUS_MIGRATION_FINISH_RETRIES}"
+        iniset "${nova_target}" incus migration_finish_retry_interval \
+            "${INCUS_MIGRATION_FINISH_RETRY_INTERVAL}"
         iniset "${nova_target}" incus enable_manila_shares \
             "${INCUS_ENABLE_MANILA_SHARES}"
         if [[ "${INCUS_ENABLE_MANILA_SHARES,,}" == "true" ]]; then

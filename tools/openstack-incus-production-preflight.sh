@@ -277,6 +277,18 @@ if [[ "$REQUIRE_COLD_MIGRATION" == true ]]; then
     check_equal "Nova cold migration" true \
         "$(crudini --get "$NOVA_CONFIG" incus \
             allow_cold_migration 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+    check_equal "Nova migration address" "https://$https_address" \
+        "$(crudini --get "$NOVA_CONFIG" incus \
+            migration_address 2>/dev/null)"
+    migration_finish_retries=$(crudini --get "$NOVA_CONFIG" incus \
+        migration_finish_retries 2>/dev/null || true)
+    if [[ "$migration_finish_retries" =~ ^[0-9]+$ ]] &&
+            ((migration_finish_retries >= 10)); then
+        pass "Nova migration finish retries" "$migration_finish_retries"
+    else
+        fail "Nova migration finish retries" \
+            "expected at least 10, actual=${migration_finish_retries:-missing}"
+    fi
 fi
 check_equal "Nova migration recovery" true \
     "$(crudini --get "$NOVA_CONFIG" incus \
