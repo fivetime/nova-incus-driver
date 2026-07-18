@@ -37,7 +37,8 @@ class IncusComputeManager(manager.ComputeManager):
     """Nova manager extension for fenced BFV post-claim recovery."""
 
     def _notify_volume_usage_detach(self, context, instance, bdm):
-        eventlet.sleep(_METRICS_SETTLEMENT_DELAY)
+        if CONF.volume_usage_poll_interval > 0:
+            eventlet.sleep(_METRICS_SETTLEMENT_DELAY)
         return super()._notify_volume_usage_detach(context, instance, bdm)
 
     def _shutdown_instance(self, context, instance, bdms,
@@ -45,7 +46,7 @@ class IncusComputeManager(manager.ComputeManager):
                            try_deallocate_networks=True):
         """Settle volume counters before Incus removes the block devices."""
         volumes = [bdm for bdm in bdms if bdm.is_volume]
-        if volumes:
+        if volumes and CONF.volume_usage_poll_interval > 0:
             # Wait once for the instance, rather than once per attached volume.
             eventlet.sleep(_METRICS_SETTLEMENT_DELAY)
 
@@ -64,6 +65,24 @@ class IncusComputeManager(manager.ComputeManager):
             requested_networks=requested_networks,
             notify=notify,
             try_deallocate_networks=try_deallocate_networks)
+
+    def _do_swap_volume(self, context, old_volume_id, new_volume_id,
+                        instance, new_attachment_id):
+        """Settle the old device before Cinder replaces its attachment."""
+        bdm = objects.BlockDeviceMapping.get_by_volume_and_instance(
+            context.elevated(), old_volume_id, instance.uuid)
+        try:
+            self._notify_volume_usage_detach(context, instance, bdm)
+        except Exception:
+            LOG.exception(
+                'Failed to settle volume usage before swapping volume '
+                '%(old)s to %(new)s',
+                {'old': old_volume_id, 'new': new_volume_id},
+                instance=instance)
+
+        return super()._do_swap_volume(
+            context, old_volume_id, new_volume_id, instance,
+            new_attachment_id)
 
     @periodic_task.periodic_task(
         spacing=CONF.incus.migration_recovery_interval)

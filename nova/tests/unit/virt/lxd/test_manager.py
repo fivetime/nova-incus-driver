@@ -26,6 +26,7 @@ class IncusComputeManagerTest(test.NoDBTestCase):
     def setUp(self):
         super().setUp()
         self.flags(migration_auto_recovery=True, group='incus')
+        self.flags(volume_usage_poll_interval=60)
         self.compute = manager.IncusComputeManager.__new__(
             manager.IncusComputeManager)
         self.compute.host = 'compute-1'
@@ -91,6 +92,58 @@ class IncusComputeManagerTest(test.NoDBTestCase):
 
         sleep.assert_called_once_with(manager._METRICS_SETTLEMENT_DELAY)
         notify_usage.assert_called_once_with(ctxt, instance, volume)
+
+    @mock.patch.object(manager.eventlet, 'sleep')
+    @mock.patch.object(
+        manager.manager.ComputeManager, '_notify_volume_usage_detach')
+    def test_detach_skips_delay_when_volume_metering_is_disabled(
+            self, notify_usage, sleep):
+        self.flags(volume_usage_poll_interval=0)
+        volume = mock.Mock()
+        instance = mock.Mock()
+        ctxt = context.get_admin_context()
+
+        self.compute._notify_volume_usage_detach(ctxt, instance, volume)
+
+        sleep.assert_not_called()
+        notify_usage.assert_called_once_with(ctxt, instance, volume)
+
+    @mock.patch.object(
+        manager.manager.ComputeManager, '_do_swap_volume')
+    @mock.patch.object(
+        manager.objects.BlockDeviceMapping, 'get_by_volume_and_instance')
+    def test_swap_settles_old_volume_before_replacing_attachment(
+            self, get_bdm, swap):
+        instance = mock.Mock(uuid='instance-1')
+        ctxt = context.get_admin_context()
+        self.compute._notify_volume_usage_detach = mock.Mock()
+
+        self.compute._do_swap_volume(
+            ctxt, 'old-volume', 'new-volume', instance, 'attachment-1')
+
+        get_bdm.assert_called_once_with(
+            mock.ANY, 'old-volume', 'instance-1')
+        self.compute._notify_volume_usage_detach.assert_called_once_with(
+            ctxt, instance, get_bdm.return_value)
+        swap.assert_called_once_with(
+            ctxt, 'old-volume', 'new-volume', instance, 'attachment-1')
+
+    @mock.patch.object(
+        manager.manager.ComputeManager, '_do_swap_volume')
+    @mock.patch.object(
+        manager.objects.BlockDeviceMapping, 'get_by_volume_and_instance')
+    def test_swap_continues_when_volume_usage_settlement_fails(
+            self, get_bdm, swap):
+        instance = mock.Mock(uuid='instance-1')
+        ctxt = context.get_admin_context()
+        self.compute._notify_volume_usage_detach = mock.Mock(
+            side_effect=RuntimeError('statistics unavailable'))
+
+        self.compute._do_swap_volume(
+            ctxt, 'old-volume', 'new-volume', instance, None)
+
+        swap.assert_called_once_with(
+            ctxt, 'old-volume', 'new-volume', instance, None)
 
     @mock.patch.object(
         manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')

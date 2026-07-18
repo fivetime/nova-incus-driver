@@ -540,8 +540,26 @@ blocker. The dated evidence below tracks the incremental hardening.
   `12582912` write bytes and Cinder automatically deleted volume
   `31da9d03-b2e0-4418-91a0-d612348a530e`. The observed server-delete duration
   was 18.25 seconds, including the deliberate nine-second consistency wait.
-  After this fix, the full Python 3.12 suite passed 229 tests with 2 intentional
+  After the lifecycle and swap-settlement fixes, the full Python 3.12 suite
+  passed 232 tests with 2 intentional
   legacy pylxd skips; pep8 and warning-as-error documentation builds passed.
+- A separate data-volume lifecycle E2E expanded Ceph volume
+  `2f091345-9b81-4e23-b7ac-980cdad7fe58` online from 1 GiB to 2 GiB. Cinder,
+  host KRBD, and container `/dev/sdb` all reported 2 GiB. A write at a 1.5 GiB
+  offset succeeded and its cumulative series grew continuously from 8 MiB to
+  12 MiB under the same Cinder UUID.
+- A forced snapshot and Cinder RBD clone preserved matching SHA-256 values for
+  both the first 8 MiB and a 4 MiB region at the 1.5 GiB offset. Independent
+  writes were attributed separately: the source finalized at 16 MiB and clone
+  `5b4681c3-9b6b-46ea-8c83-a485201d9602` at 6 MiB. The disposable instance,
+  volumes, and snapshot were removed.
+- Nova correctly rejected a tenant-initiated volume replacement with HTTP 409
+  because `os-volume_attachments` swap is reserved for Cinder migration. The
+  test deployment has only one enabled Cinder backend, so a real online
+  backend migration was not possible. The Incus compute manager now settles
+  the old volume before Nova's internal `_do_swap_volume`, with success and
+  metering-failure unit coverage. A two-backend Cinder migration remains an
+  explicit production-gate E2E.
 
 - Re-running DevStack to add Cinder rebuilt the test Nova databases. Three
   retained Incus containers (`instance-00000008`, `instance-00000009`, and

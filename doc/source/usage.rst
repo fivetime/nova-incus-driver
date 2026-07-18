@@ -948,6 +948,14 @@ behavior.
 Counters can reset when an instance restarts or migrates; Nova's volume usage
 cache owns conversion of cumulative counters into notification totals.
 
+Cinder volume migration invokes Nova's internal volume-swap path. The Incus
+compute manager applies the same fresh-metrics settlement to the old device
+before the driver replaces it, so a counter reset on the replacement device
+does not discard the old device's final interval. This API is intentionally
+restricted to Cinder; a tenant request to update ``os-volume_attachments`` for
+an ordinary volume returns HTTP 409. Validate online swap only through a real
+Cinder migration between two enabled backends.
+
 The standardized server diagnostics response still leaves its anonymous disk
 I/O fields null. Use Nova ``volume.usage`` notifications and the associated
 Ceilometer volume meters for billable per-volume I/O.
