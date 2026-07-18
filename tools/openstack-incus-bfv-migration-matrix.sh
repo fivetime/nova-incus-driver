@@ -65,6 +65,7 @@ run_case() {
     local case_name=$1 source_index=$2 dest_index=$3
     shift 3
     local test_name="${NAME_PREFIX}-${case_name}" ssh_host before after
+    local deadline
     declare -A node_baseline=()
     for ssh_host in "${node_ssh[@]}"; do
         node_baseline["$ssh_host"]=$(snapshot_node "$ssh_host")
@@ -84,7 +85,12 @@ run_case() {
         bash "$E2E_SCRIPT"
     for ssh_host in "${node_ssh[@]}"; do
         before=${node_baseline["$ssh_host"]}
-        after=$(snapshot_node "$ssh_host")
+        deadline=$((SECONDS + 90))
+        while ((SECONDS < deadline)); do
+            after=$(snapshot_node "$ssh_host")
+            [[ "$after" == "$before" ]] && break
+            sleep 2
+        done
         [[ "$after" == "$before" ]] || {
             echo "$ssh_host runtime inventory changed after $case_name" >&2
             diff -u <(printf '%s\n' "$before") <(printf '%s\n' "$after") || true
@@ -131,7 +137,13 @@ if case_enabled reverse-revert; then
         INJECT_REVERT_FAILURE=true
 fi
 
-[[ "$(snapshot_resources)" == "$baseline" ]] || {
+deadline=$((SECONDS + 90))
+while ((SECONDS < deadline)); do
+    current_resources=$(snapshot_resources)
+    [[ "$current_resources" == "$baseline" ]] && break
+    sleep 2
+done
+[[ "$current_resources" == "$baseline" ]] || {
     echo "OpenStack server/volume inventory changed across the BFV matrix" >&2
     diff -u <(printf '%s\n' "$baseline") <(snapshot_resources) || true
     exit 1
