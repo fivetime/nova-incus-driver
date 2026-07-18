@@ -21,7 +21,9 @@ Incus image digest, OpenStack deployment, and compute fleet being released.
 
 The local/static half is implemented by
 ``tools/openstack-incus-release-gate.sh``. Fleet identity is enforced by
-``tools/openstack-incus-fleet-preflight.sh``.
+``tools/openstack-incus-fleet-preflight.sh``. The latter hashes the Python
+files in its own release tree and requires every deployed driver tree to match
+that hash byte for byte; equality between computes alone is not sufficient.
 
 2. Host and fleet readiness
 ---------------------------

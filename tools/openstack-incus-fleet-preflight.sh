@@ -12,16 +12,31 @@ CONTROLLER_SSH=${CONTROLLER_SSH:-}
 CONTROLLER_OPENRC=${CONTROLLER_OPENRC:-/opt/stack/devstack/openrc admin admin}
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 HOST_PREFLIGHT=${HOST_PREFLIGHT:-$SCRIPT_DIR/openstack-incus-production-preflight.sh}
+RELEASE_DRIVER=${RELEASE_DRIVER:-$SCRIPT_DIR/../nova/virt/lxd}
 
 SSH=(ssh -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=no)
 failures=0
-reference_driver_hash=
 declare -A seen_addresses=()
 
 if [[ ! -r "$HOST_PREFLIGHT" ]]; then
     echo "FAIL host preflight script is not readable: $HOST_PREFLIGHT" >&2
     exit 1
 fi
+if [[ ! -d "$RELEASE_DRIVER" ]]; then
+    echo "FAIL release driver tree is not a directory: $RELEASE_DRIVER" >&2
+    exit 1
+fi
+
+driver_tree_hash() {
+    find "$1" -type f -name '*.py' -print0 |
+        LC_ALL=C sort -z |
+        xargs -0 sha256sum |
+        awk '{print $1}' |
+        sha256sum |
+        awk '{print $1}'
+}
+
+expected_driver_hash=$(driver_tree_hash "$RELEASE_DRIVER")
 
 pass() {
     printf 'PASS %-38s %s\n' "$1" "${2:-}"
@@ -74,14 +89,11 @@ for node in "${nodes[@]}"; do
          LC_ALL=C sort -z | xargs -0 sha256sum | awk '{print \$1}' | \
          sha256sum | awk '{print \$1}'" \
         2>/dev/null)
-    if [[ -z "$reference_driver_hash" ]]; then
-        reference_driver_hash=$driver_hash
-        pass "$host driver hash" "$driver_hash"
-    elif [[ "$driver_hash" == "$reference_driver_hash" ]]; then
+    if [[ "$driver_hash" == "$expected_driver_hash" ]]; then
         pass "$host driver hash" "$driver_hash"
     else
         fail "$host driver hash" \
-            "expected=$reference_driver_hash actual=$driver_hash"
+            "release=$expected_driver_hash actual=$driver_hash"
     fi
 
     https_address=$(remote "$target" \
