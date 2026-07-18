@@ -81,7 +81,7 @@ run_case() {
         CONTROLLER_OPENRC="$CONTROLLER_OPENRC" \
         SSH_IDENTITY="$SSH_IDENTITY" \
         "$@" \
-        "$E2E_SCRIPT"
+        bash "$E2E_SCRIPT"
     for ssh_host in "${node_ssh[@]}"; do
         before=${node_baseline["$ssh_host"]}
         after=$(snapshot_node "$ssh_host")
@@ -142,7 +142,7 @@ if [[ "$RUN_FLEET_PREFLIGHT" == true ]]; then
         CONTROLLER_SSH="$CONTROLLER_SSH" \
         CONTROLLER_OPENRC="$CONTROLLER_OPENRC" \
         SSH_IDENTITY="$SSH_IDENTITY" \
-        "$FLEET_PREFLIGHT"
+        bash "$FLEET_PREFLIGHT"
 fi
 
 echo "PASS BFV migration release matrix and residual-state audit"
