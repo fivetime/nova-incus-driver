@@ -126,6 +126,30 @@ wait_host_rbd_unmapped() {
     fail "$host still maps Cinder volume $volume"
 }
 
+wait_incus_instance_absent() {
+    local host=$1 deadline=$((SECONDS + TIMEOUT))
+    while ((SECONDS < deadline)); do
+        if ! incus "$host" info "$instance_name" >/dev/null 2>&1 &&
+                ! incus "$host" profile show "$instance_name" \
+                    >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2
+    done
+    fail "$host still has Incus instance or profile $instance_name"
+}
+
+wait_runtime_cleanup() {
+    local host
+    for host in "$SOURCE_SSH" "$DEST_SSH"; do
+        wait_incus_instance_absent "$host"
+        wait_host_rbd_unmapped "$host" "$volume_id"
+        if [[ -n "$data_volume_id" ]]; then
+            wait_host_rbd_unmapped "$host" "$data_volume_id"
+        fi
+    done
+}
+
 server_status() {
     openstack server show "$server_id" -f value -c status
 }
@@ -361,9 +385,8 @@ if [[ "$INJECT_POST_CLAIM_FAILURE" == true ]]; then
     openstack server resize confirm "$server_id"
     wait_value "$expected_server_state" server_status
     openstack server delete --wait "$server_id"
+    wait_runtime_cleanup
     server_id=
-    wait_host_rbd_unmapped "$SOURCE_SSH" "$data_volume_id"
-    wait_host_rbd_unmapped "$DEST_SSH" "$data_volume_id"
     wait_value available volume_status
     openstack volume delete "$volume_id"
     wait_absent openstack volume show "$volume_id"
@@ -445,11 +468,8 @@ assert_owner "$DEST_SSH" "$SOURCE_SSH" "$DEST_HOST"
 
 trap - EXIT INT TERM
 openstack server delete --wait "$server_id"
+wait_runtime_cleanup
 server_id=
-if [[ -n "$data_volume_id" ]]; then
-    wait_host_rbd_unmapped "$SOURCE_SSH" "$data_volume_id"
-    wait_host_rbd_unmapped "$DEST_SSH" "$data_volume_id"
-fi
 wait_value available volume_status
 openstack volume delete "$volume_id"
 wait_absent openstack volume show "$volume_id"
