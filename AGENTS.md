@@ -308,6 +308,10 @@ in `TEST_STATUS.md`; this section keeps only the rules.
   release gate. It runs the fault matrix, rejects OpenStack and compute runtime
   inventory drift after cleanup, and then runs fleet preflight. Production
   admission requires it to pass for every ordered compute pair.
+- `tools/openstack-incus-bfv-root-extend-e2e.sh` is the BFV root-growth release
+  gate. It validates online growth, migration and revert persistence, injected
+  filesystem-growth failure, reboot reconciliation, and shrink refusal. The
+  test requires Cinder API microversion 3.42 or later.
 
 ### Repository and test-VM workflow
 

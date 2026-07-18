@@ -605,6 +605,16 @@ incremental hardening.
   `9ff314...` SHA-256 while Cinder rolled back the temporary LVM target. Online
   volume migration/retype is explicitly unsupported until a crash-consistent
   block-copy protocol exists. The temporary LVM backend was disabled again.
+- A BFV root-growth E2E expanded a running Cinder root from 2 GiB to 3 GiB,
+  verified the RBD, Incus local root device, and ext4 filesystem, hard
+  rebooted it, and confirmed a cold migration to `incus-node-02`. Binding
+  `/bin/false` over the Incus image's `resize2fs` then forced the 3 GiB to
+  4 GiB filesystem-growth step to fail while Cinder retained the larger RBD
+  and Incus retained the old device size. After removing the fault, a hard
+  reboot reconciled the Cinder BDM size and grew ext4 to 4 GiB. Reverse
+  migration/revert preserved the root marker and size, and Cinder rejected a
+  shrink request. The final Python 3.12 suite passed 229 tests with 2
+  intentional legacy pylxd skips; pep8 and warning-as-error docs passed.
 
 - Re-running DevStack to add Cinder rebuilt the test Nova databases. Three
   retained Incus containers (`instance-00000008`, `instance-00000009`, and

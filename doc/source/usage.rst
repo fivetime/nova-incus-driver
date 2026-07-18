@@ -1015,3 +1015,32 @@ retains ``mean``, ``rate:mean``, and ``rate:sum`` at five-minute granularity.
 Billing should consume ``rate:sum`` for the counter increase in an archive
 window. ``rate:mean`` is useful for trends, while plain ``mean`` is only the
 average cumulative counter value inside that window.
+
+BFV root volume extension
+-------------------------
+
+Cinder BFV roots support grow-only online extension. Use Cinder API
+microversion 3.42 or later to extend an attached root volume. Cinder first
+grows the RBD image and emits Nova's ``volume-extended`` event. The compute
+driver then sets the exact byte size on the instance-local Incus root device;
+the ``cephext`` driver verifies that it matches the externally owned RBD and
+grows the filesystem without resizing the RBD itself.
+
+The size is deliberately stored on the instance-local root device, not only
+on its profile. Incus materializes a local root device when it claims a BFV
+volume, and that device overrides the profile device with the same name.
+Updating only the profile would record the requested value without applying
+it to the running root filesystem.
+
+If filesystem growth fails, the Nova event reports failure and the old Incus
+device size remains in place. The Cinder volume is not rolled back. A later
+hard reboot reconciles the Cinder BDM ``volume_size`` with the local root
+device and retries the idempotent filesystem growth before restarting the
+container. Cold migration and revert rebuild the destination root device with
+that same Cinder size. Root-volume shrinking is unsupported and is rejected
+by Cinder before Incus is called.
+
+Run ``tools/openstack-incus-bfv-root-extend-e2e.sh`` as a release gate. It
+checks online growth, reboot persistence, confirmed migration, injected
+filesystem-growth failure and reboot recovery, reverse handover during
+resize revert, persistent guest data, and shrink refusal.

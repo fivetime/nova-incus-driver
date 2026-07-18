@@ -219,6 +219,9 @@ def _bfv_root_device(instance, root_bdm, root_volume):
         'pool': CONF.incus.boot_from_volume_storage_pool,
         'initial.ceph.rbd.image_name': root_volume[1],
     }
+    if root_bdm.get('volume_size'):
+        device['size'] = '%dB' % (
+            int(root_bdm['volume_size']) * units.Gi)
     device.update(volume_limits or flavor_limits)
     return device
 
@@ -1637,9 +1640,8 @@ class LXDDriver(driver.ComputeDriver):
         See `nova.virt.driver.ComputeDriver.cleanup` for more
         information.
         """
-        self._reconcile_reboot_data_volumes(
+        container = self._reconcile_reboot_data_volumes(
             context, instance, block_device_info)
-        container = self.client.instances.get(instance.name)
         if container.status == 'Stopped':
             self._validate_reboot_vifs(instance, network_info)
             self.plug_vifs(instance, network_info)
@@ -1735,6 +1737,14 @@ class LXDDriver(driver.ComputeDriver):
             self, context, instance, block_device_info):
         """Restore data-volume devices before recovering a retained target."""
         profile = self.client.profiles.get(instance.name)
+        container = self.client.instances.get(instance.name)
+        root_bdm = _boot_from_volume(block_device_info)
+        if root_bdm is not None and root_bdm.get('volume_size'):
+            root_volume = _cinder_rbd_root(root_bdm)
+            self._resize_bfv_root(
+                container, root_volume[1],
+                int(root_bdm['volume_size']) * units.Gi)
+
         seen = set()
         for bdm in driver.block_device_info_get_mapping(block_device_info):
             if _is_boot_volume(bdm):
@@ -1764,6 +1774,25 @@ class LXDDriver(driver.ComputeDriver):
                 raise exception.InvalidVolume(
                     reason='Incus profile data volume %s does not match the '
                     'Nova block-device mapping' % volume_id)
+        return container
+
+    @staticmethod
+    def _resize_bfv_root(container, image_name, requested_size):
+        """Grow a matching Cinder-owned root filesystem through Incus."""
+        root = container.devices.get('root')
+        if not root or root.get(
+                'initial.ceph.rbd.image_name') != image_name:
+            return False
+
+        requested = '%dB' % requested_size
+        if root.get('size') == requested:
+            return True
+
+        updated_root = dict(root)
+        updated_root['size'] = requested
+        container.devices['root'] = updated_root
+        container.save(wait=True)
+        return True
 
     def _validate_reboot_vifs(self, instance, network_info):
         """Refuse to start a retained target with stale NIC ownership."""
@@ -1932,8 +1961,13 @@ class LXDDriver(driver.ComputeDriver):
 
     def extend_volume(self, context, connection_info, instance,
                       requested_size):
-        """Refresh an attached host block device after Cinder extends it."""
+        """Grow a BFV root filesystem or refresh an attached data device."""
         volume_id = _volume_id(connection_info)
+        container = self.client.instances.get(instance.name)
+        image_name = 'volume-%s' % volume_id
+        if self._resize_bfv_root(container, image_name, requested_size):
+            return
+
         storage_driver = brick_get_connector(
             connection_info['driver_volume_type'])
         try:

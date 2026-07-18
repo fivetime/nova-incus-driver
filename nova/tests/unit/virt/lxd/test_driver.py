@@ -2738,6 +2738,62 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         volume_connector.extend_volume.assert_called_once_with(
             connection_info['data'])
 
+    def test_extend_bfv_root_updates_incus_size_without_os_brick(self):
+        connection_info = {
+            'serial': 'root-id',
+            'driver_volume_type': 'rbd',
+            'data': {'name': 'pool/volume-root-id'},
+        }
+        container = self.client.instances.get.return_value
+        container.devices = {
+            'root': {
+                'type': 'disk',
+                'path': '/',
+                'initial.ceph.rbd.image_name': 'volume-root-id',
+            },
+        }
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+        driver.brick_get_connector = mock.Mock()
+
+        lxd_driver.extend_volume(
+            context.get_admin_context(), connection_info,
+            fake_instance.fake_instance_obj(
+                context.get_admin_context(), name='test'),
+            2 * units.Gi)
+
+        self.assertEqual(
+            '%dB' % (2 * units.Gi), container.devices['root']['size'])
+        container.save.assert_called_once_with(wait=True)
+        driver.brick_get_connector.assert_not_called()
+
+    def test_extend_bfv_root_is_idempotent(self):
+        requested_size = 2 * units.Gi
+        connection_info = {
+            'serial': 'root-id',
+            'driver_volume_type': 'rbd',
+            'data': {'name': 'pool/volume-root-id'},
+        }
+        container = self.client.instances.get.return_value
+        container.devices = {
+            'root': {
+                'type': 'disk',
+                'path': '/',
+                'initial.ceph.rbd.image_name': 'volume-root-id',
+                'size': '%dB' % requested_size,
+            },
+        }
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+
+        lxd_driver.extend_volume(
+            context.get_admin_context(), connection_info,
+            fake_instance.fake_instance_obj(
+                context.get_admin_context(), name='test'),
+            requested_size)
+
+        container.save.assert_not_called()
+
     def test_extend_volume_rejects_stale_size(self):
         volume_connector = mock.Mock()
         volume_connector.extend_volume.return_value = units.Gi
