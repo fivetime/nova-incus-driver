@@ -54,8 +54,16 @@ while IFS= read -r name; do
 done < <(incus_nova list --format csv -c n)
 [[ -n "$instance_name" ]]
 
-incus_nova exec "$instance_name" -- wget -qO- -T 10 \
-    http://169.254.169.254/openstack/latest/meta_data.json |
+incus_nova exec "$instance_name" -- sh -c '
+    url=$1
+    if command -v curl >/dev/null 2>&1; then
+        exec curl -fsS --max-time 10 "$url"
+    elif command -v wget >/dev/null 2>&1; then
+        exec wget -qO- -T 10 "$url"
+    fi
+    echo "Guest image requires curl or wget for metadata validation" >&2
+    exit 127
+' sh http://169.254.169.254/openstack/latest/meta_data.json |
     python3 -c 'import json,sys; expected=sys.argv[1]; assert json.load(sys.stdin)["uuid"] == expected' "$server_id"
 
 iface=$(ovs-vsctl --data=bare --no-heading --columns=name find Interface \
