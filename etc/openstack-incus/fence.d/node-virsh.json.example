@@ -1,0 +1,8 @@
+{
+  "agent": "virsh",
+  "ip": "192.0.2.20",
+  "username": "root",
+  "identity_file": "/root/.ssh/openstack-incus-fence",
+  "plug": "incus-compute-01",
+  "power_timeout": 60
+}

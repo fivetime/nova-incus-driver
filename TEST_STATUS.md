@@ -717,6 +717,43 @@ hardening.
   interface. The OVS/KRBD/binding queries were replayed against the retained
   node-03 to node-02 evacuation state: node-02 had one interface and mapping,
   node-03 had neither, and Neutron named node-02 as owner.
+- On 2026-07-18, the external STONITH release gate completed against the
+  independent KVM host `10.224.0.9`. The authoritative mapping was
+  `incus-node-02` (`10.224.0.17`) to libvirt domain
+  `ubuntu-24-incus-test`; the source and destination were separate from the
+  orchestrating controller. ClusterLabs `fence_virsh` forcibly powered the
+  source off, Ceph reached zero watchers, Nova declared the service down after
+  its configured 720-second threshold, and Nova evacuated BFV server
+  `7cbb8e9a-3532-4fb7-b3bc-8e4497bc6b72` to `incus-node-03`.
+- The target preserved the rootfs marker, Cinder root attachment, fixed
+  Neutron port and exactly one RBD watcher. After independent power-on, the
+  old source had no admission token, nova-compute was failed, every local
+  workload was stopped, its record was stale, its KRBD mapping was absent,
+  and the returning-host ownership audit passed. Explicit admission let
+  Nova remove the stale Incus record; the final gate also proved zero source
+  KRBD/OVS owners, one destination KRBD/OVS owner, one Cinder attachment and
+  the destination Neutron binding.
+- The first real attempt exposed the ClusterLabs convention that status
+  returns 2 for OFF; the provider now accepts only 0/ON or 2/OFF and rejects
+  contradictions. The second attempt exposed `TIMEOUT=600` below Nova's
+  `service_down_time=720`; the gate now derives a minimum threshold before
+  fencing. Both failures stopped before evacuation and were recovered through
+  quarantine, ownership audit and explicit admission.
+- The KVM host also exposed a lab-only cold-boot defect: the `.17` 1 TiB
+  volume was an extensionless symlinked libvirt volume that AppArmor could
+  not reopen after power loss. It was converted without copying data to the
+  real file source `/data/libvirt/images/data.qcow2`; the guest's vdb/LVM
+  layout remained intact and subsequent fence off/on succeeded. This is
+  infrastructure evidence, not an Incus workaround.
+- After the successful destructive gate, all three libvirt domains were
+  running and all three Nova computes were enabled/up. The strict fleet audit
+  passed every Incus 7.2 image/revision, admission, autostart, Ceph,
+  Placement, OVN and Cinder check. BFV evacuation is therefore supported with
+  shared Ceph and a prevalidated external STONITH provider; physical
+  deployments must repeat the gate through their production BMC or PDU.
+  The final Python 3.12 regression passed 247 tests with 2 intentional legacy
+  pylxd skips; pep8, all shell syntax checks, capability JSON validation and
+  the warning-as-error documentation build passed.
 
 - Re-running DevStack to add Cinder rebuilt the test Nova databases. Three
   retained Incus containers (`instance-00000008`, `instance-00000009`, and

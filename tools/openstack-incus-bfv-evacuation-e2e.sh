@@ -17,7 +17,7 @@ CONTROLLER_OPENRC=${CONTROLLER_OPENRC:-/opt/stack/devstack/openrc admin admin}
 RETURN_AUDIT=${RETURN_AUDIT:-"$SCRIPT_DIR/openstack-incus-returning-host-audit.sh"}
 CINDER_RBD_POOL=${CINDER_RBD_POOL:-cinder-volumes-rbd-pool}
 INCUS_PROJECT=${INCUS_PROJECT:-nova}
-TIMEOUT=${TIMEOUT:-300}
+TIMEOUT=${TIMEOUT:-}
 
 SSH=(ssh -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=no)
 marker="openstack-incus-evacuation-$(date +%s)-$$"
@@ -35,6 +35,24 @@ openstack() {
     remote "$CONTROLLER_SSH" \
         "source $CONTROLLER_OPENRC >/dev/null 2>&1; openstack $command_line"
 }
+
+nova_service_down_time=$(
+    remote "$CONTROLLER_SSH" \
+        "crudini --get /etc/nova/nova.conf DEFAULT service_down_time \
+         2>/dev/null || echo 60"
+)
+[[ "$nova_service_down_time" =~ ^[0-9]+$ ]] || {
+    echo "Invalid Nova service_down_time: $nova_service_down_time" >&2
+    exit 1
+}
+minimum_timeout=$((nova_service_down_time + 120))
+if [[ -z "$TIMEOUT" ]]; then
+    TIMEOUT=$minimum_timeout
+elif ((TIMEOUT < minimum_timeout)); then
+    echo "TIMEOUT=$TIMEOUT is unsafe: Nova service_down_time is" \
+         "$nova_service_down_time; use at least $minimum_timeout seconds" >&2
+    exit 1
+fi
 
 wait_for() {
     local description=$1

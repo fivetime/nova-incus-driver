@@ -88,6 +88,30 @@ class FenceAgentProviderTest(test.NoDBTestCase):
             )
         self.assertIn("unsupported fence agent", str(error))
 
+    def test_virsh_uses_validated_identity_without_password(self):
+        payload = (
+            '{"agent":"virsh","ip":"192.0.2.1","username":"root",'
+            '"identity_file":"/root/.ssh/fence","plug":"compute-01"}'
+        )
+        with mock.patch.object(
+                provider,
+                "_read_secure_file",
+                side_effect=[payload, "private-key"],
+        ) as read_file:
+            binary, parameters = provider.load_config(
+                Path("/cfg"),
+                "node-01",
+            )
+
+        self.assertEqual("fence_virsh", binary)
+        self.assertEqual("/root/.ssh/fence", parameters["identity_file"])
+        self.assertTrue(parameters["ssh"])
+        self.assertNotIn("password", parameters)
+        self.assertEqual(
+            mock.call(Path("/root/.ssh/fence"), "fence SSH identity"),
+            read_file.call_args_list[1],
+        )
+
     def test_secret_uses_stdin_and_status_is_normalized(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -146,16 +170,44 @@ class FenceAgentProviderTest(test.NoDBTestCase):
             self.assertIn("action=status\n", payload)
             self.assertIn("password=super-secret\n", payload)
 
-    @mock.patch.object(provider, "invoke", return_value="success")
+    @mock.patch.object(provider, "invoke", return_value=("success", 0))
     @mock.patch.object(provider, "load_config", return_value=("agent", {}))
     def test_status_fails_closed_on_ambiguous_output(
             self, mock_load, mock_invoke):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(1, provider.main(["status", "node-01"]))
 
-    @mock.patch.object(provider, "invoke", return_value="Status: OFF\nnow ON")
+    @mock.patch.object(
+        provider,
+        "invoke",
+        return_value=("Status: OFF\nnow ON", 2),
+    )
     @mock.patch.object(provider, "load_config", return_value=("agent", {}))
     def test_status_fails_closed_on_conflicting_output(
+            self, mock_load, mock_invoke):
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(1, provider.main(["status", "node-01"]))
+
+    @mock.patch.object(
+        provider,
+        "invoke",
+        return_value=("Status: OFF", 2),
+    )
+    @mock.patch.object(provider, "load_config", return_value=("agent", {}))
+    def test_status_accepts_standard_off_return_code(
+            self, mock_load, mock_invoke):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(0, provider.main(["status", "node-01"]))
+        self.assertEqual("off\n", stdout.getvalue())
+
+    @mock.patch.object(
+        provider,
+        "invoke",
+        return_value=("Status: ON", 2),
+    )
+    @mock.patch.object(provider, "load_config", return_value=("agent", {}))
+    def test_status_rejects_return_code_output_mismatch(
             self, mock_load, mock_invoke):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(1, provider.main(["status", "node-01"]))

@@ -40,13 +40,29 @@ AGENTS = {
     "ipmilan": {
         "binary": "fence_ipmilan",
         "keys": COMMON_KEYS | {"auth", "cipher", "lanplus", "privlvl"},
+        "required": {"ip", "username", "password_file"},
         "defaults": {"lanplus": True, "method": "onoff"},
     },
     "redfish": {
         "binary": "fence_redfish",
         "keys": COMMON_KEYS
         | {"redfish_uri", "systems_uri", "ssl_insecure"},
+        "required": {"ip", "username", "password_file"},
         "defaults": {"ssl_insecure": False},
+    },
+    "virsh": {
+        "binary": "fence_virsh",
+        "keys": {
+            "agent",
+            "identity_file",
+            "ip",
+            "ipport",
+            "plug",
+            "power_timeout",
+            "username",
+        },
+        "required": {"identity_file", "ip", "plug", "username"},
+        "defaults": {"ssh": True},
     },
 }
 
@@ -134,25 +150,37 @@ def load_config(config_dir, fence_id):
     if unknown:
         keys = ", ".join(sorted(unknown))
         raise ProviderError(f"unsupported configuration keys: {keys}")
-    for required in ("ip", "username", "password_file"):
+    for required in AGENTS[agent_name]["required"]:
         if required not in config:
             raise ProviderError(
                 f"missing required configuration key: {required}"
             )
 
-    password_path = Path(_scalar(config["password_file"], "password_file"))
-    if not password_path.is_absolute():
-        raise ProviderError("password_file must be an absolute path")
-    password = _read_secure_file(password_path, "fence password file")
-    password = password.rstrip("\r\n")
-    if not password or "\n" in password or "\r" in password:
-        raise ProviderError("fence password must be one non-empty line")
-
     parameters = dict(AGENTS[agent_name]["defaults"])
     for key, value in config.items():
         if key not in {"agent", "password_file"}:
             parameters[key] = value
-    parameters["password"] = password
+
+    if "password_file" in config:
+        password_path = Path(
+            _scalar(config["password_file"], "password_file")
+        )
+        if not password_path.is_absolute():
+            raise ProviderError("password_file must be an absolute path")
+        password = _read_secure_file(password_path, "fence password file")
+        password = password.rstrip("\r\n")
+        if not password or "\n" in password or "\r" in password:
+            raise ProviderError("fence password must be one non-empty line")
+        parameters["password"] = password
+
+    if "identity_file" in config:
+        identity_path = Path(
+            _scalar(config["identity_file"], "identity_file")
+        )
+        if not identity_path.is_absolute():
+            raise ProviderError("identity_file must be an absolute path")
+        _read_secure_file(identity_path, "fence SSH identity")
+
     return AGENTS[agent_name]["binary"], parameters
 
 
@@ -178,7 +206,8 @@ def invoke(binary, parameters, action, agent_dir):
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ProviderError(f"fence agent execution failed: {exc}") from exc
-    if result.returncode != 0:
+    status_off = action == "status" and result.returncode == 2
+    if result.returncode != 0 and not status_off:
         detail = (
             result.stderr.strip()
             or result.stdout.strip()
@@ -190,7 +219,7 @@ def invoke(binary, parameters, action, agent_dir):
         raise ProviderError(
             f"fence agent returned {result.returncode}: {detail}"
         )
-    return result.stdout
+    return result.stdout, result.returncode
 
 
 def main(argv=None):
@@ -212,14 +241,25 @@ def main(argv=None):
 
     try:
         binary, parameters = load_config(args.config_dir, args.fence_id)
-        output = invoke(binary, parameters, args.action, args.agent_dir)
+        output, returncode = invoke(
+            binary,
+            parameters,
+            args.action,
+            args.agent_dir,
+        )
         if args.action == "status":
             states = {match.lower() for match in STATUS_RE.findall(output)}
             if len(states) != 1:
                 raise ProviderError(
                     "fence agent did not return an unambiguous power state"
                 )
-            print(states.pop())
+            state = states.pop()
+            expected = "on" if returncode == 0 else "off"
+            if state != expected:
+                raise ProviderError(
+                    "fence agent status output contradicts its return code"
+                )
+            print(state)
     except ProviderError as exc:
         print(f"fence provider: {exc}", file=sys.stderr)
         return 1

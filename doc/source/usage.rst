@@ -709,9 +709,10 @@ The script verifies bidirectional migration API reachability, rootfs marker
 preservation, fixed-IP retention, confirm source deletion, revert source
 recovery, and final Incus, Neutron port, and OVS interface cleanup.
 
-Live migration is not supported. BFV evacuation is experimental and disabled
-by default. Enable it only after integrating an external STONITH or power
-fencing system that proves the failed source cannot access Ceph::
+Live migration is not supported. BFV evacuation is supported only for the
+shared-Ceph BFV workflow with an external STONITH or power fencing system that
+proves the failed source cannot access Ceph. It remains disabled by default so
+a deployment cannot accidentally omit that prerequisite::
 
     [incus]
     allow_bfv_evacuate = true
@@ -755,7 +756,8 @@ Production fencing providers must implement ``off``, ``status``, and ``on``
 commands and report ``off`` only after the source cannot access Ceph. Run the
 destructive release gate with a disposable BFV server::
 
-    sudo apt-get install fence-agents-ipmilan fence-agents-redfish
+    sudo apt-get install \
+      fence-agents-ipmilan fence-agents-redfish fence-agents-virsh
     sudo install -o root -g root -m 0755 \
       tools/openstack-incus-fence-agent-provider \
       /usr/local/sbin/openstack-incus-fence-agent-provider
@@ -767,13 +769,15 @@ destructive release gate with a disposable BFV server::
     sudo install -o root -g root -m 0600 node-02.password \
       /etc/openstack-incus/fence-secrets/node-02
 
-The supplied ``openstack-incus-fence-agent-provider`` accepts only
-``ipmilan`` and ``redfish`` JSON configurations. Start from the examples in
+The supplied ``openstack-incus-fence-agent-provider`` accepts ``ipmilan``,
+``redfish``, and ``virsh`` JSON configurations. Start from the examples in
 ``etc/openstack-incus/fence.d``. Configuration and password files must be
 root-owned regular files with mode ``0600``; the password is sent through the
 standard fence-agent stdin protocol and never placed in argv. Redfish TLS
-verification is enabled unless ``ssl_insecure`` is explicitly set. Validate
-every target without changing its power state::
+verification is enabled unless ``ssl_insecure`` is explicitly set. The
+provider follows the ClusterLabs status convention: return code 0 means on and
+return code 2 means off, and it rejects output that contradicts that code.
+Validate every target without changing its power state::
 
     FENCE_IDS=incus-node-01,incus-node-02,incus-node-03 \
       tools/openstack-incus-fence-preflight.sh
@@ -792,12 +796,18 @@ The gate writes and hashes a rootfs marker, fences the source, requires zero
 watchers before evacuation, validates the target attachment/network/single
 watcher, powers the source back on, proves quarantine, audits mixed local and
 stale ownership, admits the source, and waits for stale-record cleanup.
+It reads Nova's ``service_down_time`` before fencing. Its timeout defaults to
+that value plus 120 seconds, and an explicitly shorter timeout is rejected
+before any power action.
 Successful ``status`` calls alone do not prove fencing. Production release
 still requires this real ``off``/``on`` test through the same BMC or PDU path
 that automation will use. Do not use ``fence_virsh``, SSH shutdown, stopping
 Podman, or disabling a switch port as evidence unless that mechanism is an
 independent, fail-closed power control plane and has been threat-modelled as
-the site's actual STONITH implementation.
+the site's actual STONITH implementation. ``fence_virsh`` is valid for a
+KVM-based test compute only when it runs from outside that guest against an
+independent libvirt host. Its root-owned ``0600`` SSH identity and exact domain
+name are mandatory. Physical production computes must use BMC or PDU fencing.
 
 Rescue and unrescue are also disabled. The legacy implementation depended on
 binding a directory from the compute host into a rescue container, which is

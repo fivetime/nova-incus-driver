@@ -123,9 +123,12 @@ implementing changes.
   stale evacuated-record cleanup and resuming locally authoritative guests.
 - The repository's production fence adapter is
   `tools/openstack-incus-fence-agent-provider`. Keep its schema restricted to
-  standard `ipmilan` and `redfish` agents, pass secrets only through the fence
-  agent stdin protocol, and fail closed on insecure files or ambiguous status.
-  Adapter tests do not replace a real BMC/PDU `off`/`on` evacuation gate.
+  standard `ipmilan`, `redfish`, and independently hosted test-only `virsh`
+  agents, pass secrets only through the fence agent stdin protocol, and fail
+  closed on insecure files or ambiguous status. Physical production computes
+  require a real BMC/PDU `off`/`on` evacuation gate. Shared-Ceph BFV
+  evacuation is supported only after that site-specific destructive gate
+  passes; `allow_bfv_evacuate` stays disabled by default.
 - Ubuntu Apport rewrites `kernel.core_pattern` after systemd-sysctl. Production
   computes must mask `apport.service` as well as persist and apply
   `kernel.core_pattern=/dev/null`.
