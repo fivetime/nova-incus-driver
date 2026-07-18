@@ -626,7 +626,8 @@ function test_config_nova_incus {
     iniset "${TEMPEST_CONFIG}" compute-feature-enabled vnc_console False
 
     if [[ "${INCUS_TEMPEST_BUILD_IMAGE,,}" == "true" ]]; then
-        iniset "${TEMPEST_CONFIG}" validation run_validation True
+        iniset "${TEMPEST_CONFIG}" validation run_validation \
+            "${INCUS_TEMPEST_RUN_VALIDATION}"
         iniset "${TEMPEST_CONFIG}" validation image_ssh_user \
             "${INCUS_TEMPEST_IMAGE_SSH_USER}"
         iniset "${TEMPEST_CONFIG}" compute flavor_ref \
@@ -641,6 +642,15 @@ function test_config_nova_incus {
     if is_service_enabled c-vol; then
         iniset "${TEMPEST_CONFIG}" volume min_microversion 3.42
         iniset "${TEMPEST_CONFIG}" volume max_microversion 3.42
+        local tempest_volume_type="${INCUS_TEMPEST_VOLUME_TYPE}"
+        if [[ -z "${tempest_volume_type}" ]] && \
+                [[ -n "${INCUS_CINDER_CEPH_POOL}" ]]; then
+            tempest_volume_type="${INCUS_CINDER_CEPH_BACKEND_NAME}"
+        fi
+        if [[ -n "${tempest_volume_type}" ]]; then
+            iniset "${TEMPEST_CONFIG}" volume volume_type \
+                "${tempest_volume_type}"
+        fi
     fi
 
     local cold_migration=False

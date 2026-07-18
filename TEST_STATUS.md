@@ -390,6 +390,37 @@ incremental hardening.
 
 ## BFV shelve and explicit root-volume reimage
 
+- On 2026-07-18 the release-grade reimage gate passed both ACTIVE and SHUTOFF
+  explicit BFV reimage at Nova microversion 2.93. The implicit reimage was
+  rejected without changing the root marker, Cinder attachment or OVN
+  network. The SHUTOFF server remained stopped until explicitly started.
+- On 2026-07-18 host-targeted unshelve at Nova microversion 2.91 moved a BFV
+  server from `incus-node-01` to `incus-node-02`. Its root marker, Cinder
+  attachment, fixed IP, OVN/OVS binding and read-only config drive survived.
+- On 2026-07-18 the BFV bootstrap gate proved an Ed25519 keypair, metadata,
+  user-data, config-drive UUID/content, read-only mount and soft-reboot
+  persistence through the public APIs.
+- On 2026-07-18 flavor resize passed on the three-node scheduler topology:
+  1 to 2 GiB root, 512 to 1024 MiB RAM, 1 to 2 vCPU and PID 2048 to 4096.
+  Cross-host marker preservation, Placement allocations, revert and confirm
+  all passed.
+- On 2026-07-18 all five BFV migration matrix cases passed: normal
+  confirm/revert, data-volume post-claim failure, start post-claim failure,
+  stopped-instance post-claim failure and reverse revert. Every case passed
+  the residual Nova/Cinder/Incus/RBD audit.
+- Tempest's API-only run passed the compute/network lifecycle scenario with
+  two guest-data scenarios explicitly skipped because the controller cannot
+  reach TCP/22 on the floating network. A validation-enabled run proved that
+  all three scenarios reached guest SSH after successful Nova scheduling and
+  Ceph volume creation, then failed only at that network boundary. The
+  dedicated E2E gates above provide the guest-data evidence.
+- The final 2026-07-18 fleet preflight passed on `incus-node-01`,
+  `incus-node-02` and `incus-node-03`: immutable image digest and source
+  revision, driver hash, Incus 7.2 extensions, AppArmor/cgroups, Ceph access,
+  dedicated control filesystems, restricted TLS, Placement, OVN, Nova and
+  Cinder were all green. The authoritative Python 3.12 tree then passed 233
+  unit tests with 2 documented legacy skips, pep8 and Sphinx `-W`.
+
 - On 2026-07-17, shelving a BFV server reached `SHELVED_OFFLOADED`, removed
   its Incus instance record and Ceph watcher, and left the Cinder attachment
   reserved. Unshelving recreated the server on `incus-node-03` with the same

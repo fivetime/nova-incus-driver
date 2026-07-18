@@ -8,7 +8,8 @@ FLAVOR=${FLAVOR:-ds512M}
 NETWORK=${NETWORK:-private}
 VOLUME_SIZE=${VOLUME_SIZE:-5}
 VOLUME_TYPE=${VOLUME_TYPE:-ceph}
-SOURCE_HOST=${SOURCE_HOST:-incus-node-03}
+SOURCE_HOST=${SOURCE_HOST:-incus-node-01}
+DEST_HOST=${DEST_HOST:-incus-node-02}
 COMPUTE_HOSTS=${COMPUTE_HOSTS:-incus-node-01,incus-node-02,incus-node-03}
 COMPUTE_SSH=${COMPUTE_SSH:-root@10.224.0.21,root@10.224.0.17,root@10.224.0.22}
 CONTROLLER_SSH=${CONTROLLER_SSH:-root@10.224.0.21}
@@ -181,10 +182,15 @@ for index in "${!compute_hosts[@]}"; do
         fail "offloaded instance remains on ${compute_hosts[$index]}"
 done
 
-openstack server unshelve "$server_id"
+[[ "$DEST_HOST" != "$SOURCE_HOST" ]] ||
+    fail "DEST_HOST must differ from SOURCE_HOST"
+openstack --os-compute-api-version 2.91 server unshelve \
+    --host "$DEST_HOST" "$server_id"
 wait_value ACTIVE server_status
 owner_host=$(openstack server show "$server_id" -f value \
     -c OS-EXT-SRV-ATTR:host)
+[[ "$owner_host" == "$DEST_HOST" ]] ||
+    fail "unshelve selected $owner_host instead of $DEST_HOST"
 owner_ssh=$(host_ssh "$owner_host")
 assert_single_owner "$owner_host"
 [[ "$(attached_host_count)" == 1 ]]

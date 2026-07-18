@@ -78,6 +78,9 @@ class IncusVolumeScenario(manager.ScenarioTest):
     @decorators.idempotent_id('44356d4b-3a74-44e0-9719-9e36c3acff50')
     @decorators.attr(type='smoke')
     @utils.services('compute', 'network', 'volume')
+    @testtools.skipUnless(
+        CONF.validation.run_validation,
+        'Guest data verification requires Tempest SSH validation.')
     def test_volume_attach(self):
         """Attach, use and detach an ext4 volume without a kernel mount."""
         keypair = self.create_keypair()
@@ -88,7 +91,8 @@ class IncusVolumeScenario(manager.ScenarioTest):
             key_name=keypair['name'],
             security_groups=[{'name': security_group['name']}],
             wait_until='ACTIVE')
-        volume = self.create_volume()
+        volume = self.create_volume(
+            volume_type=CONF.volume.volume_type or None)
         ip_address = self.get_server_ip(server)
         ssh = self.get_remote_client(
             ip_address=ip_address, username=self.ssh_user,
@@ -112,6 +116,9 @@ class IncusVolumeScenario(manager.ScenarioTest):
     @decorators.idempotent_id('dbcc8145-d69a-44d9-86a0-b29bbf4c19d4')
     @decorators.attr(type=['multinode', 'slow'])
     @utils.services('compute', 'network', 'volume')
+    @testtools.skipUnless(
+        CONF.validation.run_validation,
+        'Guest data verification requires Tempest SSH validation.')
     @testtools.skipUnless(CONF.compute_feature_enabled.cold_migration,
                           'Cold migration not available.')
     def test_volume_extend_and_cold_migrate(self):
@@ -127,7 +134,8 @@ class IncusVolumeScenario(manager.ScenarioTest):
             key_name=keypair['name'],
             security_groups=[{'name': security_group['name']}],
             wait_until='ACTIVE')
-        volume = self.create_volume(size=1)
+        volume = self.create_volume(
+            size=1, volume_type=CONF.volume.volume_type or None)
         ip_address = self.get_server_ip(server)
         ssh = self.get_remote_client(
             ip_address=ip_address, username=self.ssh_user,

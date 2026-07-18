@@ -13,6 +13,7 @@ Contents:
 
    usage
    architecture
+   api_contract
    contributing
    exclusive_machine
    vif_wiring

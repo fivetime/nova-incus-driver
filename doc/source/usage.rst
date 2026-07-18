@@ -772,6 +772,8 @@ Noble image and generate the tested Tempest settings automatically::
     INCUS_TEMPEST_MIN_COMPUTE_NODES=2
     INCUS_TEMPEST_FLAVOR_REF=d1
     INCUS_TEMPEST_FLAVOR_REF_ALT=d2
+    INCUS_TEMPEST_VOLUME_TYPE=ceph
+    INCUS_TEMPEST_RUN_VALIDATION=True
     INCUS_ALLOW_COLD_MIGRATION=True
     INCUS_TEMPEST_ENABLE_EXPERIMENTAL_COLD_MIGRATION=True
 
@@ -795,6 +797,11 @@ the configured floating network. With validation disabled, the basic scenario
 still covers dynamic credentials, keypairs, security groups, tenant network
 creation, config-drive build, Nova/Incus lifecycle, Neutron port activation,
 and resource cleanup, but it does not prove guest SSH or floating-IP traffic.
+The two Cinder scenarios are explicitly skipped in that mode because their
+data-integrity assertions require commands inside the guest. Set
+``INCUS_TEMPEST_VOLUME_TYPE`` to an online production backend; otherwise
+Cinder may select a stale or disabled default volume type before Nova is
+involved.
 
 SSH validation also requires a system-container image that already contains
 and enables an SSH server. Incus cloud images can contain cloud-init and accept

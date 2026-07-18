@@ -8,8 +8,8 @@ FLAVOR=${FLAVOR:-ds512M}
 NETWORK=${NETWORK:-private}
 VOLUME_SIZE=${VOLUME_SIZE:-5}
 VOLUME_TYPE=${VOLUME_TYPE:-ceph}
-SOURCE_HOST=${SOURCE_HOST:-incus-node-03}
-SOURCE_SSH=${SOURCE_SSH:-root@10.224.0.22}
+SOURCE_HOST=${SOURCE_HOST:-incus-node-01}
+SOURCE_SSH=${SOURCE_SSH:-root@10.224.0.21}
 CONTROLLER_SSH=${CONTROLLER_SSH:-root@10.224.0.21}
 CONTROLLER_OPENRC=${CONTROLLER_OPENRC:-/opt/stack/devstack/openrc admin admin}
 SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute test key}
@@ -87,6 +87,10 @@ assert_network() {
 
 cleanup() {
     local status=$?
+    if [[ -z "$server_id" ]]; then
+        server_id=$(openstack server list --all-projects --name "^$NAME$" \
+            -f value -c ID 2>/dev/null | head -n1 || true)
+    fi
     if [[ -n "$server_id" ]]; then
         openstack server delete --wait "$server_id" >/dev/null 2>&1 || true
     fi
@@ -105,7 +109,7 @@ volume_id=$(openstack volume create --image "$IMAGE" --size "$VOLUME_SIZE" \
 wait_value available volume_status
 server_id=$(openstack --os-compute-api-version 2.74 server create \
     --flavor "$FLAVOR" --volume "$volume_id" --network "$NETWORK" \
-    --host "$SOURCE_HOST" --wait "$NAME" -f value -c id)
+    --host "$SOURCE_HOST" "$NAME" -f value -c id)
 wait_value ACTIVE server_status
 instance_name=$(openstack server show "$server_id" -f value \
     -c OS-EXT-SRV-ATTR:instance_name)
