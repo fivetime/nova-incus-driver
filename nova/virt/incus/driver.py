@@ -2497,6 +2497,22 @@ class IncusDriver(driver.ComputeDriver):
         else:
             local_disk_info = _get_fs_info(CONF.incus.root_dir)
 
+        incus_hv_type = getattr(
+            obj_fields.HVType, 'INCUS', obj_fields.HVType.LXC)
+        supported_instances = [
+            (obj_fields.Architecture.I686, incus_hv_type,
+             obj_fields.VMMode.EXE),
+            (obj_fields.Architecture.X86_64, incus_hv_type,
+             obj_fields.VMMode.EXE),
+        ]
+        if incus_hv_type != obj_fields.HVType.LXC:
+            supported_instances.extend([
+                (obj_fields.Architecture.I686, obj_fields.HVType.LXC,
+                 obj_fields.VMMode.EXE),
+                (obj_fields.Architecture.X86_64, obj_fields.HVType.LXC,
+                 obj_fields.VMMode.EXE),
+            ])
+
         data = {
             'vcpus': vcpus,
             'memory_mb': local_memory_info['total'] // units.Mi,
@@ -2508,16 +2524,7 @@ class IncusDriver(driver.ComputeDriver):
             'hypervisor_version': '011',
             'cpu_info': jsonutils.dumps(cpu_info),
             'hypervisor_hostname': CONF.host,
-            'supported_instances': [
-                (obj_fields.Architecture.I686, 'incus',
-                 obj_fields.VMMode.EXE),
-                (obj_fields.Architecture.X86_64, 'incus',
-                 obj_fields.VMMode.EXE),
-                (obj_fields.Architecture.I686, obj_fields.HVType.LXC,
-                 obj_fields.VMMode.EXE),
-                (obj_fields.Architecture.X86_64, obj_fields.HVType.LXC,
-                 obj_fields.VMMode.EXE),
-            ],
+            'supported_instances': supported_instances,
             'numa_topology': None,
         }
 
