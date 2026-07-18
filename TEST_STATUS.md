@@ -389,8 +389,8 @@ hardening.
   authoritative hosts.
 - `tools/openstack-incus-bfv-evacuation-e2e.sh` now defines the production
   release protocol for an external provider with `off`, `status`, and `on`
-  operations. The capability remains experimental until a real site
-  IPMI/Redfish/PDU provider passes that complete automated gate.
+  operations. At this checkpoint the external power gate had not run; the
+  later independent KVM-host result below supersedes that interim status.
 - The post-test three-node fleet preflight passed with all computes
   `enabled/up`, driver hash
   `24dffc1826f6c2202355a1c359173da9345107eae630a639900ac8e5a2754867`,
@@ -699,9 +699,9 @@ hardening.
   fence-agent stdin rather than argv, and rejects ambiguous power status.
   Six Nova unit tests, flake8, a real-process fake-agent integration test, an
   insecure-mode rejection, and the warning-as-error documentation build
-  passed on `incus-node-01`. This validates the adapter, not an actual BMC:
-  BFV evacuation remains `experimental` until the destructive release gate
-  performs real power `off` and `on` through the production management plane.
+  passed on `incus-node-01`. This checkpoint validated the adapter but not
+  external power; the later independent KVM-host gate below completed that
+  requirement.
   The final full regression passed 244 tests with 2 intentional legacy pylxd
   skips. Pep8, all shell syntax checks, the fence preflight positive/negative
   tests, and warning-as-error documentation passed. Fleet preflight then

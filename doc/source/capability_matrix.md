@@ -27,8 +27,8 @@
 - 三节点 production preflight、fleet drift audit、镜像 digest 和 Incus fork
   revision 校验。
 - BFV failed-host evacuation 的 Nova/Cinder/Neutron/Incus 数据路径已经过人工
-  隔离源端后的真实 E2E：根盘标记、固定 IP、Placement、单一 RBD watcher 和
-  源恢复清理均通过。
+  隔离和独立 KVM 宿主强制断电后的真实 E2E：根盘标记、固定 IP、Placement、
+  单一 RBD watcher、返回节点隔离和源恢复清理均通过。
 - suspend/resume/rescue/unrescue 在 compute manager 中无副作用拒绝，恢复
   task state、保留 VM state，并写入明确的 Nova action event。
 
@@ -43,11 +43,12 @@
 这些项目不能因为 API 端点存在就被视为驱动缺陷。必须保持显式、无数据破坏的
 拒绝语义，除非产品边界改变并新增完整设计与验证。
 
-## 唯一生产 HA 缺口
+## 生产 HA 边界
 
-BFV evacuation 的驱动路径和人工 fencing E2E 已完成，但生产自动化仍缺外部
-STONITH/电源隔离集成。停止 Podman 内的 incusd 不能隔离宿主上的 LXC monitor、
-挂载、KRBD 映射或 Ceph watcher。
+BFV evacuation 的驱动路径、ClusterLabs fence provider、返回节点准入机制和
+外部 STONITH E2E 已完成。测试通过独立 KVM 宿主对源计算节点真实断电和上电，
+不是停止 Podman 或来宾 SSH 关机。后两者不能隔离宿主上的 LXC monitor、挂载、
+KRBD 映射或 Ceph watcher，不能作为生产 fencing。
 
 生产启用 `allow_bfv_evacuate` 前，外部系统必须：
 
@@ -55,7 +56,9 @@ STONITH/电源隔离集成。停止 Podman 内的 incusd 不能隔离宿主上�
 2. 确认目标 RBD 没有源端 watcher。
 3. 再调用 Nova evacuation。
 4. 以 Nova terminal task state 和原始电源状态判断完成，不能假定总是 ACTIVE。
+5. 返回节点必须保持隔离，通过所有权审计后才能显式重新准入。
 
-该能力在 `capabilities.json` 中保持 `experimental`，直到上述外部 fencing
-接入发布自动化并完成断电 E2E。迁移矩阵和三节点生产审计不需要重做开发，只需
-作为每个版本的回归门禁重新执行。
+该能力在 `capabilities.json` 中为有条件 `supported`：只适用于 shared-Ceph
+BFV，并要求部署自己的外部 STONITH。物理生产环境必须通过相同门禁验证其
+IPMI/Redfish/PDU；驱动默认仍关闭 `allow_bfv_evacuate`。迁移矩阵、真实断电
+E2E 和三节点生产审计不需要重做开发，但必须作为每个版本的回归门禁重新执行。

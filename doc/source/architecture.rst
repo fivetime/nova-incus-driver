@@ -385,14 +385,15 @@ Delivery milestones
 Until implemented, advanced Nova capabilities must be reported as unsupported
 rather than silently emulated or advertised.
 
-Live migration is explicitly unsupported. Failed-host evacuation is
-experimental, disabled by default, and limited to Cinder RBD boot-from-volume
-instances. It requires external power fencing before Nova starts evacuation;
-Nova's service-down test does not prove that the old host has lost access to
-the RBD. Local and image-backed roots reject evacuation because their pet data
-is unavailable when the source host is down. Cold migration requires a
-reachable, healthy source Incus daemon so the destination can negotiate the
-transfer. Cinder BFV roots use shared Ceph without copying rootfs data.
+Live migration is explicitly unsupported. Failed-host evacuation is supported
+only for Cinder RBD boot-from-volume instances after the deployment passes the
+external STONITH release gate, and is disabled by default. External power
+fencing must complete before Nova starts evacuation; Nova's service-down test
+does not prove that the old host has lost access to the RBD. Local and
+image-backed roots reject evacuation because their pet data is unavailable
+when the source host is down. Cold migration requires a reachable, healthy
+source Incus daemon so the destination can negotiate the transfer. Cinder BFV
+roots use shared Ceph without copying rootfs data.
 
 Returning-host quarantine
 --------------------------

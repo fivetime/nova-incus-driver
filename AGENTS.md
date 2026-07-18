@@ -347,8 +347,8 @@ in `TEST_STATUS.md`; this section keeps only the rules.
 - `tools/openstack-incus-fence-preflight.sh` is a non-destructive target and
   credential check. `tools/openstack-incus-bfv-evacuation-e2e.sh` is the
   destructive STONITH release gate; it must run through the same independent
-  BMC or PDU control path used in production before BFV evacuation can leave
-  `experimental`.
+  BMC or PDU control path used in production before that deployment enables
+  the otherwise supported shared-Ceph BFV evacuation capability.
 - `tools/openstack-incus-bfv-root-extend-e2e.sh` is the BFV root-growth release
   gate. It validates online growth, migration and revert persistence, injected
   filesystem-growth failure, reboot reconciliation, and shrink refusal. The
