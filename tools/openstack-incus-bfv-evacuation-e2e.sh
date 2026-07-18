@@ -82,6 +82,53 @@ source_reachable() {
     remote "$SOURCE_SSH" true >/dev/null 2>&1
 }
 
+control_plane_is_independent() {
+    local endpoint host address source_address=${SOURCE_SSH#*@}
+    local -A source_addresses=()
+    local -a endpoints=()
+
+    source_addresses["$source_address"]=1
+    while IFS= read -r address; do
+        [[ -n "$address" ]] && source_addresses["$address"]=1
+    done < <(getent ahostsv4 "$source_address" 2>/dev/null |
+        awk '{print $1}' | sort -u)
+
+    mapfile -t endpoints < <(openstack endpoint list -f json |
+        jq -r '.[] | .URL // .url // empty' | sort -u)
+    (( ${#endpoints[@]} > 0 )) || {
+        echo "OpenStack endpoint inventory is empty" >&2
+        return 1
+    }
+
+    for endpoint in "${endpoints[@]}"; do
+        host=$(python3 -c \
+            'import sys; from urllib.parse import urlsplit; print(urlsplit(sys.argv[1]).hostname or "")' \
+            "$endpoint") || {
+            echo "Cannot determine host for OpenStack endpoint: $endpoint" \
+                >&2
+            return 1
+        }
+        [[ -n "$host" ]] || {
+            echo "Cannot determine host for OpenStack endpoint: $endpoint" \
+                >&2
+            return 1
+        }
+        if [[ -n "${source_addresses[$host]:-}" ]]; then
+            echo "OpenStack endpoint $endpoint is hosted on fence source" \
+                "$source_address" >&2
+            return 1
+        fi
+        while IFS= read -r address; do
+            if [[ -n "${source_addresses[$address]:-}" ]]; then
+                echo "OpenStack endpoint $endpoint resolves to fence source" \
+                    "$source_address" >&2
+                return 1
+            fi
+        done < <(getent ahostsv4 "$host" 2>/dev/null |
+            awk '{print $1}' | sort -u)
+    done
+}
+
 source_fenced() {
     [[ "$("$FENCE_PROVIDER" status "$SOURCE_FENCE_ID")" == off ]]
 }
@@ -168,6 +215,16 @@ mapfile -t server_ports < <(
 )
 (( ${#server_ports[@]} > 0 )) || {
     echo "Server does not have a Neutron port" >&2
+    exit 1
+}
+
+[[ "$CONTROLLER_SSH" != "$SOURCE_SSH" &&
+   "$CONTROLLER_SSH" != "$DEST_SSH" ]] || {
+    echo "CONTROLLER_SSH must be independent of source and destination" >&2
+    exit 1
+}
+control_plane_is_independent || {
+    echo "OpenStack control plane is not independent of the fence source" >&2
     exit 1
 }
 

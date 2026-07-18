@@ -756,7 +756,11 @@ Only after it passes may an operator admit and start the compute::
 
 Production fencing providers must implement ``off``, ``status``, and ``on``
 commands and report ``off`` only after the source cannot access Ceph. Run the
-destructive release gate with a disposable BFV server::
+destructive release gate with a disposable BFV server. The orchestrator and
+every Keystone, Nova, Neutron, Cinder, Placement, and Glance endpoint used by
+the test must remain available after the source is powered off. The gate
+resolves the endpoint inventory before fencing and rejects an endpoint hosted
+on the source::
 
     sudo apt-get install \
       fence-agents-ipmilan fence-agents-redfish fence-agents-virsh

@@ -46,7 +46,9 @@ Before enabling ``[incus] allow_bfv_evacuate``:
 
 #. Execute ``tools/openstack-incus-fence-preflight.sh`` for every compute.
 #. Run ``tools/openstack-incus-bfv-evacuation-e2e.sh`` from a controller that
-   is not the source or destination.
+   is not the source or destination. Every OpenStack API endpoint used by the
+   test must also remain independent of the source; the script rejects an
+   endpoint hostname or address that resolves to the fence source.
 #. Prove the source is powered off and has zero Ceph watchers before Nova
    evacuation starts.
 #. Prove one target attachment, watcher, Neutron binding, and OVS owner.
