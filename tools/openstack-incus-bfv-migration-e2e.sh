@@ -64,6 +64,21 @@ incus() {
     fi
 }
 
+wait_incus_ready() {
+    local host=$1 deadline=$((SECONDS + 60)) server
+    while ((SECONDS < deadline)); do
+        server=$(incus "$host" query /1.0 2>/dev/null || true)
+        if grep -q storage_driver_cephext <<<"$server" &&
+                grep -q migration_shared_ceph_storage <<<"$server" &&
+                incus "$host" storage show cinder-bfv 2>/dev/null |
+                    grep -q '^driver: cephext$'; then
+            return 0
+        fi
+        sleep 2
+    done
+    fail "$host did not restore the required cephext migration API"
+}
+
 fail() {
     echo "FAIL: $*" >&2
     exit 1
@@ -72,11 +87,18 @@ fail() {
 wait_value() {
     local expected=$1
     shift
-    local deadline=$((SECONDS + TIMEOUT)) current
+    local deadline=$((SECONDS + TIMEOUT)) current migration_status
     while ((SECONDS < deadline)); do
         current=$("$@" 2>/dev/null || true)
         [[ "$current" == "$expected" ]] && return 0
         [[ "$current" == ERROR ]] && break
+        if [[ "$expected" == VERIFY_RESIZE && "$current" == ACTIVE &&
+              -n "$server_id" ]]; then
+            migration_status=$(latest_migration_status 2>/dev/null || true)
+            if [[ "$migration_status" == error ]]; then
+                fail "migration entered error while waiting for VERIFY_RESIZE"
+            fi
+        fi
         sleep 2
     done
     fail "timed out waiting for $expected (current: ${current:-missing})"
@@ -225,12 +247,7 @@ trap 'exit 143' TERM
 
 [[ "$VOLUME_SIZE" =~ ^[1-9][0-9]*$ ]] || fail "VOLUME_SIZE must be positive"
 for host in "$SOURCE_SSH" "$DEST_SSH"; do
-    incus "$host" query /1.0 | grep -q migration_shared_ceph_storage || \
-        fail "$host lacks migration_shared_ceph_storage"
-    incus "$host" query /1.0 | grep -q storage_driver_cephext || \
-        fail "$host lacks storage_driver_cephext"
-    incus "$host" storage show cinder-bfv | grep -q '^driver: cephext$' || \
-        fail "$host cinder-bfv pool is not cephext"
+    wait_incus_ready "$host"
 done
 
 volume_id=$(openstack volume create --type "$VOLUME_TYPE" --image "$IMAGE" \
