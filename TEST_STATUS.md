@@ -361,6 +361,42 @@ hardening.
 
 ## BFV failed-host evacuation
 
+- On 2026-07-18 Nova-managed containers were changed to
+  `boot.autostart=false` and nova-compute gained an ephemeral per-boot
+  admission token. A real reboot of `incus-node-01` changed its boot ID,
+  started Incus with its tenant container STOPPED, left nova-compute failed
+  closed and quarantined, and preserved `kernel.core_pattern=/dev/null` after
+  Apport was masked. The returning-host audit passed before explicit admission;
+  Nova then restored the locally authoritative ACTIVE instance and OVN port.
+- `incus-node-02` was rebooted while hosting BFV server
+  `7cbb8e9a-3532-4fb7-b3bc-8e4497bc6b72`. It became unreachable, the source
+  RBD watcher disappeared, and Nova evacuated the server to
+  `incus-node-03`. On return, the source remained quarantined with the stale
+  instance STOPPED and no KRBD mapping. The audit verified Nova/Neutron
+  ownership on node 03 and exactly one target watcher. After admission, Nova
+  removed the stale source record without affecting the ACTIVE target.
+- A reverse node-03 to node-02 host-loss evacuation wrote
+  `/root/stonith-e2e-marker` before the source disappeared. The recovered file
+  on node 02 matched SHA-256
+  `13b63404394548890d9c7f7548afd54ef9ac366d243b5f85649368b4f3d83698`;
+  the target became ACTIVE with one watcher. When node 03 returned, its two
+  stopped records intentionally covered both ownership classes: Nova still
+  assigned `instance-0000000f` to node 03, while `instance-00000011` was stale
+  after evacuation. The audit accepted the local owner and rejected any early
+  start, verified the stale record had no mapping and exactly one watcher on
+  node 02, then admission let Nova restore the local owner and delete only the
+  stale record. Both distinct roots ended with one watcher on their respective
+  authoritative hosts.
+- `tools/openstack-incus-bfv-evacuation-e2e.sh` now defines the production
+  release protocol for an external provider with `off`, `status`, and `on`
+  operations. The capability remains experimental until a real site
+  IPMI/Redfish/PDU provider passes that complete automated gate.
+- The post-test three-node fleet preflight passed with all computes
+  `enabled/up`, driver hash
+  `24dffc1826f6c2202355a1c359173da9345107eae630a639900ac8e5a2754867`,
+  per-boot admission, disabled Incus autostart, persistent core-dump
+  containment, Placement, OVN and Cinder Ceph checks all green.
+
 - On 2026-07-17, server `31159ba2-2c52-4ead-98c5-a06ca934178b`
   was booted from Cinder RBD volume
   `f6f81198-2455-43fc-b00a-83e65f99e74b` on `incus-node-01`.

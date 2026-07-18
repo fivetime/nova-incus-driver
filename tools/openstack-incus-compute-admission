@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Fail-closed local admission primitive for a returning Incus compute.
+
+set -euo pipefail
+
+RUNTIME_DIR=${OPENSTACK_INCUS_ADMISSION_DIR:-/run/openstack-incus}
+TOKEN=${RUNTIME_DIR}/compute-admitted
+MODE=${1:-}
+
+usage() {
+    echo "usage: $0 {check|status|admit|revoke} [--reason TEXT]" >&2
+    exit 2
+}
+
+require_root() {
+    if ((EUID != 0)); then
+        echo "compute admission changes require root" >&2
+        exit 1
+    fi
+}
+
+reason=
+shift || true
+while (($#)); do
+    case "$1" in
+        --reason)
+            (($# >= 2)) || usage
+            reason=$2
+            shift 2
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
+
+case "$MODE" in
+    check)
+        if [[ ! -r "$TOKEN" ]]; then
+            echo "Incus compute is quarantined: admission token missing" >&2
+            exit 1
+        fi
+        ;;
+    status)
+        if [[ -r "$TOKEN" ]]; then
+            printf 'admitted '
+            cat "$TOKEN"
+        else
+            echo "quarantined"
+            exit 1
+        fi
+        ;;
+    admit)
+        require_root
+        install -d -o root -g root -m 0755 "$RUNTIME_DIR"
+        tmp=$(mktemp "${RUNTIME_DIR}/.compute-admitted.XXXXXX")
+        trap 'rm -f "$tmp"' EXIT
+        {
+            printf 'timestamp=%s\n' "$(date --iso-8601=seconds)"
+            printf 'boot_id=%s\n' "$(cat /proc/sys/kernel/random/boot_id)"
+            printf 'reason=%s\n' "${reason:-operator-admission}"
+        } >"$tmp"
+        # The token contains no secret. nova-compute's unprivileged service
+        # user must be able to validate it during ExecStartPre.
+        chmod 0644 "$tmp"
+        mv -f "$tmp" "$TOKEN"
+        trap - EXIT
+        ;;
+    revoke)
+        require_root
+        rm -f "$TOKEN"
+        ;;
+    *)
+        usage
+        ;;
+esac

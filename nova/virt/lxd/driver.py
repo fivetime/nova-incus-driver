@@ -1425,7 +1425,12 @@ class LXDDriver(driver.ComputeDriver):
             'name': instance.name,
             'type': 'container',
             'profiles': [profile.name],
-            'config': _incus_cloud_init_config(instance),
+            'config': {
+                **_incus_cloud_init_config(instance),
+                # Nova must reconcile ownership before a workload resumes
+                # after a fenced compute returns.
+                'boot.autostart': 'false',
+            },
             'source': ({'type': 'none'} if root_volume else {
                 'type': 'image', 'alias': instance.image_ref}),
         }
@@ -2431,6 +2436,8 @@ class LXDDriver(driver.ComputeDriver):
             if transfer.get('format') != 'incus-pull-v1':
                 raise ValueError('unsupported migration data format')
             migration_data = transfer['migration_data']
+            migration_data.setdefault('config', {})[
+                'boot.autostart'] = 'false'
         except (TypeError, ValueError, KeyError) as exc:
             raise exception.MigrationError(
                 reason='Invalid Incus migration data: %s' % exc)

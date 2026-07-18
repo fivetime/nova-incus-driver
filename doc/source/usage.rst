@@ -724,6 +724,50 @@ rebuild workflow. Local/image-backed roots are rejected to preserve pet data.
 Shared Ceph does not make ``instance_on_disk`` true on a destination whose
 host-local Incus database has no instance record.
 
+Computes must install ``openstack-incus-compute-admission`` and the supplied
+``nova-incus-admission.conf`` systemd drop-in. Every Nova-created container
+must have ``boot.autostart=false``. A reboot removes the admission token, so
+Incus starts for inspection while nova-compute and all tenant workloads remain
+stopped. Do not recreate the token from a boot script.
+
+Before admitting a returning host, disable its Nova service and run the
+fail-closed ownership audit from a trusted orchestrator::
+
+    RETURNING_HOST=incus-node-02 \
+      RETURNING_SSH=root@192.0.2.12 \
+      CONTROLLER_SSH=root@192.0.2.10 \
+      SSH_IDENTITY=/path/to/audit-key \
+      tools/openstack-incus-returning-host-audit.sh
+
+The audit rejects a running local container, an enabled compute service,
+misbound Neutron port, stale local RBD mapping, non-BFV stale root, or watcher
+count inconsistent with the authoritative target's ACTIVE or SHUTOFF state.
+It also requires exactly one attached Cinder root record for the Nova server.
+Only after it passes may an operator admit and start the compute::
+
+    ssh root@192.0.2.12 \
+      'openstack-incus-compute-admission admit \
+         --reason ownership-reconciled &&
+       systemctl reset-failed devstack@n-cpu &&
+       systemctl start devstack@n-cpu'
+
+Production fencing providers must implement ``off``, ``status``, and ``on``
+commands and report ``off`` only after the source cannot access Ceph. Run the
+destructive release gate with a disposable BFV server::
+
+    SERVER_ID=<uuid> \
+      SOURCE_HOST=incus-node-02 DEST_HOST=incus-node-03 \
+      SOURCE_SSH=root@192.0.2.12 DEST_SSH=root@192.0.2.13 \
+      CONTROLLER_SSH=root@192.0.2.10 \
+      SSH_IDENTITY=/path/to/audit-key \
+      FENCE_PROVIDER=/usr/local/sbin/site-fence-provider \
+      tools/openstack-incus-bfv-evacuation-e2e.sh
+
+The gate writes and hashes a rootfs marker, fences the source, requires zero
+watchers before evacuation, validates the target attachment/network/single
+watcher, powers the source back on, proves quarantine, audits mixed local and
+stale ownership, admits the source, and waits for stale-record cleanup.
+
 Rescue and unrescue are also disabled. The legacy implementation depended on
 binding a directory from the compute host into a rescue container, which is
 not valid for an Incus-managed Ceph or LVM root volume and violates the host

@@ -81,6 +81,14 @@ function pre_install_nova_incus {
     fi
 
     install_package apparmor apparmor-utils attr btrfs-progs jq lvm2 rsync
+    # A tenant can deliberately crash large processes. Ubuntu's apport
+    # service rewrites core_pattern after systemd-sysctl, so a sysctl file
+    # alone is not persistent across reboot.
+    sudo tee /etc/sysctl.d/99-openstack-incus.conf >/dev/null <<EOF
+kernel.core_pattern=/dev/null
+EOF
+    sudo systemctl mask --now apport.service 2>/dev/null || true
+    sudo sysctl -w kernel.core_pattern=/dev/null >/dev/null
     if [[ "${INCUS_STORAGE_DRIVER}" == "ceph" ]] || \
             [[ -n "${INCUS_BFV_POOL_NAME}" ]] || \
             [[ -n "${INCUS_CINDER_CEPH_POOL}" ]] || \
@@ -587,12 +595,27 @@ function configure_nova_incus_compute_service {
     fi
 
     local dropin_dir=/etc/systemd/system/devstack@n-cpu.service.d
+    sudo install -o root -g root -m 0755 \
+        "${NOVA_INCUS_DIR}/tools/openstack-incus-compute-admission" \
+        /usr/local/sbin/openstack-incus-compute-admission
+    # Stacking is an explicit admission. The token is in /run, so every host
+    # reboot returns the compute to quarantine until ownership is reconciled.
+    sudo /usr/local/sbin/openstack-incus-compute-admission admit \
+        --reason devstack
     sudo mkdir -p "${dropin_dir}"
     sudo tee "${dropin_dir}/nova-incus.conf" >/dev/null <<EOF
 [Service]
 ExecStart=
 ExecStart=${NOVA_BIN_DIR}/python -m nova.virt.lxd.cmd.compute --config-file ${NOVA_CPU_CONF}
 EOF
+    if [[ "${INCUS_REQUIRE_COMPUTE_ADMISSION,,}" == "true" ]]; then
+        sudo install -o root -g root -m 0644 \
+            "${NOVA_INCUS_DIR}/devstack/nova-incus-admission.conf" \
+            "${dropin_dir}/admission.conf"
+        iniset "${NOVA_CPU_CONF}" DEFAULT resume_guests_state_on_host_boot True
+    else
+        sudo rm -f "${dropin_dir}/admission.conf"
+    fi
     sudo systemctl daemon-reload
     restart_service devstack@n-cpu.service
 }

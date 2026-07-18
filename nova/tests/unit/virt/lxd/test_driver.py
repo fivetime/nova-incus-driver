@@ -709,7 +709,10 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'name': instance.name,
             'type': 'container',
             'profiles': [self.client.profiles.create.return_value.name],
-            'config': driver._incus_cloud_init_config(instance),
+            'config': {
+                **driver._incus_cloud_init_config(instance),
+                'boot.autostart': 'false',
+            },
             'source': {
                 'type': 'image',
                 'alias': instance.image_ref,
@@ -799,7 +802,10 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'name': instance.name,
             'type': 'container',
             'profiles': [profile.name],
-            'config': driver._incus_cloud_init_config(instance),
+            'config': {
+                **driver._incus_cloud_init_config(instance),
+                'boot.autostart': 'false',
+            },
             'source': {'type': 'none'},
         }, wait=True)
         container.start.assert_called_once_with(wait=True)
@@ -3592,7 +3598,11 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         to_profile.assert_called_once_with(
             self.client, instance, [], None)
         self.client.instances.create.assert_called_once_with(
-            {'name': instance.name, 'source': {'type': 'migration'}},
+            {
+                'name': instance.name,
+                'source': {'type': 'migration'},
+                'config': {'boot.autostart': 'false'},
+            },
             wait=True)
         container.start.assert_called_once_with(wait=True)
 

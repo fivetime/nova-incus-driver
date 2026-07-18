@@ -393,3 +393,30 @@ the RBD. Local and image-backed roots reject evacuation because their pet data
 is unavailable when the source host is down. Cold migration requires a
 reachable, healthy source Incus daemon so the destination can negotiate the
 transfer. Cinder BFV roots use shared Ceph without copying rootfs data.
+
+Returning-host quarantine
+--------------------------
+
+Every Nova-managed Incus instance sets ``boot.autostart=false``. Incus may
+therefore start after a host reboot so operators can inspect its local
+database, but it cannot resume tenant workloads before Nova reconciles
+ownership. Nova is configured with ``resume_guests_state_on_host_boot=true``
+and remains the sole component that resumes instances whose authoritative
+Nova power state is running.
+
+The nova-compute systemd service also requires an admission token under
+``/run/openstack-incus``. Because ``/run`` is recreated at boot, a restarted
+or power-cycled compute always returns quarantined. Incus starts, but
+nova-compute fails closed until an external controller:
+
+1. disables scheduling to the returning service;
+2. proves all local tenant containers are stopped;
+3. compares every local UUID with Nova's current host;
+4. verifies Neutron bindings and Cinder RBD mappings/watchers;
+5. explicitly admits the node.
+
+After admission, Nova's standard evacuated-instance cleanup removes stale
+source records, while ``resume_state_on_host_boot`` restores only instances
+that Nova still assigns to the returning host. Stopping or restarting the
+Podman Incus container is not fencing because host LXC monitors and KRBD
+mappings can survive it.

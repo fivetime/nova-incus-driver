@@ -115,6 +115,15 @@ implementing changes.
   host-local Incus record before spawn, so shared Ceph must not be represented
   by returning true from ``instance_on_disk``. Local/image-backed pet roots
   must always reject evacuation because their data is unavailable.
+- Every Nova-managed Incus instance must set ``boot.autostart=false``.
+  Incus may start on a returning host for reconciliation, but nova-compute
+  requires the ephemeral `/run/openstack-incus/compute-admitted` token.
+  Never create that token automatically at boot. Admission follows external
+  fencing and `tools/openstack-incus-returning-host-audit.sh`; Nova then owns
+  stale evacuated-record cleanup and resuming locally authoritative guests.
+- Ubuntu Apport rewrites `kernel.core_pattern` after systemd-sysctl. Production
+  computes must mask `apport.service` as well as persist and apply
+  `kernel.core_pattern=/dev/null`.
 
 ## Modernization Policy
 

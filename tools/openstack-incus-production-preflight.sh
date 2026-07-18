@@ -261,6 +261,35 @@ if grep -q 'nova\.virt\.lxd\.cmd\.compute' <<<"$exec_start"; then
 else
     fail "Nova custom manager launcher" "module entry point not active"
 fi
+admission_exec=$(
+    systemctl cat "$NOVA_SERVICE" 2>/dev/null |
+        grep -F 'ExecStartPre=/usr/local/sbin/openstack-incus-compute-admission check' ||
+        true
+)
+if [[ -x /usr/local/sbin/openstack-incus-compute-admission &&
+      -n "$admission_exec" ]]; then
+    pass "compute admission gate" "installed and required"
+else
+    fail "compute admission gate" "missing executable or systemd check"
+fi
+check_equal "Nova guest resume owner" true \
+    "$(crudini --get "$NOVA_CONFIG" DEFAULT \
+        resume_guests_state_on_host_boot 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+if /usr/local/sbin/openstack-incus-compute-admission check 2>/dev/null; then
+    pass "compute admission token" current-boot
+else
+    fail "compute admission token" "active compute is not admitted"
+fi
+unsafe_autostart=$(podman exec "$INCUS_CONTAINER" incus \
+    --project nova list --format json 2>/dev/null |
+    jq -r '.[] | select(.config["user.openstack.uuid"] != null) |
+        select(.config["boot.autostart"] != "false") | .name')
+if [[ -z "$unsafe_autostart" ]]; then
+    pass "Nova instance autostart" disabled
+else
+    fail "Nova instance autostart" \
+        "must be false: $(tr '\n' ',' <<<"$unsafe_autostart")"
+fi
 
 incus_group_members=$(getent group incus-admin | awk -F: '{print $4}' |
     tr ',' '\n' | sed '/^$/d' | sort | paste -sd, -)

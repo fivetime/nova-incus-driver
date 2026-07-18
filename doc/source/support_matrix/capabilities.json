@@ -158,7 +158,7 @@
       "driver_hooks": ["rebuild", "spawn"],
       "applicability": "shared-ceph-bfv-only",
       "status": "experimental",
-      "evidence": "Default-off BFV gate plus real manual source-isolation E2E passed Cinder attachment, OVN rebinding, Placement, single-watcher and stale-source cleanup; production external STONITH automation remains required"
+      "evidence": "Real host reboot/loss E2E preserved a Cinder root marker, attachment, OVN binding and one watcher; returning host stayed quarantined and stale cleanup passed. Generic off/status/on fence-provider release gate exists; a production IPMI/Redfish/PDU provider is still required"
     },
     {
       "id": "evacuate-local-root",
