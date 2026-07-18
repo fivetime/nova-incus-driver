@@ -811,6 +811,29 @@ KVM-based test compute only when it runs from outside that guest against an
 independent libvirt host. Its root-owned ``0600`` SSH identity and exact domain
 name are mandatory. Physical production computes must use BMC or PDU fencing.
 
+Monitoring probe
+----------------
+
+Install ``tools/openstack-incus-monitoring-audit.sh`` on an independently
+hosted monitoring node and run it with the same immutable identity inputs as
+the fleet preflight::
+
+    COMPUTE_NODES='node-01=root@10.0.0.11,node-02=root@10.0.0.12' \
+    SSH_IDENTITY=/etc/openstack-incus/monitor_ed25519 \
+    EXPECTED_INCUS_IMAGE_DIGEST='sha256:...' \
+    EXPECTED_INCUS_REVISION='...' \
+    CONTROLLER_SSH=root@10.0.0.10 \
+      tools/openstack-incus-monitoring-audit.sh
+
+The command exits non-zero for an unaudited active compute, fleet drift,
+control-filesystem or log pressure, a pending storage handover, a durable
+recovery marker, or a root image mapped on more than one compute. Configure
+the monitoring system to alert on both a non-zero result and missing probe
+data. Site monitoring must additionally correlate Cinder attachments, Ceph
+watchers, Neutron bindings, OVS ownership, cgroup pressure, and external fence
+records; those authoritative signals cannot be inferred safely from a compute
+host alone.
+
 Rescue and unrescue are also disabled. The legacy implementation depended on
 binding a directory from the compute host into a rescue container, which is
 not valid for an Incus-managed Ceph or LVM root volume and violates the host

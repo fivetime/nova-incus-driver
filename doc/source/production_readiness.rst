@@ -88,6 +88,17 @@ Alerts must carry the instance, volume, source host, target host, and last
 successful fence evidence. Automatic recovery stops when ownership is
 ambiguous.
 
+Run ``tools/openstack-incus-monitoring-audit.sh`` from the independently
+hosted monitoring plane on every collection interval. It is a fail-closed
+probe for fleet drift, compute admission, control-filesystem pressure,
+unbounded Incus logs, pending handovers, recovery markers, and duplicate KRBD
+mappings. A non-zero result must page the compute/storage owner; successful
+probe output is not a substitute for configuring the monitoring system's
+notification route. Cinder attachment, Ceph watcher, Neutron binding, OVS
+ownership, cgroup pressure, and the last successful fence record must also be
+collected from their authoritative services and correlated by instance and
+volume ID.
+
 6. Upgrade and rollback
 -----------------------
 
