@@ -66,24 +66,6 @@ class IncusComputeManager(manager.ComputeManager):
             notify=notify,
             try_deallocate_networks=try_deallocate_networks)
 
-    def _do_swap_volume(self, context, old_volume_id, new_volume_id,
-                        instance, new_attachment_id):
-        """Settle the old device before Cinder replaces its attachment."""
-        bdm = objects.BlockDeviceMapping.get_by_volume_and_instance(
-            context.elevated(), old_volume_id, instance.uuid)
-        try:
-            self._notify_volume_usage_detach(context, instance, bdm)
-        except Exception:
-            LOG.exception(
-                'Failed to settle volume usage before swapping volume '
-                '%(old)s to %(new)s',
-                {'old': old_volume_id, 'new': new_volume_id},
-                instance=instance)
-
-        return super()._do_swap_volume(
-            context, old_volume_id, new_volume_id, instance,
-            new_attachment_id)
-
     @periodic_task.periodic_task(
         spacing=CONF.incus.migration_recovery_interval)
     def _recover_incus_bfv_migration_targets(self, context):

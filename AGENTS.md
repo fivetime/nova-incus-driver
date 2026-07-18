@@ -255,6 +255,12 @@ in `TEST_STATUS.md`; this section keeps only the rules.
   mount Cinder ext4 data volumes must include `fuse2fs` and use it explicitly.
 - Keep `linstor_volume_downsize_factor=0` so Cinder's advertised size is not
   smaller than Nova's requested byte count.
+- Keep `swap_volume` explicitly unsupported. Cinder attached-volume retype
+  creates an empty target and expects the Nova driver to copy and pivot the
+  active block device. Replacing an Incus `unix-block` profile entry does not
+  perform that copy and caused confirmed data loss in E2E testing. Do not
+  re-enable swap until a crash-consistent block-copy and recovery protocol is
+  implemented and tested across process/node failure.
 - Cinder's Python RADOS client requires its keyring to be readable by the
   service user: `root:cinder 0640` in a packaged deployment (`root:stack 0640`
   in DevStack). Root-only `0600` makes the root CLI pass while the RBD driver

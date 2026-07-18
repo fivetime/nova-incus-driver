@@ -2652,102 +2652,24 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             connection_info['data'], device_info)
         self.assertNotIn('user.openstack.volume.1', profile.config)
 
-    @mock.patch('os.path.realpath', return_value='/dev/drbd1001')
-    def test_swap_volume(self, realpath):
-        profile = mock.Mock()
-        profile.config = {}
-        profile.devices = {
-            '1': {
-                'path': '/dev/sdd',
-                'required': 'true',
-                'source': '/dev/drbd1000',
-                'type': 'unix-block',
-            },
-        }
-        self.client.profiles.get.return_value = profile
+    def test_swap_volume_is_rejected_without_block_copy(self):
         old_info = fake_connection_info(
             {'id': 1, 'name': 'volume-00000001'}, '10.0.2.15:3260',
             'iqn.2010-10.org.openstack:volume-00000001')
         new_info = fake_connection_info(
             {'id': 2, 'name': 'volume-00000002'}, '10.0.2.16:3260',
             'iqn.2010-10.org.openstack:volume-00000002')
-        old_connector = mock.Mock()
-        new_connector = mock.Mock()
-        new_connector.connect_volume.return_value = {
-            'path': '/dev/disk/by-id/new'}
-        driver.brick_get_connector = mock.Mock(
-            side_effect=[new_connector, old_connector])
-        instance = fake_instance.fake_instance_obj(
-            context.get_admin_context(), name='test', memory_mb=0)
-        lxd_driver = driver.LXDDriver(None)
-        lxd_driver.init_host(None)
-
-        lxd_driver.swap_volume(
-            context.get_admin_context(), old_info, new_info, instance,
-            '/dev/sdd', 2)
-
-        self.assertNotIn('1', profile.devices)
-        self.assertEqual('/dev/drbd1001', profile.devices['2']['source'])
-        profile.save.assert_called_once_with(wait=True)
-        old_connector.disconnect_volume.assert_called_once_with(
-            old_info['data'], {'path': '/dev/drbd1000'})
-        new_connector.disconnect_volume.assert_not_called()
-
-    @mock.patch('os.path.realpath', return_value='/dev/drbd1001')
-    def test_swap_volume_rolls_back_new_connection(self, realpath):
-        old_device = {
-            'path': '/dev/sdd',
-            'source': '/dev/drbd1000',
-            'type': 'unix-block',
-        }
-        profile = mock.Mock()
-        profile.devices = {'1': old_device}
-        profile.config = {}
-        profile.save.side_effect = RuntimeError('Incus API failed')
-        self.client.profiles.get.return_value = profile
-        old_info = fake_connection_info(
-            {'id': 1, 'name': 'volume-00000001'}, '10.0.2.15:3260',
-            'iqn.2010-10.org.openstack:volume-00000001')
-        new_info = fake_connection_info(
-            {'id': 2, 'name': 'volume-00000002'}, '10.0.2.16:3260',
-            'iqn.2010-10.org.openstack:volume-00000002')
-        new_connector = mock.Mock()
-        new_device_info = {'path': '/dev/drbd1001'}
-        new_connector.connect_volume.return_value = new_device_info
-        driver.brick_get_connector = mock.Mock(return_value=new_connector)
         instance = fake_instance.fake_instance_obj(
             context.get_admin_context(), name='test', memory_mb=0)
         lxd_driver = driver.LXDDriver(None)
         lxd_driver.init_host(None)
 
         self.assertRaises(
-            RuntimeError, lxd_driver.swap_volume,
+            NotImplementedError, lxd_driver.swap_volume,
             context.get_admin_context(), old_info, new_info, instance,
-            '/dev/sdd', 0)
+            '/dev/sdd', 2)
 
-        self.assertEqual({'1': old_device}, profile.devices)
-        new_connector.disconnect_volume.assert_called_once_with(
-            new_info['data'], new_device_info)
-
-    def test_swap_volume_rejects_read_only_replacement(self):
-        connection_info = {'driver_volume_type': 'rbd', 'data': {
-            'volume_id': 'new-id', 'access_mode': 'ro'}}
-        lxd_driver = driver.LXDDriver(None)
-        lxd_driver.init_host(None)
-
-        with mock.patch(
-                'nova.virt.lxd.driver.brick_get_connector') as get_connector:
-            self.assertRaises(
-                exception.InvalidVolume, lxd_driver.swap_volume,
-                context.get_admin_context(),
-                {'driver_volume_type': 'rbd', 'data': {
-                    'volume_id': 'old-id'}},
-                connection_info,
-                fake_instance.fake_instance_obj(
-                    context.get_admin_context(), name='test'),
-                '/dev/vdb', 0)
-
-        get_connector.assert_not_called()
+        self.client.profiles.get.assert_not_called()
 
     def test_extend_volume(self):
         volume_connector = mock.Mock()

@@ -67,10 +67,18 @@
     {
       "id": "cinder-data-volume",
       "owner": "cinder+nova+driver",
-      "driver_hooks": ["attach_volume", "detach_volume", "swap_volume", "extend_volume"],
+      "driver_hooks": ["attach_volume", "detach_volume", "extend_volume"],
       "applicability": "container",
       "status": "supported",
       "evidence": "nova_lxd_tempest_plugin.tests.scenario.test_volume_ops"
+    },
+    {
+      "id": "cinder-volume-swap",
+      "owner": "cinder+nova+driver",
+      "driver_hooks": ["swap_volume"],
+      "applicability": "container",
+      "status": "unsupported",
+      "evidence": "Rejected until the driver implements block copy before attachment replacement"
     },
     {
       "id": "cinder-bfv",

@@ -1913,69 +1913,10 @@ class LXDDriver(driver.ComputeDriver):
 
     def swap_volume(self, context, old_connection_info, new_connection_info,
                     instance, mountpoint, resize_to):
-        """Replace an attached Cinder block device in one profile update."""
-        _validate_volume_mountpoint(mountpoint)
-        _validate_volume_access_mode(new_connection_info)
-
-        old_id = _volume_id(old_connection_info)
-        new_id = _volume_id(new_connection_info)
-        profile = self.client.profiles.get(instance.name)
-        old_device = profile.devices.get(old_id)
-        if not old_device or old_device.get('path') != mountpoint:
-            raise exception.InvalidVolume(
-                reason='The old volume is not attached at %s' % mountpoint)
-        _validate_profile_volume_slot(
-            profile, new_id, mountpoint, replacing_volume_id=old_id)
-        old_metadata_key = _volume_device_info_key(old_id)
-        new_metadata_key = _volume_device_info_key(new_id)
-        old_encoded_device_info = profile.config.get(old_metadata_key)
-        old_device_info = _profile_device_info(profile, old_id, old_device)
-
-        new_connector = brick_get_connector(
-            new_connection_info['driver_volume_type'])
-        new_device_info = new_connector.connect_volume(
-            new_connection_info['data'])
-        try:
-            new_path = os.path.realpath(new_device_info['path'])
-            _validate_block_device_path(new_path, 'os-brick connector path')
-        except (KeyError, TypeError, exception.InvalidVolume):
-            try:
-                new_connector.disconnect_volume(
-                    new_connection_info['data'], new_device_info)
-            except Exception:
-                LOG.exception(
-                    'Failed to roll back an invalid replacement volume',
-                    instance=instance)
-            raise exception.InvalidVolume(
-                reason='os-brick did not return a valid block device path')
-
-        try:
-            del profile.devices[old_id]
-            profile.devices[new_id] = {
-                'path': mountpoint,
-                'required': 'true',
-                'source': new_path,
-                'type': 'unix-block',
-            }
-            profile.config.pop(old_metadata_key, None)
-            profile.config[new_metadata_key] = _serialize_device_info(
-                new_device_info)
-            profile.save(wait=True)
-        except Exception:
-            with excutils.save_and_reraise_exception():
-                profile.devices.pop(new_id, None)
-                profile.devices[old_id] = old_device
-                profile.config.pop(new_metadata_key, None)
-                if old_encoded_device_info is not None:
-                    profile.config[old_metadata_key] = \
-                        old_encoded_device_info
-                new_connector.disconnect_volume(
-                    new_connection_info['data'], new_device_info)
-
-        old_connector = brick_get_connector(
-            old_connection_info['driver_volume_type'])
-        old_connector.disconnect_volume(
-            old_connection_info['data'], old_device_info)
+        """Reject Cinder online swap until block-copy support exists."""
+        raise NotImplementedError(
+            'Incus volume swap requires copying the old block device into '
+            'the replacement before changing the attachment')
 
     def extend_volume(self, context, connection_info, instance,
                       requested_size):
