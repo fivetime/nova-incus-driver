@@ -39,7 +39,7 @@ from nova.compute import vm_states
 from nova.network import model as network_model
 from nova.tests.unit import fake_instance
 from nova.virt import driver as nova_driver
-from pyincus import exceptions as incuscore_exceptions
+from pylxd import exceptions as incuscore_exceptions
 import six
 
 from nova.virt.incus import common
@@ -217,7 +217,7 @@ class IncusDriverTest(test.NoDBTestCase):
             patcher.stop()
 
     def test_init_host(self):
-        """init_host initializes the pyincus Client."""
+        """init_host initializes the pylxd Client."""
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
@@ -655,7 +655,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     @mock.patch('nova.virt.incus.driver.lockutils.lock')
     def test_spawn_unified_image(self, lock, IMAGE_API=None):
         def image_get(*args, **kwargs):
-            raise incuscore_exceptions.IncusAPIException(MockResponse(404))
+            raise incuscore_exceptions.LXDAPIException(MockResponse(404))
         self.client.images.get_by_alias.side_effect = image_get
         self.client.images.exists.return_value = False
         image = {'name': mock.Mock(), 'disk_format': 'raw'}
@@ -680,7 +680,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     @mock.patch('nova.virt.configdrive.required_by')
     def test_spawn(self, configdrive, neutron_failure=None):
         def container_get(*args, **kwargs):
-            raise incuscore_exceptions.IncusAPIException(MockResponse(404))
+            raise incuscore_exceptions.LXDAPIException(MockResponse(404))
         self.client.instances.get.side_effect = container_get
         configdrive.return_value = False
         container = mock.Mock()
@@ -755,7 +755,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     @mock.patch('nova.virt.configdrive.required_by', return_value=False)
     def test_spawn_boot_from_cinder_rbd(self, configdrive):
         def container_get(*args, **kwargs):
-            raise incuscore_exceptions.IncusAPIException(MockResponse(404))
+            raise incuscore_exceptions.LXDAPIException(MockResponse(404))
 
         volume_id = '8231d2e8-1111-4222-8333-123456789abc'
         self.client.instances.get.side_effect = container_get
@@ -874,7 +874,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     @mock.patch('nova.virt.configdrive.required_by')
     def test_spawn_with_configdrive(self, configdrive):
         def container_get(*args, **kwargs):
-            raise incuscore_exceptions.IncusAPIException(MockResponse(404))
+            raise incuscore_exceptions.LXDAPIException(MockResponse(404))
 
         self.client.instances.get.side_effect = container_get
         configdrive.return_value = True
@@ -965,10 +965,10 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     def test_spawn_profile_fail(self, configdrive, neutron_failure=None):
         """Cleanup is called when profile creation fails."""
         def container_get(*args, **kwargs):
-            raise incuscore_exceptions.IncusAPIException(MockResponse(404))
+            raise incuscore_exceptions.LXDAPIException(MockResponse(404))
 
         def profile_create(*args, **kwargs):
-            raise incuscore_exceptions.IncusAPIException(MockResponse(500))
+            raise incuscore_exceptions.LXDAPIException(MockResponse(500))
         self.client.instances.get.side_effect = container_get
         self.client.profiles.create.side_effect = profile_create
         configdrive.return_value = False
@@ -988,7 +988,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         incus_driver.cleanup = mock.Mock()
 
         self.assertRaises(
-            incuscore_exceptions.IncusAPIException,
+            incuscore_exceptions.LXDAPIException,
             incus_driver.spawn,
             ctx, instance, image_meta, injected_files, admin_password,
             allocations, network_info, block_device_info)
@@ -999,10 +999,10 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     def test_spawn_container_fail(self, configdrive, neutron_failure=None):
         """Cleanup is called when container creation fails."""
         def container_get(*args, **kwargs):
-            raise incuscore_exceptions.IncusAPIException(MockResponse(404))
+            raise incuscore_exceptions.LXDAPIException(MockResponse(404))
 
         def container_create(*args, **kwargs):
-            raise incuscore_exceptions.IncusAPIException(MockResponse(500))
+            raise incuscore_exceptions.LXDAPIException(MockResponse(500))
         self.client.instances.get.side_effect = container_get
         self.client.instances.create.side_effect = container_create
         configdrive.return_value = False
@@ -1022,7 +1022,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         incus_driver.cleanup = mock.Mock()
 
         self.assertRaises(
-            incuscore_exceptions.IncusAPIException,
+            incuscore_exceptions.LXDAPIException,
             incus_driver.spawn,
             ctx, instance, image_meta, injected_files, admin_password,
             allocations, network_info, block_device_info)
@@ -1033,7 +1033,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     def test_spawn_container_cleanup_fail(self, configdrive):
         """Cleanup is called but also fail when container creation fails."""
         self.client.instances.get.side_effect = (
-            incuscore_exceptions.IncusAPIException(MockResponse(404)))
+            incuscore_exceptions.LXDAPIException(MockResponse(404)))
         container = mock.Mock()
         self.client.instances.create.return_value = container
 
@@ -1052,12 +1052,12 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         incus_driver.init_host(None)
 
         container.start.side_effect = (
-            incuscore_exceptions.IncusAPIException(MockResponse(500)))
+            incuscore_exceptions.LXDAPIException(MockResponse(500)))
         incus_driver.cleanup = mock.Mock()
         incus_driver.cleanup.side_effect = Exception("a bad thing")
 
         self.assertRaises(
-            incuscore_exceptions.IncusAPIException,
+            incuscore_exceptions.LXDAPIException,
             incus_driver.spawn,
             ctx, instance, image_meta, injected_files, admin_password,
             allocations, network_info, block_device_info)
@@ -1067,10 +1067,10 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
     def test_spawn_container_start_fail(self, neutron_failure=None):
         def container_get(*args, **kwargs):
-            raise incuscore_exceptions.IncusAPIException(MockResponse(404))
+            raise incuscore_exceptions.LXDAPIException(MockResponse(404))
 
         def side_effect(*args, **kwargs):
-            raise incuscore_exceptions.IncusAPIException(MockResponse(200))
+            raise incuscore_exceptions.LXDAPIException(MockResponse(200))
 
         self.client.instances.get.side_effect = container_get
         container = mock.Mock()
@@ -1093,7 +1093,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         container.start.side_effect = side_effect
 
         self.assertRaises(
-            incuscore_exceptions.IncusAPIException,
+            incuscore_exceptions.LXDAPIException,
             incus_driver.spawn,
             ctx, instance, image_meta, injected_files, admin_password,
             allocations, network_info, block_device_info)
@@ -1133,7 +1133,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         @mock.patch('nova.virt.configdrive.required_by')
         def test_spawn(configdrive, plug_vifs):
             def container_get(*args, **kwargs):
-                raise incuscore_exceptions.IncusAPIException(MockResponse(404))
+                raise incuscore_exceptions.LXDAPIException(MockResponse(404))
             self.client.instances.get.side_effect = container_get
             configdrive.return_value = False
 
@@ -1234,7 +1234,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     @mock.patch('nova.virt.incus.driver.lockutils.lock')
     def test_destroy_without_instance(self, lock):
         def side_effect(*args, **kwargs):
-            raise incuscore_exceptions.IncusAPIException(MockResponse(404))
+            raise incuscore_exceptions.LXDAPIException(MockResponse(404))
         self.client.instances.get.side_effect = side_effect
 
         ctx = context.get_admin_context()

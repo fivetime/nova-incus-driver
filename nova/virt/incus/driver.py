@@ -51,7 +51,7 @@ from oslo_log import log as logging
 from oslo_utils import fileutils
 from oslo_utils import timeutils
 from prometheus_client import parser as prometheus_parser
-from pyincus import exceptions as incus_exceptions
+from pylxd import exceptions as incus_exceptions
 
 from nova.virt.incus import vif as incus_vif
 from nova.virt.incus import client as incus_client
@@ -887,7 +887,7 @@ def _sync_glance_image_to_incus(client, context, image_ref):
         try:
             client.images.get_by_alias(image_ref)
             return
-        except incus_exceptions.IncusAPIException as e:
+        except incus_exceptions.LXDAPIException as e:
             if e.response.status_code != 404:
                 raise
 
@@ -1091,7 +1091,7 @@ class IncusDriver(driver.ComputeDriver):
     def init_host(self, host):
         """Initialize the driver on the host.
 
-        The pyincus Client is initialized. This initialization may raise
+        The pylxd Client is initialized. This initialization may raise
         an exception if the Incus instance cannot be found.
 
         The `host` argument is ignored here, as the Incus instance is
@@ -1407,7 +1407,7 @@ class IncusDriver(driver.ComputeDriver):
         try:
             self.client.instances.get(instance.name)
             raise exception.InstanceExists(name=instance.name)
-        except incus_exceptions.IncusAPIException as e:
+        except incus_exceptions.LXDAPIException as e:
             if e.response.status_code != 404:
                 raise  # Re-raise the exception if it wasn't NotFound
 
@@ -1419,7 +1419,7 @@ class IncusDriver(driver.ComputeDriver):
             # A Cinder root volume already contains the prepared rootfs.
             try:
                 self.client.images.get_by_alias(instance.image_ref)
-            except incus_exceptions.IncusAPIException as e:
+            except incus_exceptions.LXDAPIException as e:
                 if e.response.status_code != 404:
                     raise
                 _sync_glance_image_to_incus(
@@ -1459,7 +1459,7 @@ class IncusDriver(driver.ComputeDriver):
                 profile.devices['root'] = _bfv_root_device(
                     instance, root_bdm, root_volume)
                 profile.save()
-        except incus_exceptions.IncusAPIException:
+        except incus_exceptions.LXDAPIException:
             with excutils.save_and_reraise_exception():
                 self.cleanup(
                     context, instance, network_info, block_device_info)
@@ -1481,7 +1481,7 @@ class IncusDriver(driver.ComputeDriver):
         try:
             container = self.client.instances.create(
                 container_config, wait=True)
-        except incus_exceptions.IncusAPIException:
+        except incus_exceptions.LXDAPIException:
             with excutils.save_and_reraise_exception():
                 self.cleanup(
                     context, instance, network_info, block_device_info)
@@ -1564,7 +1564,7 @@ class IncusDriver(driver.ComputeDriver):
                     if rescued_container.status != 'Stopped':
                         rescued_container.stop(wait=True)
                     rescued_container.delete(wait=True)
-            except incus_exceptions.IncusAPIException as e:
+            except incus_exceptions.LXDAPIException as e:
                 if e.response.status_code == 404:
                     LOG.warning("Failed to delete instance. "
                                 "Container does not exist for {instance}."
@@ -1607,7 +1607,7 @@ class IncusDriver(driver.ComputeDriver):
                 continue
             try:
                 profile = self.client.profiles.get(instance.name)
-            except incus_exceptions.IncusAPIException as exc:
+            except incus_exceptions.LXDAPIException as exc:
                 if exc.response.status_code == 404:
                     break
                 raise
@@ -1619,7 +1619,7 @@ class IncusDriver(driver.ComputeDriver):
 
         try:
             self.client.profiles.get(instance.name).delete()
-        except incus_exceptions.IncusAPIException as e:
+        except incus_exceptions.LXDAPIException as e:
             if e.response.status_code == 404:
                 LOG.warning("Failed to delete instance. "
                             "Profile does not exist for {instance}."
@@ -1631,7 +1631,7 @@ class IncusDriver(driver.ComputeDriver):
         """Remove a stopped record left on a failed migration source."""
         try:
             container = self.client.instances.get(instance.name)
-        except incus_exceptions.IncusAPIException as exc:
+        except incus_exceptions.LXDAPIException as exc:
             if exc.response.status_code == 404:
                 return True
             LOG.exception(
@@ -1670,7 +1670,7 @@ class IncusDriver(driver.ComputeDriver):
             container.delete(wait=True)
             try:
                 self.client.profiles.get(instance.name).delete()
-            except incus_exceptions.IncusAPIException as exc:
+            except incus_exceptions.LXDAPIException as exc:
                 if exc.response.status_code != 404:
                     raise
             return True
@@ -1707,7 +1707,7 @@ class IncusDriver(driver.ComputeDriver):
         try:
             container = self.client.instances.get(instance.name)
             profile = self.client.profiles.get(instance.name)
-        except incus_exceptions.IncusAPIException as exc:
+        except incus_exceptions.LXDAPIException as exc:
             if exc.response.status_code == 404:
                 return False
             raise
@@ -1776,7 +1776,7 @@ class IncusDriver(driver.ComputeDriver):
     def _clear_migration_recovery_marker(self, instance):
         try:
             profile = self.client.profiles.get(instance.name)
-        except incus_exceptions.IncusAPIException as exc:
+        except incus_exceptions.LXDAPIException as exc:
             if exc.response.status_code == 404:
                 return
             raise
@@ -2144,7 +2144,7 @@ class IncusDriver(driver.ComputeDriver):
         detached = []
         try:
             migration_data = container.generate_migration_data(live=False)
-            # pyincus historically emitted the source profile list under the
+            # pylxd historically emitted the source profile list under the
             # non-API key ``default``. The destination profile is recreated
             # by Nova and must be selected explicitly for its root quota and
             # Neutron physical NIC devices to apply.
@@ -2385,7 +2385,7 @@ class IncusDriver(driver.ComputeDriver):
 
             try:
                 profile = self.client.profiles.get(instance.name)
-            except incus_exceptions.IncusAPIException as exc:
+            except incus_exceptions.LXDAPIException as exc:
                 if exc.response.status_code == 404:
                     return
                 raise
@@ -2419,7 +2419,7 @@ class IncusDriver(driver.ComputeDriver):
                 share_proto=share_mapping.share_proto)
         try:
             profile = self.client.profiles.get(instance.name)
-        except incus_exceptions.IncusAPIException as exc:
+        except incus_exceptions.LXDAPIException as exc:
             if exc.response.status_code == 404:
                 profile = None
             else:
@@ -2508,9 +2508,9 @@ class IncusDriver(driver.ComputeDriver):
             'cpu_info': jsonutils.dumps(cpu_info),
             'hypervisor_hostname': CONF.host,
             'supported_instances': [
-                (obj_fields.Architecture.I686, obj_fields.HVType.Incus,
+            (obj_fields.Architecture.I686, 'incus',
                  obj_fields.VMMode.EXE),
-                (obj_fields.Architecture.X86_64, obj_fields.HVType.Incus,
+                (obj_fields.Architecture.X86_64, 'incus',
                  obj_fields.VMMode.EXE),
                 (obj_fields.Architecture.I686, obj_fields.HVType.LXC,
                  obj_fields.VMMode.EXE),
@@ -2776,7 +2776,7 @@ class IncusDriver(driver.ComputeDriver):
                 if root_bdm is not None and container is None:
                     try:
                         container = self.client.instances.get(instance.name)
-                    except incus_exceptions.IncusAPIException as exc:
+                    except incus_exceptions.LXDAPIException as exc:
                         if exc.response.status_code != 404:
                             bfv_ownership_uncertain = True
                             LOG.exception(

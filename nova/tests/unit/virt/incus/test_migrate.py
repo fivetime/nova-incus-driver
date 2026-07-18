@@ -20,10 +20,10 @@ import nova.conf
 from nova import exception
 from nova import test
 try:
-    from pyincus.deprecated import exceptions as incus_exceptions
+    from pylxd.deprecated import exceptions as incus_exceptions
 except ModuleNotFoundError:
     raise unittest.SkipTest(
-        'Legacy pyincus migration API is outside the initial milestone')
+        'Legacy pylxd migration API is outside the initial milestone')
 
 from nova.virt.incus import driver
 

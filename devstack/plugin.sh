@@ -128,7 +128,7 @@ function install_nova_incus {
     if is_true "${INCUS_APPLY_NOVA_DIAGNOSTICS_PATCH}"; then
         local diagnostics_patch
         diagnostics_patch="${NOVA_INCUS_DIR}/patches/nova/0001-diagnostics-add-incus-driver.patch"
-        if grep -q 'Incus = "incus"' "${NOVA_DIR}/nova/objects/fields.py" && \
+        if grep -q 'INCUS = "incus"' "${NOVA_DIR}/nova/objects/fields.py" && \
                 grep -q "'incus'," \
                     "${NOVA_DIR}/nova/api/openstack/compute/schemas/server_diagnostics.py"; then
             echo "Nova diagnostics already accepts the incus driver"

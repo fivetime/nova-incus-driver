@@ -23,8 +23,8 @@ from nova import rpc
 from oslo_log import log as logging
 from oslo_utils import excutils
 
-from pyincus.deprecated import api
-from pyincus.deprecated import exceptions as incus_exceptions
+from pylxd.deprecated import api
+from pylxd.deprecated import exceptions as incus_exceptions
 
 _ = i18n._
 
@@ -39,10 +39,10 @@ class IncusAPISession(object):
         """Returns a connection to the Incus hypervisor
 
         This method should be used to create a connection
-        to the Incus hypervisor via the pyincus API call.
+        to the Incus hypervisor via the pylxd API call.
 
         :param host: host is the Incus daemon to connect to
-        :return: pyincus object
+        :return: pylxd object
         """
         try:
             if host:

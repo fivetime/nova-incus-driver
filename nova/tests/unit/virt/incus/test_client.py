@@ -39,7 +39,7 @@ def _config(**overrides):
 
 class IncusClientTest(unittest.TestCase):
 
-    @mock.patch.object(client.pyincus, "Client")
+    @mock.patch.object(client.pylxd, "Client")
     def test_local_client(self, mock_client):
         conf = _config()
 
@@ -53,7 +53,7 @@ class IncusClientTest(unittest.TestCase):
             project="default",
         )
 
-    @mock.patch.object(client.pyincus, "Client")
+    @mock.patch.object(client.pylxd, "Client")
     def test_https_client(self, mock_client):
         conf = _config(
             endpoint="https://incus.example.test:8443",
@@ -87,7 +87,7 @@ class IncusClientTest(unittest.TestCase):
             conf,
         )
 
-    @mock.patch.object(client.pyincus, "Client")
+    @mock.patch.object(client.pylxd, "Client")
     def test_migration_preflight_client(self, mock_client):
         conf = _config(
             migration_preflight_tls_cert="/etc/nova/preflight.crt",

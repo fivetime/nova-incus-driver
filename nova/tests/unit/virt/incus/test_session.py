@@ -27,10 +27,10 @@ import unittest
 from nova import exception
 from nova import test
 try:
-    from pyincus.deprecated import exceptions as incus_exceptions
+    from pylxd.deprecated import exceptions as incus_exceptions
 except ModuleNotFoundError:
     raise unittest.SkipTest(
-        'Legacy pyincus session API is outside the initial milestone')
+        'Legacy pylxd session API is outside the initial milestone')
 
 from nova.virt.incus import session
 import fake_api
@@ -43,9 +43,9 @@ class SessionContainerTest(test.NoDBTestCase):
     def setUp(self):
         super(SessionContainerTest, self).setUp()
 
-        """This is so we can mock out pyincus API calls."""
+        """This is so we can mock out pylxd API calls."""
         self.ml = stubs.incus_mock()
-        incus_patcher = mock.patch('pyincus.deprecated.api.API',
+        incus_patcher = mock.patch('pylxd.deprecated.api.API',
                                  mock.Mock(return_value=self.ml))
         incus_patcher.start()
         self.addCleanup(incus_patcher.stop)
@@ -59,7 +59,7 @@ class SessionContainerTest(test.NoDBTestCase):
         """
         conatainer_init creates a container based on given config
         for a container. Check to see if we are returning the right
-        pyincus calls for the Incus API.
+        pylxd calls for the Incus API.
         """
         config = mock.Mock()
         instance = stubs._fake_instance()
@@ -98,7 +98,7 @@ class SessionEventTest(test.NoDBTestCase):
         super(SessionEventTest, self).setUp()
 
         self.ml = stubs.incus_mock()
-        incus_patcher = mock.patch('pyincus.deprecated.api.API',
+        incus_patcher = mock.patch('pylxd.deprecated.api.API',
                                  mock.Mock(return_value=self.ml))
         incus_patcher.start()
         self.addCleanup(incus_patcher.stop)

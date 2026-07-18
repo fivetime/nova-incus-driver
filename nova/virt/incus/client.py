@@ -13,7 +13,7 @@
 # under the License.
 
 from oslo_config import cfg
-import pyincus
+import pylxd
 
 from nova.virt.incus import config
 
@@ -43,7 +43,7 @@ def get_client(conf=cfg.CONF):
     else:
         cert = _client_certificate(options)
 
-    return pyincus.Client(
+    return pylxd.Client(
         endpoint=endpoint,
         cert=cert,
         verify=verify,
@@ -68,7 +68,7 @@ def get_migration_preflight_client(endpoint, verify=None, conf=cfg.CONF):
             ", ".join(missing)
         )
 
-    return pyincus.Client(
+    return pylxd.Client(
         endpoint=endpoint,
         cert=(options.migration_preflight_tls_cert,
               options.migration_preflight_tls_key),

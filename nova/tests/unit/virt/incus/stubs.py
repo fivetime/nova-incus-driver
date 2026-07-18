@@ -18,7 +18,7 @@ import uuid
 
 from nova import context
 from nova.tests.unit import fake_instance
-from pyincus.deprecated import api
+from pylxd.deprecated import api
 
 
 class MockConf(mock.Mock):
