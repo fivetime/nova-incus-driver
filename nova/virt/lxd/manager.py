@@ -12,6 +12,7 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+import eventlet
 from nova.compute import manager
 from nova.compute import power_state
 from nova.compute import task_states
@@ -27,9 +28,42 @@ from nova.virt.lxd import driver as incus_driver  # noqa: F401
 CONF = incus_driver.CONF
 LOG = logging.getLogger(__name__)
 
+# Incus caches /1.0/metrics for eight seconds. Final settlement must cross
+# that window or an immediate detach can reuse counters from the last poll.
+_METRICS_SETTLEMENT_DELAY = 9
+
 
 class IncusComputeManager(manager.ComputeManager):
     """Nova manager extension for fenced BFV post-claim recovery."""
+
+    def _notify_volume_usage_detach(self, context, instance, bdm):
+        eventlet.sleep(_METRICS_SETTLEMENT_DELAY)
+        return super()._notify_volume_usage_detach(context, instance, bdm)
+
+    def _shutdown_instance(self, context, instance, bdms,
+                           requested_networks=None, notify=True,
+                           try_deallocate_networks=True):
+        """Settle volume counters before Incus removes the block devices."""
+        volumes = [bdm for bdm in bdms if bdm.is_volume]
+        if volumes:
+            # Wait once for the instance, rather than once per attached volume.
+            eventlet.sleep(_METRICS_SETTLEMENT_DELAY)
+
+        for bdm in volumes:
+            try:
+                super()._notify_volume_usage_detach(context, instance, bdm)
+            except Exception:
+                # Metering must not prevent an instance from being deleted.
+                LOG.exception(
+                    'Failed to settle final volume usage before instance '
+                    'shutdown for volume %s', bdm.volume_id,
+                    instance=instance)
+
+        return super()._shutdown_instance(
+            context, instance, bdms,
+            requested_networks=requested_networks,
+            notify=notify,
+            try_deallocate_networks=try_deallocate_networks)
 
     @periodic_task.periodic_task(
         spacing=CONF.incus.migration_recovery_interval)

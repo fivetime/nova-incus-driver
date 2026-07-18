@@ -523,6 +523,25 @@ blocker. The dated evidence below tracks the incremental hardening.
   window produced exactly `20971520` for `volume.write.bytes` with
   `rate:sum`; the corresponding write-request increase was 14 and an idle
   window returned zero.
+- A temporary Ceph data volume was hot-attached to running BFV instance
+  `instance-0000000f`. Tenant `fuse2fs` mounted it without allowing the host
+  kernel to parse tenant filesystem input. Nova attributed its counters to
+  Cinder volume `928417f8-78b8-4c7a-8ada-fb1eee1cc619`; a controlled second
+  write produced `16809984` bytes in Gnocchi `rate:sum` (16 MiB plus ext4
+  metadata). Hot detach moved the final counters to `tot_*`, emitted the final
+  Gnocchi sample, removed the Incus device and metadata, unmapped the host
+  RBD, returned the volume to `available`, and allowed clean deletion.
+- The first `delete_on_termination` test exposed Incus' fixed eight-second
+  `/1.0/metrics` cache: an immediate final read reused stale counters and
+  omitted the last write. `IncusComputeManager` now waits nine seconds before
+  final detach settlement, once per instance shutdown. A cache-pinned E2E
+  then wrote 8 MiB, added 4 MiB, and immediately deleted server
+  `aaab2011-27fd-4d92-852d-48a37e2597b5`. Nova finalized exactly
+  `12582912` write bytes and Cinder automatically deleted volume
+  `31da9d03-b2e0-4418-91a0-d612348a530e`. The observed server-delete duration
+  was 18.25 seconds, including the deliberate nine-second consistency wait.
+  After this fix, the full Python 3.12 suite passed 229 tests with 2 intentional
+  legacy pylxd skips; pep8 and warning-as-error documentation builds passed.
 
 - Re-running DevStack to add Cinder rebuilt the test Nova databases. Three
   retained Incus containers (`instance-00000008`, `instance-00000009`, and

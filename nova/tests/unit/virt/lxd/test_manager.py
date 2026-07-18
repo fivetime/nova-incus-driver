@@ -34,6 +34,64 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         self.compute._get_instance_block_device_info = mock.Mock(
             return_value={'block_device_mapping': []})
 
+    @mock.patch.object(manager.eventlet, 'sleep')
+    @mock.patch.object(
+        manager.manager.ComputeManager, '_shutdown_instance')
+    @mock.patch.object(
+        manager.manager.ComputeManager, '_notify_volume_usage_detach')
+    def test_shutdown_settles_volume_usage_before_destroy(
+            self, notify_usage, shutdown, sleep):
+        volume = mock.Mock(is_volume=True, volume_id='volume-1')
+        local_disk = mock.Mock(is_volume=False)
+        instance = mock.Mock()
+        ctxt = context.get_admin_context()
+
+        self.compute._shutdown_instance(
+            ctxt, instance, [volume, local_disk],
+            requested_networks=['network-1'], notify=False,
+            try_deallocate_networks=False)
+
+        sleep.assert_called_once_with(manager._METRICS_SETTLEMENT_DELAY)
+        notify_usage.assert_called_once_with(ctxt, instance, volume)
+        shutdown.assert_called_once_with(
+            ctxt, instance, [volume, local_disk],
+            requested_networks=['network-1'], notify=False,
+            try_deallocate_networks=False)
+
+    @mock.patch.object(manager.eventlet, 'sleep')
+    @mock.patch.object(
+        manager.manager.ComputeManager, '_shutdown_instance')
+    @mock.patch.object(
+        manager.manager.ComputeManager, '_notify_volume_usage_detach')
+    def test_shutdown_continues_when_volume_usage_settlement_fails(
+            self, notify_usage, shutdown, sleep):
+        volume = mock.Mock(is_volume=True, volume_id='volume-1')
+        instance = mock.Mock()
+        ctxt = context.get_admin_context()
+        notify_usage.side_effect = RuntimeError('statistics unavailable')
+
+        self.compute._shutdown_instance(ctxt, instance, [volume])
+
+        sleep.assert_called_once_with(manager._METRICS_SETTLEMENT_DELAY)
+        shutdown.assert_called_once_with(
+            ctxt, instance, [volume],
+            requested_networks=None, notify=True,
+            try_deallocate_networks=True)
+
+    @mock.patch.object(manager.eventlet, 'sleep')
+    @mock.patch.object(
+        manager.manager.ComputeManager, '_notify_volume_usage_detach')
+    def test_detach_waits_for_fresh_incus_metrics(
+            self, notify_usage, sleep):
+        volume = mock.Mock()
+        instance = mock.Mock()
+        ctxt = context.get_admin_context()
+
+        self.compute._notify_volume_usage_detach(ctxt, instance, volume)
+
+        sleep.assert_called_once_with(manager._METRICS_SETTLEMENT_DELAY)
+        notify_usage.assert_called_once_with(ctxt, instance, volume)
+
     @mock.patch.object(
         manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
     @mock.patch.object(manager.objects.InstanceList, 'get_by_host')

@@ -916,8 +916,9 @@ the Flavor vCPU count. On servers with the
 container PID 1 start time reported by Incus; it therefore resets after a real
 container restart. It is null on older servers rather than being guessed from
 Nova's instance creation time. Disk entries describe the devices but their
-I/O fields are null because Incus does not expose attributable block I/O
-counters. Do not use this endpoint for volume I/O billing.
+I/O fields are null because Nova's standardized diagnostics disks do not
+carry the Cinder volume identity needed for billing. Do not use this endpoint
+for volume I/O billing.
 
 Microversions before 2.48 receive Nova's legacy flat diagnostics dictionary.
 Its memory values are KiB and its CPU and NIC values are the same Incus
@@ -936,7 +937,14 @@ The compute host must expose the same ``/dev`` RBD mappings to nova-compute
 and the Podman-hosted Incus daemon. RBD links must retain Cinder's
 ``volume-<uuid>`` naming. A missing, ambiguous, or incomplete mapping is
 skipped rather than attributed to the wrong tenant. Incus caches metrics for
-several seconds, so validation must wait for a refresh after generating I/O.
+eight seconds. ``IncusComputeManager`` therefore waits nine seconds before a
+hot detach or instance shutdown finalizes volume usage. Instance shutdown
+waits once regardless of volume count. This bounded latency is intentional:
+without it, an immediate detach can reuse the previous metrics response and
+lose the last I/O interval. Metering errors are logged but do not prevent
+instance deletion. Packaged computes must run ``nova-incus-compute`` rather
+than the stock ``nova-compute`` entry point to obtain this final-settlement
+behavior.
 Counters can reset when an instance restarts or migrates; Nova's volume usage
 cache owns conversion of cumulative counters into notification totals.
 
