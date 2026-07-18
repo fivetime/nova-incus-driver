@@ -96,7 +96,6 @@ TODO 需实现 · N/A 系统容器不适用(永久拒绝)。
 | list_instances / _uuids | FULL | 792 / 798 | ✅ |
 | snapshot→Glance | FULL | 1639 | ✅ |
 | attach/detach_volume | FULL | 1300 / 1377 | ✅(拒绝加密/ro/multiattach) |
-| swap_volume | FULL | 1417 | ⚠️ 待 E2E |
 | extend_volume | PARTIAL | 1483 | ✅ |
 | attach/detach_interface | FULL | 1499 / 1518 | ✅ |
 | migrate_disk_and_power_off | PARTIAL | 1550 | ✅ 正向 confirm |
@@ -110,7 +109,7 @@ TODO 需实现 · N/A 系统容器不适用(永久拒绝)。
 | resume_state_on_host_boot | FULL | 1705 | ✅ 宿主重启恢复 |
 | BFV cephext 迁移交接 + 故障恢复 | PARTIAL | 多处 | ✅ 5 类故障注入 |
 
-**已实现但缺当前三节点公共 API E2E**(你战略计划已列):pause/unpause、swap_volume、config-drive、
+**已实现但缺当前三节点公共 API E2E**(你战略计划已列):pause/unpause、config-drive、
 metadata/keypair/user-data、BFV rebuild/reimage、SHUTOFF resize 全矩阵、Flavor swap、部分 QoS 组合。
 
 ---
@@ -204,6 +203,24 @@ getty 输出送到 `/dev/console`(systemd/openrc 默认如此)。镜像流水线
 
 `rescue`/`unrescue`(当前 REJECT,未来需 storage-pool-native rootfs)、`get_serial_console`、
 `set_admin_password`、`mount_share`/`umount_share`(Manila)、config-drive 已实现待验证。
+
+### F. `swap_volume` —— REJECT(数据安全,待冷交换协议)
+
+Nova `swap_volume`(Cinder retype/migrate 触发)契约要求在运行中把旧卷数据 **live block-copy**
+到新卷再切换——libvirt 靠 QEMU `drive-mirror`。容器**无等价的运行时块镜像机制**(和"无 suspend-to-disk
+需 CRIU"同类结构性缺失)。原实现只改 profile 设备指针、从不拷贝数据 → 新卷全零,**静默数据丢失**
+(真实 Ceph→LVM retype 已证实)。
+
+现状(commit `5f46338`):`swap_volume` 在任何连接/profile 修改前 `raise NotImplementedError`,
+**fail-closed**。真实 retype 验证:Cinder retype 失败并回滚、原卷/UUID/attachment 全保留、
+前后 SHA-256 一致、临时目标清理。对应 `capabilities.json` 的 `cinder-volume-swap` = `unsupported`。
+
+**未来做完整冷交换需**(与 BFV 迁移交接同级严谨度,可复用其 handover 状态机 + 故障恢复标记):
+持久化阶段状态、nova-compute 崩溃恢复、双 attachment 清理、复制校验(checksum)、Cinder confirm
+前后的回滚协议。在此之前,明确拒绝是唯一生产安全行为。
+
+**待确认**:manager `_swap_volume` 对 `NotImplementedError` 的处理是否会污染实例态(如置 ERROR)。
+E2E 显示 attachment 保留、卷回滚、实例未受影响;若 manager 有实例置 ERROR 分支,评估换更友好的异常。
 
 ---
 
