@@ -1,4 +1,4 @@
 # Plug-in overrides
-# DevStack currently uses the legacy "lxd" selector to attach nova-compute to
+# DevStack currently uses the legacy "incus" selector to attach nova-compute to
 # the daemon socket group.  The configured Nova driver still talks to Incus.
-VIRT_DRIVER=lxd
+VIRT_DRIVER=incus

@@ -21,7 +21,7 @@ from oslo_config import cfg
 import os_vif
 
 from nova.network import model as network_model
-from nova.virt.lxd import vif as incus_vif
+from nova.virt.incus import vif as incus_vif
 
 
 class _Instance:
@@ -70,7 +70,7 @@ def main():
         devname=devname,
         ovs_interfaceid=port_id,
         details={network_model.VIF_DETAILS_OVS_HYBRID_PLUG: False})
-    driver = incus_vif.LXDGenericVifDriver()
+    driver = incus_vif.IncusGenericVifDriver()
     instance = _Instance(instance_id)
     cfg.CONF.set_override(
         "ovsdb_connection", args.ovsdb_connection, group="os_vif_ovs")

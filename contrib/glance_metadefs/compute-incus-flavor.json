@@ -1,0 +1,26 @@
+{
+    "namespace": "OS::Nova::IncusFlavor",
+    "display_name": "Incus properties",
+    "description": "You can pass several options to the Incus container hypervisor that will affect the container's capabilities.",
+    "visibility": "public",
+    "protected": false,
+    "resource_type_associations": [
+        {
+            "name": "OS::Nova::Flavor"
+        }
+    ],
+    "properties": {
+        "incus:nested_allowed": {
+            "title": "Allow nested containers",
+            "description": "Allow or disallow creation of nested containers. If True, you can install and run Incus inside the VM itself and provision another level of containers.",
+            "type": "string",
+            "default": false
+        },
+        "incus:privileged_allowed": {
+            "title": "Create privileged container",
+            "description": "Containers created as Privileged have elevated powers on the compute host. You should not set this option on containers that you don't fully trust.",
+            "type": "string",
+            "default": false
+        }
+    }
+}

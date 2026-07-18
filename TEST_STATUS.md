@@ -297,7 +297,7 @@ hardening.
 - The expanded BFV E2E passed again on 2026-07-17 after adding a Cinder data
   volume and destructive hard-reboot recovery injection. A subsequent audit
   exposed that instance deletion could release the Cinder attachment while
-  leaving data KRBD mappings on both computes. `LXDDriver.cleanup()` now
+  leaving data KRBD mappings on both computes. `IncusDriver.cleanup()` now
   disconnects data volumes before deleting their Incus profile; disconnect
   failure retains the profile metadata and aborts destroy for a safe retry.
   The rerun asserted both `.17` and `.18` had no mapping before volume delete.
@@ -345,7 +345,7 @@ hardening.
 ## Cinder data volumes (attach / extend / snapshot / backup)
 
 - Tempest covers the public-API workflow in
-  `nova_lxd_tempest_plugin.tests.scenario.test_volume_ops`. On 2026-07-16 both
+  `nova_incus_tempest_plugin.tests.scenario.test_volume_ops`. On 2026-07-16 both
   the attach/FUSE/detach smoke test (45 seconds) and the attached-volume online
   extend plus cross-compute cold-migration test (85 seconds) passed. The latter
   uses Cinder microversion 3.42 and a 5 GiB-root `d1` flavor so it fits the
@@ -580,7 +580,7 @@ hardening.
   applied on all three nodes and the public Nova API returned HTTP 200 through
   cross-host RPC for BFV server
   `7cbb8e9a-3532-4fb7-b3bc-8e4497bc6b72` on `incus-node-02`.
-- Microversion 2.48 reported `driver=lxd`, `hypervisor=incus`, running state,
+- Microversion 2.48 reported `driver=incus`, `hypervisor=incus`, running state,
   Flavor vCPU count, aggregate CPU time, runtime memory, accurate `eth0`
   counters, and uptime derived from Incus `started_at`. The tested BFV
   container returned an uptime of 7013 seconds. The root disk's unavailable

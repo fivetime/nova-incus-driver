@@ -342,7 +342,7 @@ Nova 2026.1 selects the compute manager from an internal service mapping and
 does not honor the historical ``compute_manager`` configuration option.
 Computes must therefore start with the project's wrapper entry point::
 
-    python -m nova.virt.lxd.cmd.compute --config-file /etc/nova/nova-cpu.conf
+    python -m nova.virt.incus.cmd.compute --config-file /etc/nova/nova-cpu.conf
 
 The packaged ``nova-incus-compute`` console script is equivalent. The DevStack
 plugin installs a systemd drop-in automatically. Using the stock
@@ -398,7 +398,7 @@ host after sourcing ``CONTROLLER_OPENRC``. Otherwise the orchestrator must
 provide an authenticated local ``openstack`` command.
 
 Release distributions must be built with the version explicitly pinned because
-the modernized repository retains historical ``nova-lxd`` Git tags::
+the modernized repository retains historical ``nova-incus`` Git tags::
 
     PBR_VERSION=2026.1.0 python -m build
     twine check dist/*
@@ -886,9 +886,9 @@ Enable Tempest in DevStack, generate its configuration, and list or run the
 plugin scenarios with::
 
     tempest run --list-tests \
-      --regex nova_lxd_tempest_plugin.tests.scenario
+      --regex nova_incus_tempest_plugin.tests.scenario
     tempest run \
-      --regex nova_lxd_tempest_plugin.tests.scenario
+      --regex nova_incus_tempest_plugin.tests.scenario
 
 The volume scenario requires a configured Cinder backend. Test discovery can
 be validated without Cinder, but that is not evidence that attach, persistence,
@@ -1068,7 +1068,7 @@ Instance diagnostics
 --------------------
 
 The DevStack plugin applies the Nova compatibility patch required for the
-standard diagnostics ``driver=lxd`` value by default. Set
+standard diagnostics ``driver=incus`` value by default. Set
 ``INCUS_APPLY_NOVA_DIAGNOSTICS_PATCH=False`` only when the Nova tree already
 contains equivalent support. Deployment fails rather than silently applying
 a patch that no longer matches the selected Nova release.

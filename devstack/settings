@@ -2,8 +2,8 @@
 enable_service nova-incus
 
 INCUS_GROUP=${INCUS_GROUP:-incus-admin}
-# Compatibility with DevStack's existing VIRT_DRIVER=lxd process launcher.
-LXD_GROUP=${LXD_GROUP:-${INCUS_GROUP}}
+# Compatibility with DevStack's existing VIRT_DRIVER=incus process launcher.
+Incus_GROUP=${INCUS_GROUP:-${INCUS_GROUP}}
 INCUS_PROJECT=${INCUS_PROJECT:-nova}
 INCUS_POOL_NAME=${INCUS_POOL_NAME:-default}
 INCUS_STORAGE_DRIVER=${INCUS_STORAGE_DRIVER:-dir}

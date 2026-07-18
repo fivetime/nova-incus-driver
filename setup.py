@@ -26,9 +26,9 @@ setuptools.setup(
     packages=setuptools.find_packages(include=[
         'nova',
         'nova.virt',
-        'nova.virt.lxd',
-        'nova.virt.lxd.*',
-        'nova_lxd_tempest_plugin',
-        'nova_lxd_tempest_plugin.*',
+        'nova.virt.incus',
+        'nova.virt.incus.*',
+        'nova_incus_tempest_plugin',
+        'nova_incus_tempest_plugin.*',
     ]),
     pbr=True)

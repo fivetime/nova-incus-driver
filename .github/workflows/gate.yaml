@@ -65,7 +65,7 @@ jobs:
           cd "${RUNNER_TEMP}"
           "${GITHUB_WORKSPACE}/openstack-incus/.tox/py312/bin/python" - <<'PY'
           from importlib import metadata
-          from nova.virt.lxd.cmd import compute
+          from nova.virt.incus.cmd import compute
 
           entry_points = list(metadata.entry_points(
               group='console_scripts', name='nova-incus-compute'))

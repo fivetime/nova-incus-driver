@@ -28,7 +28,7 @@ enable_plugin neutron https://opendev.org/openstack/neutron stable/2026.1
 enable_service q-svc ovn-northd ovn-controller q-ovn-agent
 disable_service q-agt q-l3 q-dhcp q-meta
 
-# The plugin keeps lxd.LXDDriver as a transitional Nova import path while all
+# The plugin keeps incus.IncusDriver as a transitional Nova import path while all
 # runtime API calls use Incus.
 enable_plugin openstack-incus \
     https://github.com/fivetime/openstack-incus.git master

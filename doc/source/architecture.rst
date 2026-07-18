@@ -4,7 +4,7 @@ OpenStack-Incus Architecture and Scope
 Purpose
 -------
 
-This project modernizes the existing Nova-LXD compute driver into a current
+This project modernizes the existing Nova-Incus compute driver into a current
 Incus system-container driver. It is an incremental evolution of the existing
 Nova driver, DevStack plugin, Tempest plugin, VIF design, and tests, not an
 unrelated replacement.
@@ -146,8 +146,8 @@ config drives and other Nova host state to the privileged daemon container.
 
 The modern Nova ``Diagnostics`` object restricts its ``driver`` field to a
 fixed list. This repository carries
-``patches/nova/0001-diagnostics-add-lxd-driver.patch`` to add the existing
-``lxd`` hypervisor identifier to the object field, API schema, and API
+``patches/nova/0001-diagnostics-add-incus-driver.patch`` to add the existing
+``incus`` hypervisor identifier to the object field, API schema, and API
 reference. The DevStack plugin applies that small compatibility patch
 explicitly and fails if it no longer applies; the driver never identifies
 itself as libvirt. This remains a Nova integration dependency until the value

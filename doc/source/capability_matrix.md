@@ -9,7 +9,7 @@
 1. `support_matrix/capabilities.json`：当前支持、框架提供、实验或拒绝状态。
 2. 仓库根目录 `TEST_STATUS.md`：带日期、节点、资源和故障场景的实测证据。
 3. `tools/openstack-incus-*-e2e.sh`：可重复执行的发布门禁。
-4. `nova/tests/unit/virt/lxd/` 和 `nova/virt/lxd/`：接口契约与实现。
+4. `nova/tests/unit/virt/incus/` 和 `nova/virt/incus/`：接口契约与实现。
 5. `capability_matrix_historical.md`：仅用于理解早期差距，不是待办清单。
 
 只有“代码、自动化门禁、实测证据”三者均缺失时，才应把项目重新列为未完成。

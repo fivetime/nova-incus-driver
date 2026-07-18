@@ -1,4 +1,4 @@
 [gerrit]
 host=review.opendev.org
 port=29418
-project=x/nova-lxd.git
+project=x/nova-incus.git

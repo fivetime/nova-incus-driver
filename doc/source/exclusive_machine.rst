@@ -1,8 +1,8 @@
-Nova-LXD Exclusive Machine
+Nova-Incus Exclusive Machine
 ==========================
 
-As LXD is a system container format, it is possible to provision "bare metal"
-machines with nova-lxd without exposing the kernel and firmware to the tenant.
+As Incus is a system container format, it is possible to provision "bare metal"
+machines with nova-incus without exposing the kernel and firmware to the tenant.
 This is done by means of host aggregates and flavor assignment. The instance
 will fill the entirety of the host, and no other instances will be assigned
 to it.
@@ -91,7 +91,7 @@ Exclusive machine flavors
 -------------------------
 
 When planning for exclusive machine flavors, there is still a small amount
-of various resources that will be needed for nova compute and lxd itself.
+of various resources that will be needed for nova compute and incus itself.
 In general, it's a safe bet that this can be quantified in 100MB of RAM,
 though specific hosts may need to be configured more closely to their
 use cases.

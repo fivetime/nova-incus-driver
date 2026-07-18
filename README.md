@@ -1,6 +1,6 @@
 # nova-incus
 
-将 **Incus 系统容器**作为 OpenStack Nova 计算后端的驱动。它是 nova-lxd 的现代化续作,面向
+将 **Incus 系统容器**作为 OpenStack Nova 计算后端的驱动。它是 nova-incus 的现代化续作,面向
 OpenStack `stable/2026.1`、Ubuntu Noble、Incus 7.x 与 Python 3.12。
 
 目标是提供"类虚拟机的持久系统容器":租户在容器内拥有完整的发行版环境(systemd、可用
@@ -78,11 +78,11 @@ tox -e py312     # 单元测试
 tox -e pep8      # 代码风格
 ```
 
-Tempest 场景测试位于 `nova_lxd_tempest_plugin/`;真实环境的端到端脚本位于 `tools/`
+Tempest 场景测试位于 `nova_incus_tempest_plugin/`;真实环境的端到端脚本位于 `tools/`
 (Ceph/BFV/迁移/卷/快照/备份的 E2E,以及生产准入 preflight)。破坏性与故障注入脚本必须从
 独立的可信编排端运行,切勿将 VM SSH 私钥拷贝到云节点。
 
 ## 说明
 
-代码模块路径与主类目前仍沿用历史命名 `nova/virt/lxd/`(`LXDDriver`),分发包名已更名为
-`nova-incus`;完整的 `lxd → incus` 重命名将作为单独的重构进行。
+代码模块路径与主类目前仍沿用历史命名 `nova/virt/incus/`(`IncusDriver`),分发包名已更名为
+`nova-incus`;完整的 `incus → incus` 重命名将作为单独的重构进行。

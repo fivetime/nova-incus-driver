@@ -7,12 +7,12 @@ COMPUTE_NODES=${COMPUTE_NODES:?Set host=ssh-target comma-separated nodes}
 SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute audit key}
 EXPECTED_INCUS_IMAGE_DIGEST=${EXPECTED_INCUS_IMAGE_DIGEST:?Set approved digest}
 EXPECTED_INCUS_REVISION=${EXPECTED_INCUS_REVISION:?Set approved source revision}
-REMOTE_DRIVER=${REMOTE_DRIVER:-/opt/stack/nova/nova/virt/lxd}
+REMOTE_DRIVER=${REMOTE_DRIVER:-/opt/stack/nova/nova/virt/incus}
 CONTROLLER_SSH=${CONTROLLER_SSH:-}
 CONTROLLER_OPENRC=${CONTROLLER_OPENRC:-/opt/stack/devstack/openrc admin admin}
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 HOST_PREFLIGHT=${HOST_PREFLIGHT:-$SCRIPT_DIR/openstack-incus-production-preflight.sh}
-RELEASE_DRIVER=${RELEASE_DRIVER:-$SCRIPT_DIR/../nova/virt/lxd}
+RELEASE_DRIVER=${RELEASE_DRIVER:-$SCRIPT_DIR/../nova/virt/incus}
 
 SSH=(ssh -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=no)
 failures=0
@@ -118,11 +118,11 @@ for node in "${nodes[@]}"; do
         -f value -c state 2>/dev/null)
     hypervisor_type=$(openstack hypervisor show "$host" \
         -f value -c hypervisor_type 2>/dev/null)
-    if [[ "$hypervisor_state" == up && "$hypervisor_type" == lxd ]]; then
-        pass "$host hypervisor" "up/lxd"
+    if [[ "$hypervisor_state" == up && "$hypervisor_type" == incus ]]; then
+        pass "$host hypervisor" "up/incus"
     else
         fail "$host hypervisor" \
-            "expected up/lxd, actual=$hypervisor_state/$hypervisor_type"
+            "expected up/incus, actual=$hypervisor_state/$hypervisor_type"
     fi
 
     provider_uuid=$(openstack resource provider list --name "$host" \

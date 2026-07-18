@@ -1,8 +1,8 @@
 ===============================
-Nova-lxd Feature Support Matrix
+Nova-incus Feature Support Matrix
 ===============================
 
-The following support matrix reflects the nova-lxd that is currently available
+The following support matrix reflects the nova-incus that is currently available
 or is available at the time of release.
 
 .. Note::

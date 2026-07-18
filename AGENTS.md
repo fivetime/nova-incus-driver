@@ -37,7 +37,7 @@ The former ovsdbapp checkout at
 it was outdated. Do not reference or recreate that path; use
 `C:\MyProjects\OpenSource\ovsdbapp` exclusively.
 
-Do not infer modern Nova or Neutron interfaces from the legacy `nova-lxd`
+Do not infer modern Nova or Neutron interfaces from the legacy `nova-incus`
 code in this repository. Compare driver method signatures, objects, Placement
 integration, os-vif handling, Neutron port binding, OVS/OVSDB behavior,
 storage attachment, image handling, dependency constraints, configuration
@@ -143,8 +143,8 @@ implementing changes.
 - Modernize this existing project incrementally. Preserve its Nova compute
   driver, DevStack plugin, Tempest plugin, supported lifecycle behavior, and
   test intent where they remain valid. Do not replace it with an unrelated
-  greenfield implementation merely to rename LXD concepts.
-- Replace legacy LXD-specific behavior with current Incus `/1.0/instances`
+  greenfield implementation merely to rename Incus concepts.
+- Replace legacy Incus-specific behavior with current Incus `/1.0/instances`
   APIs through the local Incus Python SDK.
 - Preserve Nova multi-tenancy through Nova's existing instance ownership,
   quotas, Placement allocations, Neutron ports, Glance visibility, and Cinder
@@ -270,8 +270,8 @@ in `TEST_STATUS.md`; this section keeps only the rules.
 - OpenStack 2026.1 does not consume a `compute_manager` setting when starting
   `nova-compute`; its service manager mapping is process-local and hard-coded.
   The project therefore provides `nova-incus-compute` and
-  `python -m nova.virt.lxd.cmd.compute`, which select
-  `nova.virt.lxd.manager.IncusComputeManager` before calling the upstream Nova
+  `python -m nova.virt.incus.cmd.compute`, which select
+  `nova.virt.incus.manager.IncusComputeManager` before calling the upstream Nova
   compute entry point. DevStack installs a systemd drop-in for this command.
   Never claim automatic BFV recovery when a compute still starts the stock
   `nova-compute` binary.

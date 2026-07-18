@@ -7,7 +7,7 @@
 
 本文件是 Incus 计算驱动相对 Nova `ComputeDriver` 契约的权威能力矩阵,基于对
 本地 Nova 树(master `4d9d8caff2`,冻结时需对 stable/2026.1 重做签名差异审计)、
-libvirt 参考驱动和本项目 `nova/virt/lxd/` 的四路源码审计。
+libvirt 参考驱动和本项目 `nova/virt/incus/` 的四路源码审计。
 
 **核心原则(来自 manager 编排审计)**:manager 负责编排(task_state/vm_state 状态机、
 Cinder BDM/attachment 生命周期、Neutron port 绑定、Placement claim/allocation、quota、
@@ -21,17 +21,17 @@ TODO 需实现 · N/A 系统容器不适用(永久拒绝)。
 
 ## 第零层:子系统所有权(目录级)
 
-我们的实现范围本质上**只有 `nova/virt/lxd/`**(libvirt/ironic/vmwareapi/zvm 的平级兄弟),
+我们的实现范围本质上**只有 `nova/virt/incus/`**(libvirt/ironic/vmwareapi/zvm 的平级兄弟),
 外加三个薄接入点。`nova/` 下其余目录全是**共享框架**,消费而不重写。
 
 ### 属于我们(实现)
 
 | 路径 | 内容 |
 |---|---|
-| `nova/virt/lxd/` | **驱动主体**:driver.py、storage.py、flavor.py、config.py、vif.py、common.py、session.py、client.py |
-| `nova/virt/lxd/manager.py` | ComputeManager 的最小子类(仅加 BFV 迁移故障恢复周期任务) |
-| `nova/virt/lxd/cmd/` | `nova-incus-compute` 薄入口(2026.1 不再用 compute_manager 配置项) |
-| `nova/tests/unit/virt/lxd/` | 单元测试 |
+| `nova/virt/incus/` | **驱动主体**:driver.py、storage.py、flavor.py、config.py、vif.py、common.py、session.py、client.py |
+| `nova/virt/incus/manager.py` | ComputeManager 的最小子类(仅加 BFV 迁移故障恢复周期任务) |
+| `nova/virt/incus/cmd/` | `nova-incus-compute` 薄入口(2026.1 不再用 compute_manager 配置项) |
+| `nova/tests/unit/virt/incus/` | 单元测试 |
 | `[incus]` conf 组 | 在框架 oslo.config 机制上新增配置项(机制是框架的) |
 
 ### 属于框架(消费,绝不重写)
@@ -235,7 +235,7 @@ E2E 显示 attachment 保留、卷回滚、实例未受影响;若 manager 有实
 
 1. **能力矩阵**(本文件)—— 建立 source of truth,持续更新。
 2. **语义修正(A)** —— suspend 已对;修 `vcpus_used`、显式化 capabilities、清死代码。低风险快赢。
-3. **Tempest 现代化** —— 覆盖已声明支持的功能(先堵"实现了但未验证"),去掉旧 LXD 假设(default project/bridged NIC/ephemeral)。
+3. **Tempest 现代化** —— 覆盖已声明支持的功能(先堵"实现了但未验证"),去掉旧 Incus 假设(default project/bridged NIC/ephemeral)。
 4. **计量(B)** —— `get_instance_diagnostics` + `block_stats`,打通计费。
 5. **迁移 post-claim 系统化故障注入** —— 硬化 fence/claim/reconcile(现有 production blocker)。
 6. **evacuate(C)** —— 复用第 5 步原语 + `instance_on_disk` + 外部 fencing 设计 + 断电测试。

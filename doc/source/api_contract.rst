@@ -117,7 +117,7 @@ The public API release gates are:
 * ``tools/openstack-incus-bfv-bootstrap-e2e.sh``
 * ``tools/openstack-incus-resize-e2e.sh``
 * ``tools/openstack-incus-bfv-migration-matrix.sh``
-* ``nova_lxd_tempest_plugin.tests.scenario``
+* ``nova_incus_tempest_plugin.tests.scenario``
 
 The migration matrix is fail-closed and audits Nova servers, Cinder volumes,
 Incus instances/profiles and host RBD mappings after every case. Tempest SSH

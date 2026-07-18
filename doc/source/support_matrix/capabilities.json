@@ -70,7 +70,7 @@
       "driver_hooks": ["attach_volume", "detach_volume", "extend_volume"],
       "applicability": "container",
       "status": "supported",
-      "evidence": "nova_lxd_tempest_plugin.tests.scenario.test_volume_ops"
+      "evidence": "nova_incus_tempest_plugin.tests.scenario.test_volume_ops"
     },
     {
       "id": "cinder-volume-swap",

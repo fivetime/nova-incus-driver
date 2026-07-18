@@ -127,11 +127,11 @@ function install_nova_incus {
 
     if is_true "${INCUS_APPLY_NOVA_DIAGNOSTICS_PATCH}"; then
         local diagnostics_patch
-        diagnostics_patch="${NOVA_INCUS_DIR}/patches/nova/0001-diagnostics-add-lxd-driver.patch"
-        if grep -q 'LXD = "lxd"' "${NOVA_DIR}/nova/objects/fields.py" && \
-                grep -q "'lxd'," \
+        diagnostics_patch="${NOVA_INCUS_DIR}/patches/nova/0001-diagnostics-add-incus-driver.patch"
+        if grep -q 'Incus = "incus"' "${NOVA_DIR}/nova/objects/fields.py" && \
+                grep -q "'incus'," \
                     "${NOVA_DIR}/nova/api/openstack/compute/schemas/server_diagnostics.py"; then
-            echo "Nova diagnostics already accepts the lxd driver"
+            echo "Nova diagnostics already accepts the incus driver"
         elif git -C "${NOVA_DIR}" apply --check "${diagnostics_patch}"; then
             git -C "${NOVA_DIR}" apply "${diagnostics_patch}"
         else
@@ -158,10 +158,10 @@ function install_nova_incus {
     # external distribution cannot extend nova.virt with another namespace
     # path. Keep this repository authoritative and deploy its driver package
     # into the DevStack Nova checkout on every stack run.
-    mkdir -p "${NOVA_DIR}/nova/virt/lxd"
+    mkdir -p "${NOVA_DIR}/nova/virt/incus"
     sudo rsync -a --delete --chown="${STACK_USER}:${STACK_USER}" \
-        "${NOVA_INCUS_DIR}/nova/virt/lxd/" \
-        "${NOVA_DIR}/nova/virt/lxd/"
+        "${NOVA_INCUS_DIR}/nova/virt/incus/" \
+        "${NOVA_DIR}/nova/virt/incus/"
 }
 
 
@@ -347,7 +347,7 @@ function configure_nova_incus {
 
     for nova_target in "${nova_targets[@]}"; do
         # Keep the established import path during incremental modernization.
-        iniset "${nova_target}" DEFAULT compute_driver lxd.LXDDriver
+        iniset "${nova_target}" DEFAULT compute_driver incus.IncusDriver
         iniset "${nova_target}" os_vif_ovs ovsdb_connection \
             unix:/var/run/openvswitch/db.sock
         iniset "${nova_target}" DEFAULT force_config_drive False
@@ -646,7 +646,7 @@ function configure_nova_incus_compute_service {
     sudo tee "${dropin_dir}/nova-incus.conf" >/dev/null <<EOF
 [Service]
 ExecStart=
-ExecStart=${NOVA_BIN_DIR}/python -m nova.virt.lxd.cmd.compute --config-file ${NOVA_CPU_CONF}
+ExecStart=${NOVA_BIN_DIR}/python -m nova.virt.incus.cmd.compute --config-file ${NOVA_CPU_CONF}
 EOF
     if [[ "${INCUS_REQUIRE_COMPUTE_ADMISSION,,}" == "true" ]]; then
         sudo install -o root -g root -m 0644 \

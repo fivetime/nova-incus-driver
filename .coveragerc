@@ -1,6 +1,6 @@
 [run]
 branch = True
-source = nova.virt.lxd
+source = nova.virt.incus
 omit = nova/tests/*
 
 [report]

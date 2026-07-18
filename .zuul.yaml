@@ -10,16 +10,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# This job will execute 'tox -e func_lxd' from the OSA
+# This job will execute 'tox -e func_incus' from the OSA
 # repo specified in 'osa_test_repo'.
 - job:
-    name: openstack-ansible-nova-lxd
+    name: openstack-ansible-nova-incus
     parent: openstack-ansible-cross-repo-functional
     voting: false
     required-projects:
       - name: openstack/openstack-ansible-os_nova
     vars:
-      tox_env: lxd
+      tox_env: incus
       osa_test_repo: openstack/openstack-ansible-os_nova
 
 - project:
@@ -27,4 +27,4 @@
       - openstack-lower-constraints-jobs
     check:
       jobs:
-        - openstack-ansible-nova-lxd
+        - openstack-ansible-nova-incus

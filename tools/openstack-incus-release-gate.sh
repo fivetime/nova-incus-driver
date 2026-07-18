@@ -63,7 +63,7 @@ run "credential pattern audit" bash -c '
         "$literal_credential_pattern" \
         -- . \
         ":(exclude)nova/tests/**" \
-        ":(exclude)nova_lxd_tempest_plugin/tests/**" \
+        ":(exclude)nova_incus_tempest_plugin/tests/**" \
         ":(exclude)doc/source/production_readiness.rst" \
         ":(exclude)etc/openstack-incus/fence.d/*.example"; then
         echo "possible committed literal credential detected" >&2

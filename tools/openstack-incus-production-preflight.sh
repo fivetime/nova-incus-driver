@@ -269,7 +269,7 @@ fi
 
 compute_driver=$(crudini --get "$NOVA_CONFIG" DEFAULT compute_driver \
     2>/dev/null)
-check_equal "Nova compute driver" lxd.LXDDriver "$compute_driver"
+check_equal "Nova compute driver" incus.IncusDriver "$compute_driver"
 check_equal "Nova BFV pool" "$BFV_POOL" \
     "$(crudini --get "$NOVA_CONFIG" incus \
         boot_from_volume_storage_pool 2>/dev/null)"
@@ -294,7 +294,7 @@ check_equal "Nova migration recovery" true \
     "$(crudini --get "$NOVA_CONFIG" incus \
         migration_auto_recovery 2>/dev/null)"
 exec_start=$(systemctl show "$NOVA_SERVICE" -p ExecStart --value 2>/dev/null)
-if grep -q 'nova\.virt\.lxd\.cmd\.compute' <<<"$exec_start"; then
+if grep -q 'nova\.virt\.incus\.cmd\.compute' <<<"$exec_start"; then
     pass "Nova custom manager launcher"
 else
     fail "Nova custom manager launcher" "module entry point not active"

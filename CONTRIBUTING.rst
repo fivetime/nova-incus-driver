@@ -1,32 +1,32 @@
-Crash course in lxd setup
+Crash course in incus setup
 =========================
 
-nova-lxd absolutely requires lxd, though its installation and configuration
+nova-incus absolutely requires incus, though its installation and configuration
 is out of scope here. If you're running Ubuntu, here is the easy path
-to a running lxd.
+to a running incus.
 
 .. code-block: bash
 
-   add-apt-repository ppa:ubuntu-lxc/lxd-git-master && sudo apt-get update
-   apt-get -y install lxd
-   usermod -G lxd ${your_username|stack}
-   service lxd start
+   add-apt-repository ppa:ubuntu-lxc/incus-git-master && sudo apt-get update
+   apt-get -y install incus
+   usermod -G incus ${your_username|stack}
+   service incus start
 
-If you're currently logged in as the user you just added to lxd, you'll
+If you're currently logged in as the user you just added to incus, you'll
 need to log out and log back in again.
 
 
-Using nova-lxd with devstack
+Using nova-incus with devstack
 ============================
 
-nova-lxd includes a plugin for use in devstack. If you'd like to run
-devstack with nova-lxd, you'll want to add the following to `local.conf`:
+nova-incus includes a plugin for use in devstack. If you'd like to run
+devstack with nova-incus, you'll want to add the following to `local.conf`:
 
 .. code-block: bash
 
-   enable_plugin nova-lxd https://git.openstack.org/openstack/nova-lxd
+   enable_plugin nova-incus https://git.openstack.org/openstack/nova-incus
 
-In this case, nova-lxd will run HEAD from master. You may want to point
+In this case, nova-incus will run HEAD from master. You may want to point
 this at your own fork. A final argument to `enable_plugin` can be used
 to specify a git revision.
 
@@ -53,19 +53,19 @@ run the very minimum you`ll need for devstack.
    # Optional, to enable tempest configuration as part of devstack
    enable_service tempest
 
-   enable_plugin nova-lxd https://git.openstack.org/openstack/nova-lxd
+   enable_plugin nova-incus https://git.openstack.org/openstack/nova-incus
 
    # More often than not, stack.sh explodes trying to configure IPv6 support,
    # so let's just disable it for now.
    IP_VERSION=4
 
-Once devstack is running, you'll want to add the lxd image to glance. You can
+Once devstack is running, you'll want to add the incus image to glance. You can
 do this (as an admin) with:
 
 .. code-block: bash
 
    wget http://cloud-images.ubuntu.com/trusty/current/trusty-server-cloudimg-amd64-root.tar.xz
-   glance image-create --name lxd --container-format bare --disk-format raw \
+   glance image-create --name incus --container-format bare --disk-format raw \
       --visibility=public < trusty-server-cloudimg-amd64-root.tar.xz
 
 To run the tempest tests, you can use:
@@ -82,7 +82,7 @@ Patches should be submitted to Openstack Gerrit via `git-review`.
 
 Bugs should be filed on Launchpad:
 
-   https://bugs.launchpad.net/nova-lxd
+   https://bugs.launchpad.net/nova-incus
 
 If you would like to contribute to the development of OpenStack,
 you must follow the steps in this page:
