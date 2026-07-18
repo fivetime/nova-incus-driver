@@ -17,6 +17,7 @@ INCUS_SHARE_MOUNT_ROOT=${INCUS_SHARE_MOUNT_ROOT:-/opt/stack/data/nova/instances/
 BFV_POOL=${BFV_POOL:-cinder-bfv}
 PREFLIGHT_PROJECT=${PREFLIGHT_PROJECT:-nova-preflight}
 MIN_FREE_PERCENT=${MIN_FREE_PERCENT:-20}
+REQUIRE_COLD_MIGRATION=${REQUIRE_COLD_MIGRATION:-true}
 REQUIRE_DEDICATED_CONTROL_FS=${REQUIRE_DEDICATED_CONTROL_FS:-true}
 
 failures=0
@@ -272,6 +273,11 @@ check_equal "Nova compute driver" lxd.LXDDriver "$compute_driver"
 check_equal "Nova BFV pool" "$BFV_POOL" \
     "$(crudini --get "$NOVA_CONFIG" incus \
         boot_from_volume_storage_pool 2>/dev/null)"
+if [[ "$REQUIRE_COLD_MIGRATION" == true ]]; then
+    check_equal "Nova cold migration" true \
+        "$(crudini --get "$NOVA_CONFIG" incus \
+            allow_cold_migration 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+fi
 check_equal "Nova migration recovery" true \
     "$(crudini --get "$NOVA_CONFIG" incus \
         migration_auto_recovery 2>/dev/null)"
