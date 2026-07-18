@@ -304,6 +304,10 @@ in `TEST_STATUS.md`; this section keeps only the rules.
   destructive/fault-injection E2E from a separate trusted orchestrator; never
   copy the VM SSH private key onto a cloud node (use `SOURCE_SSH=local` /
   `CONTROLLER_SSH` where supported).
+- `tools/openstack-incus-bfv-migration-matrix.sh` is the BFV cold-migration
+  release gate. It runs the fault matrix, rejects OpenStack and compute runtime
+  inventory drift after cleanup, and then runs fleet preflight. Production
+  admission requires it to pass for every ordered compute pair.
 
 ### Repository and test-VM workflow
 

@@ -290,10 +290,12 @@ if [[ "$INJECT_POST_CLAIM_FAILURE" == true ]]; then
             post_claim_failpoint_path=/usr/bin/rbd
             ;;
         start)
-            vif_source=$(incus "$SOURCE_SSH" query \
-                "/1.0/profiles/$instance_name" | jq -r \
-                '(.metadata.devices // .devices)[] |
-                 select(.type == "nic" and .nictype == "physical") | .parent')
+            vif_source=$(remote "$SOURCE_SSH" \
+                "podman exec incus incus query \
+                 '/1.0/profiles/$instance_name' |
+                 jq -r '(.metadata.devices // .devices)[] |
+                   select(.type == \"nic\" and .nictype == \"physical\") |
+                   .parent'")
             [[ -n "$vif_source" ]] || fail "cannot determine Incus VIF source"
             start_failpoint_pid=$(remote "$DEST_SSH" \
                 "nohup sh -c 'until ip link show \"$vif_source\" \

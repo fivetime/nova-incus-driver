@@ -137,9 +137,31 @@ digest/revision pair.
 
 ## BFV no-copy migration
 
-No-copy BFV cross-compute migration remains incomplete in the Nova driver;
-post-claim fault injection at each ownership transition is the open production
-blocker. The dated evidence below tracks the incremental hardening.
+No-copy BFV cross-compute migration has passed the core post-claim fault
+matrix. It remains operator-gated until the release matrix passes on every
+ordered production compute pair. The dated evidence below tracks the
+incremental hardening.
+
+- The release matrix was consolidated on 2026-07-18 in
+  `tools/openstack-incus-bfv-migration-matrix.sh`. On the three-node Noble
+  environment, normal preflight/confirm/hard-reboot/revert, post-claim
+  data-volume failure, post-claim container-start failure, stopped-instance
+  post-claim failure, and reverse-revert failure all passed. Every case
+  restored the pre-test OpenStack server/volume inventory and each compute's
+  Incus instance/profile/RBD-mapping inventory.
+- The first normal matrix attempt on 2026-07-18 failed closed because the
+  Neutron port remained `DOWN` for ten minutes after reverse revert even
+  though the destination OVS interface was up and OVN had emitted a
+  `network-vif-plugged` event. Cleanup was complete and an immediate complete
+  rerun passed. This remains an observed OVN control-plane convergence event;
+  the release gate intentionally does not suppress or retry past its timeout.
+- The three-node fleet preflight passed on 2026-07-18 after synchronizing the
+  authoritative driver tree. It verified identical driver hashes, Incus 7.2
+  image digest
+  `sha256:cc8b71093395ca89d4d5d885b84e861d75dcb2de38d7220e68f1cdee239bd72d`,
+  fork revision `5adcaca1ad383362bb824a15845ecd4a85f24ba5`,
+  Nova/Placement readiness, live OVN controllers, and the enabled/up Cinder
+  Ceph backend and scheduler.
 
 - The first hard guard landed on 2026-07-17: source preparation and destination
   finish both require `migration_shared_ceph_storage`,

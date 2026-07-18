@@ -8,6 +8,8 @@ SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute audit key}
 EXPECTED_INCUS_IMAGE_DIGEST=${EXPECTED_INCUS_IMAGE_DIGEST:?Set approved digest}
 EXPECTED_INCUS_REVISION=${EXPECTED_INCUS_REVISION:?Set approved source revision}
 REMOTE_DRIVER=${REMOTE_DRIVER:-/opt/stack/nova/nova/virt/lxd}
+CONTROLLER_SSH=${CONTROLLER_SSH:-}
+CONTROLLER_OPENRC=${CONTROLLER_OPENRC:-/opt/stack/devstack/openrc admin admin}
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 HOST_PREFLIGHT=${HOST_PREFLIGHT:-$SCRIPT_DIR/openstack-incus-production-preflight.sh}
 
@@ -34,6 +36,18 @@ remote() {
     local target=$1
     shift
     "${SSH[@]}" "$target" "$@"
+}
+
+openstack() {
+    if [[ -z "$CONTROLLER_SSH" ]]; then
+        command openstack "$@"
+        return
+    fi
+
+    local command_line
+    printf -v command_line '%q ' "$@"
+    remote "$CONTROLLER_SSH" \
+        "source $CONTROLLER_OPENRC >/dev/null 2>&1; openstack $command_line"
 }
 
 IFS=, read -ra nodes <<<"$COMPUTE_NODES"
@@ -121,12 +135,11 @@ for node in "${nodes[@]}"; do
         fi
     fi
 
-    ovn_agents=$(openstack network agent list --host "$host" \
-        -f json 2>/dev/null)
-    if jq -e \
-            'any(.[]; .Binary == "ovn-controller" and
-             .Alive == true and .State == true)' \
-            <<<"$ovn_agents" >/dev/null; then
+    ovn_agents=$(openstack network agent list --host "$host" -f value \
+        -c Binary -c Alive -c State 2>/dev/null)
+    if grep -Eq \
+            'ovn-controller.*True.*True|True.*ovn-controller.*True|True.*True.*ovn-controller' \
+            <<<"$ovn_agents"; then
         pass "$host OVN controller" alive
     else
         fail "$host OVN controller" "no alive/enabled ovn-controller agent"
@@ -135,16 +148,15 @@ done
 
 cinder_services=$(openstack volume service list -f value \
     -c Binary -c Host -c Status -c State 2>/dev/null)
-if awk '$3 != "enabled" || $4 != "up" {exit 1}' <<<"$cinder_services"; then
-    pass "Cinder services" "all enabled/up"
-else
-    fail "Cinder services" "one or more services are not enabled/up"
-fi
 for backend in '@ceph' 'cinder-scheduler'; do
-    if grep -q "$backend" <<<"$cinder_services"; then
+    if awk -v required="$backend" \
+            'index($0, required) && $(NF-1) == "enabled" && $NF == "up" {
+                 found=1
+             }
+             END {exit !found}' <<<"$cinder_services"; then
         pass "Cinder required service:$backend"
     else
-        fail "Cinder required service:$backend" "missing"
+        fail "Cinder required service:$backend" "missing or not enabled/up"
     fi
 done
 

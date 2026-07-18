@@ -374,7 +374,8 @@ not become a shared operator credential.
 After every compute passes the host audit, run the cross-compute audit from a
 controller with OpenStack administrator credentials::
 
-    COMPUTE_NODES='compute-1=root@192.0.2.10,compute-2=root@192.0.2.11' \
+      COMPUTE_NODES='compute-1=root@192.0.2.10,compute-2=root@192.0.2.11' \
+      CONTROLLER_SSH=root@192.0.2.20 \
       SSH_IDENTITY=/root/.ssh/compute-audit \
       EXPECTED_INCUS_IMAGE_DIGEST=sha256:<approved-manifest-digest> \
       EXPECTED_INCUS_REVISION=<approved-full-git-commit> \
@@ -389,6 +390,10 @@ therefore not trusted and cannot silently run an older audit policy. Run it
 before enabling a new compute, after upgrades, and as a scheduled compliance
 check. Any failure is a release or admission blocker; do not maintain an
 allow-list of ignored checks.
+
+When ``CONTROLLER_SSH`` is set, fleet-wide OpenStack queries run through that
+host after sourcing ``CONTROLLER_OPENRC``. Otherwise the orchestrator must
+provide an authenticated local ``openstack`` command.
 
 Release distributions must be built with the version explicitly pinned because
 the modernized repository retains historical ``nova-lxd`` Git tags::
@@ -418,6 +423,26 @@ driver orchestrates forward confirm and reverse revert with the same RBD. These
 zero-copy paths and the core post-claim recovery matrix have passed multi-node
 integration tests. Keep cold migration operator-gated until the same release
 suite passes on every production compute pair.
+
+Run the complete release matrix from a trusted external orchestrator. It
+executes normal confirm/revert, migration preflight rejection, data-volume and
+container-start post-claim recovery, stopped-instance recovery, and reverse
+revert recovery. After every case it requires the Incus instance, profile, and
+RBD mapping inventories on every compute to return to their pre-test snapshots.
+It also requires the OpenStack server and volume inventories to match their
+pre-test snapshots and finishes with the fleet preflight::
+
+    IMAGE=ubuntu-noble-incus-bfv-rbd \
+      COMPUTE_NODES='incus-node-01=root@192.0.2.10,incus-node-02=root@192.0.2.11' \
+      CONTROLLER_SSH=root@192.0.2.10 \
+      SSH_IDENTITY=/root/.ssh/compute-audit \
+      EXPECTED_INCUS_IMAGE_DIGEST=sha256:<approved-manifest-digest> \
+      EXPECTED_INCUS_REVISION=<approved-full-git-commit> \
+      tools/openstack-incus-bfv-migration-matrix.sh
+
+Run the matrix for every ordered production compute pair. A matrix failure,
+resource inventory difference, residual-state finding, or fleet-preflight
+failure blocks release admission.
 
 Each compute must expose its Incus HTTPS API only on a protected migration
 network and set both options::
