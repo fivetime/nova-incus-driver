@@ -729,6 +729,13 @@ binding a directory from the compute host into a rescue container, which is
 not valid for an Incus-managed Ceph or LVM root volume and violates the host
 filesystem isolation boundary. Rescue must remain unavailable until it can
 attach the retained root volume through a storage-pool-native Incus API.
+The Incus compute manager rejects rescue, unrescue, suspend, and resume before
+performing resource or power operations. It restores the task state, preserves
+the prior VM state, and records an explicit OpenStack failure exception in the
+server action event. These Nova APIs are asynchronous, so the initial request
+may still be accepted; operators and clients must inspect the action event.
+Immediate ``4xx`` feedback in Horizon requires an upstream Nova API capability
+gate.
 The deprecated ``allow_live_migration`` option has no effect. Incus CRIU/live
 migration must not be enabled through this driver because the legacy SDK path
 does not implement Nova's confirm/recover ownership protocol. A planned host

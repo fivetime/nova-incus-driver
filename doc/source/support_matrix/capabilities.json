@@ -134,7 +134,7 @@
       "driver_hooks": ["suspend", "resume"],
       "applicability": "requires-memory-checkpoint",
       "status": "unsupported",
-      "evidence": "Incus freeze does not release instance memory"
+      "evidence": "Incus manager rejects before side effects, restores task state, preserves VM state, and records InstanceSuspendFailure or InstanceResumeFailure"
     },
     {
       "id": "cold-migrate-resize",
@@ -206,7 +206,7 @@
       "driver_hooks": ["rescue", "unrescue"],
       "applicability": "requires-storage-native-root-attachment",
       "status": "unsupported",
-      "evidence": "Explicit NotImplementedError"
+      "evidence": "Incus manager rejects before side effects, restores task state, preserves VM state, and records InstanceNotRescuable or InstanceUnRescueFailure"
     },
     {
       "id": "guest-kernel-crash-dump",

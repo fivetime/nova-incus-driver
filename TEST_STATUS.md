@@ -636,6 +636,15 @@ incremental hardening.
   `9ff314...` SHA-256 while Cinder rolled back the temporary LVM target. Online
   volume migration/retype is explicitly unsupported until a crash-consistent
   block-copy protocol exists. The temporary LVM backend was disabled again.
+- Unsupported suspend, resume, rescue, and unrescue now fail in the Incus
+  compute manager before power, network, or storage side effects. Unit coverage
+  verifies task-state rollback, VM-state preservation, instance-fault
+  recording, and failed action-event recording for all four operations. A real
+  suspend request against instance
+  `7cbb8e9a-3532-4fb7-b3bc-8e4497bc6b72` left it `ACTIVE` with no task state
+  and recorded `compute_suspend_instance` as `Error` with the explicit
+  `InstanceSuspendFailure` reason. The Python 3.12 suite passed 237 tests with
+  2 intentional legacy pylxd skips; pep8 and warning-as-error docs passed.
 - A BFV root-growth E2E expanded a running Cinder root from 2 GiB to 3 GiB,
   verified the RBD, Incus local root device, and ext4 filesystem, hard
   rebooted it, and confirmed a cold migration to `incus-node-02`. Binding

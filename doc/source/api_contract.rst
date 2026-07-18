@@ -98,6 +98,15 @@ live migration fails its Nova migration pre-check, and invalid flavor limits
 fail the build/resize operation; callers must inspect server events rather
 than assume a synchronous HTTP error.
 
+Suspend, resume, rescue, and unrescue are asynchronous Nova compute actions.
+The Incus compute manager rejects them before any power, network, or storage
+side effect, clears the task state, preserves the previous VM state, and
+records the corresponding ``Instance*Failure`` in the action event. The
+initial API request can nevertheless be accepted before the compute service
+reports that failure. A synchronous ``4xx`` response in Horizon or the
+OpenStack CLI requires a generic capability gate in the upstream Nova API;
+changing only the virt driver exception cannot provide that behavior.
+
 Release evidence
 ----------------
 

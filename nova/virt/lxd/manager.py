@@ -36,6 +36,40 @@ _METRICS_SETTLEMENT_DELAY = 9
 class IncusComputeManager(manager.ComputeManager):
     """Nova manager extension for fenced BFV post-claim recovery."""
 
+    @manager.wrap_exception()
+    @manager.reverts_task_state
+    @manager.wrap_instance_event(prefix='compute')
+    @manager.wrap_instance_fault
+    def suspend_instance(self, context, instance):
+        raise exception.InstanceSuspendFailure(
+            reason='Incus system containers do not support memory suspend')
+
+    @manager.wrap_exception()
+    @manager.reverts_task_state
+    @manager.wrap_instance_event(prefix='compute')
+    @manager.wrap_instance_fault
+    def resume_instance(self, context, instance):
+        raise exception.InstanceResumeFailure(
+            reason='Incus system containers do not support memory resume')
+
+    @manager.wrap_exception()
+    @manager.reverts_task_state
+    @manager.wrap_instance_event(prefix='compute')
+    @manager.wrap_instance_fault
+    def rescue_instance(self, context, instance, rescue_password,
+                        rescue_image_ref, clean_shutdown):
+        raise exception.InstanceNotRescuable(
+            instance_id=instance.uuid,
+            reason='Incus requires a storage-native rescue implementation')
+
+    @manager.wrap_exception()
+    @manager.reverts_task_state
+    @manager.wrap_instance_event(prefix='compute')
+    @manager.wrap_instance_fault
+    def unrescue_instance(self, context, instance):
+        raise exception.InstanceUnRescueFailure(
+            reason='Incus system-container rescue is not implemented')
+
     def _notify_volume_usage_detach(self, context, instance, bdm):
         if CONF.volume_usage_poll_interval > 0:
             eventlet.sleep(_METRICS_SETTLEMENT_DELAY)

@@ -93,6 +93,12 @@ implementing changes.
   host-rootfs bind mount; a future rescue design must attach the retained
   Incus-managed root volume through storage-pool-native APIs and work with the
   production Ceph RBD rootfs backend.
+- Reject unsupported asynchronous suspend/resume/rescue/unrescue operations in
+  ``IncusComputeManager`` before resource or power side effects. Revert the
+  task state, preserve the prior VM state, and record an explicit Nova
+  ``Instance*Failure`` event. Driver exceptions cannot turn an already-cast
+  asynchronous API request into a synchronous HTTP 4xx; that requires an
+  upstream Nova API capability gate.
 - Failed-host evacuation is an operator-gated BFV-only capability. Keep
   ``[incus] allow_bfv_evacuate`` disabled unless an external STONITH or power
   fencing system proves the source host cannot access Ceph before Nova starts

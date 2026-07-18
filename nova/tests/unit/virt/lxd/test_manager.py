@@ -35,6 +35,71 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         self.compute._get_instance_block_device_info = mock.Mock(
             return_value={'block_device_mapping': []})
 
+    def _assert_unsupported_action_reverts_task(
+            self, method, expected_exception, instance, *args):
+        self.compute._instance_update = mock.Mock()
+        ctxt = context.get_admin_context()
+
+        with mock.patch.object(
+                manager.manager.compute_utils,
+                'add_instance_fault_from_exc') as add_fault, \
+                mock.patch.object(
+                    manager.manager.compute_utils.objects.InstanceActionEvent,
+                    'event_start') as event_start, \
+                mock.patch.object(
+                    manager.manager.compute_utils.objects.InstanceActionEvent,
+                    'event_finish_with_failure') as event_failure:
+            self.assertRaises(
+                expected_exception, method, ctxt, instance, *args)
+
+        self.compute._instance_update.assert_called_once_with(
+            ctxt, instance, task_state=None)
+        add_fault.assert_called_once()
+        event_start.assert_called_once()
+        event_failure.assert_called_once()
+        self.assertNotEqual('error', instance.vm_state)
+
+    def test_suspend_rejected_without_changing_vm_state(self):
+        instance = mock.MagicMock(
+            task_state=task_states.SUSPENDING, vm_state='active')
+        instance.__getitem__.return_value = (
+            '8cf7d85e-6c3f-4ebf-9ed7-5c4b64f928f8')
+
+        self._assert_unsupported_action_reverts_task(
+            self.compute.suspend_instance,
+            manager.exception.InstanceSuspendFailure, instance)
+
+    def test_resume_rejected_without_changing_vm_state(self):
+        instance = mock.MagicMock(
+            task_state=task_states.RESUMING, vm_state='suspended')
+        instance.__getitem__.return_value = (
+            '8cf7d85e-6c3f-4ebf-9ed7-5c4b64f928f8')
+
+        self._assert_unsupported_action_reverts_task(
+            self.compute.resume_instance,
+            manager.exception.InstanceResumeFailure, instance)
+
+    def test_rescue_rejected_without_changing_vm_state(self):
+        instance = mock.MagicMock(
+            task_state=task_states.RESCUING, vm_state='active',
+            uuid='8cf7d85e-6c3f-4ebf-9ed7-5c4b64f928f8')
+        instance.__getitem__.return_value = instance.uuid
+
+        self._assert_unsupported_action_reverts_task(
+            self.compute.rescue_instance,
+            manager.exception.InstanceNotRescuable, instance,
+            'password', None, True)
+
+    def test_unrescue_rejected_without_changing_vm_state(self):
+        instance = mock.MagicMock(
+            task_state=task_states.UNRESCUING, vm_state='rescued')
+        instance.__getitem__.return_value = (
+            '8cf7d85e-6c3f-4ebf-9ed7-5c4b64f928f8')
+
+        self._assert_unsupported_action_reverts_task(
+            self.compute.unrescue_instance,
+            manager.exception.InstanceUnRescueFailure, instance)
+
     @mock.patch.object(manager.eventlet, 'sleep')
     @mock.patch.object(
         manager.manager.ComputeManager, '_shutdown_instance')
