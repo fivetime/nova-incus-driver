@@ -158,7 +158,7 @@
       "driver_hooks": ["rebuild", "spawn"],
       "applicability": "shared-ceph-bfv-only",
       "status": "experimental",
-      "evidence": "Default-off BFV gate and unit contract; external fencing and source-host-down E2E required"
+      "evidence": "Default-off BFV gate plus real manual source-isolation E2E passed Cinder attachment, OVN rebinding, Placement, single-watcher and stale-source cleanup; production external STONITH automation remains required"
     },
     {
       "id": "evacuate-local-root",

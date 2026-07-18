@@ -138,9 +138,10 @@ digest/revision pair.
 ## BFV no-copy migration
 
 No-copy BFV cross-compute migration has passed the core post-claim fault
-matrix. It remains operator-gated until the release matrix passes on every
-ordered production compute pair. The dated evidence below tracks the
-incremental hardening.
+matrix and every ordered pair in the three-node test fleet. It is a release
+gate that must be rerun for each approved version, not an unfinished
+implementation item. The dated evidence below tracks the incremental
+hardening.
 
 - The release matrix was consolidated on 2026-07-18 in
   `tools/openstack-incus-bfv-migration-matrix.sh`. On the three-node Noble

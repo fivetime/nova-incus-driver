@@ -1,5 +1,14 @@
 # Project Development Context
 
+## Resume Source Of Truth
+
+- Do not derive the backlog from an old planning section or capability audit.
+  Cross-check `doc/source/support_matrix/capabilities.json`, `TEST_STATUS.md`,
+  current E2E scripts, and recent Git history before declaring work missing.
+  `doc/source/capability_matrix_historical.md` is retained only as an early
+  source audit. A release gate that has already passed is recurring validation,
+  not unfinished implementation.
+
 ## Local Upstream Source Trees
 
 Use the following local repositories as the authoritative, current API
