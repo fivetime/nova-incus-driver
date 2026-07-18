@@ -162,6 +162,21 @@ incremental hardening.
   fork revision `5adcaca1ad383362bb824a15845ecd4a85f24ba5`,
   Nova/Placement readiness, live OVN controllers, and the enabled/up Cinder
   Ceph backend and scheduler.
+- The remaining ordered compute pairs `node-01 -> node-03`,
+  `node-03 -> node-01`, `node-02 -> node-03`, and `node-03 -> node-02`
+  completed the five-case BFV release matrix on 2026-07-18. The matrix runner
+  was corrected so every selected case uses the declared source and
+  destination instead of alternating two cases in the reverse direction.
+- The expanded pair testing made the earlier OVN convergence failure
+  deterministic during an injected reverse-revert data-volume failure.
+  Neutron returned the binding to the retained source chassis, but the
+  existing OVS interface did not cause OVN to reassert `Port_Binding.up`.
+  Normal revert and durable-marker automatic recovery now stop the container
+  when necessary and recreate retained host VIF wiring before restoring the
+  intended RUNNING or SHUTOFF state. The previously failing
+  `node-02 -> node-03` reverse-revert case and the complete
+  `node-03 -> node-02` matrix then passed with ACTIVE ports and clean runtime
+  inventories.
 
 - The first hard guard landed on 2026-07-17: source preparation and destination
   finish both require `migration_shared_ceph_storage`,

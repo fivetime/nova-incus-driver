@@ -1559,6 +1559,56 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         container.stop.assert_not_called()
         self.assertNotIn(driver.MIGRATION_RECOVERY_KEY, profile.config)
 
+    def test_recover_migration_target_refreshes_vif_before_restart(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        vif = mock.Mock()
+        container = self.client.instances.get.return_value
+        container.status = 'Running'
+        profile = self.client.profiles.get.return_value
+        profile.config = {driver.MIGRATION_RECOVERY_KEY: 'running'}
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+        lxd_driver._reconcile_reboot_data_volumes = mock.Mock()
+        lxd_driver._validate_reboot_vifs = mock.Mock()
+        parent = mock.Mock()
+        parent.attach_mock(container.stop, 'stop')
+        parent.attach_mock(self.vif_driver.unplug, 'unplug')
+        parent.attach_mock(self.vif_driver.plug, 'plug')
+        parent.attach_mock(container.start, 'start')
+
+        should_run = lxd_driver.recover_migration_target(
+            ctx, instance, [vif], {'block_device_mapping': []})
+
+        self.assertTrue(should_run)
+        self.assertEqual(
+            [mock.call.stop(wait=True),
+             mock.call.unplug(instance, vif),
+             mock.call.plug(instance, vif),
+             mock.call.start(wait=True)],
+            parent.mock_calls)
+
+    def test_recover_migration_target_stops_networkless_owner(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        container = self.client.instances.get.return_value
+        container.status = 'Running'
+        profile = self.client.profiles.get.return_value
+        profile.config = {driver.MIGRATION_RECOVERY_KEY: 'stopped'}
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+        lxd_driver._reconcile_reboot_data_volumes = mock.Mock()
+        lxd_driver._validate_reboot_vifs = mock.Mock()
+
+        should_run = lxd_driver.recover_migration_target(
+            ctx, instance, [], {'block_device_mapping': []})
+
+        self.assertFalse(should_run)
+        container.stop.assert_called_once_with(wait=True)
+        container.start.assert_not_called()
+
     @mock.patch('nova.virt.driver.block_device_info_get_mapping')
     def test_reboot_rejects_inconsistent_data_volume_before_start(
             self, get_mapping):
@@ -3368,6 +3418,32 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         container.start.assert_called_once_with(wait=True)
         self.vif_driver.plug.assert_not_called()
+        self.vif_driver.unplug.assert_not_called()
+
+    def test_finish_revert_migration_refreshes_retained_vif(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        vif = mock.Mock()
+        container = mock.Mock(status='Stopped')
+        self.client.instances.get.return_value = container
+        migration = mock.Mock(
+            source_compute='source', dest_compute='destination')
+        lxd_driver = driver.LXDDriver(None)
+        lxd_driver.init_host(None)
+        parent = mock.Mock()
+        parent.attach_mock(self.vif_driver.unplug, 'unplug')
+        parent.attach_mock(self.vif_driver.plug, 'plug')
+        parent.attach_mock(container.start, 'start')
+
+        lxd_driver.finish_revert_migration(
+            ctx, instance, [vif], migration)
+
+        self.assertEqual(
+            [mock.call.unplug(instance, vif),
+             mock.call.plug(instance, vif),
+             mock.call.start(wait=True)],
+            parent.mock_calls)
 
     @mock.patch.object(driver, '_require_bfv_migration_support')
     @mock.patch.object(driver, '_boot_from_volume')

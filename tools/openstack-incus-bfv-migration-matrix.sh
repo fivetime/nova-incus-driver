@@ -106,7 +106,7 @@ if case_enabled normal; then
         INJECT_REVERT_FAILURE=false
 fi
 if case_enabled post-claim-data; then
-    run_case post-claim-data 1 0 \
+    run_case post-claim-data 0 1 \
         INJECT_PREFLIGHT_FAILURE=false \
         INJECT_POST_CLAIM_FAILURE=true \
         POST_CLAIM_FAILPOINT=data-volume
@@ -118,7 +118,7 @@ if case_enabled post-claim-start; then
         POST_CLAIM_FAILPOINT=start
 fi
 if case_enabled stopped-post-claim-data; then
-    run_case stopped-post-claim-data 1 0 \
+    run_case stopped-post-claim-data 0 1 \
         INJECT_PREFLIGHT_FAILURE=false \
         INJECT_POST_CLAIM_FAILURE=true \
         POST_CLAIM_FAILPOINT=data-volume \

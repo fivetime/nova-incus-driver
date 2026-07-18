@@ -1698,14 +1698,26 @@ class LXDDriver(driver.ComputeDriver):
             context, instance, block_device_info)
         container = self.client.instances.get(instance.name)
         self._validate_reboot_vifs(instance, network_info)
-        self.plug_vifs(instance, network_info)
         should_run = desired_state in ('true', 'running')
-        if should_run and container.status != 'Running':
+        was_running = container.status == 'Running'
+        if network_info and was_running:
+            container.stop(wait=True)
+        self._refresh_vifs(instance, network_info)
+        if should_run and (network_info or not was_running):
             container.start(wait=True)
-        elif not should_run and container.status == 'Running':
+        elif not should_run and was_running and not network_info:
             container.stop(wait=True)
         self._clear_migration_recovery_marker(instance)
         return should_run
+
+    def _refresh_vifs(self, instance, network_info):
+        """Recreate retained host VIFs so OVN reasserts their binding state."""
+        if not network_info:
+            return
+        self.unplug_vifs(instance, network_info)
+        _retry_migration_finish_action(
+            lambda: self.plug_vifs(instance, network_info),
+            'migration recovery VIF wiring', instance)
 
     def _clear_migration_recovery_marker(self, instance):
         try:
@@ -2565,9 +2577,13 @@ class LXDDriver(driver.ComputeDriver):
                         mountpoint=mountpoint: self.attach_volume(
                             context, connection_info, instance, mountpoint),
                         'revert data-volume attachment', instance)
-            _retry_migration_finish_action(
-                lambda: self.plug_vifs(instance, network_info),
-                'revert VIF wiring', instance)
+            if network_info:
+                # The retained source VIF still exists after cold migration.
+                # Re-plugging it idempotently does not make ovn-controller
+                # re-assert Port_Binding.up when a resize is reverted. Remove
+                # the stale host wiring first so OVN observes a fresh
+                # interface after the binding returns to this chassis.
+                self._refresh_vifs(instance, network_info)
             if power_on and container.status != 'Running':
                 _retry_migration_finish_action(
                     lambda: container.start(wait=True),

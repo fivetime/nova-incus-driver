@@ -444,6 +444,11 @@ Run the matrix for every ordered production compute pair. A matrix failure,
 resource inventory difference, residual-state finding, or fleet-preflight
 failure blocks release admission.
 
+Revert and durable-marker recovery recreate retained host VIF wiring while the
+container is stopped. This is required for OVN to reassert
+``Port_Binding.up`` after the Neutron binding returns to the original chassis;
+an idempotent plug of the pre-existing OVS interface is not sufficient.
+
 Each compute must expose its Incus HTTPS API only on a protected migration
 network and set both options::
 
