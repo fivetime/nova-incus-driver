@@ -987,6 +987,15 @@ driver implements a crash-consistent block-copy protocol. This API is also
 restricted to Cinder; a tenant request to update ``os-volume_attachments`` for
 an ordinary volume returns HTTP 409.
 
+This restriction applies to every volume that is still attached, including a
+volume attached to a ``SHUTOFF`` instance: Cinder still delegates that
+operation to Nova's ``swap_volume`` contract. It does not restrict detached
+volumes. For the supported production workflow, detach the data volume,
+perform Cinder retype or migration while it is ``available``, and attach it
+again. Cinder then owns the complete backend-native or host-assisted copy and
+Nova does not participate. Do not represent a stopped-but-attached copy as
+offline retype.
+
 The standardized server diagnostics response still leaves its anonymous disk
 I/O fields null. Use Nova ``volume.usage`` notifications and the associated
 Ceilometer volume meters for billable per-volume I/O.

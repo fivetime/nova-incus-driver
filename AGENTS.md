@@ -261,6 +261,10 @@ in `TEST_STATUS.md`; this section keeps only the rules.
   perform that copy and caused confirmed data loss in E2E testing. Do not
   re-enable swap until a crash-consistent block-copy and recovery protocol is
   implemented and tested across process/node failure.
+- Detached-volume retype and migration remain supported Cinder operations and
+  require no Incus driver work. The production workflow is detach, wait for
+  `available`, retype/migrate through Cinder, then attach. A volume attached
+  to a SHUTOFF instance still enters Nova `swap_volume` and must be rejected.
 - Cinder's Python RADOS client requires its keyring to be readable by the
   service user: `root:cinder 0640` in a packaged deployment (`root:stack 0640`
   in DevStack). Root-only `0600` makes the root CLI pass while the RBD driver
