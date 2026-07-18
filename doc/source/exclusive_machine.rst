@@ -1,5 +1,5 @@
 Nova-Incus Exclusive Machine
-==========================
+============================
 
 As Incus is a system container format, it is possible to provision "bare metal"
 machines with nova-incus without exposing the kernel and firmware to the tenant.

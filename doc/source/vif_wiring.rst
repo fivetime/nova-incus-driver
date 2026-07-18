@@ -1,5 +1,5 @@
 Nova-incus VIF Design Notes
-=========================
+===========================
 
 VIF plugging workflow
 ---------------------
@@ -42,7 +42,7 @@ rather than 'bridged' network devices as the driver handles creation of
 the veth pair, rather than Incus (as would happen with a bridged device).
 
 Incus profile interface naming
-----------------------------
+------------------------------
 
 The name of the interfaces in each containers Incus profile maps to the
 devname provided by Neutron as part of VIF plugging - this will typically

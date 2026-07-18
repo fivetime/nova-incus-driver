@@ -1,5 +1,5 @@
 Crash course in incus setup
-=========================
+===========================
 
 nova-incus absolutely requires incus, though its installation and configuration
 is out of scope here. If you're running Ubuntu, here is the easy path
@@ -17,7 +17,7 @@ need to log out and log back in again.
 
 
 Using nova-incus with devstack
-============================
+==============================
 
 nova-incus includes a plugin for use in devstack. If you'd like to run
 devstack with nova-incus, you'll want to add the following to `local.conf`:
