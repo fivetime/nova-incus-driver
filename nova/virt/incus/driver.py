@@ -908,7 +908,8 @@ def _sync_glance_image_to_incus(client, context, image_ref):
             # (implicitly via instance launch from affected image) will produce
             # Incus error - "Image with same fingerprint already exists".
             # Error does not have unique identifier to handle it we calculate
-            # fingerprint of image as Incus do it and check if Incus already have
+            # Calculate the fingerprint as Incus does and check whether the
+            # image is already available.
             # image with such fingerprint.
             # If any we will add alias to this image and will not re-import it
             def add_alias():
@@ -2508,9 +2509,9 @@ class IncusDriver(driver.ComputeDriver):
             'cpu_info': jsonutils.dumps(cpu_info),
             'hypervisor_hostname': CONF.host,
             'supported_instances': [
-                (obj_fields.Architecture.I686, obj_fields.HVType.INCUS,
+                (obj_fields.Architecture.I686, 'incus',
                  obj_fields.VMMode.EXE),
-                (obj_fields.Architecture.X86_64, obj_fields.HVType.INCUS,
+                (obj_fields.Architecture.X86_64, 'incus',
                  obj_fields.VMMode.EXE),
                 (obj_fields.Architecture.I686, obj_fields.HVType.LXC,
                  obj_fields.VMMode.EXE),

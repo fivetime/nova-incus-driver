@@ -51,7 +51,7 @@ class TestAttachEphemeral(test.NoDBTestCase):
             ctx, name='test', memory_mb=0)
         block_device_info = mock.Mock()
         incus_config = {'environment': {'storage': 'zfs'},
-                      'config': {'storage.zfs_pool_name': 'zfs'}}
+                        'config': {'storage.zfs_pool_name': 'zfs'}}
 
         container = mock.Mock()
         container.config = {
@@ -158,7 +158,7 @@ class TestAttachEphemeral(test.NoDBTestCase):
             ctx, name='test', memory_mb=0)
         block_device_info = mock.Mock()
         incus_config = {'environment': {'storage': 'lvm'},
-                      'config': {'storage.lvm_vg_name': 'incus'}}
+                        'config': {'storage.lvm_vg_name': 'incus'}}
 
         storage.fileutils = mock.Mock()
 
@@ -182,7 +182,8 @@ class TestAttachEphemeral(test.NoDBTestCase):
                 'lvcreate', '-L', '0G', '-n', 'instance-00000001-ephemerals0',
                 'incus', attempts=3, run_as_root=True),
             mock.call(
-                'mkfs', '-t', 'ext4', '/dev/incus/instance-00000001-ephemerals0',
+                'mkfs', '-t', 'ext4',
+                '/dev/incus/instance-00000001-ephemerals0',
                 run_as_root=True),
             mock.call(
                 'mount', '-t', 'ext4',
@@ -211,7 +212,7 @@ class TestDetachEphemeral(test.NoDBTestCase):
             ctx, name='test', memory_mb=0)
         block_device_info = mock.Mock()
         incus_config = {'environment': {'storage': 'zfs'},
-                      'config': {'storage.zfs_pool_name': 'zfs'}}
+                        'config': {'storage.zfs_pool_name': 'zfs'}}
 
         client = mock.Mock()
         storage.detach_ephemeral(
@@ -239,7 +240,7 @@ class TestDetachEphemeral(test.NoDBTestCase):
             ctx, name='test', memory_mb=0)
         block_device_info = mock.Mock()
         incus_config = {'environment': {'storage': 'lvm'},
-                      'config': {'storage.lvm_vg_name': 'incus'}}
+                        'config': {'storage.lvm_vg_name': 'incus'}}
 
         client = mock.Mock()
         storage.detach_ephemeral(

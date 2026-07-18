@@ -46,7 +46,7 @@ class SessionContainerTest(test.NoDBTestCase):
         """This is so we can mock out pylxd API calls."""
         self.ml = stubs.incus_mock()
         incus_patcher = mock.patch('pylxd.deprecated.api.API',
-                                 mock.Mock(return_value=self.ml))
+                                   mock.Mock(return_value=self.ml))
         incus_patcher.start()
         self.addCleanup(incus_patcher.stop)
 
@@ -99,7 +99,7 @@ class SessionEventTest(test.NoDBTestCase):
 
         self.ml = stubs.incus_mock()
         incus_patcher = mock.patch('pylxd.deprecated.api.API',
-                                 mock.Mock(return_value=self.ml))
+                                   mock.Mock(return_value=self.ml))
         incus_patcher.start()
         self.addCleanup(incus_patcher.stop)
 

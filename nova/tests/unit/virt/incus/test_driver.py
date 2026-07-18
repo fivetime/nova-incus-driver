@@ -199,7 +199,8 @@ class IncusDriverTest(test.NoDBTestCase):
         self.vif_driver = mock.Mock()
         self.IncusGenericVifDriver.return_value = self.vif_driver
 
-        vif_gc_patcher = mock.patch('nova.virt.incus.driver.incus_vif.get_config')
+        vif_gc_patcher = mock.patch(
+            'nova.virt.incus.driver.incus_vif.get_config')
         self.patchers.append(vif_gc_patcher)
         self.get_config = vif_gc_patcher.start()
         self.get_config.return_value = {
@@ -790,7 +791,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         instance = fake_instance.fake_instance_obj(
             ctx, name='test-bfv', memory_mb=512)
         image_meta = mock.Mock(disk_format='raw', container_format='bare')
-        incus_driver = driver.IncusDriver(manager.ComputeVirtAPI(mock.MagicMock()))
+        incus_driver = driver.IncusDriver(
+            manager.ComputeVirtAPI(mock.MagicMock()))
         incus_driver.init_host(None)
         incus_driver.firewall_driver = mock.Mock()
 
@@ -1192,7 +1194,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         incus_driver.cleanup.assert_called_once_with(
             ctx, instance, network_info, None)
-        incus_driver.client.instances.get.assert_called_once_with(instance.name)
+        incus_driver.client.instances.get.assert_called_once_with(
+            instance.name)
         mock_container.stop.assert_called_once_with(wait=True)
         mock_container.delete.assert_called_once_with(wait=True)
 
@@ -2613,7 +2616,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         volume_connector = mock.Mock()
         driver.brick_get_connector = mock.Mock(return_value=volume_connector)
         incus_driver.detach_volume(ctx, connection_info, instance,
-                                 mountpoint, None)
+                                   mountpoint, None)
 
         incus_driver.client.profiles.get.assert_called_once_with(instance.name)
 
@@ -3299,7 +3302,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         incus_driver = driver.IncusDriver(None)
         incus_driver.firewall_driver = firewall
-        incus_driver.ensure_filtering_rules_for_instance(instance, network_info)
+        incus_driver.ensure_filtering_rules_for_instance(
+            instance, network_info)
 
         firewall.ensure_filtering_rules_for_instance.assert_called_once_with(
             instance, network_info)
@@ -4210,4 +4214,5 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             ctx, instance, network_info)
 
         profile.delete.assert_called_once_with()
-        incus_driver.cleanup.assert_called_once_with(ctx, instance, network_info)
+        incus_driver.cleanup.assert_called_once_with(
+            ctx, instance, network_info)

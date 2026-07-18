@@ -38,7 +38,7 @@ def InstanceAttributes(instance):
 
 
 def is_snap_incus():
-    """Determine whether it's a snap installed incus or a package installed incus
+    """Determine whether Incus is installed as a snap or a package.
 
     This is easily done by checking if the bin file is /snap/bin/lxc
 

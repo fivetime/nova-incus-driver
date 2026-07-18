@@ -92,7 +92,8 @@ class IncusAPISession(object):
                              image=instance.image_ref),
                      instance=instance)
         except incus_exceptions.APIError as ex:
-            msg = (_("Failed to communicate with Incus API {instance}: {reason}")
+            msg = (_("Failed to communicate with Incus API "
+                     "{instance}: {reason}")
                    .format(instance=instance.name, reason=ex))
             raise exception.NovaException(msg)
         except Exception as ex:

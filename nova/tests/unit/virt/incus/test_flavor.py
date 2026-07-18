@@ -489,7 +489,8 @@ class ToProfileTest(test.NoDBTestCase):
         self.assert_profile_created(
             instance.name, expected_config, expected_devices)
 
-    @mock.patch('nova.virt.incus.flavor.driver.block_device_info_get_ephemerals')
+    @mock.patch(
+        'nova.virt.incus.flavor.driver.block_device_info_get_ephemerals')
     def test_to_profile_ephemeral_storage(self, get_ephemerals):
         get_ephemerals.return_value = [
             {'virtual_name': 'ephemeral1'},
