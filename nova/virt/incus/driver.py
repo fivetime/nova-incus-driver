@@ -2508,9 +2508,9 @@ class IncusDriver(driver.ComputeDriver):
             'cpu_info': jsonutils.dumps(cpu_info),
             'hypervisor_hostname': CONF.host,
             'supported_instances': [
-            (obj_fields.Architecture.I686, 'incus',
+                (obj_fields.Architecture.I686, obj_fields.HVType.INCUS,
                  obj_fields.VMMode.EXE),
-                (obj_fields.Architecture.X86_64, 'incus',
+                (obj_fields.Architecture.X86_64, obj_fields.HVType.INCUS,
                  obj_fields.VMMode.EXE),
                 (obj_fields.Architecture.I686, obj_fields.HVType.LXC,
                  obj_fields.VMMode.EXE),
