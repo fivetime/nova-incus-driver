@@ -10,6 +10,7 @@ EXPECTED_INCUS_REVISION=${EXPECTED_INCUS_REVISION:?Set approved source revision}
 CONTROLLER_SSH=${CONTROLLER_SSH:?Set CONTROLLER_SSH}
 CONTROLLER_OPENRC=${CONTROLLER_OPENRC:-/opt/stack/devstack/openrc admin admin}
 INCUS_PROJECT=${INCUS_PROJECT:-nova}
+CINDER_RBD_POOL=${CINDER_RBD_POOL:-cinder-volumes-rbd-pool}
 CONTROL_FS_WARNING_PERCENT=${CONTROL_FS_WARNING_PERCENT:-80}
 CONSOLE_LOG_WARNING_BYTES=${CONSOLE_LOG_WARNING_BYTES:-268435456}
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -18,6 +19,11 @@ FLEET_PREFLIGHT=${FLEET_PREFLIGHT:-$SCRIPT_DIR/openstack-incus-fleet-preflight.s
 SSH=(ssh -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=no)
 failures=0
 declare -A mapping_owners=()
+declare -A mapping_counts=()
+declare -A runtime_hosts=()
+declare -A runtime_names=()
+declare -A runtime_images=()
+declare -A runtime_states=()
 
 pass() {
     printf 'PASS %-40s %s\n' "$1" "${2:-}"
@@ -32,6 +38,13 @@ remote() {
     local target=$1
     shift
     "${SSH[@]}" "$target" "$@"
+}
+
+openstack() {
+    local command_line
+    printf -v command_line '%q ' "$@"
+    remote "$CONTROLLER_SSH" \
+        "source $CONTROLLER_OPENRC >/dev/null 2>&1; openstack $command_line"
 }
 
 [[ "$CONTROL_FS_WARNING_PERCENT" =~ ^[1-9][0-9]?$ ]] ||
@@ -131,11 +144,32 @@ for node in "${nodes[@]}"; do
         fail "$host recovery marker" "$recovery"
     fi
 
+    while IFS=$'\t' read -r uuid instance_name root_image state; do
+        [[ -n "$uuid" && -n "$root_image" ]] || continue
+        if [[ -n "${runtime_hosts[$uuid]:-}" ]]; then
+            fail "duplicate BFV runtime:$uuid" \
+                "volume=${root_image#volume-} hosts=${runtime_hosts[$uuid]},$host"
+            continue
+        fi
+        runtime_hosts[$uuid]=$host
+        runtime_names[$uuid]=$instance_name
+        runtime_images[$uuid]=$root_image
+        runtime_states[$uuid]=$state
+    done < <(jq -r '
+        .[] |
+        (.expanded_devices.root["initial.ceph.rbd.image_name"] //
+         .devices.root["initial.ceph.rbd.image_name"] // "") as $root |
+        select(.config["user.openstack.uuid"] != null and $root != "") |
+        [.config["user.openstack.uuid"], .name, $root,
+         (.status | ascii_upcase)] | @tsv
+    ' <<<"$instance_json")
+
     mappings=$(remote "$target" \
         "rbd device list --format json --id cinder 2>/dev/null ||
          printf '[]'" 2>/dev/null)
     while IFS= read -r image; do
         [[ -n "$image" ]] || continue
+        mapping_counts[$image]=$((${mapping_counts[$image]:-0} + 1))
         if [[ -n "${mapping_owners[$image]:-}" ]]; then
             fail "duplicate KRBD mapping:$image" \
                 "${mapping_owners[$image]},$host"
@@ -143,6 +177,114 @@ for node in "${nodes[@]}"; do
             mapping_owners[$image]=$host
         fi
     done < <(jq -r '.[].name' <<<"$mappings")
+done
+
+attachments=$(openstack volume attachment list -f json 2>/dev/null) || {
+    fail "Cinder attachment inventory" "query failed"
+    attachments=[]
+}
+
+for uuid in "${!runtime_hosts[@]}"; do
+    instance_name=${runtime_names[$uuid]}
+    root_image=${runtime_images[$uuid]}
+    root_volume=${root_image#volume-}
+    runtime_host=${runtime_hosts[$uuid]}
+    runtime_state=${runtime_states[$uuid]}
+    label="$instance_name/$uuid root=$root_volume"
+
+    server=$(openstack server show "$uuid" -f json 2>/dev/null) || {
+        fail "$label Nova record" "missing"
+        continue
+    }
+    nova_host=$(jq -r '."OS-EXT-SRV-ATTR:host" // empty' <<<"$server")
+    nova_status=$(jq -r '.status // empty' <<<"$server")
+    if [[ "$nova_host" == "$runtime_host" ]]; then
+        pass "$label Nova owner" "$nova_host"
+    else
+        fail "$label Nova owner" \
+            "runtime=$runtime_host nova=${nova_host:-missing}"
+    fi
+
+    attachment_total=$(jq -r --arg volume "$root_volume" \
+        '[.[] | select(."Volume ID" == $volume)] | length' \
+        <<<"$attachments")
+    attachment_match=$(jq -r \
+        --arg volume "$root_volume" --arg server "$uuid" \
+        '[.[] | select(."Volume ID" == $volume and
+            ."Server ID" == $server and .Status == "attached")] | length' \
+        <<<"$attachments")
+    if [[ "$attachment_total" == 1 && "$attachment_match" == 1 ]]; then
+        pass "$label Cinder attachment" unique
+    else
+        fail "$label Cinder attachment" \
+            "total=$attachment_total matching=$attachment_match"
+    fi
+
+    watcher_count=$(remote "$CONTROLLER_SSH" \
+        "rbd status '$CINDER_RBD_POOL/$root_image' --id cinder \
+         --format json 2>/dev/null || echo '{\"watchers\":[]}'" |
+        jq '.watchers | length')
+    expected_runtime=STOPPED
+    expected_count=0
+    if [[ "$nova_status" == ACTIVE ]]; then
+        expected_runtime=RUNNING
+        expected_count=1
+    elif [[ "$nova_status" != SHUTOFF ]]; then
+        fail "$label Nova status" \
+            "expected ACTIVE or SHUTOFF, actual=${nova_status:-missing}"
+        continue
+    fi
+    if [[ "$runtime_state" == "$expected_runtime" ]]; then
+        pass "$label Incus state" "$runtime_state"
+    else
+        fail "$label Incus state" \
+            "expected=$expected_runtime actual=$runtime_state"
+    fi
+    if [[ "$watcher_count" == "$expected_count" ]]; then
+        pass "$label Ceph watcher" "$watcher_count"
+    else
+        fail "$label Ceph watcher" \
+            "expected=$expected_count actual=$watcher_count"
+    fi
+    if [[ "${mapping_counts[$root_image]:-0}" == "$expected_count" ]]; then
+        pass "$label KRBD owner" \
+            "${mapping_owners[$root_image]:-absent}"
+    else
+        fail "$label KRBD owner" \
+            "expected=$expected_count actual=${mapping_counts[$root_image]:-0}"
+    fi
+
+    while IFS= read -r port_id; do
+        [[ -n "$port_id" ]] || continue
+        binding=$(openstack port show "$port_id" -f value \
+            -c binding_host_id 2>/dev/null || true)
+        if [[ "$binding" == "$nova_host" ]]; then
+            pass "$label Neutron:$port_id" "$binding"
+        else
+            fail "$label Neutron:$port_id" \
+                "expected=$nova_host actual=${binding:-unbound}"
+        fi
+        ovs_owners=()
+        ovs_total=0
+        for node in "${nodes[@]}"; do
+            host=${node%%=*}
+            target=${node#*=}
+            count=$(remote "$target" \
+                "ovs-vsctl --data=bare --no-heading --columns=name \
+                 find Interface external_ids:iface-id='$port_id' 2>/dev/null |
+                 sed '/^[[:space:]]*$/d' | wc -l")
+            ovs_total=$((ovs_total + count))
+            ((count > 0)) && ovs_owners+=("$host:$count")
+        done
+        if ((ovs_total == expected_count)) &&
+                { ((expected_count == 0)) ||
+                  [[ "${ovs_owners[*]}" == "$nova_host:1" ]]; }; then
+            pass "$label OVS:$port_id" "${ovs_owners[*]:-absent}"
+        else
+            fail "$label OVS:$port_id" \
+                "expected=$nova_host:$expected_count actual=${ovs_owners[*]:-absent}"
+        fi
+    done < <(openstack port list --server "$uuid" -f value -c ID)
 done
 
 if ((failures > 0)); then
