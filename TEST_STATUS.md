@@ -692,6 +692,24 @@ hardening.
   migration/revert preserved the root marker and size, and Cinder rejected a
   shrink request. The final Python 3.12 suite passed 229 tests with 2
   intentional legacy pylxd skips; pep8 and warning-as-error docs passed.
+- On 2026-07-18, a production fence-provider adapter was added for
+  ClusterLabs `fence_ipmilan` and `fence_redfish`. It accepts only a
+  whitelisted JSON schema, opens root-owned `0600` configuration and password
+  files with `O_NOFOLLOW`, caps them at 64 KiB, passes the password through
+  fence-agent stdin rather than argv, and rejects ambiguous power status.
+  Six Nova unit tests, flake8, a real-process fake-agent integration test, an
+  insecure-mode rejection, and the warning-as-error documentation build
+  passed on `incus-node-01`. This validates the adapter, not an actual BMC:
+  BFV evacuation remains `experimental` until the destructive release gate
+  performs real power `off` and `on` through the production management plane.
+  The final full regression passed 244 tests with 2 intentional legacy pylxd
+  skips. Pep8, all shell syntax checks, the fence preflight positive/negative
+  tests, and warning-as-error documentation passed. Fleet preflight then
+  passed on all three computes with Incus 7.2, image digest
+  `sha256:cc8b7109...239bd72d`, revision `5adcaca1...f24ba5`,
+  identical driver hash `24dffc18...754867`, current admission tokens,
+  disabled instance autostart, enabled/up Nova services, live OVN agents,
+  Placement inventories, and the Cinder Ceph backend.
 
 - Re-running DevStack to add Cinder rebuilt the test Nova databases. Three
   retained Incus containers (`instance-00000008`, `instance-00000009`, and

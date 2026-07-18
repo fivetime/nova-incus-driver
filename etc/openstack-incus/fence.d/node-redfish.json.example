@@ -1,0 +1,9 @@
+{
+  "agent": "redfish",
+  "ip": "192.0.2.11",
+  "username": "openstack-fence",
+  "password_file": "/etc/openstack-incus/fence-secrets/node-redfish",
+  "systems_uri": "/redfish/v1/Systems/System.Embedded.1",
+  "ssl_insecure": false,
+  "power_timeout": 60
+}

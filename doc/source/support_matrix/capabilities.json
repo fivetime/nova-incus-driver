@@ -158,7 +158,7 @@
       "driver_hooks": ["rebuild", "spawn"],
       "applicability": "shared-ceph-bfv-only",
       "status": "experimental",
-      "evidence": "Real host reboot/loss E2E preserved a Cinder root marker, attachment, OVN binding and one watcher; returning host stayed quarantined and stale cleanup passed. Generic off/status/on fence-provider release gate exists; a production IPMI/Redfish/PDU provider is still required"
+      "evidence": "Real host reboot/loss E2E preserved a Cinder root marker, attachment, OVN binding and one watcher; returning host stayed quarantined and stale cleanup passed. A fail-closed ClusterLabs IPMI/Redfish provider, target preflight and off/status/on release gate exist; real production BMC/PDU off/on evidence is still required"
     },
     {
       "id": "evacuate-local-root",

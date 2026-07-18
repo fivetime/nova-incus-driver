@@ -755,18 +755,49 @@ Production fencing providers must implement ``off``, ``status``, and ``on``
 commands and report ``off`` only after the source cannot access Ceph. Run the
 destructive release gate with a disposable BFV server::
 
+    sudo apt-get install fence-agents-ipmilan fence-agents-redfish
+    sudo install -o root -g root -m 0755 \
+      tools/openstack-incus-fence-agent-provider \
+      /usr/local/sbin/openstack-incus-fence-agent-provider
+    sudo install -d -o root -g root -m 0700 \
+      /etc/openstack-incus/fence.d \
+      /etc/openstack-incus/fence-secrets
+    sudo install -o root -g root -m 0600 node-02.json \
+      /etc/openstack-incus/fence.d/node-02.json
+    sudo install -o root -g root -m 0600 node-02.password \
+      /etc/openstack-incus/fence-secrets/node-02
+
+The supplied ``openstack-incus-fence-agent-provider`` accepts only
+``ipmilan`` and ``redfish`` JSON configurations. Start from the examples in
+``etc/openstack-incus/fence.d``. Configuration and password files must be
+root-owned regular files with mode ``0600``; the password is sent through the
+standard fence-agent stdin protocol and never placed in argv. Redfish TLS
+verification is enabled unless ``ssl_insecure`` is explicitly set. Validate
+every target without changing its power state::
+
+    FENCE_IDS=incus-node-01,incus-node-02,incus-node-03 \
+      tools/openstack-incus-fence-preflight.sh
+
+Then run the destructive release gate with a disposable BFV server::
+
     SERVER_ID=<uuid> \
       SOURCE_HOST=incus-node-02 DEST_HOST=incus-node-03 \
       SOURCE_SSH=root@192.0.2.12 DEST_SSH=root@192.0.2.13 \
       CONTROLLER_SSH=root@192.0.2.10 \
       SSH_IDENTITY=/path/to/audit-key \
-      FENCE_PROVIDER=/usr/local/sbin/site-fence-provider \
+      FENCE_PROVIDER=/usr/local/sbin/openstack-incus-fence-agent-provider \
       tools/openstack-incus-bfv-evacuation-e2e.sh
 
 The gate writes and hashes a rootfs marker, fences the source, requires zero
 watchers before evacuation, validates the target attachment/network/single
 watcher, powers the source back on, proves quarantine, audits mixed local and
 stale ownership, admits the source, and waits for stale-record cleanup.
+Successful ``status`` calls alone do not prove fencing. Production release
+still requires this real ``off``/``on`` test through the same BMC or PDU path
+that automation will use. Do not use ``fence_virsh``, SSH shutdown, stopping
+Podman, or disabling a switch port as evidence unless that mechanism is an
+independent, fail-closed power control plane and has been threat-modelled as
+the site's actual STONITH implementation.
 
 Rescue and unrescue are also disabled. The legacy implementation depended on
 binding a directory from the compute host into a rescue container, which is

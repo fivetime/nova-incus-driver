@@ -1,0 +1,8 @@
+{
+  "agent": "ipmilan",
+  "ip": "192.0.2.10",
+  "username": "openstack-fence",
+  "password_file": "/etc/openstack-incus/fence-secrets/node-ipmi",
+  "lanplus": true,
+  "power_timeout": 60
+}

@@ -598,6 +598,9 @@ function configure_nova_incus_compute_service {
     sudo install -o root -g root -m 0755 \
         "${NOVA_INCUS_DIR}/tools/openstack-incus-compute-admission" \
         /usr/local/sbin/openstack-incus-compute-admission
+    sudo install -o root -g root -m 0755 \
+        "${NOVA_INCUS_DIR}/tools/openstack-incus-fence-agent-provider" \
+        /usr/local/sbin/openstack-incus-fence-agent-provider
     # Stacking is an explicit admission. The token is in /run, so every host
     # reboot returns the compute to quarantine until ownership is reconciled.
     sudo /usr/local/sbin/openstack-incus-compute-admission admit \

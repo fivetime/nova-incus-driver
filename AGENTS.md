@@ -121,6 +121,11 @@ implementing changes.
   Never create that token automatically at boot. Admission follows external
   fencing and `tools/openstack-incus-returning-host-audit.sh`; Nova then owns
   stale evacuated-record cleanup and resuming locally authoritative guests.
+- The repository's production fence adapter is
+  `tools/openstack-incus-fence-agent-provider`. Keep its schema restricted to
+  standard `ipmilan` and `redfish` agents, pass secrets only through the fence
+  agent stdin protocol, and fail closed on insecure files or ambiguous status.
+  Adapter tests do not replace a real BMC/PDU `off`/`on` evacuation gate.
 - Ubuntu Apport rewrites `kernel.core_pattern` after systemd-sysctl. Production
   computes must mask `apport.service` as well as persist and apply
   `kernel.core_pattern=/dev/null`.
@@ -336,6 +341,11 @@ in `TEST_STATUS.md`; this section keeps only the rules.
   release gate. It runs the fault matrix, rejects OpenStack and compute runtime
   inventory drift after cleanup, and then runs fleet preflight. Production
   admission requires it to pass for every ordered compute pair.
+- `tools/openstack-incus-fence-preflight.sh` is a non-destructive target and
+  credential check. `tools/openstack-incus-bfv-evacuation-e2e.sh` is the
+  destructive STONITH release gate; it must run through the same independent
+  BMC or PDU control path used in production before BFV evacuation can leave
+  `experimental`.
 - `tools/openstack-incus-bfv-root-extend-e2e.sh` is the BFV root-growth release
   gate. It validates online growth, migration and revert persistence, injected
   filesystem-growth failure, reboot reconciliation, and shrink refusal. The
