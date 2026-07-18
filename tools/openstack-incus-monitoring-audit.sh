@@ -11,7 +11,10 @@ CONTROLLER_SSH=${CONTROLLER_SSH:?Set CONTROLLER_SSH}
 CONTROLLER_OPENRC=${CONTROLLER_OPENRC:-/opt/stack/devstack/openrc admin admin}
 INCUS_PROJECT=${INCUS_PROJECT:-nova}
 CINDER_RBD_POOL=${CINDER_RBD_POOL:-cinder-volumes-rbd-pool}
+FENCE_EVIDENCE_FILE=${FENCE_EVIDENCE_FILE:-}
+FENCE_EVIDENCE_MAX_AGE_SECONDS=${FENCE_EVIDENCE_MAX_AGE_SECONDS:-2592000}
 CONTROL_FS_WARNING_PERCENT=${CONTROL_FS_WARNING_PERCENT:-80}
+INSTANCE_PRESSURE_WARNING_PERCENT=${INSTANCE_PRESSURE_WARNING_PERCENT:-90}
 CONSOLE_LOG_WARNING_BYTES=${CONSOLE_LOG_WARNING_BYTES:-268435456}
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 FLEET_PREFLIGHT=${FLEET_PREFLIGHT:-$SCRIPT_DIR/openstack-incus-fleet-preflight.sh}
@@ -34,6 +37,22 @@ fail() {
     failures=$((failures + 1))
 }
 
+check_ratio() {
+    local label=$1 current=$2 maximum=$3
+    if [[ ! "$current" =~ ^[0-9]+$ ]]; then
+        fail "$label" "current value unavailable: ${current:-empty}"
+    elif [[ "$maximum" == max ]]; then
+        fail "$label" "limit is unlimited"
+    elif [[ ! "$maximum" =~ ^[0-9]+$ ]] || ((maximum <= 0)); then
+        fail "$label" "invalid limit: ${maximum:-empty}"
+    elif ((current * 100 < maximum * INSTANCE_PRESSURE_WARNING_PERCENT)); then
+        pass "$label" "$current/$maximum"
+    else
+        fail "$label" \
+            "$current/$maximum >= $INSTANCE_PRESSURE_WARNING_PERCENT%"
+    fi
+}
+
 remote() {
     local target=$1
     shift
@@ -49,8 +68,39 @@ openstack() {
 
 [[ "$CONTROL_FS_WARNING_PERCENT" =~ ^[1-9][0-9]?$ ]] ||
     { echo "CONTROL_FS_WARNING_PERCENT must be between 1 and 99" >&2; exit 2; }
+[[ "$INSTANCE_PRESSURE_WARNING_PERCENT" =~ ^[1-9][0-9]?$ ]] ||
+    { echo "INSTANCE_PRESSURE_WARNING_PERCENT must be between 1 and 99" >&2; exit 2; }
 [[ "$CONSOLE_LOG_WARNING_BYTES" =~ ^[1-9][0-9]*$ ]] ||
     { echo "CONSOLE_LOG_WARNING_BYTES must be positive" >&2; exit 2; }
+[[ "$FENCE_EVIDENCE_MAX_AGE_SECONDS" =~ ^[1-9][0-9]*$ ]] ||
+    { echo "FENCE_EVIDENCE_MAX_AGE_SECONDS must be positive" >&2; exit 2; }
+
+if [[ -z "$FENCE_EVIDENCE_FILE" ]]; then
+    fail "external fence evidence" "FENCE_EVIDENCE_FILE is not set"
+elif [[ ! -f "$FENCE_EVIDENCE_FILE" ]]; then
+    fail "external fence evidence" "$FENCE_EVIDENCE_FILE is not a file"
+else
+    fence_owner=$(stat -c %U "$FENCE_EVIDENCE_FILE" 2>/dev/null)
+    fence_mode=$(stat -c %a "$FENCE_EVIDENCE_FILE" 2>/dev/null)
+    fence_mtime=$(stat -c %Y "$FENCE_EVIDENCE_FILE" 2>/dev/null)
+    fence_age=$(($(date +%s) - fence_mtime))
+    fence_hash=$(sha256sum "$FENCE_EVIDENCE_FILE" | awk '{print $1}')
+    if [[ "$fence_owner" != root ]]; then
+        fail "external fence evidence owner" "$fence_owner"
+    elif ((8#$fence_mode & 8#22)); then
+        fail "external fence evidence mode" "$fence_mode is writable by group/other"
+    elif ((fence_age < 0 || fence_age > FENCE_EVIDENCE_MAX_AGE_SECONDS)); then
+        fail "external fence evidence age" \
+            "$fence_age seconds (maximum $FENCE_EVIDENCE_MAX_AGE_SECONDS)"
+    elif ! grep -Fqx \
+            "PASS fenced BFV evacuation and returning-host reconciliation" \
+            "$FENCE_EVIDENCE_FILE"; then
+        fail "external fence evidence result" "successful terminal record absent"
+    else
+        pass "external fence evidence" \
+            "age=${fence_age}s sha256=$fence_hash"
+    fi
+fi
 
 if COMPUTE_NODES="$COMPUTE_NODES" \
         SSH_IDENTITY="$SSH_IDENTITY" \
@@ -143,6 +193,69 @@ for node in "${nodes[@]}"; do
     else
         fail "$host recovery marker" "$recovery"
     fi
+
+    while IFS=$'\t' read -r instance_name uuid; do
+        [[ -n "$instance_name" ]] || continue
+        label="$host $instance_name/${uuid:-unknown}"
+        cgroup="/sys/fs/cgroup/lxc.payload.${INCUS_PROJECT}_${instance_name}"
+        pids_current=$(remote "$target" \
+            "podman exec incus cat '$cgroup/pids.current'" 2>/dev/null)
+        pids_max=$(remote "$target" \
+            "podman exec incus cat '$cgroup/pids.max'" 2>/dev/null)
+        check_ratio "$label PID pressure" "$pids_current" "$pids_max"
+
+        memory_current=$(remote "$target" \
+            "podman exec incus cat '$cgroup/memory.current'" 2>/dev/null)
+        memory_max=$(remote "$target" \
+            "podman exec incus cat '$cgroup/memory.max'" 2>/dev/null)
+        check_ratio "$label memory pressure" "$memory_current" "$memory_max"
+
+        swap_current=$(remote "$target" \
+            "podman exec incus cat '$cgroup/memory.swap.current'" 2>/dev/null)
+        swap_max=$(remote "$target" \
+            "podman exec incus cat '$cgroup/memory.swap.max'" 2>/dev/null)
+        if [[ "$swap_max" == 0 && "$swap_current" == 0 ]]; then
+            pass "$label swap pressure" disabled
+        else
+            check_ratio "$label swap pressure" "$swap_current" "$swap_max"
+        fi
+
+        oom_events=$(remote "$target" \
+            "podman exec incus awk '
+                /^oom |^oom_kill |^oom_group_kill / {sum += \$2}
+                END {print sum + 0}
+             ' '$cgroup/memory.events'" 2>/dev/null)
+        if [[ "$oom_events" == 0 ]]; then
+            pass "$label OOM events" absent
+        elif [[ "$oom_events" =~ ^[0-9]+$ ]]; then
+            fail "$label OOM events" "$oom_events"
+        else
+            fail "$label OOM events" "unavailable"
+        fi
+
+        guest_df=$(remote "$target" \
+            "timeout 15 podman exec incus incus --project '$INCUS_PROJECT' \
+             exec '$instance_name' -- df -P / /run /dev/shm" 2>/dev/null) || {
+            fail "$label guest filesystem pressure" "query failed"
+            continue
+        }
+        while IFS=$'\t' read -r mount usage; do
+            [[ -n "$mount" ]] || continue
+            usage=${usage%\%}
+            if [[ "$usage" =~ ^[0-9]+$ ]] &&
+                    ((usage < INSTANCE_PRESSURE_WARNING_PERCENT)); then
+                pass "$label $mount pressure" "$usage%"
+            elif [[ "$usage" =~ ^[0-9]+$ ]]; then
+                fail "$label $mount pressure" \
+                    "$usage% >= $INSTANCE_PRESSURE_WARNING_PERCENT%"
+            else
+                fail "$label $mount pressure" "usage unavailable"
+            fi
+        done < <(awk 'NR > 1 {print $6 "\t" $5}' <<<"$guest_df")
+    done < <(jq -r '
+        .[] | select((.status | ascii_upcase) == "RUNNING") |
+        [.name, (.config["user.openstack.uuid"] // "unknown")] | @tsv
+    ' <<<"$instance_json")
 
     while IFS=$'\t' read -r uuid instance_name root_image state; do
         [[ -n "$uuid" && -n "$root_image" ]] || continue

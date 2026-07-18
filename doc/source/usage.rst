@@ -827,16 +827,24 @@ the fleet preflight::
     EXPECTED_INCUS_IMAGE_DIGEST='sha256:...' \
     EXPECTED_INCUS_REVISION='...' \
     CONTROLLER_SSH=root@10.0.0.10 \
+    FENCE_EVIDENCE_FILE=/var/lib/openstack-incus/last-fence.log \
       tools/openstack-incus-monitoring-audit.sh
 
 The command exits non-zero for an unaudited active compute, fleet drift,
 control-filesystem or log pressure, a pending storage handover, a durable
-recovery marker, or a root image mapped on more than one compute. Configure
-the monitoring system to alert on both a non-zero result and missing probe
-data. Site monitoring must additionally correlate Cinder attachments, Ceph
-watchers, Neutron bindings, OVS ownership, cgroup pressure, and external fence
-records; those authoritative signals cannot be inferred safely from a compute
-host alone.
+recovery marker, or inconsistent BFV ownership. For every BFV runtime it
+correlates the Nova host and state, Cinder attachment, Incus state, Ceph
+watcher, fleet-wide KRBD mapping, Neutron binding, and fleet-wide OVS owner.
+The labels include the instance and root-volume UUIDs so the notification is
+actionable. Every running instance is also checked for PID, memory, swap, and
+OOM cgroup signals and for ``/``, ``/run``, and ``/dev/shm`` pressure. Set
+``INSTANCE_PRESSURE_WARNING_PERCENT`` to the desired warning threshold; its
+default is 90. Configure the monitoring system to alert on both a non-zero
+result and missing probe data. ``FENCE_EVIDENCE_FILE`` must be root-owned,
+not writable by group or other, contain the successful terminal record
+emitted by the evacuation E2E, and be newer than
+``FENCE_EVIDENCE_MAX_AGE_SECONDS`` (30 days by default). The probe logs its
+SHA-256. Alert delivery remains site-specific and must be tested separately.
 
 Rescue and unrescue are also disabled. The legacy implementation depended on
 binding a directory from the compute host into a rescue container, which is

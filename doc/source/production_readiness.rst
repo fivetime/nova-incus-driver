@@ -95,13 +95,19 @@ ambiguous.
 Run ``tools/openstack-incus-monitoring-audit.sh`` from the independently
 hosted monitoring plane on every collection interval. It is a fail-closed
 probe for fleet drift, compute admission, control-filesystem pressure,
-unbounded Incus logs, pending handovers, recovery markers, and duplicate KRBD
-mappings. A non-zero result must page the compute/storage owner; successful
-probe output is not a substitute for configuring the monitoring system's
-notification route. Cinder attachment, Ceph watcher, Neutron binding, OVS
-ownership, cgroup pressure, and the last successful fence record must also be
-collected from their authoritative services and correlated by instance and
-volume ID.
+unbounded Incus logs, pending handovers, recovery markers, and BFV ownership.
+For every discovered BFV root it correlates the Nova host and power state,
+Cinder attachment, Incus runtime, Ceph watcher, fleet-wide KRBD mapping,
+Neutron binding, and fleet-wide OVS owner by instance and volume ID. A
+non-zero result must page the compute/storage owner; successful probe output
+is not a substitute for configuring the monitoring system's notification
+route. For every running instance it also checks PID, memory, swap, and OOM
+cgroup signals plus ``/``, ``/run``, and ``/dev/shm`` usage. Set
+``FENCE_EVIDENCE_FILE`` to the root-owned, non-writable terminal log from the
+last successful external-fence evacuation. The probe checks its terminal
+result, age, and SHA-256; ``FENCE_EVIDENCE_MAX_AGE_SECONDS`` defaults to 30
+days. The notification route remains site-specific and must be tested
+separately.
 
 6. Upgrade and rollback
 -----------------------
