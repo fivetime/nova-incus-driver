@@ -79,6 +79,52 @@ watchers_are() {
     [[ "$(watcher_count)" == "$1" ]]
 }
 
+mapping_count() {
+    local target=$1
+    remote "$target" \
+        "rbd device list --format json --id cinder 2>/dev/null || echo '[]'" |
+        jq --arg image "$root_image" \
+            '[.[] | select(.name == $image)] | length'
+}
+
+mappings_are() {
+    local target=$1 expected=$2
+    [[ "$(mapping_count "$target")" == "$expected" ]]
+}
+
+attachment_is_unique() {
+    local attachments total matching
+    attachments=$(openstack volume attachment list -f json)
+    total=$(jq -r --arg volume "$root_volume" \
+        '[.[] | select(."Volume ID" == $volume)] | length' \
+        <<<"$attachments")
+    matching=$(jq -r \
+        --arg volume "$root_volume" --arg server "$SERVER_ID" \
+        '[.[] | select(."Volume ID" == $volume and
+            ."Server ID" == $server and .Status == "attached")] | length' \
+        <<<"$attachments")
+    [[ "$total" == 1 && "$matching" == 1 ]]
+}
+
+ovs_port_count() {
+    local target=$1 port_id=$2
+    remote "$target" \
+        "ovs-vsctl --data=bare --no-heading --columns=name \
+         find Interface external_ids:iface-id='$port_id'" |
+        sed '/^[[:space:]]*$/d' |
+        wc -l
+}
+
+network_owner_is_destination() {
+    local port_id
+    for port_id in "${server_ports[@]}"; do
+        [[ "$(ovs_port_count "$SOURCE_SSH" "$port_id")" == 0 ]] || return 1
+        [[ "$(ovs_port_count "$DEST_SSH" "$port_id")" == 1 ]] || return 1
+        [[ "$(openstack port show "$port_id" -f value \
+            -c binding_host_id)" == "$DEST_HOST" ]] || return 1
+    done
+}
+
 original_status=$(openstack server show "$SERVER_ID" -f value -c status)
 [[ "$original_status" == ACTIVE || "$original_status" == SHUTOFF ]] || {
     echo "Server must be ACTIVE or SHUTOFF, got $original_status" >&2
@@ -99,6 +145,13 @@ root_volume=$(openstack server volume list "$SERVER_ID" -f json |
     exit 1
 }
 root_image="volume-$root_volume"
+mapfile -t server_ports < <(
+    openstack port list --server "$SERVER_ID" -f value -c ID
+)
+(( ${#server_ports[@]} > 0 )) || {
+    echo "Server does not have a Neutron port" >&2
+    exit 1
+}
 
 if [[ "$original_status" == ACTIVE ]]; then
     printf '%s\n' "$marker" |
@@ -178,5 +231,13 @@ wait_for "stale source record cleanup" \
 openstack compute service set --enable "$SOURCE_HOST" nova-compute
 wait_for "single watcher after source admission" \
     watchers_are "$([[ "$original_status" == ACTIVE ]] && echo 1 || echo 0)"
+wait_for "single Cinder root attachment after reconciliation" \
+    attachment_is_unique
+wait_for "source RBD mapping cleanup" mappings_are "$SOURCE_SSH" 0
+wait_for "destination RBD mapping ownership" \
+    mappings_are "$DEST_SSH" \
+    "$([[ "$original_status" == ACTIVE ]] && echo 1 || echo 0)"
+wait_for "unique destination Neutron/OVS ownership" \
+    network_owner_is_destination
 
 echo "PASS fenced BFV evacuation and returning-host reconciliation"

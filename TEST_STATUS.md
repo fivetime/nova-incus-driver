@@ -710,6 +710,13 @@ hardening.
   identical driver hash `24dffc18...754867`, current admission tokens,
   disabled instance autostart, enabled/up Nova services, live OVN agents,
   Placement inventories, and the Cinder Ceph backend.
+  The destructive evacuation gate now finishes with explicit post-admission
+  assertions for one Cinder root attachment, zero source KRBD mappings, the
+  expected destination mapping count, destination Neutron binding, exactly
+  one destination OVS interface per server port, and no matching source OVS
+  interface. The OVS/KRBD/binding queries were replayed against the retained
+  node-03 to node-02 evacuation state: node-02 had one interface and mapping,
+  node-03 had neither, and Neutron named node-02 as owner.
 
 - Re-running DevStack to add Cinder rebuilt the test Nova databases. Three
   retained Incus containers (`instance-00000008`, `instance-00000009`, and
