@@ -179,6 +179,24 @@ class IncusGenericVifDriverTest(test.NoDBTestCase):
             'instance-00000001', os_vif.plug.call_args[0][1].name)
         _post_plug_wiring.assert_called_with(INSTANCE, OVS_VIF)
 
+    @mock.patch.object(vif, '_delete_ovs_vif_port')
+    @mock.patch.object(vif.IncusGenericVifDriver, 'plug')
+    def test_reassert_ovs_preserves_veth(self, plug, delete_ovs_vif_port):
+        self.vif_driver.reassert(INSTANCE, OVS_VIF)
+
+        delete_ovs_vif_port.assert_called_once_with(
+            'br0', 'tapda5cc4bf-f1', delete_dev=False)
+        plug.assert_called_once_with(INSTANCE, OVS_VIF)
+
+    @mock.patch.object(vif.ovsdb_lib, 'BaseOVS')
+    def test_delete_ovs_port_uses_os_vif_ovsdb(self, base_ovs):
+        vif._delete_ovs_vif_port(
+            'br0', 'tapda5cc4bf-f1', delete_dev=False)
+
+        base_ovs.assert_called_once_with(vif.CONF.os_vif_ovs)
+        base_ovs.return_value.delete_ovs_vif_port.assert_called_once_with(
+            'br0', 'tapda5cc4bf-f1', delete_netdev=False)
+
     @mock.patch.object(vif, '_post_unplug_wiring')
     @mock.patch('nova.virt.incus.vif.os_vif')
     def test_unplug_ovs(self, os_vif, _post_unplug_wiring):

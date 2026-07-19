@@ -19,6 +19,7 @@ from nova.compute import task_states
 from nova import context
 from nova import test
 from nova.virt.incus import manager
+from nova.virt.incus import migrate_data
 
 
 class IncusComputeManagerTest(test.NoDBTestCase):
@@ -34,6 +35,67 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         self.compute.network_api = mock.Mock()
         self.compute._get_instance_block_device_info = mock.Mock(
             return_value={'block_device_mapping': []})
+
+    def test_live_migration_cleanup_flags_clean_target_keep_shared_disks(self):
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            destination_architecture='x86_64',
+            destination_kernel_version='6.8.0-test',
+            destination_server_version='7.2')
+
+        self.assertEqual(
+            (True, False),
+            self.compute._live_migration_cleanup_flags(data))
+
+    @mock.patch.object(
+        manager.manager.ComputeManager, '_live_migration_cleanup_flags',
+        return_value=(mock.sentinel.cleanup, mock.sentinel.destroy_disks))
+    def test_live_migration_cleanup_flags_delegates_other_drivers(
+            self, base_flags):
+        data = mock.sentinel.other_migrate_data
+        migr_ctxt = mock.sentinel.migration_context
+
+        result = self.compute._live_migration_cleanup_flags(
+            data, migr_ctxt=migr_ctxt)
+
+        self.assertEqual(
+            (mock.sentinel.cleanup, mock.sentinel.destroy_disks), result)
+        base_flags.assert_called_once_with(data, migr_ctxt=migr_ctxt)
+
+    @mock.patch.object(
+        manager.manager.ComputeManager, '_rollback_live_migration',
+        return_value=mock.sentinel.result)
+    def test_rollback_live_migration_reasserts_network_after_base_cleanup(
+            self, base_rollback):
+        ctxt = context.get_admin_context()
+        instance = mock.sentinel.instance
+        data = migrate_data.IncusLiveMigrateData()
+
+        result = self.compute._rollback_live_migration(
+            ctxt, instance, 'compute-2', migrate_data=data,
+            source_bdms=mock.sentinel.source_bdms)
+
+        self.assertIs(mock.sentinel.result, result)
+        base_rollback.assert_called_once_with(
+            ctxt, instance, 'compute-2', migrate_data=data,
+            migration_status='failed',
+            source_bdms=mock.sentinel.source_bdms,
+            pre_live_migration=False)
+        finalize = self.compute.driver.finalize_live_migration_rollback
+        finalize.assert_called_once_with(ctxt, instance, data)
+
+    @mock.patch.object(
+        manager.manager.ComputeManager, '_rollback_live_migration')
+    def test_pre_live_migration_rollback_does_not_reassert_network(
+            self, base_rollback):
+        data = migrate_data.IncusLiveMigrateData()
+
+        self.compute._rollback_live_migration(
+            mock.sentinel.context, mock.sentinel.instance, 'compute-2',
+            migrate_data=data, pre_live_migration=True)
+
+        finalize = self.compute.driver.finalize_live_migration_rollback
+        finalize.assert_not_called()
 
     def _assert_unsupported_action_reverts_task(
             self, method, expected_exception, instance, *args):
@@ -99,6 +161,52 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         self._assert_unsupported_action_reverts_task(
             self.compute.unrescue_instance,
             manager.exception.InstanceUnRescueFailure, instance)
+
+    @mock.patch.object(
+        manager.manager.ComputeManager, 'pre_live_migration')
+    def test_pre_live_migration_mounts_destination_shares(self, base_pre):
+        ctxt = context.get_admin_context()
+        instance = mock.Mock(uuid='00000000-0000-0000-0000-000000000001')
+        shares = [mock.Mock(share_id='share-1'),
+                  mock.Mock(share_id='share-2')]
+        self.compute._get_share_info = mock.Mock(return_value=shares)
+        self.compute._mount_share = mock.Mock()
+        base_pre.return_value = mock.sentinel.migrate_data
+
+        result = self.compute.pre_live_migration(
+            ctxt, instance, mock.sentinel.disk,
+            mock.sentinel.migrate_data)
+
+        self.assertIs(mock.sentinel.migrate_data, result)
+        self.assertEqual(
+            [mock.call(ctxt, instance, share) for share in shares],
+            self.compute._mount_share.call_args_list)
+        base_pre.assert_called_once_with(
+            ctxt, instance, mock.sentinel.disk,
+            mock.sentinel.migrate_data)
+
+    @mock.patch.object(
+        manager.manager.ComputeManager, 'pre_live_migration')
+    def test_pre_live_migration_rolls_back_mounted_shares(self, base_pre):
+        ctxt = context.get_admin_context()
+        instance = mock.Mock(uuid='00000000-0000-0000-0000-000000000001')
+        first = mock.Mock(share_id='share-1')
+        second = mock.Mock(share_id='share-2')
+        self.compute._get_share_info = mock.Mock(
+            return_value=[first, second])
+        self.compute._mount_share = mock.Mock(
+            side_effect=[None, RuntimeError('mount failed')])
+        self.compute._umount_share = mock.Mock()
+
+        self.assertRaises(
+            RuntimeError,
+            self.compute.pre_live_migration,
+            ctxt, instance, mock.sentinel.disk,
+            mock.sentinel.migrate_data)
+
+        self.compute._umount_share.assert_called_once_with(
+            ctxt, instance, first)
+        base_pre.assert_not_called()
 
     @mock.patch.object(manager.eventlet, 'sleep')
     @mock.patch.object(

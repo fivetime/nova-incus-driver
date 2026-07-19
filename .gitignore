@@ -30,6 +30,7 @@ nosetests.xml
 .stestr
 .venv
 .stestr
+.tmp-migration-certs/
 
 # Translations
 *.mo

@@ -23,6 +23,7 @@ from nova.privsep import linux_net
 
 import os_vif
 from vif_plug_ovs import linux_net as ovs_linux_net
+from vif_plug_ovs.ovsdb import ovsdb_lib
 
 
 CONF = conf.CONF
@@ -77,16 +78,6 @@ def _get_tap_config(vif):
     return {'mac_address': vif['address']}
 
 
-def _ovs_vsctl(args):
-    full_args = ['ovs-vsctl', '--timeout=%s' % CONF.ovs_vsctl_timeout] + args
-    try:
-        return processutils.execute(*full_args, run_as_root=True)
-    except Exception as e:
-        LOG.error("Unable to execute %(cmd)s. Exception: %(exception)s",
-                  {'cmd': full_args, 'exception': e})
-        raise exception.OvsConfigurationFailure(inner_exception=e)
-
-
 def _create_ovs_vif_cmd(bridge, dev, iface_id, mac,
                         instance_id, interface_type=None):
     cmd = ['--', '--if-exists', 'del-port', dev, '--',
@@ -103,16 +94,14 @@ def _create_ovs_vif_cmd(bridge, dev, iface_id, mac,
 
 def _create_ovs_vif_port(bridge, dev, iface_id, mac, instance_id,
                          mtu=None, interface_type=None):
-    _ovs_vsctl(_create_ovs_vif_cmd(bridge, dev, iface_id,
-                                   mac, instance_id,
-                                   interface_type))
-    linux_net.set_device_mtu(dev, mtu)
+    ovsdb_lib.BaseOVS(CONF.os_vif_ovs).create_ovs_vif_port(
+        bridge, dev, iface_id, mac, instance_id, mtu=mtu,
+        interface_type=interface_type)
 
 
 def _delete_ovs_vif_port(bridge, dev, delete_dev=True):
-    _ovs_vsctl(['--', '--if-exists', 'del-port', bridge, dev])
-    if delete_dev:
-        linux_net.delete_net_dev(dev)
+    ovsdb_lib.BaseOVS(CONF.os_vif_ovs).delete_ovs_vif_port(
+        bridge, dev, delete_netdev=delete_dev)
 
 
 CONFIG_GENERATORS = {
@@ -265,6 +254,14 @@ class IncusGenericVifDriver(object):
                     "Unexpected vif_type=%s" % vif_type
                 )
             func(instance, vif)
+
+    def reassert(self, instance, vif):
+        """Reassert host wiring without deleting the container's veth peer."""
+        if _is_ovs_vif_port(vif):
+            _delete_ovs_vif_port(
+                vif['network']['bridge'], get_vif_devname(vif),
+                delete_dev=False)
+        self.plug(instance, vif)
 
     def unplug(self, instance, vif):
         vif_type = vif['type']

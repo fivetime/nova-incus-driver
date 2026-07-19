@@ -1,0 +1,11 @@
+[Unit]
+Description=OpenStack Incus live migration E2E
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/openstack-incus/live-migration-e2e.env
+WorkingDirectory=/opt/stack/openstack-incus
+ExecStart=/bin/bash -lc 'source /opt/stack/devstack/openrc admin admin >/dev/null; exec /bin/bash ./tools/openstack-incus-live-migration-e2e.sh'
+TimeoutStartSec=infinity

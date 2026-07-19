@@ -66,6 +66,20 @@ compute pair. Its required cases cover destination preflight failure,
 post-claim data-volume failure, post-claim start failure, stopped-instance
 recovery, reverse-revert failure, normal confirm, and residual-state audits.
 
+Also run ``tools/openstack-incus-live-migration-matrix.sh`` across three
+computes. It covers the 2x2x2 combination of local/BFV root, absent/present
+Cinder data volume, and absent/present Manila share. Every combination must
+complete a three-hop round trip and leave the Nova and Cinder inventories
+unchanged. The production preflight must confirm that the outer Incus image
+contains GNU tar with ``--no-unquote`` support so CRIU can checkpoint
+non-empty tmpfs mounts.
+
+Run the maximum BFV + two Cinder data volumes + Manila combination once more
+with target CRIU restore failure injection. The source must resume with
+continuous process state, all destination ownership must be removed, and an
+immediate retry must succeed. A failed optional CRIU pre-dump must degrade to a
+full final checkpoint rather than aborting the migration stream.
+
 The site acceptance matrix additionally interrupts the management network,
 Incus, ``nova-compute``, OVN controller, Cinder connectivity, and the
 orchestrator at ownership boundaries. Recovery must fail closed: uncertainty

@@ -267,13 +267,14 @@ incus_opts = [
     ),
     cfg.IntOpt(
         "migration_finish_retries",
-        default=10,
+        default=30,
         min=1,
         help=(
             "Attempts for destination VIF wiring, data-volume attachment, "
-            "and instance start during cold migration. The production "
-            "default allows time for a source KRBD unmap to release its "
-            "Ceph exclusive lock before the destination maps the volume."
+            "instance start during cold migration, and asynchronous source "
+            "restore during live-migration rollback. With the default retry "
+            "interval this provides a roughly one-minute settlement window "
+            "for CRIU, OVN and Ceph operations."
         ),
     ),
     cfg.IntOpt(

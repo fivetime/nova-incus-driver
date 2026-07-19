@@ -99,6 +99,8 @@ disable_service cinder c-sch c-api c-vol
 # For a two-compute Tempest job with Cinder volume and migration coverage:
 # INCUS_TEMPEST_BUILD_IMAGE=True
 # INCUS_TEMPEST_MIN_COMPUTE_NODES=2
+# INCUS_ENABLE_MANILA_SHARES=True
+# INCUS_MANILA_ACCESS_CIDR=10.224.0.0/24
 # INCUS_ALLOW_COLD_MIGRATION=True
 # INCUS_ALLOW_BFV_EVACUATE=True
 # INCUS_MIGRATION_AUTO_RECOVERY=True

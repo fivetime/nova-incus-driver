@@ -1,0 +1,56 @@
+From: OpenStack Incus maintainers <openstack-incus@example.invalid>
+Subject: [PATCH] compute: Allow capability-gated Incus Manila live migration
+
+Nova rejects every live migration when an instance has a share mapping.
+The Incus driver can mount the share on the destination before CRIU restore
+and unmount it on the source after handoff. Allow that path only when the
+source resource provider explicitly advertises the dedicated capability.
+Other drivers and Incus nodes without the capability remain blocked.
+
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -410,14 +410,30 @@ def block_port_accelerators():
+     return inner
+
+
+-def block_shares_not_supported():
++def _supports_share_live_migration(context, instance):
++    node = objects.ComputeNode.get_first_node_by_host_for_old_compat(
++        context, instance.host)
++    trait_info = report.report_client_singleton().get_provider_traits(
++        context, node.uuid)
++    return (
++        'CUSTOM_INCUS_MANILA_LIVE_MIGRATION' in trait_info.traits
++    )
++
++
++def block_shares_not_supported(allow_capability_gated_live_migration=False):
+     """Block actions not allowed if the instance has a share.
+     """
+     def inner(func):
+         @functools.wraps(func)
+         def wrapper(self, context, instance, *args, **kwargs):
+             # Check if instance has a share mapped
+-            if instance_has_share(context, instance):
++            has_share = instance_has_share(context, instance)
++            if (
++                has_share and not (
++                    allow_capability_gated_live_migration and
++                    _supports_share_live_migration(context, instance)
++                )
++            ):
+                 raise exception.ForbiddenWithShare()
+             return func(self, context, instance, *args, **kwargs)
+         return wrapper
+@@ -5544,7 +5560,9 @@ class API:
+
+         return _metadata
+
+-    @block_shares_not_supported()
++    @block_shares_not_supported(
++        allow_capability_gated_live_migration=True
++    )
+     @block_extended_resource_request
+     @block_port_accelerators()
+     @reject_vdpa_instances(

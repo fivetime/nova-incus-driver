@@ -136,13 +136,19 @@ same absolute path with recursive mount propagation:
 
 .. code-block:: ini
 
-   Volume=/opt/stack/data/nova/instances/incus-shares:/opt/stack/data/nova/instances/incus-shares:rw,rslave
+   Volume=/opt/stack/data/nova/instances/incus-shares:/opt/stack/data/nova/instances/incus-shares:rw,rshared
 
 The more-specific bind overrides the read-only parent only for Manila staging.
-``rslave`` is required because NFS or CephFS mounts created later by
-nova-compute must propagate into the already-running incusd container. Do not
-make the complete ``instances_path`` writable: that would unnecessarily expose
-config drives and other Nova host state to the privileged daemon container.
+``rshared`` is required for live migration: NFS or CephFS mounts created later
+by nova-compute must propagate into incusd, and CRIU must be able to resolve
+the external mount's propagation master during checkpoint and restore.
+``rslave`` is sufficient only when Manila live migration is disabled. The
+``incus-shares`` directory and each per-instance directory use mode ``0711``:
+mapped container root can traverse the path for CRIU ``open_tree(2)`` but
+cannot list staged shares. Every parent above ``incus-shares`` must likewise
+grant other execute/search permission (or an equivalent ACL). Do not make the
+complete ``instances_path`` writable: that would unnecessarily expose config
+drives and other Nova host state to the privileged daemon container.
 
 The modern Nova ``Diagnostics`` object restricts its ``driver`` field to a
 fixed list. This repository carries

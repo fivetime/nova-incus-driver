@@ -89,6 +89,8 @@ ACCEPTABLE_IMAGE_FORMATS = {'raw', 'root-tar', 'squashfs'}
 INCUS_SYSTEM_CONTAINER_TRAIT = 'CUSTOM_INCUS_SYSTEM_CONTAINER'
 INCUS_SWAP_TRAIT = 'CUSTOM_INCUS_SWAP'
 INCUS_MANILA_SHARE_TRAIT = 'CUSTOM_INCUS_MANILA_SHARE'
+INCUS_MANILA_LIVE_MIGRATION_TRAIT = (
+    'CUSTOM_INCUS_MANILA_LIVE_MIGRATION')
 INCUS_STATEFUL_MIGRATION_EXTENSION = 'migration_stateful_shifted_root'
 INCUS_LIVE_BFV_MIGRATION_EXTENSION = (
     'migration_live_shared_cephext_storage')
@@ -260,7 +262,9 @@ def _require_bfv_migration_support(client, root_bdm):
             '[incus] boot_from_volume_storage_pool is required for '
             'Cinder boot-from-volume migration')
     pool = client.storage_pools.get(pool_name)
-    if pool.driver != 'cephext' or pool.config.get('source') != root_volume[0]:
+    pool_config = pool.config or {}
+    if (pool.driver != 'cephext' or
+            pool_config.get('source') != root_volume[0]):
         raise exception.MigrationError(
             reason='Incus BFV migration requires a cephext pool backed by '
             'the Cinder RBD pool')
@@ -282,7 +286,8 @@ def _require_bfv_live_migration_support(client, root_bdm):
     return root_volume
 
 
-def _preflight_bfv_migration_destination(destination, cinder_pool):
+def _preflight_bfv_migration_destination(
+        destination, cinder_pool, live=False):
     """Verify remote BFV readiness before stopping the source instance."""
     try:
         with socket.create_connection(
@@ -310,6 +315,8 @@ def _preflight_bfv_migration_destination(destination, cinder_pool):
             'migration_shared_ceph_storage',
             'storage_driver_cephext',
         }
+        if live:
+            required.add(INCUS_LIVE_BFV_MIGRATION_EXTENSION)
         missing = sorted(required.difference(extensions))
         if missing:
             raise ValueError('missing API extensions: %s' % ', '.join(missing))
@@ -366,7 +373,35 @@ def _migration_client(address):
         _migration_endpoint(address), verify=verify)
 
 
-def _live_migration_profile_check(client, instance):
+def _live_migration_share_mappings(context, instance, profile):
+    """Validate Manila profile devices against Nova's authoritative records."""
+    mappings = objects.ShareMappingList.get_by_instance_uuid(
+        context, instance.uuid)
+    expected = {}
+    for mapping in mappings:
+        if mapping.status != obj_fields.ShareMappingStatus.ACTIVE:
+            raise exception.MigrationPreCheckError(
+                reason='Manila share %s is not active' % mapping.share_id)
+        expected[_share_device_name(mapping)] = {
+            'type': 'disk',
+            'source': _share_mount_path(instance, mapping),
+            'path': _share_guest_path(mapping),
+            'readonly': 'false',
+            'recursive': 'true',
+        }
+
+    actual = {
+        name: device
+        for name, device in profile.devices.items()
+        if name.startswith('manila-')
+    }
+    if actual != expected:
+        raise exception.MigrationPreCheckError(
+            reason='Incus Manila devices do not match Nova share mappings')
+    return mappings
+
+
+def _live_migration_profile_check(client, context, instance):
     profile = client.profiles.get(instance.name)
     if profile.config.get('migration.stateful') != 'true':
         raise exception.MigrationPreCheckError(
@@ -381,6 +416,8 @@ def _live_migration_profile_check(client, instance):
         device_type = device.get('type')
         if name == 'root' and device_type == 'disk':
             continue
+        if name.startswith('manila-') and device_type == 'disk':
+            continue
         if device_type in ('nic', 'none', 'unix-block'):
             continue
         unsupported.append('%s:%s' % (name, device_type or 'unknown'))
@@ -388,6 +425,8 @@ def _live_migration_profile_check(client, instance):
         raise exception.MigrationPreCheckError(
             reason='Incus live migration does not support profile devices: '
             '%s' % ', '.join(sorted(unsupported)))
+    if any(name.startswith('manila-') for name in profile.devices):
+        _live_migration_share_mappings(context, instance, profile)
     return profile
 
 
@@ -477,6 +516,26 @@ def _remove_live_migration_target(remote, instance):
         pass
 
 
+def _remove_stale_live_migration_profile(client, instance):
+    """Remove an unused profile left by an earlier failed migration."""
+    try:
+        client.instances.get(instance.name)
+    except incus_exceptions.NotFound:
+        pass
+    else:
+        raise exception.DestinationDiskExists(path=instance.name)
+
+    try:
+        profile = client.profiles.get(instance.name)
+    except incus_exceptions.NotFound:
+        return
+
+    if (profile.config.get('environment.product_name') !=
+            'OpenStack Nova' or profile.used_by):
+        raise exception.DestinationDiskExists(path=instance.name)
+    profile.delete()
+
+
 def _stateful_migration_profile_config(container, profile):
     """Copy a profile while pinning the source user namespace mapping."""
     config = dict(profile.config)
@@ -526,6 +585,21 @@ def _live_migration_profile_data(migrate_data):
 
 def _volume_device_info_key(volume_id):
     return 'user.openstack.volume.%s' % volume_id
+
+
+def _profile_has_volume_connections(profile):
+    """Return whether a profile retains an os-brick volume connection."""
+    if not isinstance(profile.config, dict):
+        return False
+    if any(
+            key.startswith('user.openstack.volume.')
+            for key in profile.config):
+        return True
+    if not isinstance(profile.devices, dict):
+        return False
+    return any(
+        device.get('type') == 'unix-block'
+        for device in profile.devices.values())
 
 
 def _serialize_device_info(device_info):
@@ -663,6 +737,28 @@ def _share_mount_path(instance, share_mapping):
         share_mapping.share_id)
 
 
+def _ensure_share_mount_path(instance, share_mapping):
+    """Create a CRIU-accessible, non-listable Manila staging hierarchy."""
+    share_root = os.path.join(CONF.instances_path, 'incus-shares')
+    instance_root = os.path.join(share_root, instance.uuid)
+    mount_path = _share_mount_path(instance, share_mapping)
+    mounted = os.path.ismount(mount_path)
+
+    # CRIU opens external mounts after entering the instance user namespace.
+    # Mapped root therefore needs search permission on these two directories,
+    # but it must not be able to list another instance's staged shares.
+    fileutils.ensure_tree(share_root, mode=0o711)
+    os.chmod(share_root, 0o711)
+    fileutils.ensure_tree(instance_root, mode=0o711)
+    os.chmod(instance_root, 0o711)
+    fileutils.ensure_tree(mount_path, mode=0o700)
+    # Once mounted, chmod would target the remote filesystem. In particular,
+    # an NFS export with root_squash correctly rejects that operation.
+    if not mounted:
+        os.chmod(mount_path, 0o700)
+    return mount_path
+
+
 def _share_device_name(share_mapping):
     return 'manila-' + share_mapping.share_id
 
@@ -674,6 +770,52 @@ def _share_guest_path(share_mapping):
             server_id=share_mapping.instance_uuid,
             reason='share tag contains unsupported characters')
     return '/mnt/manila/' + share_mapping.tag
+
+
+def _profile_share_mounts(profile, instance):
+    """Return validated host share mounts referenced by an Incus profile."""
+    instance_root = os.path.realpath(os.path.join(
+        CONF.instances_path, 'incus-shares', instance.uuid))
+    mounts = []
+    devices = profile.devices
+    if not isinstance(devices, dict):
+        return mounts
+    for name, device in devices.items():
+        if not name.startswith('manila-'):
+            continue
+        share_id = name.removeprefix('manila-')
+        if not _SHARE_ID_RE.fullmatch(share_id):
+            continue
+        expected = os.path.realpath(os.path.join(instance_root, share_id))
+        source = device.get('source')
+        if (device.get('type') == 'disk' and source and
+                os.path.realpath(source) == expected):
+            mounts.append(expected)
+    return mounts
+
+
+def _cleanup_profile_share_mounts(profile, instance):
+    """Unmount host-side Manila staging paths after migration handoff."""
+    instance_root = os.path.realpath(os.path.join(
+        CONF.instances_path, 'incus-shares', instance.uuid))
+    for mount_path in reversed(_profile_share_mounts(profile, instance)):
+        if os.path.ismount(mount_path):
+            privsep_fs.umount(mount_path)
+        if os.path.isdir(mount_path):
+            os.rmdir(mount_path)
+    if os.path.isdir(instance_root):
+        os.rmdir(instance_root)
+
+
+def _live_migration_share_sources(devices):
+    return [
+        device.get('source')
+        for name, device in devices.items()
+        if (name.startswith('manila-') and
+            device.get('type') == 'disk' and
+            device.get('recursive') == 'true' and
+            device.get('source'))
+    ]
 
 
 def _pack_configdrive_for_migration(instance, container):
@@ -1827,7 +1969,7 @@ class IncusDriver(driver.ComputeDriver):
         _remove_instance_directory(instance)
 
         try:
-            self.client.profiles.get(instance.name).delete()
+            profile = self.client.profiles.get(instance.name)
         except incus_exceptions.LXDAPIException as e:
             if e.response.status_code == 404:
                 LOG.warning("Failed to delete instance. "
@@ -1835,6 +1977,14 @@ class IncusDriver(driver.ComputeDriver):
                             .format(instance=instance.name))
             else:
                 raise
+        else:
+            if _profile_has_volume_connections(profile):
+                LOG.error(
+                    'Retaining Incus profile because it contains host volume '
+                    'connection metadata that requires cleanup',
+                    instance=instance)
+            else:
+                profile.delete()
 
     def cleanup_lingering_instance_resources(self, instance):
         """Remove a stopped record left on a failed migration source."""
@@ -2554,8 +2704,7 @@ class IncusDriver(driver.ComputeDriver):
         if not CONF.incus.enable_manila_shares:
             raise exception.ShareProtocolNotSupported(
                 share_proto=share_mapping.share_proto)
-        mount_path = _share_mount_path(instance, share_mapping)
-        fileutils.ensure_tree(mount_path, mode=0o700)
+        mount_path = _ensure_share_mount_path(instance, share_mapping)
         mounted = os.path.ismount(mount_path)
         secret_path = None
         try:
@@ -2838,8 +2987,13 @@ class IncusDriver(driver.ComputeDriver):
             traits.discard(INCUS_SWAP_TRAIT)
         if CONF.incus.enable_manila_shares:
             traits.add(INCUS_MANILA_SHARE_TRAIT)
+            if CONF.incus.allow_live_migration:
+                traits.add(INCUS_MANILA_LIVE_MIGRATION_TRAIT)
+            else:
+                traits.discard(INCUS_MANILA_LIVE_MIGRATION_TRAIT)
         else:
             traits.discard(INCUS_MANILA_SHARE_TRAIT)
+            traits.discard(INCUS_MANILA_LIVE_MIGRATION_TRAIT)
         provider_tree.update_traits(nodename, traits)
 
     def refresh_instance_security_rules(self, instance):
@@ -3142,12 +3296,33 @@ class IncusDriver(driver.ComputeDriver):
                 reason='Missing Incus live migration destination data')
 
         config, devices = _live_migration_profile_data(migrate_data)
-        try:
-            self.client.profiles.create(instance.name, config, devices)
-        except incus_exceptions.LXDAPIException as exc:
-            if exc.response.status_code != 409:
-                raise
-            raise exception.DestinationDiskExists(path=instance.name)
+        _remove_stale_live_migration_profile(self.client, instance)
+        share_sources = _live_migration_share_sources(devices)
+        for attempt in range(CONF.incus.migration_finish_retries):
+            try:
+                self.client.profiles.create(instance.name, config, devices)
+                break
+            except incus_exceptions.LXDAPIException as exc:
+                if exc.response.status_code == 409:
+                    raise exception.DestinationDiskExists(path=instance.name)
+                mount_visibility_race = (
+                    share_sources and
+                    all(os.path.ismount(path) for path in share_sources) and
+                    'recursive option is only supported for additional '
+                    'bind-mounted paths' in str(exc))
+                if (not mount_visibility_race or
+                        attempt + 1 >=
+                        CONF.incus.migration_finish_retries):
+                    raise
+                LOG.warning(
+                    'Waiting for destination Manila mounts to propagate into '
+                    'the Incus daemon namespace before creating profile '
+                    '%s (attempt %d/%d)',
+                    instance.name, attempt + 1,
+                    CONF.incus.migration_finish_retries,
+                    instance=instance)
+                eventlet.sleep(
+                    CONF.incus.migration_finish_retry_interval)
 
         prepared_volumes = []
         try:
@@ -3226,7 +3401,6 @@ class IncusDriver(driver.ComputeDriver):
 
         remote = None
         container = self.client.instances.get(instance.name)
-        remote_profile_created = False
         try:
             remote = _migration_client(migrate_data.destination_address)
             try:
@@ -3237,7 +3411,6 @@ class IncusDriver(driver.ComputeDriver):
                     instance.name,
                     _stateful_migration_profile_config(container, profile),
                     copy.deepcopy(profile.devices))
-                remote_profile_created = True
 
             migration_data = container.generate_migration_data(live=True)
             migration_data.pop('default', None)
@@ -3253,13 +3426,9 @@ class IncusDriver(driver.ComputeDriver):
                 source['operation'], CONF.incus.migration_address)
             remote.instances.create(migration_data, wait=True)
         except Exception:
-            if remote_profile_created:
-                try:
-                    _remove_live_migration_target(remote, instance)
-                except Exception:
-                    LOG.exception(
-                        'Failed to remove Incus live migration target after '
-                        'migration failure', instance=instance)
+            # Nova owns rollback ordering. The target profile contains the
+            # os-brick device_info required to disconnect destination volume
+            # mappings before destination VIF and Manila cleanup.
             recover_method(context, instance, dest, migrate_data)
             return
 
@@ -3273,11 +3442,50 @@ class IncusDriver(driver.ComputeDriver):
             # Incus may keep the source record in Running state briefly after
             # CRIU has restored the target. Match `incus delete --force`:
             # force-stop the source record before removing it.
-            container.stop(timeout=-1, force=True, wait=True)
+            try:
+                container.stop(timeout=-1, force=True, wait=True)
+            except incus_exceptions.LXDAPIException as exc:
+                # The migration source can finish stopping between the status
+                # read and this request. Treat only that exact Incus response
+                # as success; all other cleanup failures remain fatal.
+                if 'instance is already stopped' not in str(exc).lower():
+                    raise
+                LOG.debug(
+                    'Source instance stopped before live-migration cleanup',
+                    instance=instance)
         container.delete(wait=True)
 
+        # Cinder removes the source attachment record after this hook, but
+        # os-brick host mappings are owned by the virt driver. Disconnect
+        # every source data-volume mapping while the profile still contains
+        # the exact device_info returned by connect_volume(). The BFV root is
+        # transferred by the Incus cephext handover and never uses os-brick.
+        for bdm in driver.block_device_info_get_mapping(block_device_info):
+            if _is_boot_volume(bdm):
+                continue
+            connection_info = bdm.get('connection_info')
+            mountpoint = bdm.get('mount_device')
+            if not connection_info or not mountpoint:
+                continue
+            try:
+                self.detach_volume(
+                    context, connection_info, instance, mountpoint)
+            except Exception:
+                # Match Nova's libvirt contract: the instance is already
+                # running on the destination and cannot be rolled back here.
+                # detach_volume restores the profile entry on failure, and
+                # cleanup() deliberately retains that profile for repair.
+                LOG.exception(
+                    'Retaining source volume connection after live migration '
+                    'disconnect failed for volume %s',
+                    _volume_id(connection_info), instance=instance)
+
     def post_live_migration_at_source(self, context, instance, network_info):
-        self.client.profiles.get(instance.name).delete()
+        profile = self.client.profiles.get(instance.name)
+        _cleanup_profile_share_mounts(profile, instance)
+        # cleanup() deletes the profile only after all os-brick connection
+        # metadata has been removed. A failed source disconnect must retain
+        # that metadata for deterministic operator or periodic repair.
         self.cleanup(context, instance, network_info)
 
     def post_live_migration_at_destination(
@@ -3295,21 +3503,118 @@ class IncusDriver(driver.ComputeDriver):
             container = self.client.instances.get(instance.name)
         except incus_exceptions.NotFound:
             return
-        container.sync()
+        # A failed shared-storage receive tells the source to restore its CRIU
+        # checkpoint before the migration request returns. Incus can briefly
+        # report Stopped while that restored monitor completes its start
+        # hooks. Starting again in that window leaks a second root-volume
+        # mount reference and makes the next handover fail with ErrInUse.
+        for attempt in range(CONF.incus.migration_finish_retries):
+            container.sync()
+            if container.status == 'Running':
+                return
+            if attempt + 1 < CONF.incus.migration_finish_retries:
+                eventlet.sleep(
+                    CONF.incus.migration_finish_retry_interval)
+
         if container.status != 'Running':
-            container.start(wait=True)
+            try:
+                container.start(wait=True)
+            except Exception:
+                # ComputeManager still has to restore the original Cinder
+                # attachment IDs, tear down the destination connections and
+                # remove Neutron's inactive binding. Raising here aborts that
+                # authoritative control-plane rollback and leaves the volume
+                # with stale destination attachments. Runtime reconciliation
+                # can repair or rebuild a stopped source after ownership has
+                # been restored.
+                LOG.exception(
+                    'Failed to restart the source Incus instance during live '
+                    'migration rollback; continuing control-plane rollback',
+                    instance=instance)
+
+    def finalize_live_migration_rollback(
+            self, context, instance, migrate_data):
+        """Reassert source VIFs after target Neutron bindings are removed."""
+        network_info = network_model.NetworkInfo()
+        if ('vifs' in migrate_data and migrate_data.vifs):
+            network_info = network_model.NetworkInfo([
+                vif.source_vif for vif in migrate_data.vifs
+                if ('source_vif' in vif and vif.source_vif)
+            ])
+        if network_info:
+            remote = _migration_client(migrate_data.destination_address)
+
+            def _target_cleanup_complete():
+                try:
+                    remote.profiles.get(instance.name)
+                except incus_exceptions.NotFound:
+                    return
+                raise exception.MigrationError(
+                    reason='Incus live migration destination cleanup is '
+                    'still in progress')
+
+            # Destination rollback is an asynchronous Nova RPC. Its profile is
+            # deliberately deleted only after destination VIFs, volume maps,
+            # and Manila mounts have been cleaned up, making absence a strong
+            # ordering barrier rather than a timing assumption.
+            _retry_migration_finish_action(
+                _target_cleanup_complete,
+                'live migration destination cleanup', instance)
+
+            vif_ids = {vif['id'] for vif in network_info}
+
+            def _vifs_have_active_state(expected):
+                current = self.network_api.get_instance_nw_info(
+                    context, instance)
+                states = {
+                    vif['id']: bool(vif.get('active'))
+                    for vif in current if vif['id'] in vif_ids
+                }
+                if (set(states) != vif_ids or
+                        any(state != expected for state in states.values())):
+                    raise exception.MigrationError(
+                        reason='Neutron VIFs have not reached rollback state '
+                        '%s' % ('ACTIVE' if expected else 'DOWN'))
+
+            def _reassert_vifs():
+                for vif in network_info:
+                    self.vif_driver.reassert(instance, vif)
+
+            # os-vif unplug completion precedes OVN's asynchronous DOWN event.
+            # Observe that event before reasserting source wiring so a late
+            # destination update cannot overwrite the restored source state.
+            _retry_migration_finish_action(
+                lambda: _vifs_have_active_state(False),
+                'live migration destination VIF deactivation', instance)
+
+            # CRIU rollback has already resumed the source container with its
+            # original veth peer. Unplugging here would delete the host end and
+            # leave the running container attached to an orphaned peer. Rebuild
+            # only the OVS Port row so ovn-controller sees an unambiguous new
+            # ownership event while the veth pair remains intact.
+            _retry_migration_finish_action(
+                _reassert_vifs,
+                'live migration rollback VIF wiring', instance)
+            _retry_migration_finish_action(
+                lambda: _vifs_have_active_state(True),
+                'live migration source VIF activation', instance)
 
     def rollback_live_migration_at_destination(
             self, context, instance, network_info, block_device_info,
             destroy_disks=True, migrate_data=None):
         try:
+            profile = self.client.profiles.get(instance.name)
+        except incus_exceptions.NotFound:
+            profile = None
+        try:
             self.client.instances.get(instance.name).delete(wait=True)
         except incus_exceptions.NotFound:
             pass
-        try:
-            self.client.profiles.get(instance.name).delete()
-        except incus_exceptions.NotFound:
-            pass
+        if profile is not None:
+            _cleanup_profile_share_mounts(profile, instance)
+        # cleanup() unplugs destination VIFs and disconnects block devices
+        # before deleting the profile. The source uses profile absence as the
+        # completion barrier before it reasserts its retained VIFs.
         self.cleanup(
             context, instance, network_info, destroy_disks=destroy_disks,
             destroy_vifs=True)
@@ -3351,20 +3656,18 @@ class IncusDriver(driver.ComputeDriver):
                 reason='Incus live migration does not support config drives')
         root_bdm = _boot_from_volume(block_device_info)
         if root_bdm is not None:
-            _require_bfv_live_migration_support(self.client, root_bdm)
+            root_volume = _require_bfv_live_migration_support(
+                self.client, root_bdm)
+            destination = _validated_migration_address(
+                dest_check_data.destination_address).hostname
             try:
-                remote = _migration_client(
-                    dest_check_data.destination_address)
-                _require_bfv_live_migration_support(remote, root_bdm)
-            except exception.MigrationPreCheckError:
-                raise
-            except Exception as exc:
-                raise exception.MigrationPreCheckError(
-                    reason='Incus BFV live migration destination preflight '
-                    'failed: %s' % exc)
+                _preflight_bfv_migration_destination(
+                    destination, root_volume[0], live=True)
+            except exception.MigrationError as exc:
+                raise exception.MigrationPreCheckError(reason=str(exc))
 
         _require_stateful_migration_extension(self.client)
-        _live_migration_profile_check(self.client, instance)
+        _live_migration_profile_check(self.client, context, instance)
         container = self.client.instances.get(instance.name)
         profile = self.client.profiles.get(instance.name)
         _validate_live_migration_data_volumes(profile, block_device_info)

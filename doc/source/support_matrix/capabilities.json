@@ -150,7 +150,7 @@
       "driver_hooks": ["check_can_live_migrate_destination", "check_can_live_migrate_source", "live_migration"],
       "applicability": "workload-dependent-criu",
       "status": "supported",
-      "evidence": "Opt-in best-effort support. Direct Incus E2E preserved PID 487. Nova API and Neutron/OVN E2E passed in both directions between incus-node-02 and incus-node-03 on 2026-07-19, preserving PID 644 and increasing the guest counter from 2 to 47 in each direction; Incus commits 826c25cd9 and 20c12bce3 cover shifted CRIU image ownership and project-qualified LXC monitor identity"
+      "evidence": "Opt-in best-effort support. On 2026-07-19 tools/openstack-incus-live-migration-matrix.sh passed all 8 local/BFV-root x Cinder-data-volume x Manila-share combinations through node01 -> node02 -> node03 -> node01 with PID continuity, increasing process state, OVN rebinding, storage/share data preservation, and baseline-equal cleanup. The strict BFV + 2 data volumes + Manila case also injected a target CRIU restore failure, proved source rollback, and immediately retried successfully. Incus revision 80ba579c257e034d049d855b9173e06c73aa7e09 and image digest sha256:25b57d845276773ca219ae3f9dc0e0da3db7262dc0f2308d53c7fb9b7ac48088 include GNU tar and full-final fallback for failed CRIU pre-copy."
     },
     {
       "id": "evacuate-bfv",

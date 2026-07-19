@@ -74,7 +74,7 @@ for command_name in podman jq findmnt crudini; do
     check_command "$command_name"
 done
 
-for container_command in aa-exec apparmor_parser ceph incus incusd lxcfs rbd; do
+for container_command in aa-exec apparmor_parser ceph incus incusd lxcfs rbd tar; do
     if podman exec "$INCUS_CONTAINER" sh -c \
             "command -v '$container_command'" >/dev/null 2>&1; then
         pass "container:$container_command"
@@ -82,6 +82,14 @@ for container_command in aa-exec apparmor_parser ceph incus incusd lxcfs rbd; do
         fail "container:$container_command" "not installed in Incus image"
     fi
 done
+
+if podman exec "$INCUS_CONTAINER" tar --help 2>&1 |
+        grep -F -- "--no-unquote" >/dev/null; then
+    pass "CRIU GNU tar support"
+else
+    fail "CRIU GNU tar support" \
+        "container tar must support --no-unquote for tmpfs migration"
+fi
 
 # shellcheck disable=SC1091
 source /etc/os-release
@@ -176,19 +184,64 @@ fi
 manila_enabled=$(crudini --get "$NOVA_CONFIG" incus enable_manila_shares \
     2>/dev/null || true)
 if [[ "${manila_enabled,,}" == "true" ]]; then
+    manila_access_cidr=$(crudini --get "$NOVA_CONFIG" DEFAULT \
+        my_shared_fs_storage_ip 2>/dev/null || true)
+    if [[ "$manila_access_cidr" == */* ]]; then
+        pass "Manila compute access CIDR" "$manila_access_cidr"
+    else
+        fail "Manila compute access CIDR" \
+            "[DEFAULT] my_shared_fs_storage_ip must be an isolated storage CIDR"
+    fi
     share_mount=$(podman inspect "$INCUS_CONTAINER" --format '{{json .Mounts}}' |
         jq -c --arg path "$INCUS_SHARE_MOUNT_ROOT" \
             '.[] | select(.Source == $path and .Destination == $path)')
     if [[ -z "$share_mount" ]]; then
         fail "Manila Incus mount" \
             "$INCUS_SHARE_MOUNT_ROOT is not passed into incusd"
-    elif jq -e '.RW == true and
-            (.Propagation == "rslave" or .Propagation == "rshared")' \
+    elif jq -e '.RW == true and .Propagation == "rshared"' \
             <<<"$share_mount" >/dev/null; then
         pass "Manila Incus mount" "rw,$(jq -r .Propagation <<<"$share_mount")"
     else
         fail "Manila Incus mount" \
-            "must be rw with rslave or rshared propagation"
+            "must be rw with rshared propagation for CRIU live migration"
+    fi
+    host_share_inode=$(stat -Lc '%d:%i' "$INCUS_SHARE_MOUNT_ROOT" \
+        2>/dev/null || true)
+    incus_share_inode=$(podman exec "$INCUS_CONTAINER" \
+        stat -Lc '%d:%i' "$INCUS_SHARE_MOUNT_ROOT" 2>/dev/null || true)
+    if [[ -n "$host_share_inode" &&
+          "$incus_share_inode" == "$host_share_inode" ]]; then
+        pass "Manila runtime mount identity" "$host_share_inode"
+    else
+        fail "Manila runtime mount identity" \
+            "host=$host_share_inode incusd=${incus_share_inode:-missing}; restart $INCUS_SERVICE to clear a stale/deleted bind mount"
+    fi
+    nova_user=$(systemctl show "$NOVA_SERVICE" -p User --value)
+    nova_user=${nova_user:-root}
+    if [[ -d "$INCUS_SHARE_MOUNT_ROOT" ]] &&
+            sudo -u "$nova_user" test -w "$INCUS_SHARE_MOUNT_ROOT"; then
+        pass "Manila staging permissions" \
+            "$nova_user can write $INCUS_SHARE_MOUNT_ROOT"
+    else
+        fail "Manila staging permissions" \
+            "$nova_user must be able to create per-instance mount directories"
+    fi
+    inaccessible_parent=
+    current_path=$INCUS_SHARE_MOUNT_ROOT
+    while [[ "$current_path" != "/" ]]; do
+        mode=$(stat -c '%A' "$current_path" 2>/dev/null || true)
+        if [[ ${mode:9:1} != "x" ]]; then
+            inaccessible_parent=$current_path
+            break
+        fi
+        current_path=$(dirname "$current_path")
+    done
+    if [[ -z "$inaccessible_parent" ]]; then
+        pass "Manila CRIU path traversal" \
+            "all staging parents grant other execute/search"
+    else
+        fail "Manila CRIU path traversal" \
+            "$inaccessible_parent blocks mapped root; require o+x or equivalent ACL"
     fi
 fi
 
@@ -285,11 +338,11 @@ if [[ "$REQUIRE_COLD_MIGRATION" == true ]]; then
     migration_finish_retries=$(crudini --get "$NOVA_CONFIG" incus \
         migration_finish_retries 2>/dev/null || true)
     if [[ "$migration_finish_retries" =~ ^[0-9]+$ ]] &&
-            ((migration_finish_retries >= 10)); then
+            ((migration_finish_retries >= 30)); then
         pass "Nova migration finish retries" "$migration_finish_retries"
     else
         fail "Nova migration finish retries" \
-            "expected at least 10, actual=${migration_finish_retries:-missing}"
+            "expected at least 30, actual=${migration_finish_retries:-missing}"
     fi
 fi
 check_equal "Nova migration recovery" true \

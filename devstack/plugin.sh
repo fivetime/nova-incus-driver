@@ -152,6 +152,19 @@ function install_nova_incus {
             die $LINENO \
                 "Nova Incus Manila share patch does not apply cleanly"
         fi
+
+        local manila_live_migration_patch
+        manila_live_migration_patch="${NOVA_INCUS_DIR}/patches/nova/0003-compute-allow-incus-manila-live-migration.patch"
+        if grep -q "CUSTOM_INCUS_MANILA_LIVE_MIGRATION" \
+                "${NOVA_DIR}/nova/compute/api.py"; then
+            echo "Nova already accepts Incus Manila live migration"
+        elif git -C "${NOVA_DIR}" apply --check \
+                "${manila_live_migration_patch}"; then
+            git -C "${NOVA_DIR}" apply "${manila_live_migration_patch}"
+        else
+            die $LINENO \
+                "Nova Incus Manila live migration patch does not apply cleanly"
+        fi
     fi
 
     local migrate_data_patch
@@ -338,6 +351,14 @@ function configure_nova_incus_storage {
 function configure_nova_incus {
     echo_summary "Configuring Nova to use Incus"
 
+    if [[ "${INCUS_ENABLE_MANILA_SHARES,,}" == "true" ]]; then
+        # nova-compute creates one private staging directory per instance.
+        # The Podman deployment pre-creates this bind mount as root, so make
+        # its ownership explicit before nova-compute first uses it.
+        sudo install -d -m 0711 -o "${STACK_USER}" -g "${STACK_USER}" \
+            "${NOVA_INSTANCES_PATH}/incus-shares"
+    fi
+
     # Ensure ML2 has an allocatable project network type before neutron-api
     # starts. DevStack's post-config phase can run after an existing API
     # service has started during an idempotent stack run, leaving the Geneve
@@ -401,6 +422,12 @@ function configure_nova_incus {
         iniset "${nova_target}" incus enable_manila_shares \
             "${INCUS_ENABLE_MANILA_SHARES}"
         if [[ "${INCUS_ENABLE_MANILA_SHARES,,}" == "true" ]]; then
+            if [[ -z "${INCUS_MANILA_ACCESS_CIDR}" ]]; then
+                die $LINENO \
+                    "INCUS_MANILA_ACCESS_CIDR is required when Manila shares are enabled"
+            fi
+            iniset "${nova_target}" DEFAULT my_shared_fs_storage_ip \
+                "${INCUS_MANILA_ACCESS_CIDR}"
             # Nova's Manila adapter uses its own keystoneauth group. The
             # Manila DevStack plugin configures this on the controller only,
             # so write it explicitly for every remote nova-compute as well.

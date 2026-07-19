@@ -174,6 +174,22 @@ Custom Glance properties may document the image contract, but Nova's typed
 compute driver and a BFV BDM does not carry ``volume_image_metadata``. They
 therefore are not a security gate; the server-side claim validation is.
 
+Do not upload the unified ``.tar.gz`` used by the Incus-managed root model as
+a Glance ``raw`` BFV image. Compression is a transport format, not a disk
+format, and an RBD clone preserves those gzip bytes verbatim. Convert the
+unified tar into a real ext4 image and upload it with the dedicated tool::
+
+    source /opt/stack/devstack/openrc admin admin
+    sudo --preserve-env=OS_* \
+      UNIFIED_TAR=/path/to/alpine-unified.tar.gz \
+      IMAGE_NAME=alpine-3.21-cloud-incus-criu-bfv-raw \
+      tools/publish-incus-bfv-image-to-glance.sh
+
+The tool checks the top-level ``rootfs/sbin/init``, filesystem headroom and
+ext4 consistency before publishing the image. The unified tar remains the
+correct Glance payload for the Incus-managed root model; the ext4 raw image is
+the correct payload for Cinder BFV.
+
 Glance-to-Cinder RBD clone preparation
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -868,10 +884,11 @@ new instance profiles to use Incus's shifted on-disk rootfs layout, because
 CRIU restore cannot recreate a detached idmapped root mount. Existing
 instances must be stopped and converted before they can pass pre-checks.
 
-Boot-from-volume, config drives, Manila shares, privileged containers, block
-migration, and extra disk devices that are not Nova-managed Cinder data
-volumes remain rejected. Nova-managed Cinder data volumes use Nova's native
-temporary destination attachment and a destination-local os-brick mapping.
+Config drives, privileged containers, block migration, and extra disk devices
+that are not Nova-managed Cinder data volumes remain rejected. Shared-Ceph
+boot-from-volume roots use the Incus ordered handover protocol. Nova-managed
+Cinder data volumes use Nova's native temporary destination attachment and a
+destination-local os-brick mapping.
 The source profile's host-specific ``unix-block source`` paths are excluded
 from migration data and rebuilt from the destination connection information.
 Successful migration disconnects the source mapping after CRIU restore.
@@ -879,12 +896,38 @@ Destination preparation failure atomically removes its mappings, Incus
 profile, VIFs, and firewall state before Nova restores the source attachment.
 Encrypted, read-only, and multiattach volumes remain unsupported.
 
+Active Manila NFS and CephFS mappings are mounted on the destination before
+the Incus transfer. On success the source staging mount is removed; rollback
+removes the destination staging mount. NFS access must cover every eligible
+compute on an isolated storage network. Configure the same CIDR on all
+computes; a per-host default prevents cross-node migration::
+
+    [DEFAULT]
+    my_shared_fs_storage_ip = 10.224.0.0/24
+
+With the DevStack plugin set ``INCUS_MANILA_ACCESS_CIDR`` to that CIDR.
+Firewall the share network so tenants cannot originate traffic from this
+trusted range. A single-node deployment can use a host ``/32``.
+CRIU treats the host-staged share as an external mount master. The approved
+outer image therefore contains ``/etc/criu/default.conf`` with exactly
+``enable-external-masters``. The image entrypoint and production preflight
+fail when this immutable setting is absent. Do not add arbitrary CRIU options
+through a writable host bind.
+
 Mismatched architecture, kernel, or Incus versions are rejected. CRIU support
 remains workload-dependent. Containers with
 complex systemd services, external sockets, unsupported kernel resources, or
 processes created through a host-side ``incus exec`` session may fail their
 checkpoint. Failure is recoverable, but successful migration is never
 guaranteed merely because pre-checks passed.
+
+CRIU pre-copy is an optimization, not a correctness requirement. The approved
+Incus fork terminates pre-copy cleanly and falls back to a full final
+checkpoint when a CRIU pre-dump fails. It also retries an incremental final
+checkpoint once without a parent image when the source is still running.
+These fallbacks increase the stop interval for that migration but prevent a
+transient pre-copy failure from corrupting the migration protocol or making an
+immediate retry fail.
 
 Configure a dedicated TLS client certificate trusted by every Incus server
 and restricted to the ``nova`` project. Do not reuse the read-only
@@ -899,7 +942,12 @@ and restricted to the ``nova`` project. Do not reuse the read-only
     migration_tls_ca_by_server = 192.0.2.10:/etc/nova/incus-migration/compute-1.crt,192.0.2.11:/etc/nova/incus-migration/compute-2.crt
 
 Both the source and destination outer novm images must contain the same
-approved CRIU build plus ``iptables-restore`` and ``ip6tables-restore``.
+approved CRIU build plus ``iptables-restore``, ``ip6tables-restore``,
+``iptables-legacy-restore`` and ``ip6tables-legacy-restore``.
+They must also contain GNU tar. CRIU invokes ``tar --no-unquote`` while
+checkpointing non-empty tmpfs mounts such as ``/dev/shm``; BusyBox tar causes
+the source checkpoint to fail before the target restore begins. The image
+build and production preflight test this exact option.
 ``criu check --extra`` must pass on every compute. The driver uses staged
 destination creation. A successful destination create operation is Incus's
 authoritative signal that CRIU restore and migration control completed. Nova
@@ -939,7 +987,8 @@ CRIU restore helper. Otherwise CRIU can restore and resume every process while
 the Incus API looks up a different monitor name and incorrectly reports the
 instance as stopped. The approved fork must include Incus commits
 ``826c25cd9`` (normalize mixed CRIU image ownership) and ``20c12bce3``
-(project-qualified restore monitor name), or equivalent upstream fixes.
+(project-qualified restore monitor name), plus revision ``80ba579c2`` or later
+for CRIU pre-copy/full-final fallback, or equivalent upstream fixes.
 
 Run the Nova API and Neutron/OVN regression in both directions::
 
@@ -954,6 +1003,30 @@ interface only on the destination, and leave no instance, profile, port, OVS
 interface, or Placement allocation after deletion. Set ``KEEP_FAILED=1`` to
 retain a failed instance and its CRIU logs for diagnosis; the default is to
 clean all test resources.
+
+Run the complete root/data/share matrix after the single-path diagnostic
+passes::
+
+    SSH_IDENTITY=/path/to/test-key \
+      NODE01_SSH=root@192.0.2.10 \
+      NODE02_SSH=root@192.0.2.11 \
+      NODE03_SSH=root@192.0.2.12 \
+      MANILA_SHARE=incus-e2e-share \
+      tools/openstack-incus-live-migration-matrix.sh
+
+The matrix covers local and Cinder BFV roots, with and without a Cinder data
+volume, and with and without a Manila share. Every case follows
+``node01 -> node02 -> node03 -> node01`` and requires the Nova server and
+Cinder volume inventories to match their pre-test baselines after cleanup.
+Use ``MATRIX_CASES=local_basic,bfv_data_manila`` only for diagnosis; release
+evidence requires the default ``all``.
+
+The release gate must additionally run the maximum combination with
+``INJECT_RESTORE_FAILURE=1`` and at least two Cinder data volumes. It must
+prove that the injected failure reached target CRIU restore, that Nova restored
+the still-running source with its original PID and increasing counter, and that
+an immediate retry succeeds without stale RBD mappings, Manila mounts, or OVS
+ports.
 
 Set ``SECOND_NETWORK=private`` when running the migration E2E to attach a
 second Neutron port before migration. The extended check persists guest

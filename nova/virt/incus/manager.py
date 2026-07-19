@@ -23,6 +23,7 @@ from oslo_log import log as logging
 from oslo_service import periodic_task
 
 from nova.virt.incus import driver as incus_driver  # noqa: F401
+from nova.virt.incus import migrate_data as incus_migrate_data
 
 
 CONF = incus_driver.CONF
@@ -35,6 +36,20 @@ _METRICS_SETTLEMENT_DELAY = 9
 
 class IncusComputeManager(manager.ComputeManager):
     """Nova manager extension for fenced BFV post-claim recovery."""
+
+    def _live_migration_cleanup_flags(self, migrate_data, migr_ctxt=None):
+        """Request destination cleanup without deleting shared root storage."""
+        if isinstance(
+                migrate_data, incus_migrate_data.IncusLiveMigrateData):
+            # Incus pre_live_migration creates a destination profile, VIFs,
+            # os-brick mappings and possibly Manila mounts. Nova's base
+            # implementation only recognizes libvirt and Hyper-V migration
+            # data, so explicitly route an Incus failure through destination
+            # rollback. Both rootfs models use shared storage during CRIU
+            # migration; the driver cleanup must never delete those disks.
+            return True, False
+        return super()._live_migration_cleanup_flags(
+            migrate_data, migr_ctxt=migr_ctxt)
 
     @manager.wrap_exception()
     @manager.reverts_task_state
@@ -99,6 +114,44 @@ class IncusComputeManager(manager.ComputeManager):
             requested_networks=requested_networks,
             notify=notify,
             try_deallocate_networks=try_deallocate_networks)
+
+    def _rollback_live_migration(
+            self, context, instance, dest, migrate_data=None,
+            migration_status='failed', source_bdms=None,
+            pre_live_migration=False):
+        """Reassert source networking after Nova removes target bindings."""
+        result = super()._rollback_live_migration(
+            context, instance, dest, migrate_data=migrate_data,
+            migration_status=migration_status, source_bdms=source_bdms,
+            pre_live_migration=pre_live_migration)
+        if (
+            not pre_live_migration and
+            isinstance(migrate_data, incus_migrate_data.IncusLiveMigrateData)
+        ):
+            self.driver.finalize_live_migration_rollback(
+                context, instance, migrate_data)
+        return result
+
+    def pre_live_migration(self, context, instance, disk, migrate_data):
+        """Mount active Manila shares on the migration destination."""
+        share_info = self._get_share_info(context, instance)
+        mounted = []
+        try:
+            for share_mapping in share_info:
+                self._mount_share(context, instance, share_mapping)
+                mounted.append(share_mapping)
+            return super().pre_live_migration(
+                context, instance, disk, migrate_data)
+        except Exception:
+            for share_mapping in reversed(mounted):
+                try:
+                    self._umount_share(context, instance, share_mapping)
+                except Exception:
+                    LOG.exception(
+                        'Failed to roll back destination Manila mount for '
+                        'share %s', share_mapping.share_id,
+                        instance=instance)
+            raise
 
     @periodic_task.periodic_task(
         spacing=CONF.incus.migration_recovery_interval)

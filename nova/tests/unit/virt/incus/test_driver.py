@@ -37,6 +37,7 @@ from nova.compute import manager
 from nova.compute import power_state
 from nova.compute import vm_states
 from nova.network import model as network_model
+from nova.objects import migrate_data as nova_migrate_data
 from nova.tests.unit import fake_instance
 from nova.virt import driver as nova_driver
 from pylxd import exceptions as incuscore_exceptions
@@ -1326,10 +1327,17 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         ]}
         profile = self.client.profiles.get.return_value
         profile.devices = {'data-volume': {'type': 'unix-block'}}
+        profile.config = {
+            driver._volume_device_info_key('data-volume'): '{}'}
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
         incus_driver.firewall_driver = mock.Mock()
-        incus_driver.detach_volume = mock.Mock()
+
+        def detach(*args):
+            profile.devices.clear()
+            profile.config.clear()
+
+        incus_driver.detach_volume = mock.Mock(side_effect=detach)
 
         incus_driver.cleanup(
             ctx, instance, [], block_device_info, destroy_vifs=False)
@@ -1357,6 +1365,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         }]}
         profile = self.client.profiles.get.return_value
         profile.devices = {'data-volume': {'type': 'unix-block'}}
+        profile.config = {
+            driver._volume_device_info_key('data-volume'): '{}'}
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
         incus_driver.firewall_driver = mock.Mock()
@@ -1810,6 +1820,31 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                 'CUSTOM_INCUS_SYSTEM_CONTAINER',
             })
 
+    @mock.patch('nova.virt.incus.driver._host_has_swap', return_value=False)
+    def test_update_provider_tree_reports_manila_live_migration_trait(
+            self, _host_has_swap):
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.get_available_resource = mock.Mock(return_value={
+            'vcpus': 8, 'memory_mb': 16384, 'local_gb': 100})
+        incus_driver._get_allocation_ratios = mock.Mock(return_value={
+            'VCPU': 4.0, 'MEMORY_MB': 1.5, 'DISK_GB': 1.0})
+        incus_driver._get_reserved_host_disk_gb_from_config = mock.Mock(
+            return_value=2)
+        provider_tree = mock.Mock()
+        provider_tree.data.return_value = mock.Mock(
+            inventory={}, traits=set())
+        self.CONF.incus.enable_manila_shares = True
+        self.CONF.incus.allow_live_migration = True
+
+        incus_driver.update_provider_tree(provider_tree, 'compute-1')
+
+        provider_tree.update_traits.assert_called_once_with(
+            'compute-1', {
+                'CUSTOM_INCUS_MANILA_LIVE_MIGRATION',
+                'CUSTOM_INCUS_MANILA_SHARE',
+                'CUSTOM_INCUS_SYSTEM_CONTAINER',
+            })
+
     def test_attach_interface(self):
         expected = {
             'hwaddr': '00:11:22:33:44:55',
@@ -2167,7 +2202,9 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             '10.224.0.17': '/etc/nova/compute-2.crt'}
         remote = get_remote.return_value
         remote.host_info = {'api_extensions': [
-            'migration_shared_ceph_storage', 'storage_driver_cephext']}
+            'migration_shared_ceph_storage',
+            'migration_live_shared_cephext_storage',
+            'storage_driver_cephext']}
         remote.projects.get.return_value.config = {
             'user.openstack.preflight_protocol': '1',
             'user.openstack.bfv_pool': 'cinder-bfv',
@@ -2208,7 +2245,9 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.CONF.incus.boot_from_volume_storage_pool = 'cinder-bfv'
         remote = get_remote.return_value
         remote.host_info = {'api_extensions': [
-            'migration_shared_ceph_storage', 'storage_driver_cephext']}
+            'migration_shared_ceph_storage',
+            'migration_live_shared_cephext_storage',
+            'storage_driver_cephext']}
         remote.projects.get.return_value.config = {
             'user.openstack.preflight_protocol': '1',
             'user.openstack.bfv_pool': 'cinder-bfv',
@@ -3136,8 +3175,6 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'memory_mb_used': 8000,
             'numa_topology': None,
             'supported_instances': [
-                ('i686', 'incus', 'exe'),
-                ('x86_64', 'incus', 'exe'),
                 ('i686', 'lxc', 'exe'),
                 ('x86_64', 'lxc', 'exe')],
             'vcpus': 200,
@@ -3242,8 +3279,6 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'memory_mb_used': 8000,
             'numa_topology': None,
             'supported_instances': [
-                ('i686', 'incus', 'exe'),
-                ('x86_64', 'incus', 'exe'),
                 ('i686', 'lxc', 'exe'),
                 ('x86_64', 'lxc', 'exe')],
             'vcpus': 200,
@@ -3626,8 +3661,11 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
     @mock.patch.object(driver.os.path, 'ismount', return_value=False)
     @mock.patch.object(driver.privsep_fs, 'mount')
-    def test_mount_nfs_share_stages_incus_device(self, mount, ismount):
-        ismount.side_effect = [False, True]
+    @mock.patch.object(driver.os, 'chmod')
+    def test_mount_nfs_share_stages_incus_device(
+            self, chmod, mount, ismount):
+        ismount.side_effect = [False, False, True]
+        driver.fileutils.ensure_tree.reset_mock()
         self.CONF.incus.enable_manila_shares = True
         instance = mock.Mock(
             uuid='00000000-0000-0000-0000-000000000001',
@@ -3645,6 +3683,19 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         incus_driver.mount_share(None, instance, share)
 
         mount_path = driver._share_mount_path(instance, share)
+        share_root = os.path.join(
+            self.CONF.instances_path, 'incus-shares')
+        instance_root = os.path.join(share_root, instance.uuid)
+        self.assertEqual([
+            mock.call(share_root, mode=0o711),
+            mock.call(instance_root, mode=0o711),
+            mock.call(mount_path, mode=0o700),
+        ], driver.fileutils.ensure_tree.call_args_list)
+        self.assertEqual([
+            mock.call(share_root, 0o711),
+            mock.call(instance_root, 0o711),
+            mock.call(mount_path, 0o700),
+        ], chmod.call_args_list)
         mount.assert_called_once_with(
             'nfs', share.export_location, mount_path,
             ['-o', 'nosuid,nodev'])
@@ -3656,6 +3707,35 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'recursive': 'true',
         }, profile.devices[driver._share_device_name(share)])
         profile.save.assert_called_once_with(wait=True)
+
+    @mock.patch.object(driver.os.path, 'ismount', return_value=True)
+    @mock.patch.object(driver.privsep_fs, 'mount')
+    @mock.patch.object(driver.os, 'chmod')
+    def test_mount_nfs_share_does_not_chmod_existing_mount(
+            self, chmod, mount, ismount):
+        driver.fileutils.ensure_tree.reset_mock()
+        self.CONF.incus.enable_manila_shares = True
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            share_proto='NFS')
+        profile = self.client.profiles.get.return_value
+        profile.devices = {}
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        incus_driver.mount_share(None, instance, share)
+
+        mount_path = driver._share_mount_path(instance, share)
+        self.assertNotIn(mock.call(mount_path, 0o700), chmod.call_args_list)
+        mount.assert_not_called()
+        self.assertEqual(
+            mount_path,
+            profile.devices[driver._share_device_name(share)]['source'])
 
     @mock.patch.object(driver.os.path, 'ismount', return_value=True)
     @mock.patch.object(driver.privsep_fs, 'umount')
@@ -3696,6 +3776,42 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertRaises(
             exception.ShareProtocolNotSupported,
             incus_driver.mount_share, None, instance, share)
+
+    @mock.patch.object(driver.os.path, 'ismount', return_value=True)
+    @mock.patch.object(driver.privsep_fs, 'umount')
+    @mock.patch.object(driver.os, 'rmdir')
+    def test_post_live_migration_source_cleans_validated_share_mount(
+            self, rmdir, umount, ismount):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        share_id = '10000000-0000-0000-0000-000000000001'
+        mount_path = os.path.join(
+            self.CONF.instances_path, 'incus-shares',
+            instance.uuid, share_id)
+        profile = self.client.profiles.get.return_value
+        profile.devices = {
+            'manila-' + share_id: {
+                'type': 'disk',
+                'source': mount_path,
+                'path': '/mnt/manila/project-data',
+            },
+            'manila-not-a-uuid': {
+                'type': 'disk',
+                'source': '/must/not/unmount',
+            },
+            'root': {'type': 'disk', 'source': mount_path},
+        }
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+        incus_driver.cleanup = mock.Mock()
+
+        incus_driver.post_live_migration_at_source(
+            None, instance, mock.sentinel.network_info)
+
+        umount.assert_called_once_with(os.path.realpath(mount_path))
+        incus_driver.cleanup.assert_called_once_with(
+            None, instance, mock.sentinel.network_info)
         self.vif_driver.plug.assert_not_called()
         self.vif_driver.unplug.assert_not_called()
 
@@ -4214,10 +4330,97 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                          source_profile['config']['security.idmap.base'])
         self.assertEqual(profile.devices, source_profile['devices'])
 
-    @mock.patch.object(driver, '_migration_client')
+    @mock.patch.object(
+        driver.objects.ShareMappingList, 'get_by_instance_uuid')
+    def test_check_can_live_migrate_source_accepts_manila_share(
+            self, get_shares):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', config_drive=False)
+        instance.config_drive = ''
+        self.CONF.incus.allow_live_migration = True
+        share_id = '10000000-0000-0000-0000-000000000001'
+        mapping = mock.Mock(
+            share_id=share_id,
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            status=driver.obj_fields.ShareMappingStatus.ACTIVE)
+        get_shares.return_value = [mapping]
+        share_device = {
+            'type': 'disk',
+            'source': os.path.join(
+                self.CONF.instances_path, 'incus-shares',
+                instance.uuid, share_id),
+            'path': '/mnt/manila/project-data',
+            'readonly': 'false',
+            'recursive': 'true',
+        }
+        profile = mock.Mock(
+            config={'migration.stateful': 'true'},
+            devices={
+                'root': {'type': 'disk', 'path': '/'},
+                'manila-' + share_id: share_device,
+            })
+        self.client.profiles.get.return_value = profile
+        self.client.instances.get.return_value.status = 'Running'
+        self.client.instances.get.return_value.config = {
+            'volatile.idmap.base': '1065536'}
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            destination_architecture='x86_64',
+            destination_kernel_version='6.8.0-test',
+            destination_server_version='7.2')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        result = incus_driver.check_can_live_migrate_source(
+            ctx, instance, data, {'block_device_mapping': []})
+
+        self.assertEqual(
+            share_device,
+            jsonutils.loads(result.source_profile)['devices'][
+                'manila-' + share_id])
+
+    @mock.patch.object(
+        driver.objects.ShareMappingList, 'get_by_instance_uuid')
+    def test_check_can_live_migrate_source_rejects_forged_manila_device(
+            self, get_shares):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', config_drive=False)
+        instance.config_drive = ''
+        self.CONF.incus.allow_live_migration = True
+        get_shares.return_value = []
+        profile = mock.Mock(
+            config={'migration.stateful': 'true'},
+            devices={
+                'root': {'type': 'disk', 'path': '/'},
+                'manila-10000000-0000-0000-0000-000000000001': {
+                    'type': 'disk',
+                    'source': '/etc',
+                    'path': '/mnt/manila/forged',
+                },
+            })
+        self.client.profiles.get.return_value = profile
+        self.client.instances.get.return_value.status = 'Running'
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            destination_architecture='x86_64',
+            destination_kernel_version='6.8.0-test',
+            destination_server_version='7.2')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaisesRegex(
+            exception.MigrationPreCheckError,
+            'do not match Nova share mappings',
+            incus_driver.check_can_live_migrate_source,
+            ctx, instance, data, {'block_device_mapping': []})
+
+    @mock.patch.object(driver, '_preflight_bfv_migration_destination')
     @mock.patch.object(driver, '_require_bfv_live_migration_support')
     def test_check_can_live_migrate_source_accepts_bfv_root(
-            self, require_bfv, migration_client):
+            self, require_bfv, preflight_destination):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', config_drive=False)
@@ -4242,16 +4445,31 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'mount_device': '/dev/vda',
             'connection_info': {'serial': 'root-volume'},
         }
+        require_bfv.return_value = (
+            'cinder-volumes', 'volume-root')
 
         result = incus_driver.check_can_live_migrate_source(
             ctx, instance, data,
             {'block_device_mapping': [root_bdm]})
 
         self.assertIs(data, result)
-        self.assertEqual(
-            [mock.call(self.client, root_bdm),
-             mock.call(migration_client.return_value, root_bdm)],
-            require_bfv.call_args_list)
+        require_bfv.assert_called_once_with(self.client, root_bdm)
+        preflight_destination.assert_called_once_with(
+            '192.0.2.20', 'cinder-volumes', live=True)
+
+    @mock.patch.object(driver.incus_client,
+                       'get_migration_preflight_client')
+    @mock.patch.object(driver.socket, 'create_connection')
+    def test_bfv_live_destination_preflight_requires_live_extension(
+            self, connect, get_remote):
+        get_remote.return_value.host_info = {'api_extensions': [
+            'migration_shared_ceph_storage', 'storage_driver_cephext']}
+
+        self.assertRaisesRegex(
+            exception.MigrationError,
+            driver.INCUS_LIVE_BFV_MIGRATION_EXTENSION,
+            driver._preflight_bfv_migration_destination,
+            'compute-2.example.test', 'cinder-volumes', live=True)
 
     @mock.patch.object(driver, '_require_bfv_migration_support')
     def test_require_bfv_live_migration_support_requires_extension(
@@ -4336,8 +4554,9 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             ctx, instance, data, {'block_device_mapping': []})
 
     @mock.patch.object(driver.IncusDriver, 'attach_volume')
+    @mock.patch.object(driver, '_remove_stale_live_migration_profile')
     def test_pre_live_migration_creates_profile_and_attaches_data_volume(
-            self, attach_volume):
+            self, remove_stale_profile, attach_volume):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         data = migrate_data.IncusLiveMigrateData(
@@ -4368,6 +4587,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             }]}, [mock.sentinel.vif], None, data)
 
         self.assertIs(data, result)
+        remove_stale_profile.assert_called_once_with(
+            self.client, instance)
         self.vif_driver.plug.assert_called_once_with(
             instance, mock.sentinel.vif)
         self.client.profiles.create.assert_called_once_with(
@@ -4380,10 +4601,133 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         attach_volume.assert_called_once_with(
             ctx, connection_info, instance, '/dev/vdb')
 
+    @mock.patch.object(driver.os.path, 'ismount', return_value=True)
+    @mock.patch.object(driver.os, 'chmod')
+    def test_ensure_share_mount_path_does_not_chmod_mounted_export(
+            self, chmod, ismount):
+        driver.fileutils.ensure_tree.reset_mock()
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001')
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001')
+
+        mount_path = driver._ensure_share_mount_path(instance, share)
+
+        share_root = os.path.join(
+            self.CONF.instances_path, 'incus-shares')
+        instance_root = os.path.join(share_root, instance.uuid)
+        self.assertEqual(
+            driver._share_mount_path(instance, share), mount_path)
+        self.assertEqual([
+            mock.call(share_root, 0o711),
+            mock.call(instance_root, 0o711),
+        ], chmod.call_args_list)
+
+    @mock.patch.object(driver.IncusDriver, 'mount_share')
+    @mock.patch.object(driver, '_remove_stale_live_migration_profile')
+    def test_pre_live_migration_leaves_manila_mount_to_manager(
+            self, remove_stale_profile, mount_share):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            destination_architecture='x86_64',
+            destination_kernel_version='6.8.0-test',
+            destination_server_version='7.2',
+            source_profile=jsonutils.dumps({
+                'config': {'migration.stateful': 'true'},
+                'devices': {
+                    'root': {'type': 'disk', 'path': '/'},
+                    'manila-10000000-0000-0000-0000-000000000001': {
+                        'type': 'disk',
+                        'source': '/var/lib/nova/incus-shares/share',
+                        'path': '/mnt/manila/project-data',
+                    },
+                },
+            }))
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.pre_live_migration(
+            ctx, instance, {'block_device_mapping': []},
+            [], None, data)
+
+        mount_share.assert_not_called()
+
+    @mock.patch.object(driver.eventlet, 'sleep')
+    @mock.patch.object(driver.os.path, 'ismount', return_value=True)
+    @mock.patch.object(driver, '_remove_stale_live_migration_profile')
+    def test_pre_live_migration_retries_manila_mount_propagation(
+            self, remove_stale_profile, ismount, sleep):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        share_source = '/var/lib/nova/incus-shares/instance/share'
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            destination_architecture='x86_64',
+            destination_kernel_version='6.8.0-test',
+            destination_server_version='7.2',
+            source_profile=jsonutils.dumps({
+                'config': {'migration.stateful': 'true'},
+                'devices': {
+                    'root': {'type': 'disk', 'path': '/'},
+                    'manila-10000000-0000-0000-0000-000000000001': {
+                        'type': 'disk',
+                        'source': share_source,
+                        'path': '/mnt/manila/project-data',
+                        'recursive': 'true',
+                    },
+                },
+            }))
+        response = mock.Mock(status_code=400)
+        response.json.return_value = {
+            'error': 'The recursive option is only supported for additional '
+                     'bind-mounted paths'}
+        self.client.profiles.create.side_effect = [
+            incuscore_exceptions.LXDAPIException(response), None]
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        result = incus_driver.pre_live_migration(
+            ctx, instance, {'block_device_mapping': []},
+            [], None, data)
+
+        self.assertIs(data, result)
+        self.assertEqual(2, self.client.profiles.create.call_count)
+        ismount.assert_called_once_with(share_source)
+        sleep.assert_called_once_with(
+            self.CONF.incus.migration_finish_retry_interval)
+
+    def test_remove_stale_live_migration_profile(self):
+        instance = mock.Mock(name='instance')
+        instance.name = 'instance-00000001'
+        self.client.instances.get.side_effect = incuscore_exceptions.NotFound(
+            MockResponse(404))
+        profile = self.client.profiles.get.return_value
+        profile.config = {'environment.product_name': 'OpenStack Nova'}
+        profile.used_by = []
+
+        driver._remove_stale_live_migration_profile(
+            self.client, instance)
+
+        profile.delete.assert_called_once_with()
+
+    def test_remove_stale_live_migration_profile_rejects_live_target(self):
+        instance = mock.Mock(name='instance')
+        instance.name = 'instance-00000001'
+
+        self.assertRaises(
+            exception.DestinationDiskExists,
+            driver._remove_stale_live_migration_profile,
+            self.client, instance)
+
+        self.client.profiles.get.assert_not_called()
+
     @mock.patch.object(driver, '_require_bfv_live_migration_support')
     @mock.patch.object(driver.IncusDriver, 'attach_volume')
+    @mock.patch.object(driver, '_remove_stale_live_migration_profile')
     def test_pre_live_migration_leaves_bfv_root_to_cephext(
-            self, attach_volume, require_bfv):
+            self, remove_stale_profile, attach_volume, require_bfv):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         data = migrate_data.IncusLiveMigrateData(
@@ -4420,8 +4764,9 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
     @mock.patch.object(driver.IncusDriver, 'unplug_vifs')
     @mock.patch.object(driver.IncusDriver, 'attach_volume')
+    @mock.patch.object(driver, '_remove_stale_live_migration_profile')
     def test_pre_live_migration_failure_removes_profile_and_network(
-            self, attach_volume, unplug_vifs):
+            self, remove_stale_profile, attach_volume, unplug_vifs):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         data = migrate_data.IncusLiveMigrateData(
@@ -4590,10 +4935,9 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             container,
             profile)
 
-    @mock.patch('nova.virt.incus.driver._remove_live_migration_target')
     @mock.patch('nova.virt.incus.driver._migration_client')
-    def test_live_migration_failure_cleans_target_and_recovers(
-            self, get_remote, remove_target):
+    def test_live_migration_failure_preserves_target_for_nova_rollback(
+            self, get_remote):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         self.CONF.incus.migration_address = 'https://192.0.2.10:8443'
@@ -4627,10 +4971,133 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             ctx, instance, 'destination', post, recover,
             migrate_data=data)
 
-        remove_target.assert_called_once_with(remote, instance)
         recover.assert_called_once_with(
             ctx, instance, 'destination', data)
         post.assert_not_called()
+
+    @mock.patch('nova.virt.incus.driver._migration_client')
+    def test_live_migration_failure_preserves_precreated_target_profile(
+            self, get_remote):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        self.CONF.incus.migration_address = 'https://192.0.2.10:8443'
+        container = mock.Mock()
+        container.config = {'volatile.idmap.base': '1065536'}
+        container.generate_migration_data.return_value = {
+            'source': {
+                'operation': 'http+unix://incus/1.0/operations/op',
+            },
+        }
+        self.client.instances.get.return_value = container
+        remote = get_remote.return_value
+        remote.instances.create.side_effect = RuntimeError('restore failed')
+        post = mock.Mock()
+        recover = mock.Mock()
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            destination_architecture='x86_64',
+            destination_kernel_version='6.8.0-test',
+            destination_server_version='7.2')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.live_migration(
+            ctx, instance, 'destination', post, recover,
+            migrate_data=data)
+
+        remote.profiles.create.assert_not_called()
+        recover.assert_called_once_with(
+            ctx, instance, 'destination', data)
+        post.assert_not_called()
+
+    def test_rollback_live_migration_source_start_failure_is_nonfatal(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        container = mock.Mock(status='Stopped')
+        container.start.side_effect = RuntimeError('restore failed')
+        self.client.instances.get.return_value = container
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.rollback_live_migration_at_source(
+            ctx, instance, migrate_data.IncusLiveMigrateData())
+
+        container.start.assert_called_once_with(wait=True)
+
+    def test_rollback_live_migration_source_waits_for_criu_restore(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        container = mock.Mock(status='Stopped')
+
+        def sync():
+            if container.sync.call_count == 2:
+                container.status = 'Running'
+
+        container.sync.side_effect = sync
+        self.client.instances.get.return_value = container
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.rollback_live_migration_at_source(
+            ctx, instance, migrate_data.IncusLiveMigrateData())
+
+        self.assertEqual(2, container.sync.call_count)
+        container.start.assert_not_called()
+
+    @mock.patch('nova.virt.incus.driver._migration_client')
+    def test_finalize_live_migration_rollback_reasserts_original_vifs(
+            self, get_remote):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        source_vif = network_model.VIF(id='test-vif')
+        vif_data = nova_migrate_data.VIFMigrateData(source_vif=source_vif)
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            vifs=[vif_data])
+        get_remote.return_value.profiles.get.side_effect = [
+            mock.sentinel.profile,
+            incuscore_exceptions.NotFound(MockResponse(404)),
+        ]
+        inactive_vif = network_model.VIF(id='test-vif', active=False)
+        active_vif = network_model.VIF(id='test-vif', active=True)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver.network_api.get_instance_nw_info = mock.Mock(
+            side_effect=[
+                network_model.NetworkInfo([inactive_vif]),
+                network_model.NetworkInfo([active_vif]),
+            ])
+        incus_driver.vif_driver.reassert = mock.Mock()
+        incus_driver.unplug_vifs = mock.Mock()
+
+        incus_driver.finalize_live_migration_rollback(
+            ctx, instance, data)
+
+        incus_driver.vif_driver.reassert.assert_called_once_with(
+            instance, source_vif)
+        incus_driver.unplug_vifs.assert_not_called()
+        self.assertEqual(
+            2, get_remote.return_value.profiles.get.call_count)
+
+    @mock.patch.object(driver, '_cleanup_profile_share_mounts')
+    def test_rollback_live_migration_destination_cleans_profile_last(
+            self, cleanup_shares):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        profile = self.client.profiles.get.return_value
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver.cleanup = mock.Mock()
+
+        incus_driver.rollback_live_migration_at_destination(
+            ctx, instance, mock.sentinel.network_info,
+            {'block_device_mapping': []}, destroy_disks=False)
+
+        cleanup_shares.assert_called_once_with(profile, instance)
+        incus_driver.cleanup.assert_called_once_with(
+            ctx, instance, mock.sentinel.network_info,
+            destroy_disks=False, destroy_vifs=True)
+        profile.delete.assert_not_called()
 
     def test_confirm_migration(self):
         ctx = context.get_admin_context()
@@ -4686,6 +5153,86 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             timeout=-1, force=True, wait=True)
         container.delete.assert_called_once_with(wait=True)
 
+    def test_post_live_migration_accepts_concurrent_source_stop(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        response = mock.Mock(status_code=400)
+        response.json.return_value = {
+            'error': 'The instance is already stopped'}
+        container = mock.Mock(status='Running')
+        container.stop.side_effect = incuscore_exceptions.LXDAPIException(
+            response)
+        self.client.instances.get.return_value = container
+
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.post_live_migration(ctx, instance, None)
+
+        container.stop.assert_called_once_with(
+            timeout=-1, force=True, wait=True)
+        container.delete.assert_called_once_with(wait=True)
+
+    def test_post_live_migration_rejects_other_source_stop_error(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        response = mock.Mock(status_code=500)
+        response.json.return_value = {'error': 'storage unavailable'}
+        container = mock.Mock(status='Running')
+        container.stop.side_effect = incuscore_exceptions.LXDAPIException(
+            response)
+        self.client.instances.get.return_value = container
+
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaises(
+            incuscore_exceptions.LXDAPIException,
+            incus_driver.post_live_migration, ctx, instance, None)
+
+        container.delete.assert_not_called()
+
+    def test_post_live_migration_disconnects_source_data_volumes(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        container = mock.Mock(status='Stopped')
+        self.client.instances.get.return_value = container
+        root_connection = {
+            'driver_volume_type': 'rbd',
+            'serial': 'root-volume',
+            'data': {'volume_id': 'root-volume'},
+        }
+        data_connection = {
+            'driver_volume_type': 'rbd',
+            'serial': 'data-volume',
+            'data': {'volume_id': 'data-volume'},
+        }
+        block_device_info = {'block_device_mapping': [
+            {
+                'boot_index': 0,
+                'connection_info': root_connection,
+                'mount_device': '/dev/sda',
+            },
+            {
+                'boot_index': None,
+                'connection_info': data_connection,
+                'mount_device': '/dev/sdb',
+            },
+        ]}
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver.detach_volume = mock.Mock()
+
+        incus_driver.post_live_migration(
+            ctx, instance, block_device_info)
+
+        container.delete.assert_called_once_with(wait=True)
+        incus_driver.detach_volume.assert_called_once_with(
+            ctx, data_connection, instance, '/dev/sdb')
+
     def test_post_live_migration_at_source(self):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
@@ -4701,6 +5248,5 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         incus_driver.post_live_migration_at_source(
             ctx, instance, network_info)
 
-        profile.delete.assert_called_once_with()
         incus_driver.cleanup.assert_called_once_with(
             ctx, instance, network_info)

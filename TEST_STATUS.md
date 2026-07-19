@@ -866,3 +866,39 @@ hardening.
   checkpointed. BFV, Manila shares, privileged containers, config drives,
   encrypted/read-only/multiattach volumes, and unsupported extra devices
   remain rejected.
+
+## 2026-07-19 complete live-migration matrix
+
+- The earlier BFV and Manila rejection statement above is historical. The
+  current driver supports shared-Ceph BFV roots, Nova-managed Cinder data
+  volumes, and active Manila mounts during conditional CRIU live migration.
+- ``tools/openstack-incus-live-migration-matrix.sh`` passed all eight
+  local/BFV-root, absent/present Cinder-data-volume, and absent/present
+  Manila-share combinations. Every case completed
+  ``node01 -> node02 -> node03 -> node01``, preserved the guest PID and
+  increasing counter, moved the Neutron/OVN owner, preserved root/data/share
+  contents, and restored the Nova and Cinder inventories to their baselines.
+- The strict maximum case used a BFV root, two Cinder data volumes, and a
+  Manila share. A target-side CRIU restore failure was injected and observed
+  in the target Incus log; Nova restored the running source with the same PID
+  and advancing counter, removed target RBD/share/OVS ownership, and an
+  immediate retry then succeeded.
+- The retry exposed an optional CRIU pre-dump failure. Incus revision
+  ``80ba579c257e034d049d855b9173e06c73aa7e09`` now ends pre-copy cleanly and
+  falls back to a full final checkpoint. The focused Go driver package test,
+  all 308 Python tests (306 passed and two documented legacy suites skipped),
+  flake8, capability JSON validation, targeted ShellCheck, and
+  warning-as-error Sphinx build passed.
+- GHCR image
+  ``ghcr.io/fivetime/incus@sha256:25b57d845276773ca219ae3f9dc0e0da3db7262dc0f2308d53c7fb9b7ac48088``
+  embeds that exact Incus revision. All three computes run the immutable
+  digest and independently passed the production preflight, including Incus
+  7.2, GNU tar ``--no-unquote``, migration extensions, Ceph, Manila,
+  AppArmor, cgroups, admission, TLS, dedicated control filesystems, and Nova
+  service checks.
+- The final independent residual audit found no Nova servers, Cinder volumes,
+  compute Neutron ports, Placement allocations, Incus instances/profiles,
+  KRBD mappings, Manila staging mounts, or OVS tap interfaces. Historical
+  resources without a Nova, Neutron, or Cinder owner, including one final
+  orphaned OVS veth pair on node01, were identified and removed before the
+  clean audit.
