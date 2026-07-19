@@ -222,14 +222,16 @@ else
 fi
 trust_json=$(podman exec "$INCUS_CONTAINER" incus config trust list \
     --format json 2>/dev/null)
-if jq -e --arg project "$PREFLIGHT_PROJECT" \
+if jq -e --arg preflight_project "$PREFLIGHT_PROJECT" \
         'length > 0 and all(.[];
-         .restricted == true and .projects == [$project])' \
+         .restricted == true and
+         (.projects == [$preflight_project] or .projects == ["nova"]))' \
         <<<"$trust_json" >/dev/null; then
-    pass "Incus TLS client restrictions" "$PREFLIGHT_PROJECT only"
+    pass "Incus TLS client restrictions" \
+        "restricted to nova or $PREFLIGHT_PROJECT"
 else
     fail "Incus TLS client restrictions" \
-        "every trusted client must be restricted to $PREFLIGHT_PROJECT"
+        "every trusted client must be restricted to nova or $PREFLIGHT_PROJECT"
 fi
 project_json=$(podman exec "$INCUS_CONTAINER" incus query \
     "/1.0/projects/$PREFLIGHT_PROJECT" 2>/dev/null)
