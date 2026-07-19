@@ -843,13 +843,26 @@ hardening.
   migration URL construction, isolated idmap propagation, source force-stop,
   failure recovery, and normal power-on behavior. ``bash -n``,
   ``py_compile``, and ``git diff --check`` also passed.
-- The complete focused Python 3.12 regression subsequently passed all 216
+- The complete focused Python 3.12 regression subsequently passed all 217
   Incus client, flavor, and driver tests. All three compute hosts reported no
   host-installed CRIU binary, while the identical outer image exposed CRIU
   4.2 at ``/usr/local/sbin/criu``. A missing-destination-CRIU pre-check kept
   source PID ``644`` running with counter progress from ``3`` to ``13`` and
   left no target instance, profile, or OVS interface.
+- Incus-managed rootfs plus one Cinder Ceph data volume passed native Nova
+  live migration from ``incus-node-01`` to ``incus-node-02`` and from
+  ``incus-node-02`` to ``incus-node-03``. Both runs preserved guest PID
+  ``644``, advanced the process counter, recreated the destination os-brick
+  mapping, preserved a raw-block marker, moved the Cinder attachment and
+  Neutron binding, and cleaned the server, volume, Incus, RBD, OVS, Neutron,
+  and Placement resources.
+- Removing the destination Cinder CephX keyring forced destination volume
+  preparation to fail. The source remained ``ACTIVE`` on ``incus-node-02``;
+  its counter advanced, raw-block marker remained intact, and its sole Cinder
+  attachment remained authoritative. The corrected rollback left no target
+  instance, profile, RBD mapping, or OVS interface.
 - Support remains opt-in and best-effort. Passing pre-checks proves compatible
   infrastructure, not that every tenant process or external resource can be
-  checkpointed. BFV, attached Cinder volumes, Manila shares, privileged
-  containers, config drives, and unsupported extra devices remain rejected.
+  checkpointed. BFV, Manila shares, privileged containers, config drives,
+  encrypted/read-only/multiattach volumes, and unsupported extra devices
+  remain rejected.

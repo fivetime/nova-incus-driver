@@ -4195,6 +4195,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         }
         self.client.profiles.get.return_value = profile
         self.client.instances.get.return_value.status = 'Running'
+        self.client.instances.get.return_value.config = {
+            'volatile.idmap.base': '1065536'}
         data = migrate_data.IncusLiveMigrateData(
             destination_address='https://192.0.2.20:8443',
             destination_architecture='x86_64',
@@ -4207,8 +4209,12 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             ctx, instance, data, {'block_device_mapping': []})
 
         self.assertIs(data, result)
+        source_profile = jsonutils.loads(result.source_profile)
+        self.assertEqual('1065536',
+                         source_profile['config']['security.idmap.base'])
+        self.assertEqual(profile.devices, source_profile['devices'])
 
-    def test_check_can_live_migrate_source_rejects_cinder_volume(self):
+    def test_check_can_live_migrate_source_rejects_bfv_root(self):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', config_drive=False)
@@ -4223,10 +4229,56 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         incus_driver.init_host(None)
 
         self.assertRaisesRegex(
-            exception.MigrationPreCheckError, 'Cinder volumes',
+            exception.MigrationPreCheckError, 'boot-from-volume',
             incus_driver.check_can_live_migrate_source,
             ctx, instance, data,
-            {'block_device_mapping': [{'mount_device': '/dev/vdb'}]})
+            {'block_device_mapping': [{
+                'boot_index': 0,
+                'mount_device': '/dev/vda',
+            }]})
+
+    def test_check_can_live_migrate_source_accepts_cinder_data_volume(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', config_drive=False)
+        instance.config_drive = ''
+        self.CONF.incus.allow_live_migration = True
+        profile = mock.Mock(
+            config={'migration.stateful': 'true'},
+            devices={
+                'root': {'type': 'disk', 'path': '/'},
+                'volume-id': {
+                    'type': 'unix-block',
+                    'path': '/dev/vdb',
+                    'source': '/dev/rbd0',
+                },
+            })
+        container = self.client.instances.get.return_value
+        container.status = 'Running'
+        container.config = {'volatile.idmap.base': '1065536'}
+        self.client.profiles.get.return_value = profile
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            destination_architecture='x86_64',
+            destination_kernel_version='6.8.0-test',
+            destination_server_version='7.2')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        result = incus_driver.check_can_live_migrate_source(
+            ctx, instance, data, {'block_device_mapping': [{
+                'boot_index': None,
+                'mount_device': '/dev/vdb',
+                'connection_info': {
+                    'serial': 'volume-id',
+                    'driver_volume_type': 'rbd',
+                    'data': {},
+                },
+            }]})
+
+        source_profile = jsonutils.loads(result.source_profile)
+        self.assertNotIn('volume-id', source_profile['devices'])
+        self.assertIn('root', source_profile['devices'])
 
     def test_check_can_live_migrate_source_rejects_kernel_mismatch(self):
         ctx = context.get_admin_context()
@@ -4252,24 +4304,109 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             incus_driver.check_can_live_migrate_source,
             ctx, instance, data, {'block_device_mapping': []})
 
-    def test_pre_live_migration_returns_data_without_creating_profile(self):
+    @mock.patch.object(driver.IncusDriver, 'attach_volume')
+    def test_pre_live_migration_creates_profile_and_attaches_data_volume(
+            self, attach_volume):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         data = migrate_data.IncusLiveMigrateData(
             destination_address='https://192.0.2.20:8443',
             destination_architecture='x86_64',
             destination_kernel_version='6.8.0-test',
-            destination_server_version='7.2')
+            destination_server_version='7.2',
+            source_profile=jsonutils.dumps({
+                'config': {
+                    'migration.stateful': 'true',
+                    'security.idmap.base': '1065536',
+                },
+                'devices': {'root': {'type': 'disk', 'path': '/'}},
+            }))
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
+        connection_info = {
+            'serial': 'volume-id',
+            'driver_volume_type': 'rbd',
+            'data': {},
+        }
 
         result = incus_driver.pre_live_migration(
-            ctx, instance, {}, [mock.sentinel.vif], None, data)
+            ctx, instance, {'block_device_mapping': [{
+                'boot_index': None,
+                'mount_device': '/dev/vdb',
+                'connection_info': connection_info,
+            }]}, [mock.sentinel.vif], None, data)
 
         self.assertIs(data, result)
         self.vif_driver.plug.assert_called_once_with(
             instance, mock.sentinel.vif)
-        self.client.profiles.create.assert_not_called()
+        self.client.profiles.create.assert_called_once_with(
+            instance.name,
+            {
+                'migration.stateful': 'true',
+                'security.idmap.base': '1065536',
+            },
+            {'root': {'type': 'disk', 'path': '/'}})
+        attach_volume.assert_called_once_with(
+            ctx, connection_info, instance, '/dev/vdb')
+
+    @mock.patch.object(driver.IncusDriver, 'unplug_vifs')
+    @mock.patch.object(driver.IncusDriver, 'attach_volume')
+    def test_pre_live_migration_failure_removes_profile_and_network(
+            self, attach_volume, unplug_vifs):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            destination_architecture='x86_64',
+            destination_kernel_version='6.8.0-test',
+            destination_server_version='7.2',
+            source_profile=jsonutils.dumps({
+                'config': {'migration.stateful': 'true'},
+                'devices': {'root': {'type': 'disk', 'path': '/'}},
+            }))
+        connection_info = {
+            'serial': 'volume-id',
+            'driver_volume_type': 'rbd',
+            'data': {},
+        }
+        attach_volume.side_effect = RuntimeError('connect failed')
+        profile = self.client.profiles.get.return_value
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaisesRegex(
+            RuntimeError, 'connect failed',
+            incus_driver.pre_live_migration,
+            ctx, instance, {'block_device_mapping': [{
+                'boot_index': None,
+                'mount_device': '/dev/vdb',
+                'connection_info': connection_info,
+            }]}, [mock.sentinel.vif], None, data)
+
+        profile.delete.assert_called_once_with()
+        unplug_vifs.assert_called_once_with(
+            instance, [mock.sentinel.vif])
+        self.assertIs(
+            True,
+            connection_info['data'][driver._PRE_LIVE_DISCONNECTED_KEY])
+
+    def test_detach_volume_skips_pre_live_double_disconnect(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        connection_info = {
+            'serial': 'volume-id',
+            'driver_volume_type': 'rbd',
+            'data': {driver._PRE_LIVE_DISCONNECTED_KEY: True},
+        }
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.detach_volume(
+            ctx, connection_info, instance, '/dev/vdb')
+
+        self.client.profiles.get.assert_not_called()
+        self.assertNotIn(
+            driver._PRE_LIVE_DISCONNECTED_KEY, connection_info['data'])
 
     def test_migration_operation_url_uses_public_endpoint(self):
         result = driver._migration_operation_url(
@@ -4339,6 +4476,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         profile.devices = {'root': {'type': 'disk', 'path': '/'}}
         self.client.profiles.get.return_value = profile
         remote = get_remote.return_value
+        remote.profiles.get.side_effect = incuscore_exceptions.NotFound(
+            MockResponse(404))
         post = mock.Mock()
         recover = mock.Mock()
         data = migrate_data.IncusLiveMigrateData(
@@ -4402,6 +4541,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         profile.devices = {'root': {'type': 'disk', 'path': '/'}}
         self.client.profiles.get.return_value = profile
         remote = get_remote.return_value
+        remote.profiles.get.side_effect = incuscore_exceptions.NotFound(
+            MockResponse(404))
         remote.instances.create.side_effect = RuntimeError('restore failed')
         post = mock.Mock()
         recover = mock.Mock()

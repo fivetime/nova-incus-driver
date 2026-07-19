@@ -17,12 +17,18 @@ SERVER=${SERVER:-incus-live-migration-e2e-$RANDOM}
 TIMEOUT=${TIMEOUT:-300}
 INCUS_PROJECT=${INCUS_PROJECT:-nova}
 KEEP_FAILED=${KEEP_FAILED:-0}
+WITH_DATA_VOLUME=${WITH_DATA_VOLUME:-0}
+DATA_VOLUME_TYPE=${DATA_VOLUME_TYPE:-ceph}
+DATA_VOLUME_SIZE=${DATA_VOLUME_SIZE:-1}
+DATA_DEVICE=${DATA_DEVICE:-/dev/vdb}
 
 SSH=(ssh -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=no)
 server_id=
 instance_name=
 port_id=
 user_data=
+volume_id=
+volume_marker="INCUS_LIVE_VOLUME_${RANDOM}_$(date +%s)"
 
 remote() {
     local host=$1
@@ -138,6 +144,9 @@ cleanup() {
     if [[ -n "$server_id" ]]; then
         openstack server delete --wait "$server_id" >/dev/null 2>&1 || true
     fi
+    if [[ -n "$volume_id" ]]; then
+        openstack volume delete "$volume_id" >/dev/null 2>&1 || true
+    fi
     if [[ -n "$instance_name" ]]; then
         incus_remote "$SOURCE_SSH" delete "$instance_name" --force \
             >/dev/null 2>&1 || true
@@ -211,6 +220,42 @@ until incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
     sleep 2
 done
 
+if [[ "$WITH_DATA_VOLUME" == "1" ]]; then
+    volume_id=$(openstack volume create \
+        --type "$DATA_VOLUME_TYPE" --size "$DATA_VOLUME_SIZE" \
+        -f value -c id "${SERVER}-data")
+    openstack server add volume --device "$DATA_DEVICE" \
+        "$server_id" "$volume_id"
+    deadline=$((SECONDS + TIMEOUT))
+    until [[ "$(openstack volume show "$volume_id" -f value -c status)" == \
+            "in-use" ]]; do
+        ((SECONDS < deadline)) || {
+            echo "Cinder data volume attachment timed out" >&2
+            exit 1
+        }
+        sleep 2
+    done
+    # Nova may normalize the requested virtio-style name to its canonical
+    # SCSI BDM name. Always use the attachment record as the authority.
+    DATA_DEVICE=$(openstack server volume list "$server_id" -f json |
+        python3 -c 'import json,sys
+volume_id=sys.argv[1]
+rows=json.load(sys.stdin)
+print(next(row["Device"] for row in rows
+           if row["Volume ID"] == volume_id))' "$volume_id")
+    until incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
+            test -b "$DATA_DEVICE"; do
+        ((SECONDS < deadline)) || {
+            echo "Cinder data device did not appear in the container" >&2
+            exit 1
+        }
+        sleep 2
+    done
+    printf '%s' "$volume_marker" |
+        incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
+            dd of="$DATA_DEVICE" bs=1 conv=fsync status=none
+fi
+
 source_pid=$(incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
     cat /run/criu-counter.pid)
 source_counter=$(incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
@@ -238,6 +283,20 @@ later_counter=$(incus_remote "$DEST_SSH" exec "$instance_name" -- \
     cat /root/criu-counter)
 ((later_counter > dest_counter))
 
+if [[ "$WITH_DATA_VOLUME" == "1" ]]; then
+    [[ "$(openstack volume show "$volume_id" -f value -c status)" == \
+        "in-use" ]]
+    incus_remote "$DEST_SSH" exec "$instance_name" -- \
+        test -b "$DATA_DEVICE"
+    restored_marker=$(incus_remote "$DEST_SSH" exec "$instance_name" -- \
+        dd if="$DATA_DEVICE" bs=1 count="${#volume_marker}" status=none)
+    [[ "$restored_marker" == "$volume_marker" ]]
+    target_volume_source=$(incus_remote "$DEST_SSH" profile device get \
+        "$instance_name" "$volume_id" source)
+    [[ "$target_volume_source" == /dev/* ]]
+    remote "$DEST_SSH" test -b "$target_volume_source"
+fi
+
 guest_iface=$(incus_remote "$DEST_SSH" config get "$instance_name" \
     "volatile.tap${port_id:0:11}.name")
 [[ -n "$guest_iface" ]]
@@ -258,10 +317,22 @@ assert_no_ovs_port "$SOURCE_SSH"
 trap - EXIT
 rm -f "$user_data"
 openstack server delete --wait "$server_id"
+if [[ -n "$volume_id" ]]; then
+    deadline=$((SECONDS + TIMEOUT))
+    until [[ "$(openstack volume show "$volume_id" -f value -c status)" == \
+            "available" ]]; do
+        ((SECONDS < deadline)) || {
+            echo "Cinder data volume did not detach after server delete" >&2
+            exit 1
+        }
+        sleep 2
+    done
+    openstack volume delete "$volume_id"
+fi
 ! incus_remote "$SOURCE_SSH" info "$instance_name" >/dev/null 2>&1
 ! incus_remote "$DEST_SSH" info "$instance_name" >/dev/null 2>&1
 ! openstack port show "$port_id" >/dev/null 2>&1
 assert_no_ovs_port "$SOURCE_SSH"
 assert_no_ovs_port "$DEST_SSH"
 
-echo "PASS server=$server_id instance=$instance_name ip=$fixed_ip pid=$source_pid counter=$source_counter->$later_counter"
+echo "PASS server=$server_id instance=$instance_name ip=$fixed_ip pid=$source_pid counter=$source_counter->$later_counter volume=${volume_id:-none}"

@@ -868,10 +868,19 @@ new instance profiles to use Incus's shifted on-disk rootfs layout, because
 CRIU restore cannot recreate a detached idmapped root mount. Existing
 instances must be stopped and converted before they can pass pre-checks.
 
-The first implementation rejects boot-from-volume, every attached Cinder
-volume, config drives, Manila shares, extra disk or unix-block devices,
-privileged containers, block migration, and mismatched architecture, kernel,
-or Incus versions. CRIU support remains workload-dependent. Containers with
+Boot-from-volume, config drives, Manila shares, privileged containers, block
+migration, and extra disk devices that are not Nova-managed Cinder data
+volumes remain rejected. Nova-managed Cinder data volumes use Nova's native
+temporary destination attachment and a destination-local os-brick mapping.
+The source profile's host-specific ``unix-block source`` paths are excluded
+from migration data and rebuilt from the destination connection information.
+Successful migration disconnects the source mapping after CRIU restore.
+Destination preparation failure atomically removes its mappings, Incus
+profile, VIFs, and firewall state before Nova restores the source attachment.
+Encrypted, read-only, and multiattach volumes remain unsupported.
+
+Mismatched architecture, kernel, or Incus versions are rejected. CRIU support
+remains workload-dependent. Containers with
 complex systemd services, external sockets, unsupported kernel resources, or
 processes created through a host-side ``incus exec`` session may fail their
 checkpoint. Failure is recoverable, but successful migration is never

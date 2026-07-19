@@ -15,17 +15,26 @@
 from nova.objects import base as obj_base
 from nova.objects import fields
 from nova.objects import migrate_data
+from oslo_utils import versionutils
 
 
 @obj_base.NovaObjectRegistry.register
 class IncusLiveMigrateData(migrate_data.LiveMigrateData):
     """Incus destination facts carried through Nova's migration RPCs."""
 
-    VERSION = '1.0'
+    VERSION = '1.1'
 
     fields = {
         'destination_address': fields.StringField(),
         'destination_architecture': fields.StringField(),
         'destination_kernel_version': fields.StringField(),
         'destination_server_version': fields.StringField(),
+        # JSON keeps the nested Incus device mapping opaque to Nova objects
+        # while carrying the exact source profile into destination preflight.
+        'source_profile': fields.StringField(nullable=True),
     }
+
+    def obj_make_compatible(self, primitive, target_version):
+        super().obj_make_compatible(primitive, target_version)
+        if versionutils.convert_version_to_tuple(target_version) < (1, 1):
+            primitive.pop('source_profile', None)

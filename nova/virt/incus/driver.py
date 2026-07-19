@@ -91,6 +91,7 @@ INCUS_SWAP_TRAIT = 'CUSTOM_INCUS_SWAP'
 INCUS_MANILA_SHARE_TRAIT = 'CUSTOM_INCUS_MANILA_SHARE'
 INCUS_STATEFUL_MIGRATION_EXTENSION = 'migration_stateful_shifted_root'
 MIGRATION_RECOVERY_KEY = 'user.openstack.recovery_required'
+_PRE_LIVE_DISCONNECTED_KEY = 'incus_pre_live_disconnected'
 BASE_DIR = os.path.join(
     CONF.instances_path, CONF.image_cache.subdirectory_name)
 
@@ -364,7 +365,7 @@ def _live_migration_profile_check(client, instance):
         device_type = device.get('type')
         if name == 'root' and device_type == 'disk':
             continue
-        if device_type in ('nic', 'none'):
+        if device_type in ('nic', 'none', 'unix-block'):
             continue
         unsupported.append('%s:%s' % (name, device_type or 'unknown'))
     if unsupported:
@@ -372,6 +373,31 @@ def _live_migration_profile_check(client, instance):
             reason='Incus live migration does not support profile devices: '
             '%s' % ', '.join(sorted(unsupported)))
     return profile
+
+
+def _validate_live_migration_data_volumes(profile, block_device_info):
+    """Require each unix-block profile device to match one Nova data BDM."""
+    expected = {}
+    for bdm in driver.block_device_info_get_mapping(block_device_info):
+        if _is_boot_volume(bdm):
+            continue
+        connection_info = bdm.get('connection_info')
+        mountpoint = bdm.get('mount_device')
+        if not connection_info or not mountpoint:
+            raise exception.MigrationPreCheckError(
+                reason='Cinder data volume migration requires complete '
+                'connection information and a mount device')
+        expected[_volume_id(connection_info)] = mountpoint
+
+    actual = {
+        name: device.get('path')
+        for name, device in profile.devices.items()
+        if device.get('type') == 'unix-block'
+    }
+    if actual != expected:
+        raise exception.MigrationPreCheckError(
+            reason='Incus unix-block devices do not match Nova Cinder data '
+            'volume mappings')
 
 
 def _migration_host_facts(client):
@@ -453,6 +479,33 @@ def _stateful_migration_profile_config(container, profile):
     # daemon and shift the checkpoint files to IDs that CRIU cannot access.
     config['security.idmap.base'] = str(idmap_base_value)
     return config
+
+
+def _live_migration_source_profile(container, profile):
+    """Serialize the source profile without host-specific block paths."""
+    devices = copy.deepcopy(profile.devices)
+    for name, device in list(devices.items()):
+        if device.get('type') == 'unix-block':
+            devices.pop(name)
+
+    return jsonutils.dumps({
+        'config': _stateful_migration_profile_config(container, profile),
+        'devices': devices,
+    })
+
+
+def _live_migration_profile_data(migrate_data):
+    try:
+        data = jsonutils.loads(migrate_data.source_profile)
+        config = data['config']
+        devices = data['devices']
+    except (AttributeError, KeyError, TypeError, ValueError):
+        raise exception.MigrationError(
+            reason='Missing or invalid Incus source profile migration data')
+    if not isinstance(config, dict) or not isinstance(devices, dict):
+        raise exception.MigrationError(
+            reason='Invalid Incus source profile migration data')
+    return config, devices
 
 
 def _volume_device_info_key(volume_id):
@@ -2122,6 +2175,13 @@ class IncusDriver(driver.ComputeDriver):
         See `nova.virt.driver.Computedriver.detach_volume` for
         more information.
         """
+        data = connection_info.get('data') or {}
+        if data.pop(_PRE_LIVE_DISCONNECTED_KEY, False):
+            # Destination pre-live cleanup already disconnected this mapping.
+            # ComputeManager intentionally calls driver_detach once more while
+            # rolling back its temporary Cinder attachment.
+            return
+
         try:
             profile = self.client.profiles.get(instance.name)
         except incus_exceptions.NotFound:
@@ -3060,20 +3120,81 @@ class IncusDriver(driver.ComputeDriver):
 
     def pre_live_migration(self, context, instance, block_device_info,
                            network_info, disk_info, migrate_data):
-        for vif in network_info:
-            self.vif_driver.plug(instance, vif)
-        self.firewall_driver.setup_basic_filtering(
-            instance, network_info)
-        self.firewall_driver.prepare_instance_filter(
-            instance, network_info)
-        self.firewall_driver.apply_instance_filter(
-            instance, network_info)
+        if not isinstance(
+                migrate_data, incus_migrate_data.IncusLiveMigrateData):
+            raise exception.MigrationError(
+                reason='Missing Incus live migration destination data')
 
-        # Nova only has built-in destination cleanup flags for its in-tree
-        # Libvirt and Hyper-V migrate-data objects. Creating the Incus profile
-        # here would leak it if Nova fails after this method returns but before
-        # it invokes live_migration(). Defer profile creation to the source
-        # driver's guarded migration transaction.
+        config, devices = _live_migration_profile_data(migrate_data)
+        try:
+            self.client.profiles.create(instance.name, config, devices)
+        except incus_exceptions.LXDAPIException as exc:
+            if exc.response.status_code != 409:
+                raise
+            raise exception.DestinationDiskExists(path=instance.name)
+
+        prepared_volumes = []
+        try:
+            for vif in network_info:
+                self.vif_driver.plug(instance, vif)
+            self.firewall_driver.setup_basic_filtering(
+                instance, network_info)
+            self.firewall_driver.prepare_instance_filter(
+                instance, network_info)
+            self.firewall_driver.apply_instance_filter(
+                instance, network_info)
+
+            for bdm in driver.block_device_info_get_mapping(
+                    block_device_info):
+                if _is_boot_volume(bdm):
+                    # BFV live handover needs a separate root ownership
+                    # protocol.
+                    raise exception.MigrationPreCheckError(
+                        reason='Incus CRIU live migration does not yet '
+                        'support Cinder boot-from-volume')
+                connection_info = bdm.get('connection_info')
+                mountpoint = bdm.get('mount_device')
+                if connection_info and mountpoint:
+                    self.attach_volume(
+                        context, connection_info, instance, mountpoint)
+                    prepared_volumes.append((connection_info, mountpoint))
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                for connection_info, mountpoint in reversed(
+                        prepared_volumes):
+                    try:
+                        self.detach_volume(
+                            context, connection_info, instance, mountpoint)
+                    except Exception:
+                        LOG.exception(
+                            'Failed to roll back a destination Cinder '
+                            'connection during pre-live migration',
+                            instance=instance)
+                    finally:
+                        connection_info.setdefault(
+                            'data', {})[_PRE_LIVE_DISCONNECTED_KEY] = True
+                # attach_volume rolls back its own partially connected device.
+                # Mark every remaining destination BDM so Nova's mandatory
+                # second driver_detach is idempotent too.
+                for bdm in driver.block_device_info_get_mapping(
+                        block_device_info):
+                    connection_info = bdm.get('connection_info')
+                    if connection_info:
+                        connection_info.setdefault(
+                            'data', {})[_PRE_LIVE_DISCONNECTED_KEY] = True
+                try:
+                    self.client.profiles.get(instance.name).delete()
+                except incus_exceptions.NotFound:
+                    pass
+                try:
+                    self.unplug_vifs(instance, network_info)
+                    self.firewall_driver.unfilter_instance(
+                        instance, network_info)
+                except Exception:
+                    LOG.exception(
+                        'Failed to roll back destination networking during '
+                        'pre-live migration', instance=instance)
+
         return migrate_data
 
     def live_migration(self, context, instance, dest,
@@ -3092,12 +3213,15 @@ class IncusDriver(driver.ComputeDriver):
         remote_profile_created = False
         try:
             remote = _migration_client(migrate_data.destination_address)
-            profile = self.client.profiles.get(instance.name)
-            remote.profiles.create(
-                instance.name,
-                _stateful_migration_profile_config(container, profile),
-                copy.deepcopy(profile.devices))
-            remote_profile_created = True
+            try:
+                remote.profiles.get(instance.name)
+            except incus_exceptions.NotFound:
+                profile = self.client.profiles.get(instance.name)
+                remote.profiles.create(
+                    instance.name,
+                    _stateful_migration_profile_config(container, profile),
+                    copy.deepcopy(profile.devices))
+                remote_profile_created = True
 
             migration_data = container.generate_migration_data(live=True)
             migration_data.pop('default', None)
@@ -3209,14 +3333,17 @@ class IncusDriver(driver.ComputeDriver):
         if instance.config_drive:
             raise exception.MigrationPreCheckError(
                 reason='Incus live migration does not support config drives')
-        if driver.block_device_info_get_mapping(block_device_info):
+        root_bdm = _boot_from_volume(block_device_info)
+        if root_bdm is not None:
             raise exception.MigrationPreCheckError(
-                reason='Incus live migration does not support Cinder '
-                'volumes')
+                reason='Incus CRIU live migration does not yet support '
+                'Cinder boot-from-volume')
 
         _require_stateful_migration_extension(self.client)
         _live_migration_profile_check(self.client, instance)
         container = self.client.instances.get(instance.name)
+        profile = self.client.profiles.get(instance.name)
+        _validate_live_migration_data_volumes(profile, block_device_info)
         if container.status != 'Running':
             raise exception.MigrationPreCheckError(
                 reason='Incus CRIU live migration requires a running '
@@ -3239,6 +3366,8 @@ class IncusDriver(driver.ComputeDriver):
             raise exception.MigrationPreCheckError(
                 reason='Incus CRIU migration host mismatch: %s' %
                 '; '.join(incompatible))
+        dest_check_data.source_profile = _live_migration_source_profile(
+            container, profile)
         return dest_check_data
 
     #
