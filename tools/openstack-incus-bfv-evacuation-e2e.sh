@@ -82,6 +82,11 @@ source_reachable() {
     remote "$SOURCE_SSH" true >/dev/null 2>&1
 }
 
+source_incus_ready() {
+    remote "$SOURCE_SSH" \
+        "podman exec incus incus query /1.0 >/dev/null 2>&1"
+}
+
 control_plane_is_independent() {
     local endpoint host address source_address=${SOURCE_SSH#*@}
     local -A source_addresses=()
@@ -286,6 +291,7 @@ fi
 
 "$FENCE_PROVIDER" on "$SOURCE_FENCE_ID"
 wait_for "returning source SSH" source_reachable
+wait_for "returning source Incus daemon" source_incus_ready
 remote "$SOURCE_SSH" \
     "test ! -e /run/openstack-incus/compute-admitted"
 remote "$SOURCE_SSH" \
@@ -305,7 +311,7 @@ CONTROLLER_SSH="$CONTROLLER_SSH" \
 CONTROLLER_OPENRC="$CONTROLLER_OPENRC" \
 SSH_IDENTITY="$SSH_IDENTITY" \
 CINDER_RBD_POOL="$CINDER_RBD_POOL" \
-    "$RETURN_AUDIT"
+    bash "$RETURN_AUDIT"
 
 remote "$SOURCE_SSH" \
     "/usr/local/sbin/openstack-incus-compute-admission admit \
