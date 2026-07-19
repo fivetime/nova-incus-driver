@@ -397,31 +397,62 @@ def _require_stateful_migration_extension(client):
             INCUS_STATEFUL_MIGRATION_EXTENSION)
 
 
-def _migration_operation_url(operation_url, migration_address, project):
+def _migration_operation_url(operation_url, migration_address):
     """Expose a local Incus migration operation on its remote endpoint."""
     operation = parse.urlsplit(operation_url)
     address = _validated_migration_address(migration_address)
-    query = dict(parse.parse_qsl(operation.query, keep_blank_values=True))
-    query['project'] = project
     return parse.urlunsplit((
         address.scheme,
         address.netloc,
         operation.path,
-        parse.urlencode(query),
+        '',
         '',
     ))
+
+
+def _delete_migration_target_resource(
+        remote, collection, name, project, wait=False):
+    """Delete a remote resource without losing the client's project scope."""
+    manager = getattr(remote, collection)
+    manager.get(name)
+    response = getattr(remote.api, collection)[name].delete(
+        params={'project': project})
+    if wait:
+        remote.operations.wait_for_operation(response.json()['operation'])
 
 
 def _remove_live_migration_target(remote, instance):
     """Remove target artifacts after a failed destination create."""
     try:
-        remote.instances.get(instance.name).delete(wait=True)
+        _delete_migration_target_resource(
+            remote, 'instances', instance.name, CONF.incus.project, wait=True)
     except incus_exceptions.NotFound:
         pass
     try:
-        remote.profiles.get(instance.name).delete()
+        _delete_migration_target_resource(
+            remote, 'profiles', instance.name, CONF.incus.project)
     except incus_exceptions.NotFound:
         pass
+
+
+def _stateful_migration_profile_config(container, profile):
+    """Copy a profile while pinning the source user namespace mapping."""
+    config = dict(profile.config)
+    idmap_base = container.config.get('volatile.idmap.base')
+    try:
+        idmap_base_value = int(idmap_base)
+    except (TypeError, ValueError):
+        raise exception.MigrationPreCheckError(
+            reason='Source container has no valid isolated idmap base')
+    if idmap_base_value <= 0:
+        raise exception.MigrationPreCheckError(
+            reason='Source container has no valid isolated idmap base')
+
+    # CRIU records the source user namespace IDs in its checkpoint. Incus
+    # would otherwise allocate a new isolated range on the independent target
+    # daemon and shift the checkpoint files to IDs that CRIU cannot access.
+    config['security.idmap.base'] = str(idmap_base_value)
+    return config
 
 
 def _volume_device_info_key(volume_id):
@@ -2261,8 +2292,7 @@ class IncusDriver(driver.ComputeDriver):
             migration_data['profiles'] = [instance.name]
             source = migration_data['source']
             source['operation'] = _migration_operation_url(
-                source['operation'], migration_address,
-                CONF.incus.project)
+                source['operation'], migration_address)
 
             for bdm in driver.block_device_info_get_mapping(
                     block_device_info):
@@ -3065,7 +3095,7 @@ class IncusDriver(driver.ComputeDriver):
             profile = self.client.profiles.get(instance.name)
             remote.profiles.create(
                 instance.name,
-                dict(profile.config),
+                _stateful_migration_profile_config(container, profile),
                 copy.deepcopy(profile.devices))
             remote_profile_created = True
 
@@ -3080,22 +3110,8 @@ class IncusDriver(driver.ComputeDriver):
             # channels while the source waits for the CRIU state channel.
             source['live'] = True
             source['operation'] = _migration_operation_url(
-                source['operation'], CONF.incus.migration_address,
-                CONF.incus.project)
+                source['operation'], CONF.incus.migration_address)
             remote.instances.create(migration_data, wait=True)
-
-            deadline = (
-                timeutils.utcnow_ts() +
-                CONF.incus.live_migration_stop_timeout)
-            while timeutils.utcnow_ts() < deadline:
-                container.sync()
-                if container.status == 'Stopped':
-                    break
-                eventlet.sleep(0.2)
-            else:
-                raise exception.MigrationError(
-                    reason='Destination restored the CRIU checkpoint but '
-                    'the source Incus instance did not stop before timeout')
         except Exception:
             if remote_profile_created:
                 try:

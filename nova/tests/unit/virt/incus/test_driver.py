@@ -3101,7 +3101,10 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
     def test_power_on(self):
         container = mock.Mock()
-        container.status = 'Stopped'
+        # Incus can keep reporting the source record as Running until Nova
+        # performs its post-migration delete. Target restore success is the
+        # authoritative completion signal.
+        container.status = 'Running'
         self.client.instances.get.return_value = container
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
@@ -4272,28 +4275,51 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             instance, mock.sentinel.vif)
         self.client.profiles.create.assert_not_called()
 
-    def test_migration_operation_url_adds_project(self):
+    def test_migration_operation_url_uses_public_endpoint(self):
         result = driver._migration_operation_url(
             'http+unix://incus/1.0/operations/op',
-            'https://192.0.2.10:8443',
-            'nova')
+            'https://192.0.2.10:8443')
 
         self.assertEqual(
-            'https://192.0.2.10:8443/1.0/operations/op?project=nova',
+            'https://192.0.2.10:8443/1.0/operations/op',
             result)
 
-    def test_migration_operation_url_preserves_query_and_replaces_project(
-            self):
+    def test_migration_operation_url_drops_project_query(self):
         result = driver._migration_operation_url(
             'http+unix://incus/1.0/operations/op?target=node-1&'
             'project=default',
-            'https://192.0.2.10:8443',
-            'nova')
+            'https://192.0.2.10:8443')
 
         self.assertEqual(
-            'https://192.0.2.10:8443/1.0/operations/op?'
-            'target=node-1&project=nova',
+            'https://192.0.2.10:8443/1.0/operations/op',
             result)
+
+    def test_delete_migration_target_resource_waits_for_operation(self):
+        remote = mock.MagicMock()
+        response = (
+            remote.api.instances['test'].delete.return_value)
+        response.json.return_value = {
+            'operation': '/1.0/operations/delete-op'}
+
+        driver._delete_migration_target_resource(
+            remote, 'instances', 'test', 'nova', wait=True)
+
+        remote.instances.get.assert_called_once_with('test')
+        remote.api.instances['test'].delete.assert_called_once_with(
+            params={'project': 'nova'})
+        remote.operations.wait_for_operation.assert_called_once_with(
+            '/1.0/operations/delete-op')
+
+    def test_delete_migration_target_profile_does_not_wait(self):
+        remote = mock.MagicMock()
+
+        driver._delete_migration_target_resource(
+            remote, 'profiles', 'test', 'nova')
+
+        remote.profiles.get.assert_called_once_with('test')
+        remote.api.profiles['test'].delete.assert_called_once_with(
+            params={'project': 'nova'})
+        remote.operations.wait_for_operation.assert_not_called()
 
     @mock.patch('nova.virt.incus.driver._migration_client')
     def test_live_migration_restores_target_then_calls_post(self, get_remote):
@@ -4303,6 +4329,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.CONF.incus.project = 'nova'
         container = mock.Mock()
         container.status = 'Stopped'
+        container.config = {'volatile.idmap.base': '1065536'}
         container.generate_migration_data.return_value = {
             'default': ['test'],
             'source': {
@@ -4333,18 +4360,31 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         payload = remote.instances.create.call_args.args[0]
         remote.profiles.create.assert_called_once_with(
             instance.name,
-            {'migration.stateful': 'true'},
+            {
+                'migration.stateful': 'true',
+                'security.idmap.base': '1065536',
+            },
             {'root': {'type': 'disk', 'path': '/'}})
         self.assertEqual([instance.name], payload['profiles'])
         self.assertNotIn('default', payload)
         self.assertIs(True, payload['source']['live'])
         self.assertEqual(
-            'https://192.0.2.10:8443/1.0/operations/op?project=nova',
+            'https://192.0.2.10:8443/1.0/operations/op',
             payload['source']['operation'])
         remote.instances.create.assert_called_once_with(payload, wait=True)
         post.assert_called_once_with(
             ctx, instance, 'destination', False, data)
         recover.assert_not_called()
+
+    def test_stateful_migration_profile_config_requires_idmap_base(self):
+        container = mock.Mock(config={})
+        profile = mock.Mock(config={'migration.stateful': 'true'})
+
+        self.assertRaises(
+            exception.MigrationPreCheckError,
+            driver._stateful_migration_profile_config,
+            container,
+            profile)
 
     @mock.patch('nova.virt.incus.driver._remove_live_migration_target')
     @mock.patch('nova.virt.incus.driver._migration_client')
@@ -4354,6 +4394,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         self.CONF.incus.migration_address = 'https://192.0.2.10:8443'
         container = mock.Mock()
+        container.config = {'volatile.idmap.base': '1065536'}
         container.generate_migration_data.return_value = {
             'source': {
                 'operation': 'http+unix://incus/1.0/operations/op',

@@ -239,8 +239,9 @@ function configure_nova_incus_storage {
             ! incus_cli project show "${INCUS_PROJECT}" >/dev/null 2>&1; then
         incus_cli project create "${INCUS_PROJECT}" \
             -c features.images=false \
-            -c features.profiles=false
+            -c features.profiles=true
     fi
+    incus_cli project set "${INCUS_PROJECT}" features.profiles=true
 
     if [[ -n "${INCUS_BFV_POOL_NAME}" ]]; then
         if ! incus_cli project show \
