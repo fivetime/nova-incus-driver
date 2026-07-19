@@ -4272,18 +4272,42 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             instance, mock.sentinel.vif)
         self.client.profiles.create.assert_not_called()
 
+    def test_migration_operation_url_adds_project(self):
+        result = driver._migration_operation_url(
+            'http+unix://incus/1.0/operations/op',
+            'https://192.0.2.10:8443',
+            'nova')
+
+        self.assertEqual(
+            'https://192.0.2.10:8443/1.0/operations/op?project=nova',
+            result)
+
+    def test_migration_operation_url_preserves_query_and_replaces_project(
+            self):
+        result = driver._migration_operation_url(
+            'http+unix://incus/1.0/operations/op?target=node-1&'
+            'project=default',
+            'https://192.0.2.10:8443',
+            'nova')
+
+        self.assertEqual(
+            'https://192.0.2.10:8443/1.0/operations/op?'
+            'target=node-1&project=nova',
+            result)
+
     @mock.patch('nova.virt.incus.driver._migration_client')
     def test_live_migration_restores_target_then_calls_post(self, get_remote):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         self.CONF.incus.migration_address = 'https://192.0.2.10:8443'
+        self.CONF.incus.project = 'nova'
         container = mock.Mock()
         container.status = 'Stopped'
         container.generate_migration_data.return_value = {
             'default': ['test'],
             'source': {
                 'operation': (
-                    'http+unix://incus/1.0/operations/op?project=nova'),
+                    'http+unix://incus/1.0/operations/op'),
             },
         }
         self.client.instances.get.return_value = container

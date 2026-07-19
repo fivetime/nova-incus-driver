@@ -397,6 +397,21 @@ def _require_stateful_migration_extension(client):
             INCUS_STATEFUL_MIGRATION_EXTENSION)
 
 
+def _migration_operation_url(operation_url, migration_address, project):
+    """Expose a local Incus migration operation on its remote endpoint."""
+    operation = parse.urlsplit(operation_url)
+    address = _validated_migration_address(migration_address)
+    query = dict(parse.parse_qsl(operation.query, keep_blank_values=True))
+    query['project'] = project
+    return parse.urlunsplit((
+        address.scheme,
+        address.netloc,
+        operation.path,
+        parse.urlencode(query),
+        '',
+    ))
+
+
 def _remove_live_migration_target(remote, instance):
     """Remove target artifacts after a failed destination create."""
     try:
@@ -2245,14 +2260,9 @@ class IncusDriver(driver.ComputeDriver):
             migration_data.pop('default', None)
             migration_data['profiles'] = [instance.name]
             source = migration_data['source']
-            operation = parse.urlsplit(source['operation'])
-            source['operation'] = parse.urlunsplit((
-                parsed_address.scheme,
-                parsed_address.netloc,
-                operation.path,
-                operation.query,
-                '',
-            ))
+            source['operation'] = _migration_operation_url(
+                source['operation'], migration_address,
+                CONF.incus.project)
 
             for bdm in driver.block_device_info_get_mapping(
                     block_device_info):
@@ -3063,17 +3073,10 @@ class IncusDriver(driver.ComputeDriver):
             migration_data.pop('default', None)
             migration_data['profiles'] = [instance.name]
 
-            parsed_address = _validated_migration_address(
-                CONF.incus.migration_address)
             source = migration_data['source']
-            operation = parse.urlsplit(source['operation'])
-            source['operation'] = parse.urlunsplit((
-                parsed_address.scheme,
-                parsed_address.netloc,
-                operation.path,
-                operation.query,
-                '',
-            ))
+            source['operation'] = _migration_operation_url(
+                source['operation'], CONF.incus.migration_address,
+                CONF.incus.project)
             remote.instances.create(migration_data, wait=True)
 
             deadline = (

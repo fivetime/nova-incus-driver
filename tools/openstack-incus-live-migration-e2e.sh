@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Validate conditional CRIU live migration through the native Nova API.
 
-set -euo pipefail
+set -Eeuo pipefail
 
 IMAGE=${IMAGE:-alpine-3.21-cloud-incus-criu}
 FLAVOR=${FLAVOR:-ds512M}
@@ -74,6 +74,29 @@ wait_host() {
     return 1
 }
 
+wait_migration() {
+    local deadline=$((SECONDS + TIMEOUT))
+    local status
+    while ((SECONDS < deadline)); do
+        status=$(openstack server migration list --server "$server_id" \
+            -f value -c Status 2>/dev/null | head -n1 || true)
+        case "${status,,}" in
+            completed)
+                return 0
+                ;;
+            failed|error)
+                openstack server migration list --server "$server_id" \
+                    || true
+                echo "Live migration failed (status: $status)" >&2
+                return 1
+                ;;
+        esac
+        sleep 2
+    done
+    echo "Live migration status timed out (current: ${status:-missing})" >&2
+    return 1
+}
+
 assert_no_ovs_port() {
     local host=$1
     ! remote "$host" \
@@ -88,6 +111,15 @@ diagnose() {
         incus_remote "$SOURCE_SSH" info "$instance_name" 2>/dev/null || true
         incus_remote "$DEST_SSH" info "$instance_name" 2>/dev/null || true
     fi
+}
+
+on_error() {
+    local rc=$?
+    local line=$1
+    local command=$2
+    printf 'FAIL rc=%s line=%s command=%s\n' \
+        "$rc" "$line" "$command" >&2
+    return "$rc"
 }
 
 cleanup() {
@@ -111,12 +143,13 @@ cleanup() {
     fi
     return "$rc"
 }
+trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
 for host in "$SOURCE_SSH" "$DEST_SSH"; do
-    incus_remote "$host" query /1.0 |
+    remote "$host" incus query /1.0 |
         grep -q migration_stateful_shifted_root
     remote "$host" "podman exec incus criu check --extra" >/dev/null
 done
@@ -177,11 +210,10 @@ source_counter=$(incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
     cat /root/criu-counter)
 [[ "$source_pid" =~ ^[0-9]+$ ]]
 [[ "$source_counter" =~ ^[0-9]+$ ]]
-incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
-    sh -c "ps -o pid,ppid | grep -Eq '^ *$source_pid +1$'"
 
 openstack server migrate --live-migration --host "$DEST_HOST" \
     --wait "$server_id"
+wait_migration
 wait_status ACTIVE
 wait_host "$DEST_HOST"
 
