@@ -459,8 +459,6 @@ function configure_nova_incus {
             iniset "${nova_target}" incus migration_tls_ca_by_server \
                 "${INCUS_MIGRATION_TLS_CA_BY_SERVER}"
         fi
-        iniset "${nova_target}" incus live_migration_stop_timeout \
-            "${INCUS_LIVE_MIGRATION_STOP_TIMEOUT}"
     done
 
     if is_service_enabled glance; then

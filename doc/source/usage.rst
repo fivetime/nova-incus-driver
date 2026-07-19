@@ -711,10 +711,13 @@ The script verifies bidirectional migration API reachability, rootfs marker
 preservation, fixed-IP retention, confirm source deletion, revert source
 recovery, and final Incus, Neutron port, and OVS interface cleanup.
 
-Live migration is not supported. BFV evacuation is supported only for the
-shared-Ceph BFV workflow with an external STONITH or power fencing system that
-proves the failed source cannot access Ceph. It remains disabled by default so
-a deployment cannot accidentally omit that prerequisite::
+Live migration is documented in the CRIU section below. It is disabled by
+default and remains workload-dependent even after all pre-checks pass.
+
+BFV evacuation is supported only for the shared-Ceph BFV workflow with an
+external STONITH or power fencing system that proves the failed source cannot
+access Ceph. It remains disabled by default so a deployment cannot accidentally
+omit that prerequisite::
 
     [incus]
     allow_bfv_evacuate = true
@@ -885,15 +888,27 @@ and restricted to the ``nova`` project. Do not reuse the read-only
     migration_tls_key = /etc/nova/incus-migration/client.key
     migration_tls_ca = /etc/nova/incus-migration/default-server.crt
     migration_tls_ca_by_server = 192.0.2.10:/etc/nova/incus-migration/compute-1.crt,192.0.2.11:/etc/nova/incus-migration/compute-2.crt
-    live_migration_stop_timeout = 30
-
 Both the source and destination outer novm images must contain the same
 approved CRIU build plus ``iptables-restore`` and ``ip6tables-restore``.
 ``criu check --extra`` must pass on every compute. The driver uses staged
-destination creation, waits for the source record to become ``Stopped`` to
-avoid Incus's post-restore delete race, and only then enters Nova's normal
-post-migration cleanup. A destination failure is removed before Nova recovery,
-and a stopped source is restarted during rollback.
+destination creation. A successful destination create operation is Incus's
+authoritative signal that CRIU restore and migration control completed. Nova
+then enters its normal post-migration flow, force-stops the source record only
+if Incus still reports it running, and deletes that record. A destination
+failure is removed before Nova recovery, and a stopped source is restarted
+during rollback.
+
+CRIU is packaged inside the outer ``alpine-novm`` image and is executed by
+``incusd`` there. It must not be installed on the compute host. The Podman
+container still uses the host kernel and namespaces, so matching kernel
+versions and CRIU-compatible host features remain mandatory.
+
+CRIU checkpoints contain the source user-namespace IDs. The destination must
+therefore reserve the exact source ``volatile.idmap.base`` through the
+temporary migration profile. Migration pre-check fails if the base is missing,
+invalid, or already used on the destination. The Nova project must have
+``features.profiles=true`` so each temporary profile is owned and cleaned up
+inside that project rather than the Incus default project.
 
 The outer Podman deployment must bind ``/run/incus`` from a host runtime
 directory so Incus does not lose LXC runtime configuration when the outer
@@ -908,6 +923,27 @@ Both daemons must advertise the
 ``migration_stateful_shifted_root`` API extension. This prevents an
 unmodified Incus server from being mistaken for a server that can restore a
 shifted stateful root.
+
+Independent Incus daemons must also pass the project-qualified LXC name to the
+CRIU restore helper. Otherwise CRIU can restore and resume every process while
+the Incus API looks up a different monitor name and incorrectly reports the
+instance as stopped. The approved fork must include Incus commits
+``826c25cd9`` (normalize mixed CRIU image ownership) and ``20c12bce3``
+(project-qualified restore monitor name), or equivalent upstream fixes.
+
+Run the Nova API and Neutron/OVN regression in both directions::
+
+    SSH_IDENTITY=/path/to/test-key \
+      SOURCE_HOST=incus-node-02 DEST_HOST=incus-node-03 \
+      SOURCE_SSH=root@192.0.2.11 DEST_SSH=root@192.0.2.12 \
+      tools/openstack-incus-live-migration-e2e.sh
+
+The test must preserve the exact guest PID, observe a continuously increasing
+counter, move the Nova host and Neutron binding, find the OVN-installed OVS
+interface only on the destination, and leave no instance, profile, port, OVS
+interface, or Placement allocation after deletion. Set ``KEEP_FAILED=1`` to
+retain a failed instance and its CRIU logs for diagnosis; the default is to
+clean all test resources.
 
 Set ``SECOND_NETWORK=private`` when running the migration E2E to attach a
 second Neutron port before migration. The extended check persists guest

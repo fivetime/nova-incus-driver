@@ -200,17 +200,6 @@ incus_opts = [
         ),
     ),
     cfg.IntOpt(
-        "live_migration_stop_timeout",
-        default=30,
-        min=1,
-        help=(
-            "Seconds to wait for the source Incus instance to reach Stopped "
-            "after the destination has restored its CRIU checkpoint. This "
-            "avoids racing source-record deletion with Incus migration "
-            "cleanup."
-        ),
-    ),
-    cfg.IntOpt(
         "migration_port",
         default=8443,
         min=1,

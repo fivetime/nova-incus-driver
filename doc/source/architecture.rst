@@ -399,9 +399,15 @@ Delivery milestones
 Until implemented, advanced Nova capabilities must be reported as unsupported
 rather than silently emulated or advertised.
 
-Live migration is explicitly unsupported. Failed-host evacuation is supported
-only for Cinder RBD boot-from-volume instances after the deployment passes the
-external STONITH release gate, and is disabled by default. External power
+CRIU live migration is opt-in, conditional, and best-effort. It is supported
+only when the source instance and both independent Incus computes pass the
+driver's architecture, kernel, Incus, storage, device, privilege, and CRIU
+pre-checks. Passing pre-checks does not guarantee that an arbitrary workload
+is checkpointable. Force-complete and post-copy remain unsupported.
+
+Failed-host evacuation is supported only for Cinder RBD boot-from-volume
+instances after the deployment passes the external STONITH release gate, and
+is disabled by default. External power
 fencing must complete before Nova starts evacuation; Nova's service-down test
 does not prove that the old host has lost access to the RBD. Local and
 image-backed roots reject evacuation because their pet data is unavailable

@@ -817,3 +817,39 @@ hardening.
   `user.openstack.uuid` is intentionally unset so the new nova-compute service
   does not claim them. **Do not present these as current OpenStack instances or
   delete them without explicit approval.**
+
+## 2026-07-19 CRIU live migration
+
+- The approved Alpine no-VM image contains CRIU 4.2 and passed
+  ``criu check --extra`` inside the outer Podman container; CRIU is not
+  installed on the compute host.
+- A real Nova API migration initially restored every process successfully but
+  Incus reported the target as stopped. The CRIU log ended with
+  ``Restore finished successfully. Tasks resumed.`` and the guest counter kept
+  increasing. The target LXC monitor used the bare instance name while the
+  non-default ``nova`` project queried its project-qualified name.
+- Incus commit ``20c12bce3`` passes the project-qualified name to
+  ``forkmigrate``. Together with ``826c25cd9``, which normalizes mixed
+  namespace ownership in received CRIU images, the fix is published in
+  ``ghcr.io/fivetime/incus:alpine-novm`` digest
+  ``sha256:7e0a91bf7f52311d82276ccb81f90bde39d8482d5485c6f258ba99cdfc3b1807``.
+- Nova API plus Neutron/OVN migration passed from ``incus-node-02`` to
+  ``incus-node-03`` and back. Both runs preserved guest PID ``644``, advanced
+  the persistent counter from ``2`` to ``47``, moved the Nova host and
+  Neutron binding, verified the OVN-installed OVS interface only on the
+  destination, and removed the instance, profile, Neutron port, OVS interface,
+  and Placement allocation after deletion.
+- Ten targeted Python 3.12 unit tests passed for project-scoped cleanup,
+  migration URL construction, isolated idmap propagation, source force-stop,
+  failure recovery, and normal power-on behavior. ``bash -n``,
+  ``py_compile``, and ``git diff --check`` also passed.
+- The complete focused Python 3.12 regression subsequently passed all 216
+  Incus client, flavor, and driver tests. All three compute hosts reported no
+  host-installed CRIU binary, while the identical outer image exposed CRIU
+  4.2 at ``/usr/local/sbin/criu``. A missing-destination-CRIU pre-check kept
+  source PID ``644`` running with counter progress from ``3`` to ``13`` and
+  left no target instance, profile, or OVS interface.
+- Support remains opt-in and best-effort. Passing pre-checks proves compatible
+  infrastructure, not that every tenant process or external resource can be
+  checkpointed. BFV, attached Cinder volumes, Manila shares, privileged
+  containers, config drives, and unsupported extra devices remain rejected.

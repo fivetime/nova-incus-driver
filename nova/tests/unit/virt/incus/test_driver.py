@@ -170,7 +170,6 @@ class IncusDriverTest(test.NoDBTestCase):
         self.CONF.incus.migration_tls_ca = None
         self.CONF.incus.migration_tls_ca_by_server = {}
         self.CONF.incus.migration_preflight_server_names = {}
-        self.CONF.incus.live_migration_stop_timeout = 30
         self.CONF.incus.migration_finish_retries = 3
         self.CONF.incus.migration_finish_retry_interval = 0
         self.CONF.incus.configdrive_migration_max_bytes = 8 * 1024 * 1024

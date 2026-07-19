@@ -149,8 +149,8 @@
       "owner": "nova+driver+incus-fork+criu",
       "driver_hooks": ["check_can_live_migrate_destination", "check_can_live_migrate_source", "live_migration"],
       "applicability": "workload-dependent-criu",
-      "status": "framework",
-      "evidence": "Conditional driver callbacks and 209 unit tests pass; direct two-node Incus E2E preserved PID 487 and a continuously increasing counter on an automatically shifted unprivileged rootfs. OpenStack API/OVN E2E remains required before status=supported"
+      "status": "supported",
+      "evidence": "Opt-in best-effort support. Direct Incus E2E preserved PID 487. Nova API and Neutron/OVN E2E passed in both directions between incus-node-02 and incus-node-03 on 2026-07-19, preserving PID 644 and increasing the guest counter from 2 to 47 in each direction; Incus commits 826c25cd9 and 20c12bce3 cover shifted CRIU image ownership and project-qualified LXC monitor identity"
     },
     {
       "id": "evacuate-bfv",
