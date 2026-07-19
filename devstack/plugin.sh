@@ -154,6 +154,18 @@ function install_nova_incus {
         fi
     fi
 
+    local migrate_data_patch
+    migrate_data_patch="${NOVA_INCUS_DIR}/patches/nova/0003-register-incus-live-migrate-data.patch"
+    if grep -q "__import__('nova.virt.incus.migrate_data')" \
+            "${NOVA_DIR}/nova/objects/__init__.py"; then
+        echo "Nova already registers the Incus live migration data object"
+    elif git -C "${NOVA_DIR}" apply --check "${migrate_data_patch}"; then
+        git -C "${NOVA_DIR}" apply "${migrate_data_patch}"
+    else
+        die $LINENO \
+            "Nova Incus live migration object patch does not apply cleanly"
+    fi
+
     # Nova's source checkout is a regular Python package, so an editable
     # external distribution cannot extend nova.virt with another namespace
     # path. Keep this repository authoritative and deploy its driver package
@@ -373,6 +385,8 @@ function configure_nova_incus {
             "${INCUS_NUM_VOLUME_SCAN_TRIES}"
         iniset "${nova_target}" incus allow_cold_migration \
             "${INCUS_ALLOW_COLD_MIGRATION}"
+        iniset "${nova_target}" incus allow_live_migration \
+            "${INCUS_ALLOW_LIVE_MIGRATION}"
         iniset "${nova_target}" incus allow_bfv_evacuate \
             "${INCUS_ALLOW_BFV_EVACUATE}"
         iniset "${nova_target}" incus migration_auto_recovery \
@@ -428,6 +442,24 @@ function configure_nova_incus {
             iniset "${nova_target}" incus migration_preflight_tls_ca_by_server \
                 "${INCUS_MIGRATION_PREFLIGHT_TLS_CA_BY_SERVER}"
         fi
+        if [[ -n "${INCUS_MIGRATION_TLS_CERT}" ]]; then
+            iniset "${nova_target}" incus migration_tls_cert \
+                "${INCUS_MIGRATION_TLS_CERT}"
+        fi
+        if [[ -n "${INCUS_MIGRATION_TLS_KEY}" ]]; then
+            iniset "${nova_target}" incus migration_tls_key \
+                "${INCUS_MIGRATION_TLS_KEY}"
+        fi
+        if [[ -n "${INCUS_MIGRATION_TLS_CA}" ]]; then
+            iniset "${nova_target}" incus migration_tls_ca \
+                "${INCUS_MIGRATION_TLS_CA}"
+        fi
+        if [[ -n "${INCUS_MIGRATION_TLS_CA_BY_SERVER}" ]]; then
+            iniset "${nova_target}" incus migration_tls_ca_by_server \
+                "${INCUS_MIGRATION_TLS_CA_BY_SERVER}"
+        fi
+        iniset "${nova_target}" incus live_migration_stop_timeout \
+            "${INCUS_LIVE_MIGRATION_STOP_TIMEOUT}"
     done
 
     if is_service_enabled glance; then

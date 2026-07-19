@@ -51,6 +51,7 @@ class ToProfileTest(test.NoDBTestCase):
         self.CONF2.incus.default_process_limit = 1024
         self.CONF2.incus.maximum_process_limit = 65536
         self.CONF2.incus.allow_instance_swap = False
+        self.CONF2.incus.allow_live_migration = False
 
     def tearDown(self):
         super(ToProfileTest, self).tearDown()
@@ -181,6 +182,17 @@ class ToProfileTest(test.NoDBTestCase):
 
         config = self.client.profiles.create.call_args.args[1]
         self.assertEqual('4096', config['limits.processes'])
+
+    def test_to_profile_prepares_new_instances_for_live_migration(self):
+        self.CONF2.incus.allow_live_migration = True
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=1024)
+
+        flavor.to_profile(self.client, instance, [], [])
+
+        config = self.client.profiles.create.call_args.args[1]
+        self.assertEqual('true', config['migration.stateful'])
 
     def test_to_profile_maps_flavor_swap_to_cgroup_limit(self):
         self.CONF2.incus.allow_instance_swap = True

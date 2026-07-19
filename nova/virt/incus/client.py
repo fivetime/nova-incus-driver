@@ -76,3 +76,28 @@ def get_migration_preflight_client(endpoint, verify=None, conf=cfg.CONF):
         timeout=options.migration_preflight_timeout,
         project=options.migration_preflight_project,
     )
+
+
+def get_migration_client(endpoint, verify=None, conf=cfg.CONF):
+    """Create the project-restricted client used for instance migration."""
+    options = conf.incus
+    values = {
+        "migration_tls_cert": options.migration_tls_cert,
+        "migration_tls_key": options.migration_tls_key,
+    }
+    missing = sorted(name for name, value in values.items() if not value)
+    if missing:
+        raise ValueError(
+            "Missing Incus migration TLS options: %s" % ", ".join(missing)
+        )
+    verify = verify or options.migration_tls_ca
+    if not verify:
+        raise ValueError("Missing Incus migration TLS CA")
+
+    return pylxd.Client(
+        endpoint=endpoint,
+        cert=(options.migration_tls_cert, options.migration_tls_key),
+        verify=verify,
+        timeout=options.request_timeout,
+        project=options.project,
+    )

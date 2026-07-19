@@ -130,10 +130,12 @@ incus_opts = [
     cfg.BoolOpt(
         "allow_live_migration",
         default=False,
-        deprecated_for_removal=True,
         help=(
-            "Deprecated compatibility option. Live migration is rejected; "
-            "cold migration is a separate experimental capability."
+            "Enable best-effort CRIU live migration for explicitly supported "
+            "Incus system containers. New instances are created with "
+            "migration.stateful=true, which uses a shifted on-disk rootfs "
+            "instead of an idmapped root mount. Existing instances must be "
+            "stopped and converted before they can pass migration prechecks."
         ),
     ),
     cfg.BoolOpt(
@@ -164,6 +166,48 @@ incus_opts = [
             "Externally reachable HTTPS Incus API origin used by destination "
             "computes to pull migration data, for example "
             "https://192.0.2.10:8443."
+        ),
+    ),
+    cfg.StrOpt(
+        "migration_tls_cert",
+        default=None,
+        help=(
+            "Client certificate trusted by every destination Incus server "
+            "and restricted to the configured Nova project. This identity "
+            "creates the target record for cold and CRIU live migration."
+        ),
+    ),
+    cfg.StrOpt(
+        "migration_tls_key",
+        default=None,
+        secret=True,
+        help="Private key for migration_tls_cert.",
+    ),
+    cfg.StrOpt(
+        "migration_tls_ca",
+        default=None,
+        help=(
+            "Default CA bundle or pinned server certificate used for "
+            "authenticated Incus migration API connections."
+        ),
+    ),
+    cfg.DictOpt(
+        "migration_tls_ca_by_server",
+        default={},
+        help=(
+            "Optional destination-address to CA bundle or pinned server "
+            "certificate mapping. Entries override migration_tls_ca."
+        ),
+    ),
+    cfg.IntOpt(
+        "live_migration_stop_timeout",
+        default=30,
+        min=1,
+        help=(
+            "Seconds to wait for the source Incus instance to reach Stopped "
+            "after the destination has restored its CRIU checkpoint. This "
+            "avoids racing source-record deletion with Incus migration "
+            "cleanup."
         ),
     ),
     cfg.IntOpt(

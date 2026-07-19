@@ -58,6 +58,7 @@ from nova.virt.incus import client as incus_client
 from nova.virt.incus import common
 from nova.virt.incus import console as incus_console
 from nova.virt.incus import flavor
+from nova.virt.incus import migrate_data as incus_migrate_data
 from nova.virt.incus import storage
 
 from nova.api.metadata import base as instance_metadata
@@ -314,6 +315,88 @@ def _preflight_bfv_migration_destination(destination, cinder_pool):
     except Exception as exc:
         raise exception.MigrationError(
             reason='Incus BFV destination readiness check failed: %s' % exc)
+
+
+def _validated_migration_address(address):
+    parsed = parse.urlsplit(address or '')
+    if (parsed.scheme != 'https' or not parsed.netloc or
+            parsed.path not in ('', '/') or parsed.query or parsed.fragment):
+        raise exception.InvalidConfiguration(
+            '[incus] migration_address must be an HTTPS origin')
+    return parsed
+
+
+def _migration_endpoint(address):
+    """Return a TLS-verifiable endpoint for an advertised migration origin."""
+    parsed = _validated_migration_address(address)
+    server_name = CONF.incus.migration_preflight_server_names.get(
+        parsed.hostname, parsed.hostname)
+    if ':' in server_name and not server_name.startswith('['):
+        server_name = '[%s]' % server_name
+    netloc = server_name
+    if parsed.port:
+        netloc = '%s:%d' % (server_name, parsed.port)
+    return parse.urlunsplit((parsed.scheme, netloc, '', '', ''))
+
+
+def _migration_client(address):
+    parsed = _validated_migration_address(address)
+    verify = CONF.incus.migration_tls_ca_by_server.get(
+        parsed.hostname, CONF.incus.migration_tls_ca)
+    return incus_client.get_migration_client(
+        _migration_endpoint(address), verify=verify)
+
+
+def _live_migration_profile_check(client, instance):
+    profile = client.profiles.get(instance.name)
+    if profile.config.get('migration.stateful') != 'true':
+        raise exception.MigrationPreCheckError(
+            reason='Instance was not created with migration.stateful=true')
+    if profile.config.get('security.privileged', 'false').lower() == 'true':
+        raise exception.MigrationPreCheckError(
+            reason='Privileged Incus containers cannot use Nova live '
+            'migration')
+
+    unsupported = []
+    for name, device in profile.devices.items():
+        device_type = device.get('type')
+        if name == 'root' and device_type == 'disk':
+            continue
+        if device_type in ('nic', 'none'):
+            continue
+        unsupported.append('%s:%s' % (name, device_type or 'unknown'))
+    if unsupported:
+        raise exception.MigrationPreCheckError(
+            reason='Incus live migration does not support profile devices: '
+            '%s' % ', '.join(sorted(unsupported)))
+    return profile
+
+
+def _migration_host_facts(client):
+    environment = client.host_info.get('environment', {})
+    facts = {
+        'architecture': environment.get('kernel_architecture'),
+        'kernel_version': environment.get('kernel_version'),
+        'server_version': environment.get('server_version'),
+    }
+    missing = sorted(name for name, value in facts.items() if not value)
+    if missing:
+        raise exception.MigrationPreCheckError(
+            reason='Incus did not report migration host facts: %s' %
+            ', '.join(missing))
+    return facts
+
+
+def _remove_live_migration_target(remote, instance):
+    """Remove target artifacts after a failed destination create."""
+    try:
+        remote.instances.get(instance.name).delete(wait=True)
+    except incus_exceptions.NotFound:
+        pass
+    try:
+        remote.profiles.get(instance.name).delete()
+    except incus_exceptions.NotFound:
+        pass
 
 
 def _volume_device_info_key(volume_id):
@@ -2942,8 +3025,60 @@ class IncusDriver(driver.ComputeDriver):
     def live_migration(self, context, instance, dest,
                        post_method, recover_method, block_migration=False,
                        migrate_data=None):
-        raise exception.MigrationError(
-            reason='Incus live migration is not supported')
+        if not isinstance(
+                migrate_data, incus_migrate_data.IncusLiveMigrateData):
+            raise exception.MigrationError(
+                reason='Missing Incus live migration destination data')
+        if block_migration:
+            raise exception.MigrationError(
+                reason='Incus CRIU block migration is not supported')
+
+        remote = _migration_client(migrate_data.destination_address)
+        container = self.client.instances.get(instance.name)
+        migration_data = None
+        try:
+            migration_data = container.generate_migration_data(live=True)
+            migration_data.pop('default', None)
+            migration_data['profiles'] = [instance.name]
+
+            parsed_address = _validated_migration_address(
+                CONF.incus.migration_address)
+            source = migration_data['source']
+            operation = parse.urlsplit(source['operation'])
+            source['operation'] = parse.urlunsplit((
+                parsed_address.scheme,
+                parsed_address.netloc,
+                operation.path,
+                operation.query,
+                '',
+            ))
+            remote.instances.create(migration_data, wait=True)
+
+            deadline = (
+                timeutils.utcnow_ts() +
+                CONF.incus.live_migration_stop_timeout)
+            while timeutils.utcnow_ts() < deadline:
+                container.sync()
+                if container.status == 'Stopped':
+                    break
+                eventlet.sleep(0.2)
+            else:
+                raise exception.MigrationError(
+                    reason='Destination restored the CRIU checkpoint but '
+                    'the source Incus instance did not stop before timeout')
+        except Exception:
+            if migration_data is not None:
+                try:
+                    _remove_live_migration_target(remote, instance)
+                except Exception:
+                    LOG.exception(
+                        'Failed to remove Incus live migration target after '
+                        'migration failure', instance=instance)
+            recover_method(context, instance, dest, migrate_data)
+            return
+
+        post_method(
+            context, instance, dest, block_migration, migrate_data)
 
     def post_live_migration(self, context, instance, block_device_info,
                             migrate_data=None):
@@ -2953,11 +3088,57 @@ class IncusDriver(driver.ComputeDriver):
         self.client.profiles.get(instance.name).delete()
         self.cleanup(context, instance, network_info)
 
+    def post_live_migration_at_destination(
+            self, context, instance, network_info, block_migration=False,
+            block_device_info=None):
+        container = self.client.instances.get(instance.name)
+        if container.status != 'Running':
+            raise exception.MigrationError(
+                reason='CRIU-restored Incus instance is not running on the '
+                'destination')
+
+    def rollback_live_migration_at_source(
+            self, context, instance, migrate_data):
+        try:
+            container = self.client.instances.get(instance.name)
+        except incus_exceptions.NotFound:
+            return
+        container.sync()
+        if container.status != 'Running':
+            container.start(wait=True)
+
+    def rollback_live_migration_at_destination(
+            self, context, instance, network_info, block_device_info,
+            destroy_disks=True, migrate_data=None):
+        try:
+            self.client.instances.get(instance.name).delete(wait=True)
+        except incus_exceptions.NotFound:
+            pass
+        try:
+            self.client.profiles.get(instance.name).delete()
+        except incus_exceptions.NotFound:
+            pass
+        self.cleanup(
+            context, instance, network_info, destroy_disks=destroy_disks,
+            destroy_vifs=True)
+
     def check_can_live_migrate_destination(
             self, context, instance, src_compute_info, dst_compute_info,
             block_migration=False, disk_over_commit=False):
-        raise exception.MigrationPreCheckError(
-            reason='Incus live migration is not supported')
+        if not CONF.incus.allow_live_migration:
+            raise exception.MigrationPreCheckError(
+                reason='Incus live migration is disabled by configuration')
+        if block_migration:
+            raise exception.MigrationPreCheckError(
+                reason='Incus CRIU block migration is not supported')
+        address = CONF.incus.migration_address
+        _validated_migration_address(address)
+        facts = _migration_host_facts(self.client)
+        return incus_migrate_data.IncusLiveMigrateData(
+            destination_address=address,
+            destination_architecture=facts['architecture'],
+            destination_kernel_version=facts['kernel_version'],
+            destination_server_version=facts['server_version'])
 
     def cleanup_live_migration_destination_check(
             self, context, dest_check_data):
@@ -2965,8 +3146,46 @@ class IncusDriver(driver.ComputeDriver):
 
     def check_can_live_migrate_source(self, context, instance,
                                       dest_check_data, block_device_info=None):
-        raise exception.MigrationPreCheckError(
-            reason='Incus live migration is not supported')
+        if not CONF.incus.allow_live_migration:
+            raise exception.MigrationPreCheckError(
+                reason='Incus live migration is disabled by configuration')
+        if not isinstance(
+                dest_check_data, incus_migrate_data.IncusLiveMigrateData):
+            raise exception.MigrationPreCheckError(
+                reason='Destination did not return Incus migration data')
+        if instance.config_drive:
+            raise exception.MigrationPreCheckError(
+                reason='Incus live migration does not support config drives')
+        if driver.block_device_info_get_mapping(block_device_info):
+            raise exception.MigrationPreCheckError(
+                reason='Incus live migration does not support Cinder '
+                'volumes')
+
+        _live_migration_profile_check(self.client, instance)
+        container = self.client.instances.get(instance.name)
+        if container.status != 'Running':
+            raise exception.MigrationPreCheckError(
+                reason='Incus CRIU live migration requires a running '
+                'instance')
+
+        source_facts = _migration_host_facts(self.client)
+        comparisons = (
+            ('architecture', source_facts['architecture'],
+             dest_check_data.destination_architecture),
+            ('kernel version', source_facts['kernel_version'],
+             dest_check_data.destination_kernel_version),
+            ('Incus version', source_facts['server_version'],
+             dest_check_data.destination_server_version),
+        )
+        incompatible = [
+            '%s source=%s destination=%s' % values
+            for values in comparisons if values[1] != values[2]
+        ]
+        if incompatible:
+            raise exception.MigrationPreCheckError(
+                reason='Incus CRIU migration host mismatch: %s' %
+                '; '.join(incompatible))
+        return dest_check_data
 
     #
     # IncusDriver "private" implementation methods

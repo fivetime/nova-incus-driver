@@ -44,6 +44,7 @@ import six
 
 from nova.virt.incus import common
 from nova.virt.incus import driver
+from nova.virt.incus import migrate_data
 
 ORIGINAL_BRICK_GET_CONNECTOR = driver.brick_get_connector
 
@@ -143,6 +144,9 @@ class IncusDriverTest(test.NoDBTestCase):
             'api_extensions': ['id_map'],
             'environment': {
                 'storage': 'zfs',
+                'kernel_architecture': 'x86_64',
+                'kernel_version': '6.8.0-test',
+                'server_version': '7.2',
             }
         }
         self.Client.return_value = self.client
@@ -158,7 +162,12 @@ class IncusDriverTest(test.NoDBTestCase):
         self.CONF.force_config_drive = False
         self.CONF.incus.storage_pool = None
         self.CONF.incus.allow_cold_migration = False
+        self.CONF.incus.allow_live_migration = False
         self.CONF.incus.migration_address = None
+        self.CONF.incus.migration_tls_ca = None
+        self.CONF.incus.migration_tls_ca_by_server = {}
+        self.CONF.incus.migration_preflight_server_names = {}
+        self.CONF.incus.live_migration_stop_timeout = 30
         self.CONF.incus.migration_finish_retries = 3
         self.CONF.incus.migration_finish_retry_interval = 0
         self.CONF.incus.configdrive_migration_max_bytes = 8 * 1024 * 1024
@@ -3125,6 +3134,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'memory_mb_used': 8000,
             'numa_topology': None,
             'supported_instances': [
+                ('i686', 'incus', 'exe'),
+                ('x86_64', 'incus', 'exe'),
                 ('i686', 'lxc', 'exe'),
                 ('x86_64', 'lxc', 'exe')],
             'vcpus': 200,
@@ -3229,6 +3240,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'memory_mb_used': 8000,
             'numa_topology': None,
             'supported_instances': [
+                ('i686', 'incus', 'exe'),
+                ('x86_64', 'incus', 'exe'),
                 ('i686', 'lxc', 'exe'),
                 ('x86_64', 'lxc', 'exe')],
             'vcpus': 200,
@@ -4132,7 +4145,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertEqual('cinder', profile.devices['root']['pool'])
         self.assertNotIn('size', profile.devices['root'])
 
-    def test_check_can_live_migrate_destination(self):
+    def test_check_can_live_migrate_destination_disabled(self):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
@@ -4147,16 +4160,171 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             incus_driver.check_can_live_migrate_destination,
             ctx, instance, src_compute_info, dst_compute_info)
 
-    def test_live_migration_is_always_rejected(self):
+    def test_check_can_live_migrate_destination_returns_host_facts(self):
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        self.CONF.incus.allow_live_migration = True
+        self.CONF.incus.migration_address = 'https://192.0.2.20:8443'
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
-        self.assertRaises(
-            exception.MigrationError,
-            incus_driver.live_migration,
-            ctx, instance, 'destination', mock.Mock(), mock.Mock())
+        data = incus_driver.check_can_live_migrate_destination(
+            ctx, instance, mock.Mock(), mock.Mock())
+
+        self.assertIsInstance(data, migrate_data.IncusLiveMigrateData)
+        self.assertEqual(
+            'https://192.0.2.20:8443', data.destination_address)
+        self.assertEqual('x86_64', data.destination_architecture)
+        self.assertEqual('6.8.0-test', data.destination_kernel_version)
+        self.assertEqual('7.2', data.destination_server_version)
+
+    def test_check_can_live_migrate_source_accepts_compatible_container(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', config_drive=False)
+        instance.config_drive = ''
+        self.CONF.incus.allow_live_migration = True
+        profile = mock.Mock()
+        profile.config = {'migration.stateful': 'true'}
+        profile.devices = {
+            'root': {'type': 'disk', 'path': '/'},
+            'eth0': {'type': 'nic'},
+        }
+        self.client.profiles.get.return_value = profile
+        self.client.instances.get.return_value.status = 'Running'
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            destination_architecture='x86_64',
+            destination_kernel_version='6.8.0-test',
+            destination_server_version='7.2')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        result = incus_driver.check_can_live_migrate_source(
+            ctx, instance, data, {'block_device_mapping': []})
+
+        self.assertIs(data, result)
+
+    def test_check_can_live_migrate_source_rejects_cinder_volume(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', config_drive=False)
+        instance.config_drive = ''
+        self.CONF.incus.allow_live_migration = True
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            destination_architecture='x86_64',
+            destination_kernel_version='6.8.0-test',
+            destination_server_version='7.2')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaisesRegex(
+            exception.MigrationPreCheckError, 'Cinder volumes',
+            incus_driver.check_can_live_migrate_source,
+            ctx, instance, data,
+            {'block_device_mapping': [{'mount_device': '/dev/vdb'}]})
+
+    def test_check_can_live_migrate_source_rejects_kernel_mismatch(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', config_drive=False)
+        instance.config_drive = ''
+        self.CONF.incus.allow_live_migration = True
+        profile = mock.Mock()
+        profile.config = {'migration.stateful': 'true'}
+        profile.devices = {'root': {'type': 'disk', 'path': '/'}}
+        self.client.profiles.get.return_value = profile
+        self.client.instances.get.return_value.status = 'Running'
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            destination_architecture='x86_64',
+            destination_kernel_version='6.9.0-other',
+            destination_server_version='7.2')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaisesRegex(
+            exception.MigrationPreCheckError, 'kernel version',
+            incus_driver.check_can_live_migrate_source,
+            ctx, instance, data, {'block_device_mapping': []})
+
+    @mock.patch('nova.virt.incus.driver._migration_client')
+    def test_live_migration_restores_target_then_calls_post(self, get_remote):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        self.CONF.incus.migration_address = 'https://192.0.2.10:8443'
+        container = mock.Mock()
+        container.status = 'Stopped'
+        container.generate_migration_data.return_value = {
+            'default': ['test'],
+            'source': {
+                'operation': (
+                    'http+unix://incus/1.0/operations/op?project=nova'),
+            },
+        }
+        self.client.instances.get.return_value = container
+        remote = get_remote.return_value
+        post = mock.Mock()
+        recover = mock.Mock()
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            destination_architecture='x86_64',
+            destination_kernel_version='6.8.0-test',
+            destination_server_version='7.2')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.live_migration(
+            ctx, instance, 'destination', post, recover,
+            migrate_data=data)
+
+        payload = remote.instances.create.call_args.args[0]
+        self.assertEqual([instance.name], payload['profiles'])
+        self.assertNotIn('default', payload)
+        self.assertEqual(
+            'https://192.0.2.10:8443/1.0/operations/op?project=nova',
+            payload['source']['operation'])
+        remote.instances.create.assert_called_once_with(payload, wait=True)
+        post.assert_called_once_with(
+            ctx, instance, 'destination', False, data)
+        recover.assert_not_called()
+
+    @mock.patch('nova.virt.incus.driver._remove_live_migration_target')
+    @mock.patch('nova.virt.incus.driver._migration_client')
+    def test_live_migration_failure_cleans_target_and_recovers(
+            self, get_remote, remove_target):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        self.CONF.incus.migration_address = 'https://192.0.2.10:8443'
+        container = mock.Mock()
+        container.generate_migration_data.return_value = {
+            'source': {
+                'operation': 'http+unix://incus/1.0/operations/op',
+            },
+        }
+        self.client.instances.get.return_value = container
+        remote = get_remote.return_value
+        remote.instances.create.side_effect = RuntimeError('restore failed')
+        post = mock.Mock()
+        recover = mock.Mock()
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            destination_architecture='x86_64',
+            destination_kernel_version='6.8.0-test',
+            destination_server_version='7.2')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.live_migration(
+            ctx, instance, 'destination', post, recover,
+            migrate_data=data)
+
+        remove_target.assert_called_once_with(remote, instance)
+        recover.assert_called_once_with(
+            ctx, instance, 'destination', data)
+        post.assert_not_called()
 
     def test_confirm_migration(self):
         ctx = context.get_admin_context()

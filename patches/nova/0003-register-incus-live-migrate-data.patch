@@ -1,0 +1,18 @@
+From: OpenStack Incus maintainers <openstack-incus@example.invalid>
+Subject: [PATCH] objects: Register external Incus live migration data
+
+The Incus compute driver carries destination compatibility facts in a
+LiveMigrateData subclass. Import the external object from register_all() so
+conductor and compute services can deserialize it across RPC boundaries.
+
+diff --git a/nova/objects/__init__.py b/nova/objects/__init__.py
+--- a/nova/objects/__init__.py
++++ b/nova/objects/__init__.py
+@@ -98,6 +98,7 @@ def register_all():
+     __import__('nova.objects.instance_numa')
+     __import__('nova.objects.instance_pci_requests')
+     __import__('nova.objects.keypair')
++    __import__('nova.virt.incus.migrate_data')
+     __import__('nova.objects.migrate_data')
+     __import__('nova.objects.virt_device_metadata')
+     __import__('nova.objects.migration')

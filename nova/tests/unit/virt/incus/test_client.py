@@ -32,6 +32,9 @@ def _config(**overrides):
         "migration_preflight_tls_ca": None,
         "migration_preflight_timeout": 5,
         "migration_preflight_project": "nova-preflight",
+        "migration_tls_cert": None,
+        "migration_tls_key": None,
+        "migration_tls_ca": None,
     }
     options.update(overrides)
     return SimpleNamespace(incus=SimpleNamespace(**options))
@@ -117,6 +120,40 @@ class IncusClientTest(unittest.TestCase):
             ValueError,
             "migration_preflight_tls_ca, migration_preflight_tls_key",
             client.get_migration_preflight_client,
+            "https://compute-2.example.test:8443",
+            conf=conf,
+        )
+
+    @mock.patch.object(client.pylxd, "Client")
+    def test_migration_client_uses_nova_project(self, mock_client):
+        conf = _config(
+            project="nova",
+            migration_tls_cert="/etc/nova/migration.crt",
+            migration_tls_key="/etc/nova/migration.key",
+            migration_tls_ca="/etc/nova/incus-ca.crt",
+            request_timeout=45,
+        )
+
+        client.get_migration_client(
+            "https://compute-2.example.test:8443", conf=conf)
+
+        mock_client.assert_called_once_with(
+            endpoint="https://compute-2.example.test:8443",
+            cert=("/etc/nova/migration.crt", "/etc/nova/migration.key"),
+            verify="/etc/nova/incus-ca.crt",
+            timeout=45,
+            project="nova",
+        )
+
+    def test_migration_client_requires_certificate_pair_and_ca(self):
+        conf = _config(
+            migration_tls_cert="/etc/nova/migration.crt",
+        )
+
+        self.assertRaisesRegex(
+            ValueError,
+            "migration_tls_key",
+            client.get_migration_client,
             "https://compute-2.example.test:8443",
             conf=conf,
         )

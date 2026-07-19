@@ -43,10 +43,13 @@ case "$(file -b "$root_file")" in
         ;;
 esac
 
-test -x "$WORK_DIR/unified/rootfs/sbin/init"
+rootfs="$WORK_DIR/unified/rootfs"
+if [[ ! -x "$rootfs/sbin/init" && ! -L "$rootfs/sbin/init" ]]; then
+    echo "Incus image does not provide /sbin/init" >&2
+    exit 1
+fi
 
 if [[ "$PREINSTALL_SSH" == "true" || -n "$PREINSTALL_PACKAGES" ]]; then
-    rootfs="$WORK_DIR/unified/rootfs"
     cleanup_chroot_mounts() {
         if mountpoint -q "$rootfs/sys"; then umount -l "$rootfs/sys"; fi
         if mountpoint -q "$rootfs/proc"; then umount -l "$rootfs/proc"; fi

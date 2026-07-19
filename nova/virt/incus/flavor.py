@@ -94,6 +94,11 @@ def _processes(instance, _):
     return {'limits.processes': str(process_limit)}
 
 
+def _stateful_migration(instance, _):
+    if CONF.incus.allow_live_migration:
+        return {'migration.stateful': 'true'}
+
+
 _CONFIG_FILTER_MAP = [
     _base_config,
     _nesting,
@@ -102,6 +107,7 @@ _CONFIG_FILTER_MAP = [
     _cpu,
     _isolated,
     _processes,
+    _stateful_migration,
 ]
 
 

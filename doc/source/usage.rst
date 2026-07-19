@@ -858,11 +858,42 @@ server action event. These Nova APIs are asynchronous, so the initial request
 may still be accepted; operators and clients must inspect the action event.
 Immediate ``4xx`` feedback in Horizon requires an upstream Nova API capability
 gate.
-The deprecated ``allow_live_migration`` option has no effect. Incus CRIU/live
-migration must not be enabled through this driver because the legacy SDK path
-does not implement Nova's confirm/recover ownership protocol. A planned host
-maintenance test can use the experimental cold migration path above, subject
-to its documented manual-recovery boundary.
+CRIU live migration is an opt-in, best-effort capability. It is disabled by
+default and is accepted only for a running, unprivileged system container
+created with ``migration.stateful=true``. Enabling the driver option causes
+new instance profiles to use Incus's shifted on-disk rootfs layout, because
+CRIU restore cannot recreate a detached idmapped root mount. Existing
+instances must be stopped and converted before they can pass pre-checks.
+
+The first implementation rejects boot-from-volume, every attached Cinder
+volume, config drives, Manila shares, extra disk or unix-block devices,
+privileged containers, block migration, and mismatched architecture, kernel,
+or Incus versions. CRIU support remains workload-dependent. Containers with
+complex systemd services, external sockets, unsupported kernel resources, or
+processes created through a host-side ``incus exec`` session may fail their
+checkpoint. Failure is recoverable, but successful migration is never
+guaranteed merely because pre-checks passed.
+
+Configure a dedicated TLS client certificate trusted by every Incus server
+and restricted to the ``nova`` project. Do not reuse the read-only
+``nova-preflight`` identity::
+
+    [incus]
+    allow_live_migration = true
+    migration_address = https://192.0.2.10:8443
+    migration_tls_cert = /etc/nova/incus-migration/client.crt
+    migration_tls_key = /etc/nova/incus-migration/client.key
+    migration_tls_ca = /etc/nova/incus-migration/default-server.crt
+    migration_tls_ca_by_server = 192.0.2.10:/etc/nova/incus-migration/compute-1.crt,192.0.2.11:/etc/nova/incus-migration/compute-2.crt
+    live_migration_stop_timeout = 30
+
+Both the source and destination outer novm images must contain the same
+approved CRIU build plus ``iptables-restore`` and ``ip6tables-restore``.
+``criu check --extra`` must pass on every compute. The driver uses staged
+destination creation, waits for the source record to become ``Stopped`` to
+avoid Incus's post-restore delete race, and only then enters Nova's normal
+post-migration cleanup. A destination failure is removed before Nova recovery,
+and a stopped source is restarted during rollback.
 
 Set ``SECOND_NETWORK=private`` when running the migration E2E to attach a
 second Neutron port before migration. The extended check persists guest
