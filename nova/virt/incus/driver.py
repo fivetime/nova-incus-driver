@@ -16,6 +16,7 @@
 from __future__ import absolute_import
 
 import base64
+import copy
 import errno
 import glob
 import io
@@ -88,6 +89,7 @@ ACCEPTABLE_IMAGE_FORMATS = {'raw', 'root-tar', 'squashfs'}
 INCUS_SYSTEM_CONTAINER_TRAIT = 'CUSTOM_INCUS_SYSTEM_CONTAINER'
 INCUS_SWAP_TRAIT = 'CUSTOM_INCUS_SWAP'
 INCUS_MANILA_SHARE_TRAIT = 'CUSTOM_INCUS_MANILA_SHARE'
+INCUS_STATEFUL_MIGRATION_EXTENSION = 'migration_stateful_shifted_root'
 MIGRATION_RECOVERY_KEY = 'user.openstack.recovery_required'
 BASE_DIR = os.path.join(
     CONF.instances_path, CONF.image_cache.subdirectory_name)
@@ -385,6 +387,14 @@ def _migration_host_facts(client):
             reason='Incus did not report migration host facts: %s' %
             ', '.join(missing))
     return facts
+
+
+def _require_stateful_migration_extension(client):
+    if INCUS_STATEFUL_MIGRATION_EXTENSION not in set(
+            client.host_info.get('api_extensions', [])):
+        raise exception.MigrationPreCheckError(
+            reason='Incus server does not advertise %s' %
+            INCUS_STATEFUL_MIGRATION_EXTENSION)
 
 
 def _remove_live_migration_target(remote, instance):
@@ -3019,8 +3029,12 @@ class IncusDriver(driver.ComputeDriver):
         self.firewall_driver.apply_instance_filter(
             instance, network_info)
 
-        flavor.to_profile(self.client,
-                          instance, network_info, block_device_info)
+        # Nova only has built-in destination cleanup flags for its in-tree
+        # Libvirt and Hyper-V migrate-data objects. Creating the Incus profile
+        # here would leak it if Nova fails after this method returns but before
+        # it invokes live_migration(). Defer profile creation to the source
+        # driver's guarded migration transaction.
+        return migrate_data
 
     def live_migration(self, context, instance, dest,
                        post_method, recover_method, block_migration=False,
@@ -3033,10 +3047,18 @@ class IncusDriver(driver.ComputeDriver):
             raise exception.MigrationError(
                 reason='Incus CRIU block migration is not supported')
 
-        remote = _migration_client(migrate_data.destination_address)
+        remote = None
         container = self.client.instances.get(instance.name)
-        migration_data = None
+        remote_profile_created = False
         try:
+            remote = _migration_client(migrate_data.destination_address)
+            profile = self.client.profiles.get(instance.name)
+            remote.profiles.create(
+                instance.name,
+                dict(profile.config),
+                copy.deepcopy(profile.devices))
+            remote_profile_created = True
+
             migration_data = container.generate_migration_data(live=True)
             migration_data.pop('default', None)
             migration_data['profiles'] = [instance.name]
@@ -3067,7 +3089,7 @@ class IncusDriver(driver.ComputeDriver):
                     reason='Destination restored the CRIU checkpoint but '
                     'the source Incus instance did not stop before timeout')
         except Exception:
-            if migration_data is not None:
+            if remote_profile_created:
                 try:
                     _remove_live_migration_target(remote, instance)
                 except Exception:
@@ -3133,6 +3155,7 @@ class IncusDriver(driver.ComputeDriver):
                 reason='Incus CRIU block migration is not supported')
         address = CONF.incus.migration_address
         _validated_migration_address(address)
+        _require_stateful_migration_extension(self.client)
         facts = _migration_host_facts(self.client)
         return incus_migrate_data.IncusLiveMigrateData(
             destination_address=address,
@@ -3161,6 +3184,7 @@ class IncusDriver(driver.ComputeDriver):
                 reason='Incus live migration does not support Cinder '
                 'volumes')
 
+        _require_stateful_migration_extension(self.client)
         _live_migration_profile_check(self.client, instance)
         container = self.client.instances.get(instance.name)
         if container.status != 'Running':

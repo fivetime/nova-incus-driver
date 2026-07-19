@@ -34,7 +34,7 @@
 
 ## 有意拒绝
 
-- CRIU live migration。
+- CRIU live migration 已完成条件化驱动和双节点 Incus 直接 E2E；OpenStack API/OVN E2E 通过前保持 framework 状态。
 - 本地根盘 failed-host evacuation。
 - suspend-to-memory、rescue、guest kernel crash dump。
 - 图形控制台以及 VM 固件、vTPM、Secure Boot、PCI/NUMA 加速能力。

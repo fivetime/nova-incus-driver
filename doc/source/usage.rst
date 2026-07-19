@@ -895,6 +895,20 @@ avoid Incus's post-restore delete race, and only then enters Nova's normal
 post-migration cleanup. A destination failure is removed before Nova recovery,
 and a stopped source is restarted during rollback.
 
+The outer Podman deployment must bind ``/run/incus`` from a host runtime
+directory so Incus does not lose LXC runtime configuration when the outer
+container is recreated. The Incus state bind must use recursive shared mount
+propagation so CRIU can resolve the external master of
+``/dev/.incus-mounts``::
+
+    Volume=/var/lib/incus:/var/lib/incus:rshared
+    Volume=/run/incus-podman:/run/incus:rshared
+
+Both daemons must advertise the
+``migration_stateful_shifted_root`` API extension. This prevents an
+unmodified Incus server from being mistaken for a server that can restore a
+shifted stateful root.
+
 Set ``SECOND_NETWORK=private`` when running the migration E2E to attach a
 second Neutron port before migration. The extended check persists guest
 netplan configuration, verifies the secondary fixed IP and OVN-installed OVS

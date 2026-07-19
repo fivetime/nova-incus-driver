@@ -41,6 +41,7 @@ apt/dnf/yum 安装软件),数据在实例重启、Incus 重启、宿主重启后
 - `migration_shared_ceph_storage` —— 共享 Ceph 池的零拷贝迁移交接。
 - `storage_driver_cephext` —— 认领外部(Cinder)RBD 作为容器根盘。
 - `unix_block_limits` —— `unix-block` 设备 I/O 限速(已提交上游 PR)。
+- `migration_stateful_shifted_root` —— CRIU restore 使用可迁移的 shifted 非特权 rootfs。
 
 生产 BFV 镜像从 fork 的 `docker/alpine-novm/Dockerfile` 构建,发布为
 `ghcr.io/fivetime/incus:alpine-novm`。通用 Incus 镜像不含上述扩展,**不得**作为 BFV 计算镜像使用。
@@ -66,7 +67,8 @@ Ceph/LINSTOR 后端、Ceph 备份服务等 DevStack 变量见 `devstack/` 与
 
 - BFV 迁移在每个所有权转换点的**系统化故障注入 + Nova/Cinder/Neutron 自动对账**(发布阻断项)。
 - 在统一的 **Noble / Python 3.12** 三节点上跑完整测试套件(当前为混合版本,仅证明兼容性)。
-- 有意不支持的能力(热迁移、撤离、rescue、multiattach、加密卷、临时盘)以显式报错声明,而非静默模拟。
+- CRIU 热迁移仅对满足严格预检的系统容器尽力而为；OpenStack API/OVN E2E 通过前不标记为生产支持。
+- 有意不支持的能力(本地根盘撤离、rescue、multiattach、加密卷、临时盘)以显式报错声明,而非静默模拟。
 
 逐项功能完成度与最新验证记录见 [`AGENTS.md`](AGENTS.md)(稳定规范)与
 [`TEST_STATUS.md`](TEST_STATUS.md)(动态测试进度)。

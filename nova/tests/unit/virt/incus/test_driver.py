@@ -141,7 +141,10 @@ class IncusDriverTest(test.NoDBTestCase):
 
         self.client = mock.Mock()
         self.client.host_info = {
-            'api_extensions': ['id_map'],
+            'api_extensions': [
+                'id_map',
+                'migration_stateful_shifted_root',
+            ],
             'environment': {
                 'storage': 'zfs',
                 'kernel_architecture': 'x86_64',
@@ -4250,6 +4253,25 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             incus_driver.check_can_live_migrate_source,
             ctx, instance, data, {'block_device_mapping': []})
 
+    def test_pre_live_migration_returns_data_without_creating_profile(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            destination_architecture='x86_64',
+            destination_kernel_version='6.8.0-test',
+            destination_server_version='7.2')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        result = incus_driver.pre_live_migration(
+            ctx, instance, {}, [mock.sentinel.vif], None, data)
+
+        self.assertIs(data, result)
+        self.vif_driver.plug.assert_called_once_with(
+            instance, mock.sentinel.vif)
+        self.client.profiles.create.assert_not_called()
+
     @mock.patch('nova.virt.incus.driver._migration_client')
     def test_live_migration_restores_target_then_calls_post(self, get_remote):
         ctx = context.get_admin_context()
@@ -4265,6 +4287,10 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             },
         }
         self.client.instances.get.return_value = container
+        profile = mock.Mock()
+        profile.config = {'migration.stateful': 'true'}
+        profile.devices = {'root': {'type': 'disk', 'path': '/'}}
+        self.client.profiles.get.return_value = profile
         remote = get_remote.return_value
         post = mock.Mock()
         recover = mock.Mock()
@@ -4281,6 +4307,10 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             migrate_data=data)
 
         payload = remote.instances.create.call_args.args[0]
+        remote.profiles.create.assert_called_once_with(
+            instance.name,
+            {'migration.stateful': 'true'},
+            {'root': {'type': 'disk', 'path': '/'}})
         self.assertEqual([instance.name], payload['profiles'])
         self.assertNotIn('default', payload)
         self.assertEqual(
@@ -4305,6 +4335,10 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             },
         }
         self.client.instances.get.return_value = container
+        profile = mock.Mock()
+        profile.config = {'migration.stateful': 'true'}
+        profile.devices = {'root': {'type': 'disk', 'path': '/'}}
+        self.client.profiles.get.return_value = profile
         remote = get_remote.return_value
         remote.instances.create.side_effect = RuntimeError('restore failed')
         post = mock.Mock()

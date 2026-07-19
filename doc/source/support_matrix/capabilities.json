@@ -146,11 +146,11 @@
     },
     {
       "id": "live-migration",
-      "owner": "nova+driver",
+      "owner": "nova+driver+incus-fork+criu",
       "driver_hooks": ["check_can_live_migrate_destination", "check_can_live_migrate_source", "live_migration"],
       "applicability": "workload-dependent-criu",
-      "status": "unsupported",
-      "evidence": "Explicit MigrationPreCheckError"
+      "status": "framework",
+      "evidence": "Conditional driver callbacks and 209 unit tests pass; direct two-node Incus E2E preserved PID 487 and a continuously increasing counter on an automatically shifted unprivileged rootfs. OpenStack API/OVN E2E remains required before status=supported"
     },
     {
       "id": "evacuate-bfv",
