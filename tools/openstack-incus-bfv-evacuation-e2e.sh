@@ -190,6 +190,14 @@ network_owner_is_destination() {
     done
 }
 
+bfv_evacuation_enabled() {
+    local target=$1
+    [[ "$(remote "$target" \
+        "crudini --get /etc/nova/nova-cpu.conf incus \
+         allow_bfv_evacuate 2>/dev/null || echo false" |
+        tr '[:upper:]' '[:lower:]')" == true ]]
+}
+
 original_status=$(openstack server show "$SERVER_ID" -f value -c status)
 [[ "$original_status" == ACTIVE || "$original_status" == SHUTOFF ]] || {
     echo "Server must be ACTIVE or SHUTOFF, got $original_status" >&2
@@ -227,6 +235,12 @@ control_plane_is_independent || {
     echo "OpenStack control plane is not independent of the fence source" >&2
     exit 1
 }
+for target in "$SOURCE_SSH" "$DEST_SSH"; do
+    bfv_evacuation_enabled "$target" || {
+        echo "BFV evacuation is disabled on $target; refusing to fence" >&2
+        exit 1
+    }
+done
 
 if [[ "$original_status" == ACTIVE ]]; then
     printf '%s\n' "$marker" |
