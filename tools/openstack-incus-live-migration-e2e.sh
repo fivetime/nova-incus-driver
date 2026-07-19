@@ -16,6 +16,7 @@ SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute test key}
 SERVER=${SERVER:-incus-live-migration-e2e-$RANDOM}
 TIMEOUT=${TIMEOUT:-300}
 INCUS_PROJECT=${INCUS_PROJECT:-nova}
+KEEP_FAILED=${KEEP_FAILED:-0}
 
 SSH=(ssh -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=no)
 server_id=
@@ -128,6 +129,12 @@ cleanup() {
         rm -f "$user_data"
     fi
     ((rc == 0)) || diagnose
+    if ((rc != 0)) && [[ "$KEEP_FAILED" == "1" ]]; then
+        printf 'Keeping failed resources for diagnosis: server=%s instance=%s port=%s\n' \
+            "${server_id:-unset}" "${instance_name:-unset}" \
+            "${port_id:-unset}" >&2
+        return "$rc"
+    fi
     if [[ -n "$server_id" ]]; then
         openstack server delete --wait "$server_id" >/dev/null 2>&1 || true
     fi
