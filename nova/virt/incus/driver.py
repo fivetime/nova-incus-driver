@@ -90,6 +90,8 @@ INCUS_SYSTEM_CONTAINER_TRAIT = 'CUSTOM_INCUS_SYSTEM_CONTAINER'
 INCUS_SWAP_TRAIT = 'CUSTOM_INCUS_SWAP'
 INCUS_MANILA_SHARE_TRAIT = 'CUSTOM_INCUS_MANILA_SHARE'
 INCUS_STATEFUL_MIGRATION_EXTENSION = 'migration_stateful_shifted_root'
+INCUS_LIVE_BFV_MIGRATION_EXTENSION = (
+    'migration_live_shared_cephext_storage')
 MIGRATION_RECOVERY_KEY = 'user.openstack.recovery_required'
 _PRE_LIVE_DISCONNECTED_KEY = 'incus_pre_live_disconnected'
 BASE_DIR = os.path.join(
@@ -263,6 +265,20 @@ def _require_bfv_migration_support(client, root_bdm):
             reason='Incus BFV migration requires a cephext pool backed by '
             'the Cinder RBD pool')
 
+    return root_volume
+
+
+def _require_bfv_live_migration_support(client, root_bdm):
+    """Require the ordered CRIU/cephext handover protocol on one endpoint."""
+    try:
+        root_volume = _require_bfv_migration_support(client, root_bdm)
+    except (exception.InvalidConfiguration, exception.MigrationError) as exc:
+        raise exception.MigrationPreCheckError(reason=str(exc))
+    extensions = set(client.host_info.get('api_extensions', []))
+    if INCUS_LIVE_BFV_MIGRATION_EXTENSION not in extensions:
+        raise exception.MigrationPreCheckError(
+            reason='Incus BFV live migration requires API extension: %s' %
+            INCUS_LIVE_BFV_MIGRATION_EXTENSION)
     return root_volume
 
 
@@ -3147,11 +3163,11 @@ class IncusDriver(driver.ComputeDriver):
             for bdm in driver.block_device_info_get_mapping(
                     block_device_info):
                 if _is_boot_volume(bdm):
-                    # BFV live handover needs a separate root ownership
-                    # protocol.
-                    raise exception.MigrationPreCheckError(
-                        reason='Incus CRIU live migration does not yet '
-                        'support Cinder boot-from-volume')
+                    # Incus cephext claims the root during the ordered
+                    # CRIU/shared-storage handover. Connecting it through
+                    # os-brick here would violate single-writer ownership.
+                    _require_bfv_live_migration_support(self.client, bdm)
+                    continue
                 connection_info = bdm.get('connection_info')
                 mountpoint = bdm.get('mount_device')
                 if connection_info and mountpoint:
@@ -3335,9 +3351,17 @@ class IncusDriver(driver.ComputeDriver):
                 reason='Incus live migration does not support config drives')
         root_bdm = _boot_from_volume(block_device_info)
         if root_bdm is not None:
-            raise exception.MigrationPreCheckError(
-                reason='Incus CRIU live migration does not yet support '
-                'Cinder boot-from-volume')
+            _require_bfv_live_migration_support(self.client, root_bdm)
+            try:
+                remote = _migration_client(
+                    dest_check_data.destination_address)
+                _require_bfv_live_migration_support(remote, root_bdm)
+            except exception.MigrationPreCheckError:
+                raise
+            except Exception as exc:
+                raise exception.MigrationPreCheckError(
+                    reason='Incus BFV live migration destination preflight '
+                    'failed: %s' % exc)
 
         _require_stateful_migration_extension(self.client)
         _live_migration_profile_check(self.client, instance)

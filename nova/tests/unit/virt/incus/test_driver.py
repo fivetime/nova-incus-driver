@@ -4214,12 +4214,22 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                          source_profile['config']['security.idmap.base'])
         self.assertEqual(profile.devices, source_profile['devices'])
 
-    def test_check_can_live_migrate_source_rejects_bfv_root(self):
+    @mock.patch.object(driver, '_migration_client')
+    @mock.patch.object(driver, '_require_bfv_live_migration_support')
+    def test_check_can_live_migrate_source_accepts_bfv_root(
+            self, require_bfv, migration_client):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', config_drive=False)
         instance.config_drive = ''
         self.CONF.incus.allow_live_migration = True
+        profile = mock.Mock(
+            config={'migration.stateful': 'true'},
+            devices={'root': {'type': 'disk', 'path': '/', 'pool': 'cinder'}})
+        container = self.client.instances.get.return_value
+        container.status = 'Running'
+        container.config = {'volatile.idmap.base': '1065536'}
+        self.client.profiles.get.return_value = profile
         data = migrate_data.IncusLiveMigrateData(
             destination_address='https://192.0.2.20:8443',
             destination_architecture='x86_64',
@@ -4227,15 +4237,36 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             destination_server_version='7.2')
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
+        root_bdm = {
+            'boot_index': 0,
+            'mount_device': '/dev/vda',
+            'connection_info': {'serial': 'root-volume'},
+        }
+
+        result = incus_driver.check_can_live_migrate_source(
+            ctx, instance, data,
+            {'block_device_mapping': [root_bdm]})
+
+        self.assertIs(data, result)
+        self.assertEqual(
+            [mock.call(self.client, root_bdm),
+             mock.call(migration_client.return_value, root_bdm)],
+            require_bfv.call_args_list)
+
+    @mock.patch.object(driver, '_require_bfv_migration_support')
+    def test_require_bfv_live_migration_support_requires_extension(
+            self, require_bfv):
+        require_bfv.return_value = (
+            'cinder-volumes', 'volume-root')
+        extensions = self.client.host_info['api_extensions']
+        if driver.INCUS_LIVE_BFV_MIGRATION_EXTENSION in extensions:
+            extensions.remove(driver.INCUS_LIVE_BFV_MIGRATION_EXTENSION)
 
         self.assertRaisesRegex(
-            exception.MigrationPreCheckError, 'boot-from-volume',
-            incus_driver.check_can_live_migrate_source,
-            ctx, instance, data,
-            {'block_device_mapping': [{
-                'boot_index': 0,
-                'mount_device': '/dev/vda',
-            }]})
+            exception.MigrationPreCheckError,
+            driver.INCUS_LIVE_BFV_MIGRATION_EXTENSION,
+            driver._require_bfv_live_migration_support,
+            self.client, mock.sentinel.root_bdm)
 
     def test_check_can_live_migrate_source_accepts_cinder_data_volume(self):
         ctx = context.get_admin_context()
@@ -4348,6 +4379,44 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             {'root': {'type': 'disk', 'path': '/'}})
         attach_volume.assert_called_once_with(
             ctx, connection_info, instance, '/dev/vdb')
+
+    @mock.patch.object(driver, '_require_bfv_live_migration_support')
+    @mock.patch.object(driver.IncusDriver, 'attach_volume')
+    def test_pre_live_migration_leaves_bfv_root_to_cephext(
+            self, attach_volume, require_bfv):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            destination_architecture='x86_64',
+            destination_kernel_version='6.8.0-test',
+            destination_server_version='7.2',
+            source_profile=jsonutils.dumps({
+                'config': {'migration.stateful': 'true'},
+                'devices': {
+                    'root': {
+                        'type': 'disk',
+                        'path': '/',
+                        'pool': 'cinder',
+                        'initial.ceph.rbd.image_name': 'volume-root',
+                    },
+                },
+            }))
+        root_bdm = {
+            'boot_index': 0,
+            'mount_device': '/dev/vda',
+            'connection_info': {'serial': 'root-volume'},
+        }
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        result = incus_driver.pre_live_migration(
+            ctx, instance, {'block_device_mapping': [root_bdm]},
+            [], None, data)
+
+        self.assertIs(data, result)
+        require_bfv.assert_called_once_with(self.client, root_bdm)
+        attach_volume.assert_not_called()
 
     @mock.patch.object(driver.IncusDriver, 'unplug_vifs')
     @mock.patch.object(driver.IncusDriver, 'attach_volume')
