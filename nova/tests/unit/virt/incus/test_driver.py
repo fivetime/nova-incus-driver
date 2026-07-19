@@ -3101,10 +3101,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
     def test_power_on(self):
         container = mock.Mock()
-        # Incus can keep reporting the source record as Running until Nova
-        # performs its post-migration delete. Target restore success is the
-        # authoritative completion signal.
-        container.status = 'Running'
+        container.status = 'Stopped'
         self.client.instances.get.return_value = container
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
