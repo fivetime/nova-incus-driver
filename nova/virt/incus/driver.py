@@ -3128,7 +3128,13 @@ class IncusDriver(driver.ComputeDriver):
 
     def post_live_migration(self, context, instance, block_device_info,
                             migrate_data=None):
-        self.client.instances.get(instance.name).delete(wait=True)
+        container = self.client.instances.get(instance.name)
+        if container.status != 'Stopped':
+            # Incus may keep the source record in Running state briefly after
+            # CRIU has restored the target. Match `incus delete --force`:
+            # force-stop the source record before removing it.
+            container.stop(timeout=-1, force=True, wait=True)
+        container.delete(wait=True)
 
     def post_live_migration_at_source(self, context, instance, network_info):
         self.client.profiles.get(instance.name).delete()

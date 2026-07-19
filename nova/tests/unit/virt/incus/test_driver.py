@@ -4453,6 +4453,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
         container = mock.Mock()
+        container.status = 'Stopped'
         self.client.instances.get.return_value = container
 
         incus_driver = driver.IncusDriver(None)
@@ -4460,6 +4461,23 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         incus_driver.post_live_migration(context, instance, None)
 
+        container.stop.assert_not_called()
+        container.delete.assert_called_once_with(wait=True)
+
+    def test_post_live_migration_force_stops_running_source(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        container = mock.Mock(status='Running')
+        self.client.instances.get.return_value = container
+
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.post_live_migration(ctx, instance, None)
+
+        container.stop.assert_called_once_with(
+            timeout=-1, force=True, wait=True)
         container.delete.assert_called_once_with(wait=True)
 
     def test_post_live_migration_at_source(self):
