@@ -83,8 +83,8 @@ for container_command in aa-exec apparmor_parser ceph incus incusd lxcfs rbd tar
     fi
 done
 
-if podman exec "$INCUS_CONTAINER" tar --help 2>&1 |
-        grep -F -- "--no-unquote" >/dev/null; then
+tar_help=$(podman exec "$INCUS_CONTAINER" tar --help 2>&1)
+if grep -F -- "--no-unquote" <<<"$tar_help" >/dev/null; then
     pass "CRIU GNU tar support"
 else
     fail "CRIU GNU tar support" \

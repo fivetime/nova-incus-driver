@@ -897,8 +897,10 @@ hardening.
   AppArmor, cgroups, admission, TLS, dedicated control filesystems, and Nova
   service checks.
 - The final independent residual audit found no Nova servers, Cinder volumes,
-  compute Neutron ports, Placement allocations, Incus instances/profiles,
-  KRBD mappings, Manila staging mounts, or OVS tap interfaces. Historical
+  compute Neutron ports, Placement allocations, Incus instances or non-default
+  profiles, KRBD mappings, instance-level Manila staging mounts, or OVS tap
+  interfaces. The controller's Manila service-backend LVM mount is expected
+  infrastructure and was not counted as an instance mount. Historical
   resources without a Nova, Neutron, or Cinder owner, including one final
   orphaned OVS veth pair on node01, were identified and removed before the
   clean audit.
