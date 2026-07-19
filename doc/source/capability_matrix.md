@@ -31,10 +31,13 @@
   单一 RBD watcher、返回节点隔离和源恢复清理均通过。
 - suspend/resume/rescue/unrescue 在 compute manager 中无副作用拒绝，恢复
   task state、保留 VM state，并写入明确的 Nova action event。
+- CRIU live migration 已通过 Nova API、Placement 和 Neutron OVN/OVS
+  双向 E2E。对于通过严格 pre-check 的无特权、本地根盘系统容器，
+  迁移保持固定 IP、PID 和进程计数器连续性。该能力仍是
+  workload-dependent、opt-in 和尽力而为。
 
 ## 有意拒绝
 
-- CRIU live migration 已完成条件化驱动和双节点 Incus 直接 E2E；OpenStack API/OVN E2E 通过前保持 framework 状态。
 - 本地根盘 failed-host evacuation。
 - suspend-to-memory、rescue、guest kernel crash dump。
 - 图形控制台以及 VM 固件、vTPM、Secure Boot、PCI/NUMA 加速能力。

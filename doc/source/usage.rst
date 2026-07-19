@@ -888,6 +888,7 @@ and restricted to the ``nova`` project. Do not reuse the read-only
     migration_tls_key = /etc/nova/incus-migration/client.key
     migration_tls_ca = /etc/nova/incus-migration/default-server.crt
     migration_tls_ca_by_server = 192.0.2.10:/etc/nova/incus-migration/compute-1.crt,192.0.2.11:/etc/nova/incus-migration/compute-2.crt
+
 Both the source and destination outer novm images must contain the same
 approved CRIU build plus ``iptables-restore`` and ``ip6tables-restore``.
 ``criu check --extra`` must pass on every compute. The driver uses staged
