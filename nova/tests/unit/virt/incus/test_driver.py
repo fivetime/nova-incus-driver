@@ -4337,6 +4337,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             {'root': {'type': 'disk', 'path': '/'}})
         self.assertEqual([instance.name], payload['profiles'])
         self.assertNotIn('default', payload)
+        self.assertIs(True, payload['source']['live'])
         self.assertEqual(
             'https://192.0.2.10:8443/1.0/operations/op?project=nova',
             payload['source']['operation'])

@@ -3074,6 +3074,11 @@ class IncusDriver(driver.ComputeDriver):
             migration_data['profiles'] = [instance.name]
 
             source = migration_data['source']
+            # pylxd starts the source operation in live mode but does not
+            # propagate that mode into the target InstanceSource payload.
+            # Without this flag the target opens only the cold-migration
+            # channels while the source waits for the CRIU state channel.
+            source['live'] = True
             source['operation'] = _migration_operation_url(
                 source['operation'], CONF.incus.migration_address,
                 CONF.incus.project)
