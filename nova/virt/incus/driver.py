@@ -2884,7 +2884,11 @@ class IncusDriver(driver.ComputeDriver):
             'local_gb': local_disk_info['total'] // units.Gi,
             'local_gb_used': local_disk_info['used'] // units.Gi,
             'vcpus_used': self._get_vcpus_used(),
-            'hypervisor_type': 'incus',
+            # ComputeNode.hypervisor_type is constrained by Nova's HVType
+            # enum on conductor nodes. Incus system containers implement the
+            # native LXC execution model, so report the standard LXC type
+            # rather than requiring Incus-specific Nova control-plane code.
+            'hypervisor_type': obj_fields.HVType.LXC,
             'hypervisor_version': '011',
             'cpu_info': jsonutils.dumps(cpu_info),
             'hypervisor_hostname': CONF.host,

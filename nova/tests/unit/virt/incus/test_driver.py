@@ -3168,7 +3168,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                 "arch": "x86_64", "vendor": "FakeVendor"
             },
             'hypervisor_hostname': 'fake_hostname',
-            'hypervisor_type': 'incus',
+            'hypervisor_type': 'lxc',
             'hypervisor_version': '011',
             'local_gb': 1000,
             'local_gb_used': 500,
@@ -3274,7 +3274,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                 "arch": "x86_64", "vendor": "FakeVendor"
             },
             'hypervisor_hostname': 'fake_hostname',
-            'hypervisor_type': 'incus',
+            'hypervisor_type': 'lxc',
             'hypervisor_version': '011',
             'local_gb': 2222,
             'local_gb_used': 200,
