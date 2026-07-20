@@ -3,25 +3,17 @@ Subject: [PATCH] diagnostics: Add the Incus driver identifier
 
 The standardized diagnostics response uses a closed enum for the virt
 driver. External system-container drivers cannot return truthful diagnostics
-because "incus" is not accepted. Add the external driver name to the object
-field, hypervisor virt type, response schema and API reference.
+because "incus" is not accepted. Add the external driver name to the
+diagnostics driver field, response schema and API reference.
+
+Do not add Incus to HVType. HVSpec objects containing that enum cross the RPC
+boundary to conductor, which must remain compatible with unmodified Nova.
+Incus system containers use the standard LXC execution type for supported
+instance reporting.
 
 diff --git a/nova/objects/fields.py b/nova/objects/fields.py
 --- a/nova/objects/fields.py
 +++ b/nova/objects/fields.py
-@@ -400,6 +400,7 @@ class HVType(BaseNovaEnum):
-     KVM = 'kvm'
-     LXC = 'lxc'
-     LXD = 'lxd'
-+    INCUS = 'incus'
-     OPENVZ = 'openvz'
-     PARALLELS = 'parallels'
-     VIRTUOZZO = 'vz'
-@@ -416,3 +417,3 @@ class HVType(BaseNovaEnum):
-     ALL = (BAREMETAL, BHYVE, DOCKER, FAKE, HYPERV, IRONIC, KQEMU, KVM, LXC,
--           LXD, OPENVZ, PARALLELS, PHYP, QEMU, TEST, UML, VBOX, VIRTUOZZO,
-+           LXD, INCUS, OPENVZ, PARALLELS, PHYP, QEMU, TEST, UML, VBOX, VIRTUOZZO,
-            VMWARE, XEN, ZVM, PRSM)
 @@ -850,8 +850,9 @@ class HypervisorDriver(BaseNovaEnum):
      VMWAREAPI = "vmwareapi"
      IRONIC = "ironic"
