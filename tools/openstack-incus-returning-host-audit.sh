@@ -11,7 +11,7 @@ CONTROLLER_OPENRC=${CONTROLLER_OPENRC:-/opt/stack/devstack/openrc admin admin}
 INCUS_PROJECT=${INCUS_PROJECT:-nova}
 CINDER_RBD_POOL=${CINDER_RBD_POOL:-cinder-volumes-rbd-pool}
 
-SSH=(ssh -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=no)
+SSH=(ssh -n -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=no)
 failures=0
 
 pass() {
@@ -137,10 +137,20 @@ for record in "${records[@]}"; do
         fail "$label local RBD mapping" "$local_mapping"
     fi
 
-    watcher_count=$(remote \
-        "rbd status '$CINDER_RBD_POOL/$root_image' \
-         --format json --id cinder 2>/dev/null || echo '{\"watchers\":[]}'" |
-        jq '.watchers | length')
+    image_id=$(remote \
+        "rados --id cinder -p '$CINDER_RBD_POOL' get \
+         'rbd_id.$root_image' - 2>/dev/null | tail -c +5" || true)
+    if [[ ! "$image_id" =~ ^[0-9a-f]+$ ]]; then
+        fail "$label Ceph watcher" "cannot resolve RBD image ID"
+        continue
+    fi
+    watcher_output=$(remote \
+        "rados --id cinder -p '$CINDER_RBD_POOL' listwatchers \
+         'rbd_header.$image_id'" 2>/dev/null) || {
+        fail "$label Ceph watcher" "cannot query RBD header"
+        continue
+    }
+    watcher_count=$(sed '/^[[:space:]]*$/d' <<<"$watcher_output" | wc -l)
     if [[ "$nova_status" == ACTIVE ]]; then
         expected_watchers=1
     elif [[ "$nova_status" == SHUTOFF ]]; then

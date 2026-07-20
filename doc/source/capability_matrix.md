@@ -61,6 +61,23 @@ KRBD 映射或 Ceph watcher，不能作为生产 fencing。
 4. 以 Nova terminal task state 和原始电源状态判断完成，不能假定总是 ACTIVE。
 5. 返回节点必须保持隔离，通过所有权审计后才能显式重新准入。
 
+计算节点的管理地址必须使用静态地址或 DHCP reservation。STONITH 标识应
+绑定不可变的 BMC/虚拟化域，而返回节点审计使用的管理地址也必须稳定；地址
+漂移会让节点已经上电但自动化仍判定为不可达。
+
+当 Glance 和 Cinder 使用同一 Ceph 集群并通过 RBD clone 创建 BFV 根卷时，
+`client.cinder` 除 Cinder pool 的读写权限外，还必须具有 Glance pool 的
+只读父链权限：
+
+```text
+profile rbd pool=cinder-volumes-rbd-pool,
+profile rbd-read-only pool=glance-images-rbd-pool
+```
+
+不得授予 `client.cinder` 对 Glance pool 的写权限。发布前应通过
+`openstack-incus-ceph-preflight.sh` 的 `GLANCE_POOL` 检查在每个计算节点
+实际验证该权限，而不是只检查 keyring 是否存在。
+
 该能力在 `capabilities.json` 中为有条件 `supported`：只适用于 shared-Ceph
 BFV，并要求部署自己的外部 STONITH。物理生产环境必须通过相同门禁验证其
 IPMI/Redfish/PDU；驱动默认仍关闭 `allow_bfv_evacuate`。迁移矩阵、真实断电

@@ -92,8 +92,8 @@ else
     elif ((fence_age < 0 || fence_age > FENCE_EVIDENCE_MAX_AGE_SECONDS)); then
         fail "external fence evidence age" \
             "$fence_age seconds (maximum $FENCE_EVIDENCE_MAX_AGE_SECONDS)"
-    elif ! grep -Fqx \
-            "PASS fenced BFV evacuation and returning-host reconciliation" \
+    elif ! grep -Eq \
+            '^PASS (fenced BFV evacuation and returning-host reconciliation|returning source quarantined and reconciled [0-9]+ servers)$' \
             "$FENCE_EVIDENCE_FILE"; then
         fail "external fence evidence result" "successful terminal record absent"
     else
@@ -333,10 +333,20 @@ for uuid in "${!runtime_hosts[@]}"; do
             "total=$attachment_total matching=$attachment_match"
     fi
 
-    watcher_count=$(remote "$CONTROLLER_SSH" \
-        "rbd status '$CINDER_RBD_POOL/$root_image' --id cinder \
-         --format json 2>/dev/null || echo '{\"watchers\":[]}'" |
-        jq '.watchers | length')
+    image_id=$(remote "$CONTROLLER_SSH" \
+        "rados --id cinder -p '$CINDER_RBD_POOL' get \
+         'rbd_id.$root_image' - 2>/dev/null | tail -c +5" || true)
+    if [[ ! "$image_id" =~ ^[0-9a-f]+$ ]]; then
+        fail "$label Ceph watcher" "cannot resolve RBD image ID"
+        continue
+    fi
+    watcher_output=$(remote "$CONTROLLER_SSH" \
+        "rados --id cinder -p '$CINDER_RBD_POOL' listwatchers \
+         'rbd_header.$image_id'" 2>/dev/null) || {
+        fail "$label Ceph watcher" "cannot query RBD header"
+        continue
+    }
+    watcher_count=$(sed '/^[[:space:]]*$/d' <<<"$watcher_output" | wc -l)
     expected_runtime=STOPPED
     expected_count=0
     if [[ "$nova_status" == ACTIVE ]]; then

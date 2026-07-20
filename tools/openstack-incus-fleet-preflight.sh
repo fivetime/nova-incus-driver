@@ -28,12 +28,11 @@ if [[ ! -d "$RELEASE_DRIVER" ]]; then
 fi
 
 driver_tree_hash() {
-    find "$1" -type f -name '*.py' -print0 |
-        LC_ALL=C sort -z |
-        xargs -0 sha256sum |
-        awk '{print $1}' |
-        sha256sum |
-        awk '{print $1}'
+    local file
+    while IFS= read -r -d '' file; do
+        sed 's/\r$//' "$file" | sha256sum | awk '{print $1}'
+    done < <(find "$1" -type f -name '*.py' -print0 | LC_ALL=C sort -z) |
+        sha256sum | awk '{print $1}'
 }
 
 expected_driver_hash=$(driver_tree_hash "$RELEASE_DRIVER")
@@ -85,9 +84,10 @@ for node in "${nodes[@]}"; do
     fi
 
     driver_hash=$(remote "$target" \
-        "find '$REMOTE_DRIVER' -type f -name '*.py' -print0 | \
-         LC_ALL=C sort -z | xargs -0 sha256sum | awk '{print \$1}' | \
-         sha256sum | awk '{print \$1}'" \
+        "while IFS= read -r -d '' file; do \
+             sed 's/\r\$//' \"\$file\" | sha256sum | awk '{print \$1}'; \
+         done < <(find '$REMOTE_DRIVER' -type f -name '*.py' -print0 | \
+             LC_ALL=C sort -z) | sha256sum | awk '{print \$1}'" \
         2>/dev/null)
     if [[ "$driver_hash" == "$expected_driver_hash" ]]; then
         pass "$host driver hash" "$driver_hash"

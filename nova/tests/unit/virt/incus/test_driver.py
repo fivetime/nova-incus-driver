@@ -3176,6 +3176,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'memory_mb_used': 8000,
             'numa_topology': None,
             'supported_instances': [
+                ('i686', 'incus', 'exe'),
+                ('x86_64', 'incus', 'exe'),
                 ('i686', 'lxc', 'exe'),
                 ('x86_64', 'lxc', 'exe')],
             'vcpus': 200,
@@ -3280,6 +3282,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'memory_mb_used': 8000,
             'numa_topology': None,
             'supported_instances': [
+                ('i686', 'incus', 'exe'),
+                ('x86_64', 'incus', 'exe'),
                 ('i686', 'lxc', 'exe'),
                 ('x86_64', 'lxc', 'exe')],
             'vcpus': 200,

@@ -19,7 +19,7 @@ CINDER_RBD_POOL=${CINDER_RBD_POOL:-cinder-volumes-rbd-pool}
 INCUS_PROJECT=${INCUS_PROJECT:-nova}
 TIMEOUT=${TIMEOUT:-}
 
-SSH=(ssh -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=no)
+SSH=(ssh -n -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=no)
 marker="openstack-incus-evacuation-$(date +%s)-$$"
 marker_sha=$(printf '%s\n' "$marker" | sha256sum | awk '{print $1}')
 
@@ -139,10 +139,15 @@ source_fenced() {
 }
 
 watcher_count() {
-    remote "$CONTROLLER_SSH" \
-        "rbd status '$CINDER_RBD_POOL/$root_image' --id cinder \
-         --format json 2>/dev/null || echo '{\"watchers\":[]}'" |
-        jq '.watchers | length'
+    local image_id output
+    image_id=$(remote "$CONTROLLER_SSH" \
+        "rados --id cinder -p '$CINDER_RBD_POOL' get \
+         'rbd_id.$root_image' - 2>/dev/null | tail -c +5")
+    [[ "$image_id" =~ ^[0-9a-f]+$ ]] || return 1
+    output=$(remote "$CONTROLLER_SSH" \
+        "rados --id cinder -p '$CINDER_RBD_POOL' listwatchers \
+         'rbd_header.$image_id'") || return 1
+    sed '/^[[:space:]]*$/d' <<<"$output" | wc -l
 }
 
 watchers_are() {

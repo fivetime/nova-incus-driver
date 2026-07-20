@@ -928,3 +928,48 @@ hardening.
 - The final post-change suite ran 310 Python tests (308 passed, two documented
   legacy skips). Bash syntax, ShellCheck, three-node Incus/RBD/Manila/OVS
   residue audits and the OpenStack allocation audit passed.
+- The complete 18-case matrix was repeated after the compute-node reboot and
+  failed-host evacuation exercise. All 54 live migrations passed again, and
+  the final Nova server, Cinder volume, Neutron port, Manila access/lock,
+  Incus instance, host NFS mount and Placement allocation inventories were
+  empty or baseline-equal. The rerun also proved two deployment preconditions:
+  a compute's fixed management address must exist before Incus binds its
+  migration listener, and a loop-backed Manila LVM test backend must restore
+  its loop device and activate its VG before ``manila-share`` starts. These
+  were test-infrastructure failures, not migration-driver failures.
+
+## 2026-07-20 30-instance failed-host evacuation matrix
+
+- Thirty 1-vCPU/512-MiB BFV system containers with independent Cinder RBD
+  roots were created on ``incus-node-02``. While its Nova service remained
+  up, all 30 native ``openstack server evacuate`` requests returned HTTP 400
+  ``Compute service ... is still in use``. All servers stayed ACTIVE on the
+  source with one attachment and one watcher per root.
+- The independent KVM host then powered the source domain off through
+  ``fence_virsh``. Nova reported the service down and direct RBD-header
+  queries proved zero watchers before any evacuation was submitted.
+- The first target attempt exposed a missing production Ceph permission:
+  Cinder volumes were RBD clones of Glance images, but ``client.cinder`` had
+  no access to the Glance parent pool. It now has only
+  ``profile rbd-read-only pool=glance-images-rbd-pool`` in addition to its
+  existing Cinder-pool profile. The same credentials on ``incus-node-03``
+  then opened the parent chain, and all 30 retries became ACTIVE there.
+- Every recovered root preserved its unique marker. The final target state
+  had 30 unique Cinder attachments and exactly one RBD-header watcher per
+  volume. Watcher gates now query ``rbd_header.<image-id>`` with ``rados``;
+  they no longer treat ``rbd status`` parent-pool ``EPERM`` as zero watchers.
+- When the old source domain was powered on, its DHCP address changed from
+  ``10.224.0.17`` to ``10.224.0.23``. This proved the production requirement
+  for static management addressing or DHCP reservations. At the actual
+  address, the admission token was absent, nova-compute was failed, all 30
+  stale Incus records were STOPPED, and none had a local KRBD mapping.
+- The returning-host audit passed all 30 records: Nova and Neutron named
+  ``incus-node-03``, each root had one matching Cinder attachment and target
+  watcher, and the source had no mapping. Explicit admission then started
+  nova-compute, Nova removed all 30 stale source records, and the destination
+  remained the sole owner. All temporary servers, volumes, Flavor and quota
+  changes were removed after the test.
+- The final fleet audit passed all three hosts. Its driver hash now
+  normalizes CRLF to LF before hashing, so equivalent Windows-deployed Python
+  files do not create false drift alerts while any code-character change
+  remains detectable.

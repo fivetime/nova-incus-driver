@@ -1046,6 +1046,15 @@ driver hard-coded maximum; Nova, Cinder, Manila and project quotas, Linux
 device limits, CRIU checkpoint size, and compute/storage capacity remain
 authoritative limits.
 
+Before running the matrix after a host reboot, verify that every compute's
+fixed management address is present and that Incus is actually listening on
+its configured migration address. A configured ``core.https_address`` alone
+is not sufficient if Incus started before that address became available.
+When the Manila LVM backend uses a loop-backed file in a test environment,
+restore the loop device and activate the volume group before starting
+``manila-share``. Production Manila backends should use persistent storage
+with equivalent boot ordering rather than an unmanaged loop device.
+
 Set ``SECOND_NETWORK=private`` when running the migration E2E to attach a
 second Neutron port before migration. The extended check persists guest
 netplan configuration, verifies the secondary fixed IP and OVN-installed OVS

@@ -6,6 +6,7 @@ set -euo pipefail
 ROOTFS_POOL=${ROOTFS_POOL:?Set ROOTFS_POOL to the Incus-only RBD pool}
 DEST_ROOTFS_POOL=${DEST_ROOTFS_POOL:?Set DEST_ROOTFS_POOL to the destination Incus RBD pool}
 CINDER_POOL=${CINDER_POOL:?Set CINDER_POOL to the Cinder-only RBD pool}
+GLANCE_POOL=${GLANCE_POOL:-}
 ROOTFS_USER=${ROOTFS_USER:-incus}
 DEST_ROOTFS_USER=${DEST_ROOTFS_USER:-incus-node02}
 CINDER_USER=${CINDER_USER:-cinder}
@@ -79,6 +80,7 @@ validate_cinder_backend() {
 validate_name ROOTFS_POOL "$ROOTFS_POOL"
 validate_name DEST_ROOTFS_POOL "$DEST_ROOTFS_POOL"
 validate_name CINDER_POOL "$CINDER_POOL"
+[[ -z "$GLANCE_POOL" ]] || validate_name GLANCE_POOL "$GLANCE_POOL"
 validate_name ROOTFS_USER "$ROOTFS_USER"
 validate_name DEST_ROOTFS_USER "$DEST_ROOTFS_USER"
 validate_name CINDER_USER "$CINDER_USER"
@@ -98,6 +100,11 @@ validate_client "$DEST_SSH" "$DEST_ROOTFS_USER" "$DEST_ROOTFS_POOL"
 validate_client "$SOURCE_SSH" "$CINDER_USER" "$CINDER_POOL"
 validate_client "$DEST_SSH" "$CINDER_USER" "$CINDER_POOL"
 validate_client "$CONTROLLER_SSH" "$CINDER_USER" "$CINDER_POOL"
+if [[ -n "$GLANCE_POOL" ]]; then
+    validate_client "$SOURCE_SSH" "$CINDER_USER" "$GLANCE_POOL"
+    validate_client "$DEST_SSH" "$CINDER_USER" "$GLANCE_POOL"
+    validate_client "$CONTROLLER_SSH" "$CINDER_USER" "$GLANCE_POOL"
+fi
 
 if [[ "${CHECK_CONFIGURED_BACKENDS,,}" == true ]]; then
     validate_incus_backend \
