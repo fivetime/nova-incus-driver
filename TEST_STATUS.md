@@ -482,7 +482,10 @@ hardening.
   revision, driver hash, Incus 7.2 extensions, AppArmor/cgroups, Ceph access,
   dedicated control filesystems, restricted TLS, Placement, OVN, Nova and
   Cinder were all green. The authoritative Python 3.12 tree then passed 233
-  unit tests with 2 documented legacy skips, pep8 and Sphinx `-W`.
+  active unit tests, pep8 and Sphinx `-W`. Two obsolete modules for the
+  removed ``pylxd.deprecated`` migration/session API were skipped at that
+  historical checkpoint and have since been deleted with their unreachable
+  production session wrapper.
 
 - On 2026-07-17, shelving a BFV server reached `SHELVED_OFFLOADED`, removed
   its Incus instance record and Ceph watcher, and left the Cinder attachment
@@ -925,9 +928,9 @@ hardening.
 - BFV + three Cinder data volumes + three Manila shares also passed a
   target-side CRIU restore failure injection, source rollback with the same
   PID, per-resource destination cleanup, and immediate retry.
-- The final post-change suite ran 310 Python tests (308 passed, two documented
-  legacy skips). Bash syntax, ShellCheck, three-node Incus/RBD/Manila/OVS
-  residue audits and the OpenStack allocation audit passed.
+- The final post-change suite ran 308 Python tests with no skips or failures.
+  Bash syntax, ShellCheck, three-node Incus/RBD/Manila/OVS residue audits and
+  the OpenStack allocation audit passed.
 - The complete 18-case matrix was repeated after the compute-node reboot and
   failed-host evacuation exercise. All 54 live migrations passed again, and
   the final Nova server, Cinder volume, Neutron port, Manila access/lock,
