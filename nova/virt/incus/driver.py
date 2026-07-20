@@ -2861,21 +2861,12 @@ class IncusDriver(driver.ComputeDriver):
         else:
             local_disk_info = _get_fs_info(CONF.incus.root_dir)
 
-        incus_hv_type = getattr(
-            obj_fields.HVType, 'INCUS', obj_fields.HVType.LXC)
         supported_instances = [
-            (obj_fields.Architecture.I686, incus_hv_type,
+            (obj_fields.Architecture.I686, obj_fields.HVType.LXC,
              obj_fields.VMMode.EXE),
-            (obj_fields.Architecture.X86_64, incus_hv_type,
+            (obj_fields.Architecture.X86_64, obj_fields.HVType.LXC,
              obj_fields.VMMode.EXE),
         ]
-        if incus_hv_type != obj_fields.HVType.LXC:
-            supported_instances.extend([
-                (obj_fields.Architecture.I686, obj_fields.HVType.LXC,
-                 obj_fields.VMMode.EXE),
-                (obj_fields.Architecture.X86_64, obj_fields.HVType.LXC,
-                 obj_fields.VMMode.EXE),
-            ])
 
         data = {
             'vcpus': vcpus,
@@ -2884,7 +2875,7 @@ class IncusDriver(driver.ComputeDriver):
             'local_gb': local_disk_info['total'] // units.Gi,
             'local_gb_used': local_disk_info['used'] // units.Gi,
             'vcpus_used': self._get_vcpus_used(),
-            'hypervisor_type': 'incus',
+            'hypervisor_type': obj_fields.HVType.LXC,
             'hypervisor_version': '011',
             'cpu_info': jsonutils.dumps(cpu_info),
             'hypervisor_hostname': CONF.host,
