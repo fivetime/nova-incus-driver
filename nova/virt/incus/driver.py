@@ -1572,14 +1572,14 @@ class IncusDriver(driver.ComputeDriver):
 
     def get_instance_diagnostics(self, instance):
         """Return the standardized diagnostics object for Incus containers."""
-        if not hasattr(obj_fields.HypervisorDriver, 'Incus'):
+        if not hasattr(obj_fields.HypervisorDriver, 'INCUS'):
             raise NotImplementedError(
                 'Nova must include the incus diagnostics driver identifier')
 
         data = self._get_diagnostics_data(instance)
         diags = objects.Diagnostics(
             state=power_state.STATE_MAP[data['state']],
-            driver=obj_fields.HypervisorDriver.Incus,
+            driver=obj_fields.HypervisorDriver.INCUS,
             config_drive=configdrive.required_by(instance),
             hypervisor='incus',
             hypervisor_os='linux',
