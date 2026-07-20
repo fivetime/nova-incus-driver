@@ -150,7 +150,7 @@
       "driver_hooks": ["check_can_live_migrate_destination", "check_can_live_migrate_source", "live_migration"],
       "applicability": "workload-dependent-criu",
       "status": "supported",
-      "evidence": "Opt-in best-effort support. On 2026-07-19 tools/openstack-incus-live-migration-matrix.sh passed all 8 local/BFV-root x Cinder-data-volume x Manila-share combinations through node01 -> node02 -> node03 -> node01 with PID continuity, increasing process state, OVN rebinding, storage/share data preservation, and baseline-equal cleanup. The strict BFV + 2 data volumes + Manila case also injected a target CRIU restore failure, proved source rollback, and immediately retried successfully. Incus revision 80ba579c257e034d049d855b9173e06c73aa7e09 and image digest sha256:25b57d845276773ca219ae3f9dc0e0da3db7262dc0f2308d53c7fb9b7ac48088 include GNU tar and full-final fallback for failed CRIU pre-copy."
+      "evidence": "Opt-in best-effort support. On 2026-07-20 tools/openstack-incus-live-migration-cardinality-matrix.sh passed all 18 local/BFV-root x 0/1/3 Cinder-data-volume x 0/1/3 independent-Manila-share combinations through node01 -> node02 -> node03 -> node01: 54 migrations with PID continuity, increasing process state, OVN rebinding, per-resource data preservation, and baseline-equal cleanup. BFV + 3 data volumes + 3 shares also passed target CRIU restore failure injection, source rollback, per-resource destination cleanup, and immediate retry. Incus revision 80ba579c257e034d049d855b9173e06c73aa7e09 and image digest sha256:25b57d845276773ca219ae3f9dc0e0da3db7262dc0f2308d53c7fb9b7ac48088 include GNU tar and full-final fallback for failed CRIU pre-copy."
     },
     {
       "id": "evacuate-bfv",

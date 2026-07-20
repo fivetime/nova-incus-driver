@@ -2798,7 +2798,13 @@ class IncusDriver(driver.ComputeDriver):
                 os.rmdir(mount_path)
             instance_share_dir = os.path.dirname(mount_path)
             if os.path.isdir(instance_share_dir):
-                os.rmdir(instance_share_dir)
+                try:
+                    os.rmdir(instance_share_dir)
+                except OSError as exc:
+                    # Other share mappings for this instance legitimately
+                    # keep sibling directories beneath the common parent.
+                    if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+                        raise
             return False
         except Exception as exc:
             raise exception.ShareUmountError(

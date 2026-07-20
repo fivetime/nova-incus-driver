@@ -31,6 +31,10 @@ DATA_VOLUME_COUNT=${DATA_VOLUME_COUNT:-1}
 DATA_DEVICES=${DATA_DEVICES:-$DATA_DEVICE}
 MANILA_SHARE=${MANILA_SHARE:-}
 MANILA_TAG=${MANILA_TAG:-tenant-data}
+# Space-separated share names or IDs and optional one-to-one guest tags.
+# MANILA_SHARE/MANILA_TAG remain supported for single-share callers.
+MANILA_SHARES=${MANILA_SHARES:-$MANILA_SHARE}
+MANILA_TAGS=${MANILA_TAGS:-}
 INJECT_RESTORE_FAILURE=${INJECT_RESTORE_FAILURE:-0}
 E2E_LOCK_FILE=${E2E_LOCK_FILE:-/run/lock/openstack-incus-live-migration-e2e.lock}
 
@@ -46,15 +50,20 @@ instance_name=
 port_id=
 user_data=
 root_volume_id=
-share_id=
 shares_url=
 token=
-manila_marker_path=
 volume_ids=()
 volume_devices=()
 volume_markers=()
+share_ids=()
+share_tags=()
+share_markers=()
+manila_marker_paths=()
+share_mounts=()
 restore_failpoint_ssh=
 read -r -a requested_data_devices <<<"$DATA_DEVICES"
+read -r -a requested_manila_shares <<<"$MANILA_SHARES"
+read -r -a requested_manila_tags <<<"$MANILA_TAGS"
 IFS=',' read -r -a migration_targets <<<"$MIGRATION_TARGETS"
 test_sshs=("$SOURCE_SSH")
 for target in "${migration_targets[@]}"; do
@@ -180,7 +189,7 @@ share_api() {
 }
 
 wait_share_status() {
-    local expected=$1
+    local share_id=$1 expected=$2
     local deadline=$((SECONDS + TIMEOUT))
     local body
     while ((SECONDS < deadline)); do
@@ -202,6 +211,7 @@ raise SystemExit(0 if any(
 }
 
 wait_share_absent() {
+    local share_id=$1
     local deadline=$((SECONDS + TIMEOUT))
     while ((SECONDS < deadline)); do
         if ! share_api GET "$shares_url" | grep -Fq "$share_id"; then
@@ -260,10 +270,13 @@ cleanup() {
         return "$rc"
     fi
     if [[ -n "$server_id" ]]; then
-        if [[ -n "$share_id" && -n "$shares_url" ]]; then
+        if ((${#share_ids[@]} > 0)) && [[ -n "$shares_url" ]]; then
             openstack server stop "$server_id" >/dev/null 2>&1 || true
-            share_api DELETE "$shares_url/$share_id" \
-                >/dev/null 2>&1 || true
+            local share_id
+            for share_id in "${share_ids[@]}"; do
+                share_api DELETE "$shares_url/$share_id" \
+                    >/dev/null 2>&1 || true
+            done
         fi
         openstack server delete --wait "$server_id" >/dev/null 2>&1 || true
     fi
@@ -407,8 +420,12 @@ until incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
     sleep 2
 done
 
-if [[ -n "$MANILA_SHARE" ]]; then
-    share_id=$(openstack share show "$MANILA_SHARE" -f value -c id)
+if ((${#requested_manila_shares[@]} > 0)); then
+    if ((${#requested_manila_tags[@]} > 0 &&
+         ${#requested_manila_tags[@]} != ${#requested_manila_shares[@]})); then
+        echo "MANILA_TAGS must be empty or match MANILA_SHARES count" >&2
+        exit 2
+    fi
     token=$(openstack token issue -f value -c id)
     endpoint=$(openstack endpoint list --service nova --interface public \
         -f value -c URL | head -n1)
@@ -418,10 +435,31 @@ if [[ -n "$MANILA_SHARE" ]]; then
 
     openstack server stop "$server_id"
     wait_status SHUTOFF
-    share_api POST "$shares_url" \
-        "{\"share\":{\"share_id\":\"$share_id\",\"tag\":\"$MANILA_TAG\"}}" \
-        >/dev/null
-    wait_share_status inactive
+    for index in "${!requested_manila_shares[@]}"; do
+        share_ref=${requested_manila_shares[index]}
+        share_id=$(openstack share show "$share_ref" -f value -c id)
+        if ((${#requested_manila_tags[@]} > 0)); then
+            share_tag=${requested_manila_tags[index]}
+        elif ((${#requested_manila_shares[@]} == 1)); then
+            share_tag=$MANILA_TAG
+        else
+            share_tag="${MANILA_TAG}-$((index + 1))"
+        fi
+        [[ " ${share_ids[*]} " != *" $share_id "* ]] || {
+            echo "MANILA_SHARES contains duplicate share: $share_ref" >&2
+            exit 2
+        }
+        [[ " ${share_tags[*]} " != *" $share_tag "* ]] || {
+            echo "Manila guest tags must be unique: $share_tag" >&2
+            exit 2
+        }
+        share_ids+=("$share_id")
+        share_tags+=("$share_tag")
+        share_api POST "$shares_url" \
+            "{\"share\":{\"share_id\":\"$share_id\",\"tag\":\"$share_tag\"}}" \
+            >/dev/null
+        wait_share_status "$share_id" inactive
+    done
     openstack server start "$server_id"
     wait_status ACTIVE
 
@@ -434,42 +472,51 @@ if [[ -n "$MANILA_SHARE" ]]; then
         }
         sleep 2
     done
-    until incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
-            grep -Fq "/mnt/manila/$MANILA_TAG" /proc/self/mountinfo; do
-        ((SECONDS < deadline)) || {
-            echo "Manila share did not appear in the source container" >&2
-            exit 1
-        }
-        sleep 2
+    for index in "${!share_ids[@]}"; do
+        share_id=${share_ids[index]}
+        share_tag=${share_tags[index]}
+        share_mount="/opt/stack/data/nova/instances/incus-shares/$server_id/$share_id"
+        share_mounts+=("$share_mount")
+        until incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
+                grep -Fq "/mnt/manila/$share_tag" /proc/self/mountinfo; do
+            ((SECONDS < deadline)) || {
+                echo "Manila share did not appear: $share_id" >&2
+                exit 1
+            }
+            sleep 2
+        done
+        manila_marker="MANILA_LIVE_${index}_${RANDOM}_$(date +%s)"
+        manila_marker_path="/mnt/manila/$share_tag/live-marker-$server_id"
+        share_markers+=("$manila_marker")
+        manila_marker_paths+=("$manila_marker_path")
+        until incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
+                sh -c "printf '%s' '$manila_marker' >'$manila_marker_path'"; do
+            ((SECONDS < deadline)) || {
+                echo "Manila share was mounted but not writable: $share_id" >&2
+                exit 1
+            }
+            sleep 2
+        done
+        [[ "$(incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
+            cat "$manila_marker_path")" == "$manila_marker" ]]
+        remote "$SOURCE_SSH" findmnt -rn "$share_mount" >/dev/null
     done
-    manila_marker="MANILA_LIVE_${RANDOM}_$(date +%s)"
-    manila_marker_path="/mnt/manila/$MANILA_TAG/live-marker-$server_id"
-    until incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
-            sh -c "printf '%s' '$manila_marker' >'$manila_marker_path'"; do
-        ((SECONDS < deadline)) || {
-            echo "Manila share was mounted but not writable" >&2
-            exit 1
-        }
-        sleep 2
-    done
-    [[ "$(incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
-        cat "$manila_marker_path")" == "$manila_marker" ]]
 fi
 
 if [[ "$WITH_DATA_VOLUME" == "1" ]]; then
     [[ "$DATA_VOLUME_COUNT" =~ ^[1-9][0-9]*$ ]]
-    ((${#requested_data_devices[@]} >= DATA_VOLUME_COUNT)) || {
-        echo "DATA_DEVICES has fewer entries than DATA_VOLUME_COUNT" >&2
-        exit 1
-    }
     for ((index = 0; index < DATA_VOLUME_COUNT; index++)); do
         volume_id=$(openstack volume create \
             --type "$DATA_VOLUME_TYPE" --size "$DATA_VOLUME_SIZE" \
             -f value -c id "${SERVER}-data-$((index + 1))")
         volume_ids+=("$volume_id")
-        openstack server add volume \
-            --device "${requested_data_devices[index]}" \
-            "$server_id" "$volume_id"
+        if [[ -n "${requested_data_devices[index]:-}" ]]; then
+            openstack server add volume \
+                --device "${requested_data_devices[index]}" \
+                "$server_id" "$volume_id"
+        else
+            openstack server add volume "$server_id" "$volume_id"
+        fi
         deadline=$((SECONDS + TIMEOUT))
         until [[ "$(openstack volume show "$volume_id" \
                 -f value -c status)" == "in-use" ]]; do
@@ -519,8 +566,8 @@ later_counter=$source_counter
 
 inject_and_verify_restore_rollback() {
     local target_host=$1 target_ssh=$2
-    local rollback_pid rollback_counter volume_id image_name
-    local deadline status share_mount injection_since
+    local rollback_pid rollback_counter index volume_id image_name
+    local deadline status share_id share_mount injection_since
     local source_migration_log target_migration_log
 
     injection_since=$(( $(date +%s) - 2 ))
@@ -599,20 +646,21 @@ inject_and_verify_restore_rollback() {
             "rbd device list --format json --id cinder | jq -e \
              '.[] | select(.name == \"$image_name\")'" >/dev/null
     done
-    if [[ -n "$share_id" ]]; then
-        share_mount="/opt/stack/data/nova/instances/incus-shares/$server_id/$share_id"
+    for index in "${!share_ids[@]}"; do
+        share_id=${share_ids[index]}
+        share_mount=${share_mounts[index]}
         remote "$current_ssh" findmnt -rn "$share_mount" >/dev/null
         assert_fails "target Manila staging mount must be absent after rollback" \
             remote "$target_ssh" findmnt -rn "$share_mount" >/dev/null
-    fi
+    done
     echo "PASS injected live-restore failure rolled back to $current_host"
 }
 
 migrate_and_verify() {
     local target_host=$1 target_ssh=$2
     local dest_pid dest_counter index volume_id data_device volume_marker
-    local restored_marker target_volume_source restored_manila_marker
-    local guest_iface dest_ovs_iface root_image
+    local restored_marker target_volume_source restored_manila_marker share_mount
+    local guest_iface dest_ovs_iface root_image manila_marker_path manila_marker
 
     openstack server migrate --live-migration --host "$target_host" \
         --wait "$server_id"
@@ -669,15 +717,17 @@ migrate_and_verify() {
         done
     fi
 
-    if [[ -n "$share_id" ]]; then
+    for index in "${!share_ids[@]}"; do
+        manila_marker_path=${manila_marker_paths[index]}
+        manila_marker=${share_markers[index]}
+        share_mount=${share_mounts[index]}
         restored_manila_marker=$(incus_remote "$target_ssh" \
             exec "$instance_name" -- cat "$manila_marker_path")
         [[ "$restored_manila_marker" == "$manila_marker" ]]
-        share_mount="/opt/stack/data/nova/instances/incus-shares/$server_id/$share_id"
         remote "$target_ssh" findmnt -rn "$share_mount" >/dev/null
         assert_fails "source Manila staging mount must be absent after migration" \
             remote "$current_ssh" findmnt -rn "$share_mount" >/dev/null
-    fi
+    done
 
     guest_iface=$(incus_remote "$target_ssh" config get "$instance_name" \
         "volatile.tap${port_id:0:11}.name")
@@ -710,18 +760,24 @@ for target in "${migration_targets[@]}"; do
     migrate_and_verify "${target%%=*}" "${target#*=}"
 done
 
-trap - EXIT
 rm -f "$user_data"
-if [[ -n "$share_id" ]]; then
-    incus_remote "$current_ssh" exec "$instance_name" -- \
-        rm -f "$manila_marker_path"
+user_data=
+if ((${#share_ids[@]} > 0)); then
+    for manila_marker_path in "${manila_marker_paths[@]}"; do
+        incus_remote "$current_ssh" exec "$instance_name" -- \
+            rm -f "$manila_marker_path"
+    done
     openstack server stop "$server_id"
     wait_status SHUTOFF
-    share_api DELETE "$shares_url/$share_id" >/dev/null
-    wait_share_absent
-    for host in "${test_sshs[@]}"; do
-        assert_fails "Manila staging mount must be absent after detach" \
-            remote "$host" findmnt -rn "$share_mount" >/dev/null
+    for index in "${!share_ids[@]}"; do
+        share_id=${share_ids[index]}
+        share_mount=${share_mounts[index]}
+        share_api DELETE "$shares_url/$share_id" >/dev/null
+        wait_share_absent "$share_id"
+        for host in "${test_sshs[@]}"; do
+            assert_fails "Manila staging mount must be absent after detach" \
+                remote "$host" findmnt -rn "$share_mount" >/dev/null
+        done
     done
 fi
 openstack server delete --wait "$server_id"
@@ -757,4 +813,12 @@ for host in "${test_sshs[@]}"; do
     assert_no_ovs_port "$host"
 done
 
-echo "PASS server=$server_id instance=$instance_name ip=$fixed_ip pid=$source_pid counter=$source_counter->$later_counter hops=${#migration_targets[@]} root_volume=${root_volume_id:-local} data_volumes=${volume_ids[*]:-none} manila_share=${share_id:-none}"
+result="PASS server=$server_id instance=$instance_name ip=$fixed_ip pid=$source_pid counter=$source_counter->$later_counter hops=${#migration_targets[@]} root_volume=${root_volume_id:-local} data_volumes=${volume_ids[*]:-none} manila_shares=${share_ids[*]:-none}"
+server_id=
+instance_name=
+port_id=
+root_volume_id=
+volume_ids=()
+share_ids=()
+trap - EXIT
+echo "$result"

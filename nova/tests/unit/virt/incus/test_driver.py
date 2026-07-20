@@ -16,6 +16,7 @@
 import collections
 import base64
 from contextlib import closing
+import errno
 import hashlib
 import inspect
 import io
@@ -3763,6 +3764,66 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         profile.save.assert_called_once_with(wait=True)
         umount.assert_called_once_with(
             driver._share_mount_path(instance, share))
+
+    @mock.patch.object(driver.os.path, 'isdir', return_value=True)
+    @mock.patch.object(driver.os.path, 'ismount', return_value=True)
+    @mock.patch.object(driver.privsep_fs, 'umount')
+    @mock.patch.object(driver.os, 'rmdir')
+    def test_umount_share_keeps_parent_with_other_share(
+            self, rmdir, umount, ismount, isdir):
+        self.CONF.incus.enable_manila_shares = True
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            share_proto='NFS')
+        profile = self.client.profiles.get.return_value
+        profile.devices = {
+            driver._share_device_name(share): {'type': 'disk'}}
+        rmdir.side_effect = [
+            None,
+            OSError(errno.ENOTEMPTY, 'Directory not empty'),
+        ]
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        self.assertFalse(incus_driver.umount_share(None, instance, share))
+
+        self.assertEqual(2, rmdir.call_count)
+        umount.assert_called_once_with(
+            driver._share_mount_path(instance, share))
+
+    @mock.patch.object(driver.os.path, 'isdir', return_value=True)
+    @mock.patch.object(driver.os.path, 'ismount', return_value=True)
+    @mock.patch.object(driver.privsep_fs, 'umount')
+    @mock.patch.object(driver.os, 'rmdir')
+    def test_umount_share_reports_parent_removal_error(
+            self, rmdir, umount, ismount, isdir):
+        self.CONF.incus.enable_manila_shares = True
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            share_proto='NFS')
+        profile = self.client.profiles.get.return_value
+        profile.devices = {
+            driver._share_device_name(share): {'type': 'disk'}}
+        rmdir.side_effect = [
+            None,
+            OSError(errno.EACCES, 'Permission denied'),
+        ]
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        self.assertRaises(
+            exception.ShareUmountError,
+            incus_driver.umount_share, None, instance, share)
 
     def test_mount_share_disabled_is_explicitly_rejected(self):
         self.CONF.incus.enable_manila_shares = False

@@ -904,3 +904,27 @@ hardening.
   resources without a Nova, Neutron, or Cinder owner, including one final
   orphaned OVS veth pair on node01, were identified and removed before the
   clean audit.
+
+## 2026-07-20 attachment-cardinality live-migration matrix
+
+- The E2E runner now accepts arbitrary-length ``DATA_VOLUME_COUNT`` and
+  space-separated ``MANILA_SHARES``/``MANILA_TAGS`` lists. It verifies every
+  volume marker, share marker, host staging mount, RBD mapping, OVN owner and
+  cleanup operation independently on every hop.
+- The first local-root + three-data-volume + three-share run exposed a real
+  multi-share detach bug: removing the first share treated the non-empty
+  per-instance parent as an error. The driver now ignores only the expected
+  ``ENOTEMPTY``/``EEXIST`` parent result while preserving all share-local
+  unmount and removal failures. A focused regression test covers this case.
+- ``tools/openstack-incus-live-migration-cardinality-matrix.sh`` passed all
+  18 local/BFV-root x 0/1/3 Cinder-data-volume x 0/1/3 independent-Manila-share
+  combinations. Each case completed
+  ``node01 -> node02 -> node03 -> node01`` with PID continuity, increasing
+  state, per-resource data preservation and baseline-equal Nova, Cinder,
+  Neutron and Placement inventories: 54 successful live migrations.
+- BFV + three Cinder data volumes + three Manila shares also passed a
+  target-side CRIU restore failure injection, source rollback with the same
+  PID, per-resource destination cleanup, and immediate retry.
+- The final post-change suite ran 310 Python tests (308 passed, two documented
+  legacy skips). Bash syntax, ShellCheck, three-node Incus/RBD/Manila/OVS
+  residue audits and the OpenStack allocation audit passed.

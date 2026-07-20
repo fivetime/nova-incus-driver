@@ -1028,6 +1028,24 @@ the still-running source with its original PID and increasing counter, and that
 an immediate retry succeeds without stale RBD mappings, Manila mounts, or OVS
 ports.
 
+The driver and E2E path do not impose a fixed Cinder-volume or Manila-share
+count. Validate attachment cardinality separately with independent shares::
+
+    SSH_IDENTITY=/path/to/test-key \
+      MANILA_SHARES="share-a share-b share-c" \
+      CARDINALITY_COUNTS="0 1 3" \
+      tools/openstack-incus-live-migration-cardinality-matrix.sh
+
+This runs both root models across zero, one, and three data volumes and
+shares, for 18 three-hop cases. Increase the final cardinality for a site's
+acceptance limit. ``MANILA_SHARES`` and optional ``MANILA_TAGS`` are
+space-separated one-to-one lists; tags must be unique within an instance.
+If ``DATA_DEVICES`` supplies fewer hints than ``DATA_VOLUME_COUNT``, Nova
+assigns the remaining device names. "Arbitrary count" means there is no
+driver hard-coded maximum; Nova, Cinder, Manila and project quotas, Linux
+device limits, CRIU checkpoint size, and compute/storage capacity remain
+authoritative limits.
+
 Set ``SECOND_NETWORK=private`` when running the migration E2E to attach a
 second Neutron port before migration. The extended check persists guest
 netplan configuration, verifies the secondary fixed IP and OVN-installed OVS

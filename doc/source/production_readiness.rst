@@ -80,6 +80,14 @@ continuous process state, all destination ownership must be removed, and an
 immediate retry must succeed. A failed optional CRIU pre-dump must degrade to a
 full final checkpoint rather than aborting the migration stream.
 
+Run ``tools/openstack-incus-live-migration-cardinality-matrix.sh`` with at
+least three independent Manila shares. Its default ``0 1 3`` cardinalities
+cover both root models crossed with zero, one, and multiple Cinder data
+volumes and Manila shares. Every one of the 18 cases must complete the
+three-hop round trip and restore Nova, Cinder, Neutron, and Placement to their
+baselines. Repeat the BFV + three-data-volume + three-share maximum with
+target restore failure injection.
+
 The site acceptance matrix additionally interrupts the management network,
 Incus, ``nova-compute``, OVN controller, Cinder connectivity, and the
 orchestrator at ownership boundaries. Recovery must fail closed: uncertainty
