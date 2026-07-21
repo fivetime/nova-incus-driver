@@ -12,6 +12,8 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+import re
+
 from nova import exception
 from nova import i18n
 from nova.virt import driver
@@ -23,6 +25,8 @@ from nova.virt.incus import vif
 
 _ = i18n._
 CONF = cfg.CONF
+
+_FUSE_NAME_RE = re.compile(r'^[A-Za-z0-9._+/-]+$')
 
 
 def _base_config(instance, _):
@@ -100,6 +104,34 @@ def _stateful_migration(instance, _):
         return {'migration.stateful': 'true'}
 
 
+def data_volume_fuse_binaries():
+    value = (CONF.incus.data_volume_mount_fuse or '').strip()
+    if not value:
+        raise exception.InvalidConfiguration(
+            '[incus] data_volume_mount_fuse must configure at least one '
+            'safe FUSE filesystem helper')
+
+    binaries = []
+    for mapping in value.split(','):
+        fields = mapping.strip().split('=')
+        if (len(fields) != 2 or not all(fields) or
+                not all(_FUSE_NAME_RE.fullmatch(field) for field in fields)):
+            raise exception.InvalidConfiguration(
+                '[incus] data_volume_mount_fuse entries must use '
+                'filesystem=helper syntax')
+        binaries.append(fields[1])
+    return binaries
+
+
+def _data_volume_mounts(instance, _):
+    data_volume_fuse_binaries()
+    return {
+        'security.syscalls.intercept.mount': 'true',
+        'security.syscalls.intercept.mount.fuse':
+            CONF.incus.data_volume_mount_fuse,
+    }
+
+
 _CONFIG_FILTER_MAP = [
     _base_config,
     _nesting,
@@ -109,6 +141,7 @@ _CONFIG_FILTER_MAP = [
     _isolated,
     _processes,
     _stateful_migration,
+    _data_volume_mounts,
 ]
 
 

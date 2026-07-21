@@ -2333,6 +2333,15 @@ class IncusDriver(driver.ComputeDriver):
         profile = self.client.profiles.get(instance.name)
         _validate_profile_volume_slot(profile, volume_id, mountpoint)
 
+        container = self.client.instances.get(instance.name)
+        if container.status == 'Running':
+            for binary in flavor.data_volume_fuse_binaries():
+                result = container.execute(['which', binary])
+                if result.exit_code != 0:
+                    raise exception.InvalidVolume(
+                        reason='Guest image must provide {} before attaching '
+                               'Cinder data volumes'.format(binary))
+
         protocol = connection_info['driver_volume_type']
         storage_driver = brick_get_connector(protocol)
         device_info = storage_driver.connect_volume(

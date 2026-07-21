@@ -121,6 +121,16 @@ incus_opts = [
         min=1,
         help="Number of os-brick device discovery attempts.",
     ),
+    cfg.StrOpt(
+        "data_volume_mount_fuse",
+        default="ext4=fuse2fs",
+        help=(
+            "Comma-separated filesystem=FUSE-helper mappings used by Incus "
+            "mount syscall interception for Cinder data volumes. The default "
+            "keeps tenant-provided filesystem data out of the host kernel; "
+            "the selected helper must be installed in every guest image."
+        ),
+    ),
     cfg.IntOpt(
         "request_timeout",
         default=300,

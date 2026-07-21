@@ -54,6 +54,7 @@ class ToProfileTest(test.NoDBTestCase):
         self.CONF2.incus.maximum_process_limit = 65536
         self.CONF2.incus.allow_instance_swap = False
         self.CONF2.incus.allow_live_migration = False
+        self.CONF2.incus.data_volume_mount_fuse = 'ext4=fuse2fs'
 
     def tearDown(self):
         super(ToProfileTest, self).tearDown()
@@ -65,6 +66,8 @@ class ToProfileTest(test.NoDBTestCase):
             'limits.processes': '1024',
             'security.idmap.isolated': 'True',
             'security.privileged': 'False',
+            'security.syscalls.intercept.mount': 'true',
+            'security.syscalls.intercept.mount.fuse': 'ext4=fuse2fs',
         })
         if 'limits.memory' in expected_config:
             expected_config['limits.memory.swap'] = 'false'
@@ -73,6 +76,13 @@ class ToProfileTest(test.NoDBTestCase):
             root['size'] = '1GB'
         create = self.client.profiles.create
         create.assert_called_once_with(name, expected_config, expected_devices)
+
+    def test_data_volume_mount_fuse_rejects_unsafe_syntax(self):
+        self.CONF2.incus.data_volume_mount_fuse = 'ext4=fuse2fs;touch /tmp/x'
+
+        self.assertRaises(
+            exception.InvalidConfiguration,
+            flavor.data_volume_fuse_binaries)
 
     def test_to_profile(self):
         """A profile configuration is requested of the Incus client."""

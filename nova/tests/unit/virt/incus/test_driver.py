@@ -182,6 +182,7 @@ class IncusDriverTest(test.NoDBTestCase):
         self.CONF.incus.volume_use_multipath = False
         self.CONF.incus.volume_enforce_multipath = False
         self.CONF.incus.num_volume_scan_tries = 3
+        self.CONF.incus.data_volume_mount_fuse = 'ext4=fuse2fs'
         self.CONF.incus.enable_manila_shares = False
         self.CONF.serial_console.enabled = False
         self.CONF.serial_console.proxyclient_address = '127.0.0.1'
@@ -2489,6 +2490,32 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             {'path': '/dev/disk/x'},
             jsonutils.loads(profile.config['user.openstack.volume.1']))
         profile.save.assert_called_once_with(wait=True)
+
+    def test_attach_volume_requires_guest_fuse_helper_before_connect(self):
+        profile = mock.Mock(devices={}, config={})
+        self.client.profiles.get.return_value = profile
+        container = mock.Mock(status='Running')
+        container.execute.return_value.exit_code = 1
+        self.client.instances.get.return_value = container
+        volume_connector = mock.Mock()
+        driver.brick_get_connector = mock.Mock(return_value=volume_connector)
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'},
+            '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaisesRegex(
+            exception.InvalidVolume, 'must provide fuse2fs',
+            incus_driver.attach_volume,
+            context.get_admin_context(), connection_info, instance,
+            '/dev/sdd')
+
+        container.execute.assert_called_once_with(['which', 'fuse2fs'])
+        volume_connector.connect_volume.assert_not_called()
 
     @mock.patch('os.path.realpath', return_value='/dev/sdc')
     def test_attach_volume_rolls_back_host_connection(self, realpath):
