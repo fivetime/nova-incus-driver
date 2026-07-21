@@ -1,0 +1,35 @@
+diff --git a/glanceclient/common/http.py b/glanceclient/common/http.py
+index 661264f..17cd3f5 100644
+--- a/glanceclient/common/http.py
++++ b/glanceclient/common/http.py
+@@ -79,12 +79,24 @@ class _BaseHTTPClient(object):
+ 
+     @staticmethod
+     def _chunk_body(body):
+-        chunk = body
+-        while chunk:
+-            chunk = body.read(CHUNKSIZE)
+-            if not chunk:
+-                break
+-            yield chunk
++        def chunker():
++            while True:
++                chunk = body.read(CHUNKSIZE)
++                if not chunk:
++                    break
++                yield chunk
++
++        chunks = chunker()
++        size = utils.get_file_size(body)
++        if size is None:
++            return chunks
++
++        try:
++            position = body.tell()
++        except (AttributeError, OSError, ValueError):
++            return chunks
++
++        return utils.IterableWithLength(chunks, max(0, size - position))
+ 
+     def _set_common_request_kwargs(self, headers, kwargs):
+         """Handle the common parameters used to send the request."""
