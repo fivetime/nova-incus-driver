@@ -1,0 +1,30 @@
+diff --git a/os_brick/initiator/connectors/rbd.py b/os_brick/initiator/connectors/rbd.py
+index eb2911c..ffa1d29 100644
+--- a/os_brick/initiator/connectors/rbd.py
++++ b/os_brick/initiator/connectors/rbd.py
+@@ -229,13 +229,18 @@ class RBDConnector(base_rbd.RBDConnectorMixin, base.BaseLinuxConnector):
+                 not os.path.islink(rbd_dev_path) or
+                 not os.path.exists(os.path.realpath(rbd_dev_path))
+             ):
+-                LOG.warning(
+-                    'Volume %(vol)s has not been mapped to local device '
+-                    '%(dev)s; is the udev daemon running and are the '
+-                    'ceph-renamer udev rules configured? See bug #1884114 for '
+-                    'more information.',
+-                    {'vol': volume, 'dev': rbd_dev_path},
+-                )
++                root_device = self._find_root_device(
++                    connection_properties, conf)
++                if root_device:
++                    rbd_dev_path = root_device
++                else:
++                    LOG.warning(
++                        'Volume %(vol)s has not been mapped to local device '
++                        '%(dev)s; is the udev daemon running and are the '
++                        'ceph-renamer udev rules configured? See bug #1884114 '
++                        'for more information.',
++                        {'vol': volume, 'dev': rbd_dev_path},
++                    )
+         except Exception:
+             # Cleanup conf file on failure
+             with excutils.save_and_reraise_exception():
