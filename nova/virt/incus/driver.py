@@ -184,6 +184,31 @@ def _volume_id(connection_info):
     return str(volume_id)
 
 
+def _detach_volume_id(profile, connection_info, mountpoint):
+    """Resolve a data volume ID when Nova has lost attachment metadata."""
+    try:
+        return _volume_id(connection_info)
+    except exception.InvalidVolume:
+        matches = []
+        for device_id, device in profile.devices.items():
+            if (device.get('type') == 'unix-block' and
+                    device.get('path') == mountpoint and
+                    _volume_device_info_key(device_id) in profile.config):
+                matches.append(device_id)
+
+        if len(matches) != 1:
+            raise exception.InvalidVolume(
+                reason='Cinder connection information has no volume '
+                       'identifier and Incus profile path {} resolves to {} '
+                       'managed volumes'.format(mountpoint, len(matches)))
+
+        LOG.warning(
+            'Recovered missing Cinder volume identifier %(volume_id)s from '
+            'Incus profile mountpoint %(mountpoint)s',
+            {'volume_id': matches[0], 'mountpoint': mountpoint})
+        return matches[0]
+
+
 def _boot_from_volume(block_device_info):
     """Return and validate the single Nova root-volume BDM, if present."""
     if not isinstance(block_device_info, dict):
@@ -2416,7 +2441,7 @@ class IncusDriver(driver.ComputeDriver):
             # unmounted and never used the os-brick data-volume path.
             _cinder_rbd_root({'connection_info': connection_info})
             return
-        volume_id = _volume_id(connection_info)
+        volume_id = _detach_volume_id(profile, connection_info, mountpoint)
         device = profile.devices.get(volume_id)
         metadata_key = _volume_device_info_key(volume_id)
         encoded_device_info = profile.config.get(metadata_key)
