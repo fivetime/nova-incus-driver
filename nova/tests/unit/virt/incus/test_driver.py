@@ -2852,6 +2852,40 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         connector.disconnect_volume.assert_called_once_with(
             connection_info['data'], {'path': '/dev/rbd7'})
 
+    def test_detach_volume_recovers_legacy_profile_metadata(self):
+        volume_id = '8231d2e8-1111-4222-8333-123456789abc'
+        metadata_key = driver._legacy_volume_device_info_key(volume_id)
+        profile = mock.Mock()
+        profile.config = {metadata_key: '{"path":"/dev/rbd7"}'}
+        profile.devices = {
+            volume_id: {
+                'path': '/dev/sdc',
+                'source': '/dev/rbd7',
+                'type': 'unix-block',
+            },
+        }
+        self.client.profiles.get.return_value = profile
+        connector = mock.Mock()
+        driver.brick_get_connector = mock.Mock(return_value=connector)
+        connection_info = {
+            'driver_volume_type': 'rbd',
+            'data': {'name': 'pool/volume-%s' % volume_id},
+        }
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.detach_volume(
+            context.get_admin_context(), connection_info, instance,
+            '/dev/sdc')
+
+        self.assertNotIn(volume_id, profile.devices)
+        self.assertNotIn(metadata_key, profile.config)
+        profile.save.assert_called_once_with(wait=True)
+        connector.disconnect_volume.assert_called_once_with(
+            connection_info['data'], {'path': '/dev/rbd7'})
+
     def test_detach_volume_missing_id_rejects_unmanaged_mountpoint(self):
         profile = mock.Mock()
         profile.config = {}

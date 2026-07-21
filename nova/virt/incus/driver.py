@@ -193,7 +193,8 @@ def _detach_volume_id(profile, connection_info, mountpoint):
         for device_id, device in profile.devices.items():
             if (device.get('type') == 'unix-block' and
                     device.get('path') == mountpoint and
-                    _volume_device_info_key(device_id) in profile.config):
+                    any(key in profile.config for key in
+                        _volume_device_info_keys(device_id))):
                 matches.append(device_id)
 
         if len(matches) != 1:
@@ -665,12 +666,22 @@ def _volume_device_info_key(volume_id):
     return 'user.openstack.volume.%s' % volume_id
 
 
+def _legacy_volume_device_info_key(volume_id):
+    return 'user.openstack.volume_device_info.%s' % volume_id
+
+
+def _volume_device_info_keys(volume_id):
+    return (_volume_device_info_key(volume_id),
+            _legacy_volume_device_info_key(volume_id))
+
+
 def _profile_has_volume_connections(profile):
     """Return whether a profile retains an os-brick volume connection."""
     if not isinstance(profile.config, dict):
         return False
     if any(
-            key.startswith('user.openstack.volume.')
+            key.startswith(('user.openstack.volume.',
+                            'user.openstack.volume_device_info.'))
             for key in profile.config):
         return True
     if not isinstance(profile.devices, dict):
@@ -1081,7 +1092,9 @@ def _commit_staged_configdrive(instance, container, staging):
 
 
 def _profile_device_info(profile, volume_id, device):
-    encoded = profile.config.get(_volume_device_info_key(volume_id))
+    encoded = next((profile.config[key]
+                    for key in _volume_device_info_keys(volume_id)
+                    if key in profile.config), None)
     if encoded:
         try:
             device_info = jsonutils.loads(encoded)
@@ -2443,12 +2456,16 @@ class IncusDriver(driver.ComputeDriver):
             return
         volume_id = _detach_volume_id(profile, connection_info, mountpoint)
         device = profile.devices.get(volume_id)
-        metadata_key = _volume_device_info_key(volume_id)
-        encoded_device_info = profile.config.get(metadata_key)
+        metadata_keys = _volume_device_info_keys(volume_id)
+        encoded_device_info = {
+            key: profile.config[key]
+            for key in metadata_keys if key in profile.config
+        }
         device_info = _profile_device_info(profile, volume_id, device)
         if device:
             del profile.devices[volume_id]
-            profile.config.pop(metadata_key, None)
+            for metadata_key in metadata_keys:
+                profile.config.pop(metadata_key, None)
             profile.save(wait=True)
 
         protocol = connection_info['driver_volume_type']
@@ -2460,8 +2477,7 @@ class IncusDriver(driver.ComputeDriver):
             if device:
                 try:
                     profile.devices[volume_id] = device
-                    if encoded_device_info is not None:
-                        profile.config[metadata_key] = encoded_device_info
+                    profile.config.update(encoded_device_info)
                     profile.save(wait=True)
                 except Exception:
                     LOG.exception(
