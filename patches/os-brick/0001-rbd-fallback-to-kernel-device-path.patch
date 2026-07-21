@@ -35,3 +35,11 @@ index eb2911c..ffa1d29 100644
          except Exception:
              # Cleanup conf file on failure
              with excutils.save_and_reraise_exception():
+@@ -357,6 +363,7 @@ class RBDConnector(base_rbd.RBDConnectorMixin, base.BaseLinuxConnector):
+                 # command introduced in ceph 13.0 (commit 6a57358add1157629a6d)
+                 # when we drop support earlier versions
+                 cmd = ['rbd', 'unmap', root_device]
++                cmd += ['--options', 'noudev']
+                 cmd += self._get_rbd_args(connection_properties, conf)
+                 self._execute(*cmd, root_helper=self._root_helper,
+                               run_as_root=True)
