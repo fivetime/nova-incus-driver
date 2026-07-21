@@ -1,0 +1,66 @@
+diff --git a/nova/image/glance.py b/nova/image/glance.py
+index 7804e6a3bd..433d603b50 100644
+--- a/nova/image/glance.py
++++ b/nova/image/glance.py
+@@ -579,10 +579,22 @@ class GlanceImageServiceV2(object):
+             _reraise_translated_exception()
+ 
+     def _upload_data(self, context, image_id, data):
++        image_size = None
++        try:
++            image_size = os.fstat(data.fileno()).st_size - data.tell()
++        except (AttributeError, OSError, TypeError, ValueError):
++            # Preserve support for generators and other non-seekable streams.
++            pass
++
+         # NOTE(aarents) In eventlet mode offload upload in a native thread as
+         # it can block coroutine in busy environment.
+-        utils.tpool_wrap(
+-            self._client.call)(context, 2, 'upload', args=(image_id, data))
++        upload = utils.tpool_wrap(self._client.call)
++        if image_size is None:
++            upload(context, 2, 'upload', args=(image_id, data))
++        else:
++            upload(
++                context, 2, 'upload', args=(image_id, data),
++                kwargs={'image_size': image_size})
+ 
+         return self._client.call(context, 2, 'get', args=(image_id,))
+ 
+diff --git a/nova/tests/unit/image/test_glance.py b/nova/tests/unit/image/test_glance.py
+index 5871a67f00..43ae5080f5 100644
+--- a/nova/tests/unit/image/test_glance.py
++++ b/nova/tests/unit/image/test_glance.py
+@@ -18,6 +18,7 @@ import copy
+ import datetime
+ import io
+ from io import StringIO
++import tempfile
+ from unittest import mock
+ import urllib.parse as urlparse
+ 
+@@ -1914,6 +1915,24 @@ class TestUpdate(test.NoDBTestCase):
+             args=(mock.sentinel.image_id,
+                   mock.sentinel.data))
+ 
++    @mock.patch('nova.utils.tpool_wrap')
++    def test_upload_seekable_data_sends_remaining_size(self, twrap_mock):
++        client = mock.MagicMock()
++        client.call.return_value = {'id': mock.sentinel.image_id}
++        twrap_mock.return_value = client.call
++        service = glance.GlanceImageServiceV2(client)
++
++        with tempfile.TemporaryFile() as data:
++            data.write(b'0123456789')
++            data.seek(3)
++            service._upload_data(
++                mock.sentinel.ctx, mock.sentinel.image_id, data)
++
++            twrap_mock.return_value.assert_called_once_with(
++                mock.sentinel.ctx, 2, 'upload',
++                args=(mock.sentinel.image_id, data),
++                kwargs={'image_size': 7})
++
+     @mock.patch('nova.image.glance.GlanceImageServiceV2.show')
+     @mock.patch('nova.image.glance._translate_from_glance')
+     @mock.patch('nova.image.glance._translate_to_glance')

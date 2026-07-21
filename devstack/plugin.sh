@@ -179,6 +179,16 @@ function install_nova_incus {
             "Nova Incus live migration object patch does not apply cleanly"
     fi
 
+    local glance_upload_size_patch
+    glance_upload_size_patch="${NOVA_INCUS_DIR}/patches/nova/0004-glance-send-seekable-upload-size.patch"
+    if ! git -C "${NOVA_DIR}" apply --check "${glance_upload_size_patch}"; then
+        if ! git -C "${NOVA_DIR}" apply --reverse --check "${glance_upload_size_patch}"; then
+            die $LINENO "Unable to apply Nova Glance upload size patch"
+        fi
+    else
+        git -C "${NOVA_DIR}" apply "${glance_upload_size_patch}"
+    fi
+
     # Nova's source checkout is a regular Python package, so an editable
     # external distribution cannot extend nova.virt with another namespace
     # path. Keep this repository authoritative and deploy its driver package
