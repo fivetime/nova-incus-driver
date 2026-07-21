@@ -140,11 +140,33 @@ host preflight, explicitly admit it, and re-enable scheduling. Test local-root
 development instances, BFV roots, attached data volumes, OVN ports, and
 recovery markers across the upgrade.
 
+After a fenced host returns, keep scheduling disabled while the ownership
+audit removes stale instance records. Admit and start ``nova-compute``, wait
+until its service state is ``up``, and only then enable the service. Finally,
+require the root resource provider to lose ``COMPUTE_STATUS_DISABLED`` before
+declaring the host schedulable. Enabling the service while its heartbeat is
+still down causes Nova to defer that Placement synchronization and can leave a
+healthy process temporarily unable to receive builds.
+
 Rollback is allowed only while API extensions, database objects, and on-disk
 metadata remain readable by the previous build. Never roll back an Incus
 server after it has performed an irreversible database migration. In that
 case roll forward or restore the complete Incus database and storage metadata
 from a coordinated backup.
+
+Before release, prove all storage-owner recovery paths independently:
+
+* ``openstack-incus-snapshot-e2e.sh`` for an Incus-managed root, including a
+  local root pool selected through its production Flavor;
+* ``openstack-incus-ceph-backup-e2e.sh`` for a Cinder data volume; and
+* ``openstack-incus-bfv-backup-e2e.sh`` for a Cinder BFV root restored and
+  booted on another compute; and
+* ``openstack-incus-manila-snapshot-e2e.sh`` for every Manila backend that
+  advertises snapshot and create-from-snapshot support.
+
+The release record must identify the independent failure domain holding each
+backup. A backup RBD pool in the source Ceph cluster is not sufficient evidence
+for recovery from loss of that cluster.
 
 7. Operations and security acceptance
 --------------------------------------
@@ -171,6 +193,8 @@ Archive the output of ``tools/openstack-incus-release-gate.sh`` with:
 * OpenStack release, configuration hashes, and compute inventory;
 * every directed migration-matrix result;
 * one destructive external-fence evacuation per fencing implementation;
+* ``openstack-incus-bfv-cow-e2e.sh`` proving that Glance-to-Cinder BFV
+  provisioning retains an RBD parent and non-zero overlap;
 * returning-host reconciliation and final three-node fleet audit;
 * known unsupported capabilities from
   ``support_matrix/capabilities.json``;

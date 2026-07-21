@@ -3,11 +3,11 @@
 
 set -euo pipefail
 
-IMAGE=${IMAGE:-ubuntu-noble-cloud-incus-fuse}
-FLAVOR=${FLAVOR:-m1.small}
-NETWORK=${NETWORK:-private}
+IMAGE=${IMAGE:-alpine-3.21-cloud-incus-criu}
+FLAVOR=${FLAVOR:-ds512M}
+NETWORK=${NETWORK:-public}
 COMPUTE_HOST=${COMPUTE_HOST:-incus-node-01}
-COMPUTE_SSH=${COMPUTE_SSH:-root@10.224.0.16}
+COMPUTE_SSH=${COMPUTE_SSH:-root@10.224.0.21}
 SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute test key}
 VOLUME_TYPE=${VOLUME_TYPE:-ceph}
 NAME=${NAME:-incus-ceph-backup-e2e-$RANDOM}
@@ -52,20 +52,27 @@ detach() {
 
 cleanup() {
     for volume in "$restore_id" "$source_id"; do
-        [[ -n "$server_id" && -n "$volume" ]] && \
+        if [[ -n "$server_id" && -n "$volume" ]]; then
             openstack server remove volume "$server_id" "$volume" \
                 >/dev/null 2>&1 || true
+        fi
     done
-    [[ -n "$incremental_id" ]] && \
-        openstack volume backup delete "$incremental_id" >/dev/null 2>&1 || true
-    [[ -n "$full_id" ]] && \
+    if [[ -n "$incremental_id" ]]; then
+        openstack volume backup delete "$incremental_id" \
+            >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$full_id" ]]; then
         openstack volume backup delete "$full_id" >/dev/null 2>&1 || true
-    [[ -n "$server_id" ]] && \
+    fi
+    if [[ -n "$server_id" ]]; then
         openstack server delete --wait "$server_id" >/dev/null 2>&1 || true
-    [[ -n "$restore_id" ]] && \
+    fi
+    if [[ -n "$restore_id" ]]; then
         openstack volume delete "$restore_id" >/dev/null 2>&1 || true
-    [[ -n "$source_id" ]] && \
+    fi
+    if [[ -n "$source_id" ]]; then
         openstack volume delete "$source_id" >/dev/null 2>&1 || true
+    fi
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -91,9 +98,7 @@ wait_value "openstack volume show '$source_id' -f value -c status" in-use
 device=$(openstack server volume list "$server_id" -f value -c Device | head -n1)
 marker="full-$source_id"
 remote "incus exec '$instance_name' -- sh -c \
-    'mkfs.ext4 -F $device >/dev/null; mkdir -p /mnt/cinder; \
-     fuse2fs $device /mnt/cinder; printf %s $marker > /mnt/cinder/marker; \
-     sync; fusermount -u /mnt/cinder'"
+    'printf %s $marker | dd of=$device bs=1 seek=4096 2>/dev/null; sync'"
 detach "$source_id"
 
 full_id=$(openstack volume backup create --name "$NAME-full" \
@@ -105,8 +110,7 @@ openstack server add volume --device /dev/vdb "$server_id" "$source_id"
 wait_value "openstack volume show '$source_id' -f value -c status" in-use
 marker="incremental-$source_id"
 remote "incus exec '$instance_name' -- sh -c \
-    'fuse2fs $device /mnt/cinder; printf %s $marker > /mnt/cinder/marker; \
-     sync; fusermount -u /mnt/cinder'"
+    'printf %s $marker | dd of=$device bs=1 seek=8192 2>/dev/null; sync'"
 detach "$source_id"
 
 incremental_id=$(openstack volume backup create --incremental \
@@ -125,8 +129,7 @@ wait_value "openstack volume show '$restore_id' -f value -c status" available
 openstack server add volume --device /dev/vdb "$server_id" "$restore_id"
 wait_value "openstack volume show '$restore_id' -f value -c status" in-use
 restored=$(remote "incus exec '$instance_name' -- sh -c \
-    'fuse2fs -o ro $device /mnt/cinder; cat /mnt/cinder/marker; \
-     fusermount -u /mnt/cinder'")
+    'dd if=$device bs=1 skip=8192 count=${#marker} 2>/dev/null'")
 [[ "$restored" == "$marker" ]]
 detach "$restore_id"
 

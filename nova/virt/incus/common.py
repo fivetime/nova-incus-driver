@@ -14,8 +14,22 @@
 #    under the License.
 import collections
 import os
+import re
 
 from nova import conf
+from nova import exception
+
+
+INCUS_STORAGE_POOL_TRAIT_PREFIX = 'CUSTOM_INCUS_STORAGE_POOL_'
+
+
+def root_storage_pool_trait(selector):
+    suffix = re.sub(r'[^A-Z0-9_]', '_', selector.upper())
+    trait = INCUS_STORAGE_POOL_TRAIT_PREFIX + suffix
+    if not suffix or len(trait) > 255:
+        raise exception.InvalidConfiguration(
+            'Invalid Incus root storage pool selector {}'.format(selector))
+    return trait
 
 
 _InstanceAttributes = collections.namedtuple('InstanceAttributes', [

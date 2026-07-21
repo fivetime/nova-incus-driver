@@ -146,6 +146,7 @@ class IncusDriverTest(test.NoDBTestCase):
             'api_extensions': [
                 'id_map',
                 'migration_stateful_shifted_root',
+                'migration_live_shared_ceph_storage',
             ],
             'environment': {
                 'storage': 'zfs',
@@ -166,6 +167,8 @@ class IncusDriverTest(test.NoDBTestCase):
         self.CONF.config_drive_format = 'iso9660'
         self.CONF.force_config_drive = False
         self.CONF.incus.storage_pool = None
+        self.CONF.incus.root_storage_pools = {}
+        self.CONF.incus.root_storage_pool_resource_classes = {}
         self.CONF.incus.allow_cold_migration = False
         self.CONF.incus.allow_live_migration = False
         self.CONF.incus.migration_address = None
@@ -775,7 +778,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.client.instances.get.side_effect = container_get
         self.client.host_info['api_extensions'].append(
             'storage_driver_cephext')
-        self.CONF.incus.boot_from_volume_storage_pool = 'cinder'
+        self.CONF.incus.boot_from_volume_storage_pools = {
+            'cinder-volumes': 'cinder'}
         bfv_pool = self.client.storage_pools.get.return_value
         bfv_pool.driver = 'cephext'
         bfv_pool.config = {'source': 'cinder-volumes'}
@@ -843,6 +847,26 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         }}
         self.assertRaises(exception.InvalidConfiguration,
                           driver._cinder_rbd_root, bdm)
+
+    def test_bfv_storage_pool_selects_by_cinder_rbd_pool(self):
+        self.CONF.incus.boot_from_volume_storage_pools = {
+            'ssd-rep3-rbd-pool': 'cinder-ssd-rep3',
+            'nvme-rep3-rbd-pool': 'cinder-nvme-rep3',
+        }
+
+        self.assertEqual(
+            'cinder-nvme-rep3',
+            driver._bfv_storage_pool_name('nvme-rep3-rbd-pool'))
+
+    def test_bfv_storage_pool_rejects_unconfigured_cinder_pool(self):
+        self.CONF.incus.boot_from_volume_storage_pools = {
+            'ssd-rep3-rbd-pool': 'cinder-ssd-rep3'}
+
+        self.assertRaisesRegex(
+            exception.InvalidConfiguration,
+            'No Incus cephext storage pool is configured',
+            driver._bfv_storage_pool_name,
+            'nvme-rep3-rbd-pool')
 
     def test_boot_from_volume_rejects_mismatched_rbd_uuid(self):
         bdm = {'connection_info': {
@@ -1752,6 +1776,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     @mock.patch('nova.virt.incus.driver._host_has_swap', return_value=False)
     def test_update_provider_tree(self, _host_has_swap):
         incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
         incus_driver.get_available_resource = mock.Mock(return_value={
             'vcpus': 8,
             'memory_mb': 16384,
@@ -1820,6 +1845,90 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                 'CUSTOM_INCUS_SWAP',
                 'CUSTOM_INCUS_SYSTEM_CONTAINER',
             })
+
+    @mock.patch('nova.virt.incus.driver._host_has_swap', return_value=False)
+    def test_update_provider_tree_reports_root_pool_traits(
+            self, _host_has_swap):
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.get_available_resource = mock.Mock(return_value={
+            'vcpus': 8, 'memory_mb': 16384, 'local_gb': 100})
+        incus_driver._get_allocation_ratios = mock.Mock(return_value={
+            'VCPU': 4.0, 'MEMORY_MB': 1.5, 'DISK_GB': 1.0})
+        incus_driver._get_reserved_host_disk_gb_from_config = mock.Mock(
+            return_value=2)
+        provider_tree = mock.Mock()
+        provider_tree.data.return_value = mock.Mock(
+            inventory={}, traits={
+                'CUSTOM_INCUS_STORAGE_POOL_REMOVED',
+                'CUSTOM_OPERATOR_MANAGED',
+            })
+        self.CONF.incus.root_storage_pools = {
+            'local-nvme': 'local-zfs',
+            'durable': 'ceph-rootfs',
+        }
+        self.CONF.reserved_host_cpus = 0
+        self.CONF.reserved_host_memory_mb = 0
+
+        incus_driver.update_provider_tree(provider_tree, 'compute-1')
+
+        provider_tree.update_traits.assert_called_once_with(
+            'compute-1', {
+                'CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME',
+                'CUSTOM_INCUS_STORAGE_POOL_DURABLE',
+                'CUSTOM_INCUS_SYSTEM_CONTAINER',
+                'CUSTOM_OPERATOR_MANAGED',
+            })
+
+    def test_root_storage_pool_traits_reject_collisions(self):
+        self.CONF.incus.root_storage_pools = {
+            'local-nvme': 'one',
+            'local_nvme': 'two',
+        }
+
+        self.assertRaises(
+            exception.InvalidConfiguration,
+            driver._root_storage_pool_traits)
+
+    @mock.patch('nova.virt.incus.driver._get_storage_pool_info')
+    @mock.patch('nova.virt.incus.driver._host_has_swap', return_value=False)
+    def test_update_provider_tree_reports_local_pool_capacity(
+            self, _host_has_swap, get_pool_info):
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+        incus_driver.get_available_resource = mock.Mock(return_value={
+            'vcpus': 8, 'memory_mb': 16384, 'local_gb': 100})
+        incus_driver._get_allocation_ratios = mock.Mock(return_value={
+            'VCPU': 4.0, 'MEMORY_MB': 1.5, 'DISK_GB': 1.0})
+        incus_driver._get_reserved_host_disk_gb_from_config = mock.Mock(
+            return_value=2)
+        get_pool_info.return_value = {
+            'total': 80 * units.Gi,
+            'used': 10 * units.Gi,
+        }
+        provider_tree = mock.Mock()
+        provider_tree.data.return_value = mock.Mock(
+            inventory={}, traits=set())
+        self.CONF.incus.root_storage_pools = {
+            'local-nvme': 'local-zfs',
+        }
+        self.CONF.incus.root_storage_pool_resource_classes = {
+            'local-nvme': 'CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME_DISK_GB',
+        }
+        self.CONF.reserved_host_cpus = 0
+        self.CONF.reserved_host_memory_mb = 0
+
+        incus_driver.update_provider_tree(provider_tree, 'compute-1')
+
+        inventory = provider_tree.update_inventory.call_args.args[1]
+        self.assertEqual({
+            'total': 80,
+            'min_unit': 1,
+            'max_unit': 80,
+            'step_size': 1,
+            'allocation_ratio': 1.0,
+            'reserved': 0,
+        }, inventory['CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME_DISK_GB'])
+        get_pool_info.assert_called_once_with(self.client, 'local-zfs')
 
     @mock.patch('nova.virt.incus.driver._host_has_swap', return_value=False)
     def test_update_provider_tree_reports_manila_live_migration_trait(
@@ -2086,7 +2195,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'migration_shared_ceph_storage',
             'storage_driver_cephext',
         ])
-        self.CONF.incus.boot_from_volume_storage_pool = 'cinder'
+        self.CONF.incus.boot_from_volume_storage_pools = {
+            'cinder-volumes': 'cinder'}
         pool = self.client.storage_pools.get.return_value
         pool.driver = 'cephext'
         pool.config = {'source': 'cinder-volumes'}
@@ -2192,7 +2302,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                        'get_migration_preflight_client')
     @mock.patch.object(driver.socket, 'create_connection')
     def test_bfv_destination_readiness_preflight(self, connect, get_remote):
-        self.CONF.incus.boot_from_volume_storage_pool = 'cinder-bfv'
+        self.CONF.incus.boot_from_volume_storage_pools = {
+            'cinder-volumes': 'cinder-bfv'}
         self.CONF.incus.migration_port = 8443
         self.CONF.incus.migration_preflight_timeout = 5
         self.CONF.incus.migration_preflight_project = 'nova-preflight'
@@ -2208,8 +2319,9 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'storage_driver_cephext']}
         remote.projects.get.return_value.config = {
             'user.openstack.preflight_protocol': '1',
-            'user.openstack.bfv_pool': 'cinder-bfv',
-            'user.openstack.cinder_rbd_pool': 'cinder-volumes',
+            'user.openstack.bfv_storage_pools': (
+                '{"cinder-volumes":"cinder-bfv",'
+                '"nvme-volumes":"nvme-bfv"}'),
         }
         remote.storage_pools.get.return_value.driver = 'cephext'
 
@@ -2243,7 +2355,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     @mock.patch.object(driver.socket, 'create_connection')
     def test_bfv_destination_preflight_rejects_cinder_pool_mismatch(
             self, connect, get_remote):
-        self.CONF.incus.boot_from_volume_storage_pool = 'cinder-bfv'
+        self.CONF.incus.boot_from_volume_storage_pools = {
+            'cinder-volumes': 'cinder-bfv'}
         remote = get_remote.return_value
         remote.host_info = {'api_extensions': [
             'migration_shared_ceph_storage',
@@ -2254,10 +2367,11 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'user.openstack.bfv_pool': 'cinder-bfv',
             'user.openstack.cinder_rbd_pool': 'wrong-pool',
         }
+        remote.storage_pools.get.return_value.driver = 'cephext'
 
         self.assertRaisesRegex(
             exception.MigrationError,
-            'destination Cinder RBD pool does not match root volume',
+            'destination readiness metadata does not advertise',
             driver._preflight_bfv_migration_destination,
             'compute-2.example.test', 'cinder-volumes')
 
@@ -4300,7 +4414,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         profile = to_profile.return_value
         profile.devices = {'root': {'size': '10GB'}}
         self.CONF.incus.allow_cold_migration = True
-        self.CONF.incus.boot_from_volume_storage_pool = 'cinder'
+        self.CONF.incus.boot_from_volume_storage_pools = {
+            'cinder-volumes': 'cinder'}
         disk_info = jsonutils.dumps({
             'format': 'incus-pull-v1',
             'boot_from_volume': True,
@@ -4357,6 +4472,25 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertEqual('x86_64', data.destination_architecture)
         self.assertEqual('6.8.0-test', data.destination_kernel_version)
         self.assertEqual('7.2', data.destination_server_version)
+
+    def test_live_migrate_destination_rejects_old_ceph_handover(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        self.CONF.incus.allow_live_migration = True
+        self.CONF.incus.migration_address = 'https://192.0.2.20:8443'
+        self.client.host_info['api_extensions'].remove(
+            'migration_live_shared_ceph_storage')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        exc = self.assertRaises(
+            exception.MigrationPreCheckError,
+            incus_driver.check_can_live_migrate_destination,
+            ctx, instance, mock.Mock(), mock.Mock())
+
+        self.assertIn(
+            'migration_live_shared_ceph_storage', str(exc))
 
     def test_check_can_live_migrate_source_accepts_compatible_container(self):
         ctx = context.get_admin_context()

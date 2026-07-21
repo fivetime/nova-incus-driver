@@ -20,6 +20,7 @@ import copy
 import errno
 import glob
 import io
+import json
 import os
 import platform
 import re
@@ -94,6 +95,8 @@ INCUS_MANILA_LIVE_MIGRATION_TRAIT = (
 INCUS_STATEFUL_MIGRATION_EXTENSION = 'migration_stateful_shifted_root'
 INCUS_LIVE_BFV_MIGRATION_EXTENSION = (
     'migration_live_shared_cephext_storage')
+INCUS_LIVE_CEPH_MIGRATION_EXTENSION = (
+    'migration_live_shared_ceph_storage')
 MIGRATION_RECOVERY_KEY = 'user.openstack.recovery_required'
 _PRE_LIVE_DISCONNECTED_KEY = 'incus_pre_live_disconnected'
 BASE_DIR = os.path.join(
@@ -109,6 +112,20 @@ _SHARE_ID_RE = re.compile(
     r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-'
     r'[0-9a-f]{4}-[0-9a-f]{12}$')
 _SHARE_TAG_RE = re.compile(r'^[A-Za-z0-9-]{1,255}$')
+
+
+def _root_storage_pool_traits():
+    """Return collision-free Placement traits for configured pool selectors."""
+    traits = {}
+    for selector in CONF.incus.root_storage_pools:
+        trait = common.root_storage_pool_trait(selector)
+        previous = traits.get(trait)
+        if previous is not None and previous != selector:
+            raise exception.InvalidConfiguration(
+                'Incus root storage pool selectors {} and {} map to the '
+                'same Placement trait {}'.format(previous, selector, trait))
+        traits[trait] = selector
+    return set(traits)
 
 
 def _validate_block_device_path(path, description):
@@ -218,6 +235,40 @@ def _cinder_rbd_root(bdm):
     return ceph_pool, image_name
 
 
+def _bfv_storage_pool_name(cinder_pool):
+    """Resolve a Cinder RBD pool to its configured Incus cephext pool."""
+    pool_name = CONF.incus.boot_from_volume_storage_pools.get(cinder_pool)
+    if not pool_name:
+        raise exception.InvalidConfiguration(
+            'No Incus cephext storage pool is configured for Cinder RBD '
+            'pool %s' % cinder_pool)
+    return pool_name
+
+
+def _advertised_bfv_storage_pools(readiness):
+    """Return the non-secret Cinder-to-Incus pool readiness mapping."""
+    encoded = readiness.get('user.openstack.bfv_storage_pools')
+    if encoded:
+        try:
+            mapping = json.loads(encoded)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                'invalid destination BFV storage pool metadata: %s' % exc)
+        if (not isinstance(mapping, dict) or
+                not all(isinstance(key, str) and isinstance(value, str)
+                        for key, value in mapping.items())):
+            raise ValueError(
+                'destination BFV storage pool metadata must be a string '
+                'mapping')
+        return mapping
+
+    cinder_pool = readiness.get('user.openstack.cinder_rbd_pool')
+    bfv_pool = readiness.get('user.openstack.bfv_pool')
+    if cinder_pool and bfv_pool:
+        return {cinder_pool: bfv_pool}
+    return {}
+
+
 def _bfv_root_device(instance, root_bdm, root_volume):
     """Build a Cinder-owned root device without Flavor size semantics."""
     flavor_limits = flavor.disk_qos_limits(instance.flavor.extra_specs)
@@ -232,7 +283,7 @@ def _bfv_root_device(instance, root_bdm, root_volume):
     device = {
         'type': 'disk',
         'path': '/',
-        'pool': CONF.incus.boot_from_volume_storage_pool,
+        'pool': _bfv_storage_pool_name(root_volume[0]),
         'initial.ceph.rbd.image_name': root_volume[1],
     }
     if root_bdm.get('volume_size'):
@@ -256,11 +307,7 @@ def _require_bfv_migration_support(client, root_bdm):
             reason='Incus BFV migration requires API extensions: %s' %
             ', '.join(missing))
 
-    pool_name = CONF.incus.boot_from_volume_storage_pool
-    if not pool_name:
-        raise exception.InvalidConfiguration(
-            '[incus] boot_from_volume_storage_pool is required for '
-            'Cinder boot-from-volume migration')
+    pool_name = _bfv_storage_pool_name(root_volume[0])
     pool = client.storage_pools.get(pool_name)
     pool_config = pool.config or {}
     if (pool.driver != 'cephext' or
@@ -324,17 +371,15 @@ def _preflight_bfv_migration_destination(
         project = remote.projects.get(CONF.incus.migration_preflight_project)
         readiness = project.config
         protocol = readiness.get('user.openstack.preflight_protocol')
-        bfv_pool = readiness.get('user.openstack.bfv_pool')
-        advertised_cinder_pool = readiness.get(
-            'user.openstack.cinder_rbd_pool')
         if protocol != '1':
             raise ValueError('unsupported or missing readiness protocol')
-        if bfv_pool != CONF.incus.boot_from_volume_storage_pool:
-            raise ValueError('destination BFV pool does not match source')
-        if advertised_cinder_pool != cinder_pool:
+        bfv_pool = _bfv_storage_pool_name(cinder_pool)
+        advertised_pools = _advertised_bfv_storage_pools(readiness)
+        if advertised_pools.get(cinder_pool) != bfv_pool:
             raise ValueError(
-                'destination Cinder RBD pool does not match root volume')
-
+                'destination readiness metadata does not advertise '
+                'Cinder RBD pool %s through Incus pool %s' % (
+                    cinder_pool, bfv_pool))
         pool = remote.storage_pools.get(bfv_pool)
         if pool.driver != 'cephext':
             raise ValueError('destination BFV pool is not cephext')
@@ -476,6 +521,14 @@ def _require_stateful_migration_extension(client):
         raise exception.MigrationPreCheckError(
             reason='Incus server does not advertise %s' %
             INCUS_STATEFUL_MIGRATION_EXTENSION)
+
+
+def _require_live_ceph_migration_extension(client):
+    if INCUS_LIVE_CEPH_MIGRATION_EXTENSION not in set(
+            client.host_info.get('api_extensions', [])):
+        raise exception.MigrationPreCheckError(
+            reason='Incus server does not advertise %s' %
+            INCUS_LIVE_CEPH_MIGRATION_EXTENSION)
 
 
 def _migration_operation_url(operation_url, migration_address):
@@ -1737,11 +1790,7 @@ class IncusDriver(driver.ComputeDriver):
         root_volume = None
         if root_bdm:
             root_volume = _cinder_rbd_root(root_bdm)
-            bfv_pool_name = CONF.incus.boot_from_volume_storage_pool
-            if not bfv_pool_name:
-                raise exception.InvalidConfiguration(
-                    '[incus] boot_from_volume_storage_pool is required for '
-                    'Cinder boot-from-volume')
+            bfv_pool_name = _bfv_storage_pool_name(root_volume[0])
             extensions = self.client.host_info.get('api_extensions', [])
             if 'storage_driver_cephext' not in extensions:
                 raise exception.InvalidConfiguration(
@@ -1749,7 +1798,7 @@ class IncusDriver(driver.ComputeDriver):
             bfv_pool = self.client.storage_pools.get(bfv_pool_name)
             if bfv_pool.driver != 'cephext':
                 raise exception.InvalidConfiguration(
-                    'Incus boot_from_volume_storage_pool must use cephext')
+                    'Incus boot-from-volume storage pool must use cephext')
             if bfv_pool.config.get('source') != root_volume[0]:
                 raise exception.InvalidConfiguration(
                     'The Incus cephext pool source does not match the Cinder '
@@ -2976,8 +3025,39 @@ class IncusDriver(driver.ComputeDriver):
                 'reserved': self._get_reserved_host_disk_gb_from_config(),
             },
         }
+        for selector, resource_class in (
+                CONF.incus.root_storage_pool_resource_classes.items()):
+            pool_name = CONF.incus.root_storage_pools.get(selector)
+            if not pool_name:
+                raise exception.InvalidConfiguration(
+                    'Capacity-tracked Incus root storage selector {} is not '
+                    'present in root_storage_pools'.format(selector))
+            if not resource_class.startswith('CUSTOM_'):
+                raise exception.InvalidConfiguration(
+                    'Incus root storage resource class {} must start with '
+                    'CUSTOM_'.format(resource_class))
+            pool_info = _get_storage_pool_info(self.client, pool_name)
+            total_gb = pool_info['total'] // units.Gi
+            if total_gb < 1:
+                raise exception.InvalidConfiguration(
+                    'Incus root storage pool {} has no reportable '
+                    'capacity'.format(pool_name))
+            inventory[resource_class] = {
+                'total': total_gb,
+                'min_unit': 1,
+                'max_unit': total_gb,
+                'step_size': 1,
+                'allocation_ratio': 1.0,
+                'reserved': 0,
+            }
         provider_tree.update_inventory(nodename, inventory)
         traits = set(current.traits) | {INCUS_SYSTEM_CONTAINER_TRAIT}
+        managed_pool_traits = {
+            trait for trait in traits
+            if trait.startswith(common.INCUS_STORAGE_POOL_TRAIT_PREFIX)
+        }
+        traits.difference_update(managed_pool_traits)
+        traits.update(_root_storage_pool_traits())
         if CONF.incus.allow_instance_swap and _host_has_swap():
             traits.add(INCUS_SWAP_TRAIT)
         else:
@@ -3628,6 +3708,7 @@ class IncusDriver(driver.ComputeDriver):
         address = CONF.incus.migration_address
         _validated_migration_address(address)
         _require_stateful_migration_extension(self.client)
+        _require_live_ceph_migration_extension(self.client)
         facts = _migration_host_facts(self.client)
         return incus_migrate_data.IncusLiveMigrateData(
             destination_address=address,
@@ -3664,6 +3745,7 @@ class IncusDriver(driver.ComputeDriver):
                 raise exception.MigrationPreCheckError(reason=str(exc))
 
         _require_stateful_migration_extension(self.client)
+        _require_live_ceph_migration_extension(self.client)
         _live_migration_profile_check(self.client, context, instance)
         container = self.client.instances.get(instance.name)
         profile = self.client.profiles.get(instance.name)

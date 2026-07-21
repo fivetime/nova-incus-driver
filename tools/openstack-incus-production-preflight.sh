@@ -14,7 +14,6 @@ INCUS_SERVICE=${INCUS_SERVICE:-incus-podman.service}
 NOVA_SERVICE=${NOVA_SERVICE:-devstack@n-cpu.service}
 NOVA_CONFIG=${NOVA_CONFIG:-/etc/nova/nova-cpu.conf}
 INCUS_SHARE_MOUNT_ROOT=${INCUS_SHARE_MOUNT_ROOT:-/opt/stack/data/nova/instances/incus-shares}
-BFV_POOL=${BFV_POOL:-cinder-bfv}
 PREFLIGHT_PROJECT=${PREFLIGHT_PROJECT:-nova-preflight}
 MIN_FREE_PERCENT=${MIN_FREE_PERCENT:-20}
 REQUIRE_COLD_MIGRATION=${REQUIRE_COLD_MIGRATION:-true}
@@ -74,7 +73,8 @@ for command_name in podman jq findmnt crudini; do
     check_command "$command_name"
 done
 
-for container_command in aa-exec apparmor_parser ceph incus incusd lxcfs rbd tar; do
+for container_command in \
+        aa-exec apparmor_parser ceph incus incusd lxcfs rbd tar zfs zpool; do
     if podman exec "$INCUS_CONTAINER" sh -c \
             "command -v '$container_command'" >/dev/null 2>&1; then
         pass "container:$container_command"
@@ -299,35 +299,72 @@ check_equal "preflight project restricted" true "$project_restricted"
 check_equal "preflight protocol" 1 \
     "$(jq -r '(.metadata.config // .config)
         ["user.openstack.preflight_protocol"] // empty' <<<"$project_json")"
-check_equal "preflight BFV pool" "$BFV_POOL" \
-    "$(jq -r '(.metadata.config // .config)
-        ["user.openstack.bfv_pool"] // empty' <<<"$project_json")"
-preflight_cinder_pool=$(jq -r '(.metadata.config // .config)
-    ["user.openstack.cinder_rbd_pool"] // empty' <<<"$project_json")
-if [[ -n "$preflight_cinder_pool" ]]; then
-    pass "preflight Cinder RBD pool" "$preflight_cinder_pool"
-else
-    fail "preflight Cinder RBD pool" "missing"
-fi
-
-pool_json=$(podman exec "$INCUS_CONTAINER" incus query \
-    "/1.0/storage-pools/$BFV_POOL" 2>/dev/null)
-check_equal "BFV pool driver" cephext \
-    "$(jq -r '.metadata.driver // .driver // empty' <<<"$pool_json")"
-bfv_source=$(jq -r '.metadata.config.source // .config.source // empty' \
-    <<<"$pool_json")
-if [[ -n "$bfv_source" ]]; then
-    pass "BFV pool source" "$bfv_source"
-else
-    fail "BFV pool source" "missing"
-fi
 
 compute_driver=$(crudini --get "$NOVA_CONFIG" DEFAULT compute_driver \
     2>/dev/null)
 check_equal "Nova compute driver" incus.IncusDriver "$compute_driver"
-check_equal "Nova BFV pool" "$BFV_POOL" \
-    "$(crudini --get "$NOVA_CONFIG" incus \
-        boot_from_volume_storage_pool 2>/dev/null)"
+nova_bfv_mappings=$(crudini --get "$NOVA_CONFIG" incus \
+    boot_from_volume_storage_pools 2>/dev/null || true)
+advertised_bfv_pools=$(jq -r '(.metadata.config // .config)
+    ["user.openstack.bfv_storage_pools"] // empty' <<<"$project_json")
+if [[ -z "$nova_bfv_mappings" ]]; then
+    fail "Nova BFV pool mappings" "missing"
+else
+    IFS=',' read -r -a bfv_mappings <<<"$nova_bfv_mappings"
+    for mapping in "${bfv_mappings[@]}"; do
+        bfv_source=${mapping%%:*}
+        bfv_pool=${mapping#*:}
+        if [[ -z "$bfv_source" || -z "$bfv_pool" || \
+              "$bfv_source" == "$mapping" ]]; then
+            fail "Nova BFV pool mapping" "invalid entry=$mapping"
+            continue
+        fi
+        pool_json=$(podman exec "$INCUS_CONTAINER" incus query \
+            "/1.0/storage-pools/$bfv_pool" 2>/dev/null || true)
+        check_equal "BFV pool driver:$bfv_pool" cephext \
+            "$(jq -r '.metadata.driver // .driver // empty' \
+                <<<"$pool_json")"
+        actual_source=$(jq -r \
+            '.metadata.config.source // .config.source // empty' \
+            <<<"$pool_json")
+        check_equal "BFV pool source:$bfv_pool" "$bfv_source" \
+            "$actual_source"
+        if jq -e --arg source "$bfv_source" --arg pool "$bfv_pool" \
+                '.[$source] == $pool' \
+                <<<"$advertised_bfv_pools" >/dev/null; then
+            pass "preflight BFV mapping:$bfv_pool" "$mapping"
+        else
+            fail "preflight BFV mapping:$bfv_pool" \
+                "missing $mapping in ${advertised_bfv_pools:-empty}"
+        fi
+    done
+fi
+
+root_pool=$(crudini --get "$NOVA_CONFIG" incus storage_pool 2>/dev/null || true)
+if [[ -z "$root_pool" ]]; then
+    fail "Nova root storage pool" "missing"
+else
+    root_pool_json=$(podman exec "$INCUS_CONTAINER" incus query \
+        "/1.0/storage-pools/$root_pool" 2>/dev/null || true)
+    root_pool_driver=$(jq -r '.metadata.driver // .driver // empty' \
+        <<<"$root_pool_json")
+    if [[ -z "$root_pool_driver" || "$root_pool_driver" == dir ]]; then
+        fail "Nova root storage pool" \
+            "$root_pool uses unsupported production driver ${root_pool_driver:-missing}"
+    else
+        pass "Nova root storage pool" "$root_pool ($root_pool_driver)"
+    fi
+fi
+
+root_pool_mappings=$(crudini --get "$NOVA_CONFIG" incus \
+    root_storage_pools 2>/dev/null || true)
+if tr ',' '\n' <<<"$root_pool_mappings" | \
+        cut -d: -f2- | grep -Fxq "$root_pool"; then
+    pass "Nova root storage pool mapping" "$root_pool"
+else
+    fail "Nova root storage pool mapping" \
+        "default pool $root_pool is absent from ${root_pool_mappings:-empty}"
+fi
 if [[ "$REQUIRE_COLD_MIGRATION" == true ]]; then
     check_equal "Nova cold migration" true \
         "$(crudini --get "$NOVA_CONFIG" incus \

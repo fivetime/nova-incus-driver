@@ -411,6 +411,18 @@ driver's architecture, kernel, Incus, storage, device, privilege, and CRIU
 pre-checks. Passing pre-checks does not guarantee that an arbitrary workload
 is checkpointable. Force-complete and post-copy remain unsupported.
 
+An Incus-managed root on a shared ``ceph`` pool uses the same ordered CRIU
+cutover principle as BFV without changing ownership layers. The source writes
+``volatile.migration.storage_handover=pending``, checkpoints the container,
+unmounts the RBD, and only then lets a standalone target using the same Ceph
+FSID, OSD pool, and ``ceph`` driver claim the existing root. Success transfers
+Incus ownership to the target without copying data. A failed target restore
+unmounts the claim and removes only the target database record before the
+source resumes; it must not delete the RBD. Nova requires the
+``migration_live_shared_ceph_storage`` API extension on every live-migration
+compute so a mixed-version rollout fails pre-check instead of reaching a
+same-name RBD conflict.
+
 Failed-host evacuation is supported only for Cinder RBD boot-from-volume
 instances after the deployment passes the external STONITH release gate, and
 is disabled by default. External power

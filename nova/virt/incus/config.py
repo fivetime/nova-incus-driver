@@ -41,12 +41,32 @@ incus_opts = [
         default=None,
         help="Incus storage pool used for instance root filesystems.",
     ),
-    cfg.StrOpt(
-        "boot_from_volume_storage_pool",
-        default=None,
+    cfg.DictOpt(
+        "root_storage_pools",
+        default={},
         help=(
-            "Incus cephext storage pool used to claim Cinder RBD root "
-            "volumes. It must reference the same Ceph pool as Cinder."
+            "Mapping of operator-defined Flavor selectors to Incus storage "
+            "pools available for Nova-managed instance roots. A Flavor can "
+            "select an entry with incus:root_storage_pool. The configured "
+            "storage_pool remains the default when the extra spec is absent."
+        ),
+    ),
+    cfg.DictOpt(
+        "root_storage_pool_resource_classes",
+        default={},
+        help=(
+            "Mapping of root-storage selectors to custom Placement resource "
+            "classes used for capacity accounting of node-local pools. The "
+            "corresponding Flavor resources:<class> value must equal root_gb."
+        ),
+    ),
+    cfg.DictOpt(
+        "boot_from_volume_storage_pools",
+        default={},
+        help=(
+            "Mapping of Cinder RBD pool names to Incus cephext storage "
+            "pools used to claim boot-from-volume roots. Every configured "
+            "Incus pool must reference its mapped Cinder pool as source."
         ),
     ),
     cfg.IntOpt(

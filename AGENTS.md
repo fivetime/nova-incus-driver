@@ -312,6 +312,12 @@ in `TEST_STATUS.md`; this section keeps only the rules.
   client must be scoped only to that backup pool with no access to the volume
   or Incus rootfs pools. Same-cluster backups are operational backups, not an
   independent disaster-recovery failure domain.
+- Cinder backup owns BFV roots and Cinder data volumes. Incus-managed local or
+  Ceph roots use Nova snapshot-to-Glance instead; Manila data uses backend
+  snapshot/replication/backup capabilities. Nova does not provide an atomic
+  snapshot spanning those three owners. Application-consistent recovery
+  requires guest quiesce plus a manifest of the independently captured
+  resource UUIDs.
 - DevStack supports an existing Cinder Ceph backend through
   `INCUS_CINDER_CEPH_POOL`, `INCUS_CINDER_CEPH_USER`, `INCUS_CINDER_CEPH_CONF`,
   and `INCUS_CINDER_CEPH_CLUSTER_NAME`, and the Ceph backup service through

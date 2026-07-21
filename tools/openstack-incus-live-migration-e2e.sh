@@ -61,6 +61,12 @@ share_markers=()
 manila_marker_paths=()
 share_mounts=()
 restore_failpoint_ssh=
+managed_root_pool=
+managed_root_driver=
+managed_root_ceph_pool=
+managed_root_ceph_user=
+managed_root_rbd_image=
+managed_root_rbd_id=
 read -r -a requested_data_devices <<<"$DATA_DEVICES"
 read -r -a requested_manila_shares <<<"$MANILA_SHARES"
 read -r -a requested_manila_tags <<<"$MANILA_TAGS"
@@ -123,6 +129,15 @@ incus_remote() {
     local command_line
     printf -v command_line '%q ' incus --project "$INCUS_PROJECT" "$@"
     "${SSH[@]}" "$host" "$command_line"
+}
+
+managed_root_image_id() {
+    local host=$1 command_line
+    printf -v command_line \
+        'rbd --id %q --pool %q info %q --format json | jq -er .id' \
+        "$managed_root_ceph_user" "$managed_root_ceph_pool" \
+        "$managed_root_rbd_image"
+    remote "$host" "$command_line"
 }
 
 wait_status() {
@@ -420,6 +435,28 @@ until incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
     sleep 2
 done
 
+if [[ "$BOOT_FROM_VOLUME" != "1" ]]; then
+    managed_root_pool=$(incus_remote "$SOURCE_SSH" profile device get \
+        "$instance_name" root pool)
+    managed_root_driver=$(incus_remote "$SOURCE_SSH" storage list \
+        --format csv | awk -F, -v pool="$managed_root_pool" \
+        '$1 == pool {print $2}')
+    if [[ "$managed_root_driver" == ceph ]]; then
+        managed_root_ceph_pool=$(incus_remote "$SOURCE_SSH" storage get \
+            "$managed_root_pool" ceph.osd.pool_name)
+        if [[ -z "$managed_root_ceph_pool" ]]; then
+            managed_root_ceph_pool=$(incus_remote "$SOURCE_SSH" storage get \
+                "$managed_root_pool" source)
+        fi
+        managed_root_ceph_user=$(incus_remote "$SOURCE_SSH" storage get \
+            "$managed_root_pool" ceph.user.name)
+        managed_root_ceph_user=${managed_root_ceph_user:-admin}
+        managed_root_rbd_image="container_${INCUS_PROJECT}_${instance_name}"
+        managed_root_rbd_id=$(managed_root_image_id "$SOURCE_SSH")
+        [[ -n "$managed_root_rbd_id" ]]
+    fi
+fi
+
 if ((${#requested_manila_shares[@]} > 0)); then
     if ((${#requested_manila_tags[@]} > 0 &&
          ${#requested_manila_tags[@]} != ${#requested_manila_shares[@]})); then
@@ -691,6 +728,10 @@ migrate_and_verify() {
             "rbd device list --format json --id cinder | jq -e \
              '.[] | select(.name == \"$root_image\")'" >/dev/null
     fi
+    if [[ -n "$managed_root_rbd_id" ]]; then
+        [[ "$(managed_root_image_id "$target_ssh")" == \
+            "$managed_root_rbd_id" ]]
+    fi
     sleep 3
     later_counter=$(incus_remote "$target_ssh" exec "$instance_name" -- \
         cat /root/criu-counter)
@@ -812,8 +853,12 @@ for host in "${test_sshs[@]}"; do
         incus_remote "$host" info "$instance_name" >/dev/null 2>&1
     assert_no_ovs_port "$host"
 done
+if [[ -n "$managed_root_rbd_id" ]]; then
+    assert_fails "managed Ceph root RBD must be absent after server delete" \
+        managed_root_image_id "$SOURCE_SSH" >/dev/null 2>&1
+fi
 
-result="PASS server=$server_id instance=$instance_name ip=$fixed_ip pid=$source_pid counter=$source_counter->$later_counter hops=${#migration_targets[@]} root_volume=${root_volume_id:-local} data_volumes=${volume_ids[*]:-none} manila_shares=${share_ids[*]:-none}"
+result="PASS server=$server_id instance=$instance_name ip=$fixed_ip pid=$source_pid counter=$source_counter->$later_counter hops=${#migration_targets[@]} root_volume=${root_volume_id:-local} managed_root_rbd_id=${managed_root_rbd_id:-none} data_volumes=${volume_ids[*]:-none} manila_shares=${share_ids[*]:-none}"
 server_id=
 instance_name=
 port_id=

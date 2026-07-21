@@ -3,12 +3,12 @@
 
 set -euo pipefail
 
-IMAGE=${IMAGE:-ubuntu-noble-cloud-incus-ssh}
-FLAVOR=${FLAVOR:-m1.tiny}
-NETWORK=${NETWORK:-private}
-SOURCE_HOST=${SOURCE_HOST:-ubuntu}
+IMAGE=${IMAGE:-alpine-3.21-cloud-incus-criu}
+FLAVOR=${FLAVOR:-ds512M}
+NETWORK=${NETWORK:-public}
+SOURCE_HOST=${SOURCE_HOST:-incus-node-01}
 DEST_HOST=${DEST_HOST:-incus-node-02}
-SOURCE_SSH=${SOURCE_SSH:-root@10.224.0.16}
+SOURCE_SSH=${SOURCE_SSH:-root@10.224.0.21}
 DEST_SSH=${DEST_SSH:-root@10.224.0.17}
 SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute test key}
 NAME=${NAME:-incus-snapshot-e2e-$RANDOM}
@@ -47,12 +47,15 @@ raise SystemExit(not ports or any(p["Status"] != "ACTIVE" for p in ports))
 }
 
 cleanup() {
-    [[ -n "$restore_id" ]] && \
+    if [[ -n "$restore_id" ]]; then
         openstack server delete --wait "$restore_id" >/dev/null 2>&1 || true
-    [[ -n "$source_id" ]] && \
+    fi
+    if [[ -n "$source_id" ]]; then
         openstack server delete --wait "$source_id" >/dev/null 2>&1 || true
-    [[ -n "$snapshot_id" ]] && \
+    fi
+    if [[ -n "$snapshot_id" ]]; then
         openstack image delete "$snapshot_id" >/dev/null 2>&1 || true
+    fi
 }
 trap cleanup EXIT
 trap 'exit 130' INT

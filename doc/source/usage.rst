@@ -140,6 +140,42 @@ and image inventories before and after the operation to detect leaked
 temporary objects. Normal production requests omit ``--host`` and remain
 subject to Scheduler and Placement decisions.
 
+Selecting an Incus-managed root pool
+-------------------------------------
+
+Operators can expose several Incus pools without allowing a tenant to inject
+an arbitrary pool name. Configure ``[incus] root_storage_pools`` as a mapping
+of stable selector names to host-local Incus pool names. A Flavor selects a
+mapping entry and requires the Placement trait reported for that selector::
+
+    [incus]
+    storage_pool = ceph-rootfs
+    root_storage_pools = durable:ceph-rootfs,local-nvme:local-zfs
+    root_storage_pool_resource_classes = local-nvme:CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME_DISK_GB
+
+    openstack flavor set incus-local-nvme \
+      --property incus:root_storage_pool=local-nvme \
+      --property trait:CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME=required \
+      --property resources:CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME_DISK_GB=20
+
+When the extra spec is absent, ``storage_pool`` is used. Unknown selectors are
+rejected during spawn. Selector characters other than letters, digits and
+underscore become underscores in the upper-case trait name; configurations
+that would produce the same trait are rejected.
+
+The storage Trait proves that the destination has the named pool. For a
+node-local Btrfs, LVM, or ZFS pool, map its selector to a custom resource class
+and set the Flavor's ``resources:<class>`` amount exactly equal to that
+Flavor's ``root_gb``. The driver rejects a mismatch, and Placement then
+accounts each local pool independently. The standard ``DISK_GB`` request is
+still present and acts as an additional host-level ceiling.
+
+Shared Ceph capacity must not be published in full independently by every
+compute through a custom resource class. Keep shared Ceph on the standard
+``DISK_GB`` model and set ``disk_allocation_ratio`` and reserved capacity from
+an external cluster-wide capacity policy. Local pools cannot provide automatic
+evacuation after host loss and require remote snapshots or backups.
+
 Cinder boot-from-volume
 -----------------------
 
@@ -152,9 +188,12 @@ same Ceph pool and least-privilege CephX user as the Cinder backend::
     INCUS_BFV_CEPH_USER=cinder
     INCUS_BFV_CEPH_CLUSTER_NAME=ceph
 
-DevStack creates the pool and writes ``[incus]
-boot_from_volume_storage_pool``. Outside DevStack, create the ``cephext`` pool
-with the Incus API and set that Nova option explicitly.
+DevStack creates the pool and writes the Cinder-to-Incus mapping to ``[incus]
+boot_from_volume_storage_pools``. Outside DevStack, create one ``cephext``
+pool for every Cinder RBD pool accepted for BFV and configure the mapping as
+``cinder-rbd-pool:incus-pool`` pairs separated by commas. The driver selects
+the pool from Cinder's authoritative ``connection_info`` rather than from the
+Volume Type name.
 
 Create a server from an existing bootable Cinder volume with the standard
 OpenStack API::
@@ -217,7 +256,11 @@ The test-environment readiness check must verify all of the following::
 
 Also inspect the Cinder volume log for the RBD ``clone_image`` path and verify
 the new image's RBD parent/snapshot relationship. Provisioning time by itself
-is not proof that the optimized path was used.
+is not proof that the optimized path was used. The release gate performs all
+of those checks and removes its test volume afterward::
+
+    source /opt/stack/devstack/openrc admin admin
+    tools/openstack-incus-bfv-cow-e2e.sh
 
 Server deletion first removes the Incus instance and releases the RBD mapping,
 then Nova/Cinder detach the volume. Incus must never delete an externally owned
@@ -485,6 +528,17 @@ listener so it is reachable only from Nova compute nodes. The ordinary driver
 connection remains the local Unix socket; tenants must never receive Incus API
 or migration credentials.
 
+For OpenStack-Helm, combine the selected storage override with
+``values_overrides/nova/incus-migration.yaml``. The DaemonSet derives each
+``migration_address`` from ``status.hostIP``, writes a node-local Nova config,
+mounts the migration Secret, and idempotently registers two restricted client
+identities in the local Incus daemon. The Secret must contain
+``migration.crt``, ``migration.key``, ``preflight.crt``, ``preflight.key`` and
+``ca.crt``. Every Incus HTTPS server certificate must be issued by that CA and
+contain its Kubernetes node InternalIP as an IP subjectAltName. The Helm chart
+does not issue or rotate the server certificate; that remains part of the
+Incus host PKI and Podman deployment lifecycle.
+
 BFV destination readiness uses a separate TLS client identity. Trust each
 compute's client certificate on every destination, restricted to a dedicated
 ``nova-preflight`` Incus project. The project must prohibit instances and
@@ -497,8 +551,7 @@ restricted project::
         features.images=false features.networks=false \
         features.storage.volumes=false features.storage.buckets=false \
         user.openstack.preflight_protocol=1 \
-        user.openstack.bfv_pool=cinder-bfv \
-        user.openstack.cinder_rbd_pool=cinder-volumes-rbd-pool
+        'user.openstack.bfv_storage_pools={"cinder-volumes-rbd-pool":"cinder-bfv"}'
     incus project set nova-preflight restricted=true
     incus config trust add-certificate peer-client.crt \
         --name nova-preflight-compute-2 --restricted \
@@ -637,6 +690,48 @@ cleanup through the public APIs::
     source /opt/stack/devstack/openrc admin admin
     SSH_IDENTITY=/path/to/test-key \
       tools/openstack-incus-ceph-backup-e2e.sh
+
+The preceding test covers a Cinder data volume. Validate the same native
+Cinder backup path for a boot-from-volume root separately. The BFV test stops
+the source container for filesystem consistency, creates full and incremental
+backups, restores the incremental chain into a new bootable volume, boots that
+volume on another compute, and reads the tenant marker from the restored
+rootfs::
+
+    source /opt/stack/devstack/openrc admin admin
+    SSH_IDENTITY=/path/to/test-key \
+      tools/openstack-incus-bfv-backup-e2e.sh
+
+Backup ownership follows storage ownership:
+
+* Cinder BFV roots and Cinder data volumes use ``cinder-backup``. They support
+  full and incremental backup and restore into a new Cinder volume.
+* Incus-managed roots, including local ZFS/LVM and Incus-owned Ceph roots, are
+  not Cinder volumes. Use Nova snapshot-to-Glance and validate restore with
+  ``tools/openstack-incus-snapshot-e2e.sh``. This is a crash-consistent image
+  unless the tenant application is quiesced first.
+* Manila shares use the snapshot, replication, or backup feature exposed by
+  their Manila backend. A Nova snapshot does not include share contents.
+  For a backend advertising ``snapshot_support`` and
+  ``create_share_from_snapshot_support``, validate tenant data restoration
+  with ``tools/openstack-incus-manila-snapshot-e2e.sh``. A Manila snapshot in
+  the same backend is still not an independent disaster-recovery copy.
+
+  Capability extra specs are applied when a share is created and are not
+  retroactive. Configure the Share Type before creating protected shares::
+
+      openstack share type set incus-nfs --extra-specs \
+        snapshot_support=True \
+        create_share_from_snapshot_support=True \
+        revert_to_snapshot_support=True \
+        mount_snapshot_support=True
+
+OpenStack does not provide one atomic operation spanning a Nova root, multiple
+Cinder volumes, and multiple Manila shares. An application-consistent service
+backup must quiesce the application, record all resource UUIDs in a manifest,
+create the owner-specific backups while writes remain frozen, and then thaw
+the application. Restore must use that manifest rather than assuming that
+independently created snapshots represent the same point in time.
 
 This test was completed against the production-like Ceph backend on
 2026-07-16. The Ceph driver used native RBD differential export/import, the
@@ -889,6 +984,12 @@ that are not Nova-managed Cinder data volumes remain rejected. Shared-Ceph
 boot-from-volume roots use the Incus ordered handover protocol. Nova-managed
 Cinder data volumes use Nova's native temporary destination attachment and a
 destination-local os-brick mapping.
+
+Incus-managed roots on a shared ``ceph`` pool also use zero-copy ordered
+handover. Both computes must advertise
+``migration_live_shared_ceph_storage`` and expose the same Ceph FSID, OSD pool,
+and ``ceph`` driver. Local ``dir``, LVM, Btrfs, and ZFS roots instead transfer
+their rootfs data; they cannot use shared-storage handover.
 The source profile's host-specific ``unix-block source`` paths are excluded
 from migration data and rebuilt from the destination connection information.
 Successful migration disconnects the source mapping after CRIU restore.

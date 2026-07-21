@@ -7,6 +7,7 @@ COMPUTE_NODES=${COMPUTE_NODES:?Set host=ssh-target comma-separated nodes}
 SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute audit key}
 EXPECTED_INCUS_IMAGE_DIGEST=${EXPECTED_INCUS_IMAGE_DIGEST:?Set approved digest}
 EXPECTED_INCUS_REVISION=${EXPECTED_INCUS_REVISION:?Set approved source revision}
+EXPECTED_HYPERVISOR_TYPE=${EXPECTED_HYPERVISOR_TYPE:-lxc}
 REMOTE_DRIVER=${REMOTE_DRIVER:-/opt/stack/nova/nova/virt/incus}
 CONTROLLER_SSH=${CONTROLLER_SSH:-}
 CONTROLLER_OPENRC=${CONTROLLER_OPENRC:-/opt/stack/devstack/openrc admin admin}
@@ -118,11 +119,12 @@ for node in "${nodes[@]}"; do
         -f value -c state 2>/dev/null)
     hypervisor_type=$(openstack hypervisor show "$host" \
         -f value -c hypervisor_type 2>/dev/null)
-    if [[ "$hypervisor_state" == up && "$hypervisor_type" == incus ]]; then
-        pass "$host hypervisor" "up/incus"
+    if [[ "$hypervisor_state" == up && \
+          "$hypervisor_type" == "$EXPECTED_HYPERVISOR_TYPE" ]]; then
+        pass "$host hypervisor" "up/$hypervisor_type"
     else
         fail "$host hypervisor" \
-            "expected up/incus, actual=$hypervisor_state/$hypervisor_type"
+            "expected up/$EXPECTED_HYPERVISOR_TYPE, actual=$hypervisor_state/$hypervisor_type"
     fi
 
     provider_uuid=$(openstack resource provider list --name "$host" \

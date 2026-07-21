@@ -269,8 +269,7 @@ function configure_nova_incus_storage {
             limits.containers=0 \
             limits.virtual-machines=0 \
             user.openstack.preflight_protocol=1 \
-            "user.openstack.bfv_pool=${INCUS_BFV_POOL_NAME}" \
-            "user.openstack.cinder_rbd_pool=${INCUS_BFV_CEPH_POOL}"
+            "user.openstack.bfv_storage_pools={\"${INCUS_BFV_CEPH_POOL}\":\"${INCUS_BFV_POOL_NAME}\"}"
     fi
 
     if ! incus_cli storage show "${INCUS_POOL_NAME}" >/dev/null 2>&1; then
@@ -392,8 +391,8 @@ function configure_nova_incus {
         iniset "${nova_target}" incus root_dir /var/lib/incus
         iniset "${nova_target}" incus storage_pool "${INCUS_POOL_NAME}"
         if [[ -n "${INCUS_BFV_POOL_NAME}" ]]; then
-            iniset "${nova_target}" incus boot_from_volume_storage_pool \
-                "${INCUS_BFV_POOL_NAME}"
+            iniset "${nova_target}" incus boot_from_volume_storage_pools \
+                "${INCUS_BFV_CEPH_POOL}:${INCUS_BFV_POOL_NAME}"
         fi
         iniset "${nova_target}" incus default_process_limit \
             "${INCUS_DEFAULT_PROCESS_LIMIT}"

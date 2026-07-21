@@ -18,6 +18,7 @@ from nova.virt import driver
 from oslo_config import cfg
 from oslo_utils import units
 
+from nova.virt.incus import common
 from nova.virt.incus import vif
 
 _ = i18n._
@@ -155,14 +156,48 @@ def _root(instance, client, *_args):
     """Configure the root disk."""
     device = {'type': 'disk', 'path': '/'}
 
+    selector = instance.flavor.extra_specs.get('incus:root_storage_pool')
+    if selector:
+        storage_pool = CONF.incus.root_storage_pools.get(selector)
+        if not storage_pool:
+            raise exception.InvalidConfiguration(
+                'Flavor requests unknown Incus root storage pool selector '
+                '{}'.format(selector))
+        trait = common.root_storage_pool_trait(selector)
+        trait_value = instance.flavor.extra_specs.get(
+            'trait:{}'.format(trait))
+        if trait_value != 'required':
+            raise exception.InvalidConfiguration(
+                'Flavor selecting Incus root storage pool {} must require '
+                'Placement trait {}'.format(selector, trait))
+        resource_class = (
+            CONF.incus.root_storage_pool_resource_classes.get(selector))
+        if resource_class:
+            resource_key = 'resources:{}'.format(resource_class)
+            requested = instance.flavor.extra_specs.get(resource_key)
+            root_gb = max(instance.root_gb, CONF.incus.minimum_root_disk_gb)
+            try:
+                requested_gb = int(requested)
+            except (TypeError, ValueError):
+                raise exception.InvalidConfiguration(
+                    'Flavor selecting Incus root storage pool {} must set '
+                    '{} to root_gb ({})'.format(
+                        selector, resource_key, root_gb))
+            if requested_gb != root_gb:
+                raise exception.InvalidConfiguration(
+                    '{} must equal root_gb ({})'.format(
+                        resource_key, root_gb))
+    else:
+        storage_pool = CONF.incus.storage_pool
+
     # A managed block or copy-on-write pool must enforce the Nova root disk
     # allocation. The dir backend cannot provide this isolation.
-    if CONF.incus.storage_pool:
+    if storage_pool:
         extensions = client.host_info.get('api_extensions', [])
         if 'storage' in extensions:
-            device['pool'] = CONF.incus.storage_pool
+            device['pool'] = storage_pool
             storage_type = client.storage_pools.get(
-                CONF.incus.storage_pool).driver
+                storage_pool).driver
         else:
             msg = _("Host does not have storage pool support")
             raise exception.NovaException(msg)

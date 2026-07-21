@@ -46,6 +46,8 @@ class ToProfileTest(test.NoDBTestCase):
         self.patchers.append(CONF_patcher)
         self.CONF2 = CONF_patcher.start()
         self.CONF2.incus.storage_pool = None
+        self.CONF2.incus.root_storage_pools = {}
+        self.CONF2.incus.root_storage_pool_resource_classes = {}
         self.CONF2.incus.root_dir = ''
         self.CONF2.incus.minimum_root_disk_gb = 1
         self.CONF2.incus.default_process_limit = 1024
@@ -149,6 +151,64 @@ class ToProfileTest(test.NoDBTestCase):
 
         self.assert_profile_created(
             instance.name, expected_config, expected_devices)
+
+    def test_flavor_selects_root_storage_pool(self):
+        self.client.host_info['api_extensions'].append('storage')
+        self.CONF2.incus.storage_pool = 'ceph-default'
+        self.CONF2.incus.root_storage_pools = {
+            'local-nvme': 'local-zfs',
+            'durable': 'ceph-rootfs',
+        }
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=1024)
+        instance.flavor.extra_specs = {
+            'incus:root_storage_pool': 'local-nvme',
+            'trait:CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME': 'required',
+        }
+        self.client.storage_pools.get.return_value.driver = 'zfs'
+
+        flavor.to_profile(self.client, instance, [], [])
+
+        devices = self.client.profiles.create.call_args.args[2]
+        self.assertEqual('local-zfs', devices['root']['pool'])
+        self.client.storage_pools.get.assert_called_once_with('local-zfs')
+
+    def test_flavor_rejects_unknown_root_storage_pool(self):
+        self.CONF2.incus.storage_pool = 'ceph-default'
+        self.CONF2.incus.root_storage_pools = {
+            'durable': 'ceph-rootfs',
+        }
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=1024)
+        instance.flavor.extra_specs = {
+            'incus:root_storage_pool': 'unmanaged',
+        }
+
+        self.assertRaises(
+            exception.InvalidConfiguration,
+            flavor.to_profile, self.client, instance, [], [])
+
+    def test_flavor_requires_local_pool_capacity_resource(self):
+        self.CONF2.incus.root_storage_pools = {
+            'local-nvme': 'local-zfs',
+        }
+        self.CONF2.incus.root_storage_pool_resource_classes = {
+            'local-nvme': 'CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME_DISK_GB',
+        }
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=1024, root_gb=20)
+        instance.flavor.extra_specs = {
+            'incus:root_storage_pool': 'local-nvme',
+            'trait:CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME': 'required',
+            'resources:CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME_DISK_GB': '10',
+        }
+
+        self.assertRaises(
+            exception.InvalidConfiguration,
+            flavor.to_profile, self.client, instance, [], [])
 
     def test_to_profile_rejects_privileged(self):
         ctx = context.get_admin_context()

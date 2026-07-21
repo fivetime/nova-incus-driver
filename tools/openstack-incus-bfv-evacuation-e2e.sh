@@ -19,11 +19,17 @@ CINDER_RBD_POOL=${CINDER_RBD_POOL:-cinder-volumes-rbd-pool}
 INCUS_PROJECT=${INCUS_PROJECT:-nova}
 TIMEOUT=${TIMEOUT:-}
 
-SSH=(ssh -n -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=no)
+SSH=(ssh -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=no)
 marker="openstack-incus-evacuation-$(date +%s)-$$"
 marker_sha=$(printf '%s\n' "$marker" | sha256sum | awk '{print $1}')
 
 remote() {
+    local target=$1
+    shift
+    "${SSH[@]}" -n "$target" "$@"
+}
+
+remote_stdin() {
     local target=$1
     shift
     "${SSH[@]}" "$target" "$@"
@@ -76,6 +82,21 @@ server_field_is() {
 source_service_down() {
     [[ "$(openstack compute service list --service nova-compute \
         --host "$SOURCE_HOST" -f value -c State)" == down ]]
+}
+
+source_service_up() {
+    [[ "$(openstack compute service list --service nova-compute \
+        --host "$SOURCE_HOST" -f value -c State)" == up ]]
+}
+
+source_placement_enabled() {
+    local provider_uuid traits
+    provider_uuid=$(openstack resource provider list --name "$SOURCE_HOST" \
+        -f value -c uuid)
+    [[ "$provider_uuid" =~ ^[0-9a-f-]{36}$ ]] || return 1
+    traits=$(openstack resource provider trait list "$provider_uuid" \
+        -f value -c name)
+    ! grep -Fxq COMPUTE_STATUS_DISABLED <<<"$traits"
 }
 
 source_reachable() {
@@ -254,7 +275,7 @@ done
 
 if [[ "$original_status" == ACTIVE ]]; then
     printf '%s\n' "$marker" |
-        remote "$SOURCE_SSH" \
+        remote_stdin "$SOURCE_SSH" \
             "podman exec -i incus incus --project '$INCUS_PROJECT' \
              file push - '$instance_name/root/stonith-e2e-marker'"
 fi
@@ -324,11 +345,13 @@ remote "$SOURCE_SSH" \
      systemctl reset-failed devstack@n-cpu.service; \
      systemctl start devstack@n-cpu.service"
 
+wait_for "returning Nova compute heartbeat" source_service_up
 wait_for "stale source record cleanup" \
     remote "$SOURCE_SSH" \
         "! podman exec incus incus --project '$INCUS_PROJECT' \
          info '$instance_name' >/dev/null 2>&1"
 openstack compute service set --enable "$SOURCE_HOST" nova-compute
+wait_for "returning source Placement eligibility" source_placement_enabled
 wait_for "single watcher after source admission" \
     watchers_are "$([[ "$original_status" == ACTIVE ]] && echo 1 || echo 0)"
 wait_for "single Cinder root attachment after reconciliation" \

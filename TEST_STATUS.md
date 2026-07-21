@@ -28,32 +28,93 @@ digest/revision pair.
   (the synchronized SDK path); the default sibling path remains correct for
   local checkouts.
 
-### Storage substrate (LINSTOR/DRBD and Cinder control plane)
+### Current storage substrate
 
-- All three nodes have a dedicated 1 TiB `/dev/vdb`, initialized on 2026-07-16
-  as `linstor_vg/linstor_thinpool`. Each `linstor-pool` reports 972.55 GiB.
-  DRBD 9.3.2 is loaded on all nodes and LINSTOR 1.34.1 reports them online.
-  The three-copy `drbd-smoke` resource is `UpToDate` on every node with two
-  established peer connections and majority quorum. Ubuntu 26.04 nodes need
-  DRBD 9.3.2 source-built for kernel 7.0 and Noble's `drbd-utils` 9.34; this
-  public-PPA/source combination is test-only, not the production package path.
-- The Cinder stable/2026.1 v3 control plane was deployed on `.16` on
-  2026-07-16. The public `block-storage` endpoint is
-  `http://10.224.0.16/volume/v3`. The `cinder-scheduler` and LINSTOR-backed
-  `cinder-volume` services are up. OpenStack volume
-  `6964b960-bdff-400a-a1fc-adadfe9de62e` was created through the v3 API and
-  maps to an `UpToDate` three-copy LINSTOR resource on `.16`, `.17`, and `.18`.
-  Keep this volume as a backend health baseline.
-- The existing Rook pool `cinder-volumes-rbd-pool` is also registered on `.16`
-  as the `incus-node-01@ceph` Cinder RBD backend with public volume type `ceph`.
-  The test deployment temporarily keeps LINSTOR and Ceph enabled together for
-  comparison; this is runtime test state, not the DevStack plugin's mutually
-  exclusive reproducible configuration.
-- The test nodes now mount preallocated ext4 filesystems of 8 GiB and 2 GiB at
-  `/var/lib/incus` and `/var/log/incus`, respectively. This is a test-only
-  substitute because `/dev/vdb` is fully assigned to LINSTOR; production must
-  use dedicated partitions or LVs. The original directory backups were removed
-  only after the full migration E2E passed.
+- The current Noble test nodes do not have `/dev/vdb`; the earlier
+  LINSTOR/DRBD topology was removed when `.21` and `.22` were reinstalled.
+  LINSTOR results later in this file are historical evidence only.
+- The external Rook cluster supplies `glance-images-rbd-pool`,
+  `cinder-volumes-rbd-pool`, `nvme-rep3-rbd-pool`,
+  `cinder-backups-rbd-pool`, and the Incus rootfs pool. Glance, both Cinder
+  volume backends, Cinder Backup, and every Incus compute use pool-scoped
+  CephX clients.
+- Every compute exposes two dynamic BFV mappings:
+  `cinder-volumes-rbd-pool:cinder-bfv` and
+  `nvme-rep3-rbd-pool:cinder-nvme-bfv`. The restricted `nova-preflight`
+  project publishes the same mapping as JSON for authenticated destination
+  readiness checks.
+- Every compute also has an independent 7.5-GiB `incus-local-zpool` exposed as
+  `local-zfs`. It is intentionally non-HA and exercises Flavor-selected local
+  roots, capacity inventory, snapshot export and cross-node restore.
+- `/var/lib/incus` and `/var/log/incus` remain bounded by dedicated loop-backed
+  filesystems in this test topology. Production requires dedicated partitions,
+  LVs, or equivalent hard quotas rather than loop files.
+
+### Current release-candidate warning
+
+- The 2026-07-21 shared-Ceph live-handover candidate is running through a
+  temporary read-only bind of the locally built `incusd` binary on all three
+  nodes. The previously approved GHCR digest below does not contain that final
+  patch. It remains historical evidence and must not be promoted as the next
+  production digest.
+- Final release admission still requires review, an explicit user-approved
+  commit/push, GHCR rebuild, digest-pinned three-node rollout, and a clean fleet
+  preflight against the new Incus revision.
+
+### 2026-07-21 release-candidate evidence
+
+- The complete 2x2x2 live-migration matrix passed on `.21`, `.17`, and `.22`:
+  Incus-managed Ceph or Cinder BFV root, zero or one Cinder data volume, and
+  zero or one Manila share. Every case completed `.21 -> .17 -> .22 -> .21`,
+  preserving PID/CRIU state, increasing guest counters, root and data content,
+  Manila content, OVN ownership, and baseline-equal cleanup.
+- A Flavor-selected local ZFS root completed the same three-hop test through
+  the non-shared copy path. A second Cinder backend
+  (`nvme-rep3-rbd-pool:cinder-nvme-bfv`) completed BFV three-hop shared-Ceph
+  migration, proving dynamic volume-type-to-cephext-pool selection.
+- The Incus-owned Ceph live-handover rollback path was failure-injected on the
+  first target. The target released its claim without deleting the RBD root,
+  the source restored its checkpoint with the original PID and increasing
+  counter, and the immediate `.21 -> .17 -> .22 -> .21` retry passed with the
+  same RBD image ID and clean final deletion.
+- Cinder data-volume and BFV-root full/incremental backup and restore passed.
+  The restored BFV root booted on another compute and retained its marker.
+  Incus-managed Ceph and local-ZFS roots passed Nova snapshot-to-Glance and
+  cross-compute restore. Manila snapshot, create-from-snapshot, reattach and
+  marker recovery passed. Glance-RBD to Cinder-RBD provisioning retained a
+  real RBD parent snapshot and non-zero overlap rather than copying the image.
+- A destructive BFV evacuation powered off `.17` through the external
+  hypervisor fence provider, waited for Nova's 720-second service-down gate,
+  proved zero source RBD watchers, evacuated to `.22`, and verified a non-empty
+  rootfs marker. On return, `.17` remained quarantined with nova-compute
+  stopped; the ownership audit proved the old record stale, the Cinder
+  attachment and OVN binding unique, and the target the sole watcher. Explicit
+  admission removed the stale record, restored the compute heartbeat, removed
+  `COMPUTE_STATUS_DISABLED` from Placement, and returned all three services to
+  `enabled/up`.
+- That exercise corrected two test/recovery defects: stdin-bearing `incus file
+  push` no longer uses SSH `-n`, and returning-host scheduling is enabled only
+  after the compute heartbeat is up, followed by an explicit Placement-trait
+  eligibility check.
+- `tox -e py312` passed 317/317 tests, `tox -e pep8` passed, Sphinx completed
+  with `-W --keep-going`, changed shell scripts passed ShellCheck, all seven
+  Incus storage/migration Helm overrides passed lint and combined rendering,
+  and all four worktrees passed `git diff --check` (line-ending notices only).
+- The exact uncommitted Incus fork diff was overlaid on a clean
+  `057da9998` checkout on Linux. `gofmt -d` was empty, the complete
+  `internal/server/instance/drivers` package test suite passed, and
+  `go build ./cmd/incusd` succeeded.
+- After synchronizing the authoritative driver tree, the three-node fleet
+  preflight passed with identical driver hashes, every nova-compute
+  `enabled/up`, Nova-compatible `hypervisor_type=lxc`, valid Placement
+  inventory/traits, live OVN controllers, both BFV mappings, and the current
+  digest/revision pair. This proves the running test baseline is internally
+  consistent; it does not supersede the immutable-image warning above.
+- Rebooting `.17` also proved why the pending immutable image rebuild is a
+  release gate: the old image lost the test-time `zpool` installation and Nova
+  resource reporting failed closed. The candidate Dockerfile installs and CI
+  verifies `zfs`/`zpool`; the new digest must be rebuilt and rolled out before
+  release approval.
 
 ### Approved image and preflight evidence
 
