@@ -2,6 +2,13 @@ diff --git a/os_brick/initiator/connectors/rbd.py b/os_brick/initiator/connector
 index eb2911c..ffa1d29 100644
 --- a/os_brick/initiator/connectors/rbd.py
 +++ b/os_brick/initiator/connectors/rbd.py
+@@ -216,6 +216,7 @@ class RBDConnector(base_rbd.RBDConnectorMixin, base.BaseLinuxConnector):
+                 # when we drop support earlier versions
+                 cmd = ['rbd', 'map', volume, '--pool', pool]
++                cmd += ['--options', 'noudev']
+                 cmd += self._get_rbd_args(connection_properties, conf)
+                 self._execute(*cmd, root_helper=self._root_helper,
+                               run_as_root=True)
 @@ -229,13 +229,18 @@ class RBDConnector(base_rbd.RBDConnectorMixin, base.BaseLinuxConnector):
                  not os.path.islink(rbd_dev_path) or
                  not os.path.exists(os.path.realpath(rbd_dev_path))
