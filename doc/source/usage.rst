@@ -656,7 +656,15 @@ Validate the backend through the public API with an explicit volume type; an
 
 After attachment, the Incus driver maps the Cinder RBD through os-brick and
 adds a ``unix-block`` device to the instance profile. Unprivileged containers
-must use a userspace filesystem implementation such as ``fuse2fs``. Cinder
+must use a userspace filesystem implementation. The production default is
+``[incus] data_volume_mount_fuse=ext4=fuse2fs``: the driver enables Incus
+mount syscall interception in every instance profile and rejects attachment to
+a running guest that does not provide ``fuse2fs``. Install the Ubuntu/Debian
+``fuse2fs`` package (or the distribution equivalent) in every supported base
+image. Do not replace this with
+``security.syscalls.intercept.mount.allowed=ext4`` for untrusted tenants;
+that passes tenant-controlled filesystem data into the host kernel and can
+expose the compute node to filesystem-parser vulnerabilities. Cinder
 online extension refreshes the KRBD and container block-device size; the tenant
 must then unmount as appropriate and grow its filesystem. Backend validation
 must finish by detaching and confirming that both the host RBD mapping and the
