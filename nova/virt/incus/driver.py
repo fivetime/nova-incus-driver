@@ -210,6 +210,30 @@ def _detach_volume_id(profile, connection_info, mountpoint):
         return matches[0]
 
 
+def _detach_volume_protocol(connection_info, device, device_info):
+    """Resolve the os-brick protocol for legacy incomplete attachments."""
+    protocol = connection_info.get('driver_volume_type')
+    if protocol:
+        return protocol
+
+    # Older Nova attachment records can lose their connection_info while the
+    # Incus profile still has the authoritative kernel RBD mapping. Only infer
+    # a protocol when the device path proves which connector owns it.
+    paths = [
+        (device or {}).get('source'),
+        (device_info or {}).get('path'),
+    ]
+    if any(str(path).startswith('/dev/rbd') for path in paths if path):
+        LOG.warning(
+            'Recovered missing Cinder driver_volume_type as rbd from Incus '
+            'profile device metadata')
+        return 'rbd'
+
+    raise exception.InvalidVolume(
+        reason='Cinder connection information has no driver_volume_type and '
+               'the Incus profile does not prove an RBD mapping')
+
+
 def _boot_from_volume(block_device_info):
     """Return and validate the single Nova root-volume BDM, if present."""
     if not isinstance(block_device_info, dict):
@@ -2462,17 +2486,19 @@ class IncusDriver(driver.ComputeDriver):
             for key in metadata_keys if key in profile.config
         }
         device_info = _profile_device_info(profile, volume_id, device)
+        protocol = _detach_volume_protocol(
+            connection_info, device, device_info)
+        storage_driver = brick_get_connector(protocol)
+
         if device:
             del profile.devices[volume_id]
             for metadata_key in metadata_keys:
                 profile.config.pop(metadata_key, None)
             profile.save(wait=True)
 
-        protocol = connection_info['driver_volume_type']
-        storage_driver = brick_get_connector(protocol)
         try:
             storage_driver.disconnect_volume(
-                connection_info['data'], device_info)
+                connection_info.get('data') or {}, device_info)
         except Exception:
             if device:
                 try:

@@ -2834,7 +2834,6 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         connector = mock.Mock()
         driver.brick_get_connector = mock.Mock(return_value=connector)
         connection_info = {
-            'driver_volume_type': 'rbd',
             'data': {'name': 'pool/volume-%s' % volume_id},
         }
         instance = fake_instance.fake_instance_obj(
@@ -2849,6 +2848,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertNotIn(volume_id, profile.devices)
         self.assertNotIn(metadata_key, profile.config)
         profile.save.assert_called_once_with(wait=True)
+        driver.brick_get_connector.assert_called_once_with('rbd')
         connector.disconnect_volume.assert_called_once_with(
             connection_info['data'], {'path': '/dev/rbd7'})
 
