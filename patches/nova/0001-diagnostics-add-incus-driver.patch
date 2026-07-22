@@ -5,7 +5,7 @@ The standardized diagnostics response uses a closed enum for the virt
 driver. External system-container drivers cannot return truthful diagnostics
 because "incus" is not accepted. Add the external driver name to the
 diagnostics driver field, response schema and API reference. Incus compute
-nodes report Nova's standard LXC hypervisor type and use Placement traits for
+nodes report Nova's standard LXD hypervisor type and use Placement traits for
 backend-specific scheduling, so HVType does not need an Incus extension.
 
 diff --git a/nova/objects/fields.py b/nova/objects/fields.py

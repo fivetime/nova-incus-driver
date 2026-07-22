@@ -2961,9 +2961,9 @@ class IncusDriver(driver.ComputeDriver):
             local_disk_info = _get_fs_info(CONF.incus.root_dir)
 
         supported_instances = [
-            (obj_fields.Architecture.I686, obj_fields.HVType.LXC,
+            (obj_fields.Architecture.I686, obj_fields.HVType.LXD,
              obj_fields.VMMode.EXE),
-            (obj_fields.Architecture.X86_64, obj_fields.HVType.LXC,
+            (obj_fields.Architecture.X86_64, obj_fields.HVType.LXD,
              obj_fields.VMMode.EXE),
         ]
 
@@ -2974,7 +2974,7 @@ class IncusDriver(driver.ComputeDriver):
             'local_gb': local_disk_info['total'] // units.Gi,
             'local_gb_used': local_disk_info['used'] // units.Gi,
             'vcpus_used': self._get_vcpus_used(),
-            'hypervisor_type': obj_fields.HVType.LXC,
+            'hypervisor_type': obj_fields.HVType.LXD,
             'hypervisor_version': '011',
             'cpu_info': jsonutils.dumps(cpu_info),
             'hypervisor_hostname': CONF.host,

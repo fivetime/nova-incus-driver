@@ -3405,7 +3405,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                 "arch": "x86_64", "vendor": "FakeVendor"
             },
             'hypervisor_hostname': 'fake_hostname',
-            'hypervisor_type': 'lxc',
+            'hypervisor_type': 'lxd',
             'hypervisor_version': '011',
             'local_gb': 1000,
             'local_gb_used': 500,
@@ -3413,8 +3413,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'memory_mb_used': 8000,
             'numa_topology': None,
             'supported_instances': [
-                ('i686', 'lxc', 'exe'),
-                ('x86_64', 'lxc', 'exe')],
+                ('i686', 'lxd', 'exe'),
+                ('x86_64', 'lxd', 'exe')],
             'vcpus': 200,
             'vcpus_used': 0}
 
@@ -3509,7 +3509,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                 "arch": "x86_64", "vendor": "FakeVendor"
             },
             'hypervisor_hostname': 'fake_hostname',
-            'hypervisor_type': 'lxc',
+            'hypervisor_type': 'lxd',
             'hypervisor_version': '011',
             'local_gb': 2222,
             'local_gb_used': 200,
@@ -3517,8 +3517,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'memory_mb_used': 8000,
             'numa_topology': None,
             'supported_instances': [
-                ('i686', 'lxc', 'exe'),
-                ('x86_64', 'lxc', 'exe')],
+                ('i686', 'lxd', 'exe'),
+                ('x86_64', 'lxd', 'exe')],
             'vcpus': 200,
             'vcpus_used': 0}
 
