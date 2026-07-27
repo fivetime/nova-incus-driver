@@ -877,6 +877,13 @@ def _is_incus_busy_operation(exc):
         'already has an operation' in message)
 
 
+def _is_incus_profile_change_saved(exc):
+    return (
+        'profile change still saved' in
+        _incus_api_error_message(exc).lower()
+    )
+
+
 def _retry_incus_instance_action(action, description, instance):
     attempts = CONF.incus.migration_finish_retries
     for attempt in range(1, attempts + 1):
@@ -2409,10 +2416,12 @@ class IncusDriver(driver.ComputeDriver):
         """Refuse to start a retained target with stale NIC ownership."""
         if not network_info:
             return
+        container = self.client.instances.get(instance.name)
         profile = self.client.profiles.get(instance.name)
         for vif in network_info:
             device_name = incus_vif.get_vif_devname(vif)
-            device = profile.devices.get(device_name)
+            device = container.devices.get(
+                device_name, profile.devices.get(device_name))
             expected = {
                 'type': 'nic',
                 'nictype': 'physical',
@@ -2632,42 +2641,117 @@ class IncusDriver(driver.ComputeDriver):
         self.vif_driver.plug(instance, vif)
         self.firewall_driver.setup_basic_filtering(instance, vif)
 
-        profile = self.client.profiles.get(instance.name)
-
         net_device = incus_vif.get_vif_devname(vif)
-        config_update = {
-            net_device: {
+        device = {
                 'nictype': 'physical',
                 'hwaddr': vif['address'],
                 'parent': incus_vif.get_vif_internal_devname(vif),
                 'type': 'nic',
-            }
         }
 
-        profile.devices.update(config_update)
-        profile.save(wait=True)
+        def add_device():
+            container = self.client.instances.get(instance.name)
+            devices = dict(container.devices)
+            devices[net_device] = device
+            container.devices = devices
+            container.save(wait=True)
+
+        _retry_incus_instance_action(
+            add_device,
+            'attach interface {}'.format(vif['id']),
+            instance)
 
     def detach_interface(self, context, instance, vif):
-        try:
-            profile = self.client.profiles.get(instance.name)
-            devname = incus_vif.get_vif_devname(vif)
+        # A Neutron vif-deleted event races with normal server deletion. The
+        # destroy path owns profile and instance cleanup, so changing the
+        # profile here would only contend with stop/delete and produce a
+        # misleading external_instance_event failure.
+        if instance.task_state == task_states.DELETING:
+            self.vif_driver.unplug(instance, vif)
+            return
 
-            # NOTE(jamespage): Attempt to remove device using
-            #                  new style tap naming
-            if devname in profile.devices:
-                del profile.devices[devname]
+        requested_devname = incus_vif.get_vif_devname(vif)
+
+        def find_device(devices):
+            if requested_devname in devices:
+                return requested_devname
+
+            for name, device in devices.items():
+                if device.get('hwaddr') == vif['address']:
+                    return name
+
+            return None
+
+        def update_local_device(device_name, device):
+            def update():
+                container = self.client.instances.get(instance.name)
+                devices = dict(container.devices)
+                if device is None:
+                    devices.pop(device_name, None)
+                else:
+                    devices[device_name] = device
+                container.devices = devices
+                container.save(wait=True)
+
+            _retry_incus_instance_action(
+                update,
+                'update interface {} during detach'.format(vif['id']),
+                instance)
+
+        try:
+            container = self.client.instances.get(instance.name)
+            profile = self.client.profiles.get(instance.name)
+            profile_devname = find_device(profile.devices)
+            local_devname = find_device(container.devices)
+            if (local_devname is None and profile_devname is not None and
+                    profile_devname in container.devices):
+                local_devname = profile_devname
+
+            local_device = (
+                container.devices.get(local_devname)
+                if local_devname is not None else None)
+            mask_applied = (
+                local_device is not None and
+                local_device.get('type') == 'none')
+
+            if profile_devname is None:
+                if local_devname is not None:
+                    update_local_device(local_devname, None)
+                self.vif_driver.unplug(instance, vif)
+                return
+
+            # Mask the inherited profile NIC using an instance-local "none"
+            # device. Instance updates are rolled back by Incus if applying
+            # the device change fails, so this step is safe to retry. Apply
+            # the mask before removing a differently named local NIC. For the
+            # usual same-name override this atomically replaces the local NIC
+            # and masks the profile device in one update.
+            if not mask_applied:
+                update_local_device(profile_devname, {'type': 'none'})
+
+            if (local_devname is not None and
+                    local_devname != profile_devname):
+                update_local_device(local_devname, None)
+
+            devices = dict(profile.devices)
+            devices.pop(profile_devname)
+            profile.devices = devices
+            try:
                 profile.save(wait=True)
-            else:
-                # NOTE(jamespage): For upgrades, scan devices
-                #                  and attempt to identify
-                #                  using mac address as the
-                #                  device will *not* have a
-                #                  consistent name
-                for key, val in profile.devices.items():
-                    if val.get('hwaddr') == vif['address']:
-                        del profile.devices[key]
-                        profile.save(wait=True)
-                        break
+            except incus_exceptions.LXDAPIException as exc:
+                # Incus commits profile changes before applying them to each
+                # instance. Accept this specific partial-success response only
+                # after confirming the desired profile state was persisted.
+                if not _is_incus_profile_change_saved(exc):
+                    raise
+
+                saved_profile = self.client.profiles.get(instance.name)
+                if profile_devname in saved_profile.devices:
+                    raise
+
+            # The profile no longer supplies the NIC, so remove the temporary
+            # mask. The effective instance configuration remains detached.
+            update_local_device(profile_devname, None)
         except incus_exceptions.NotFound:
             # This method is called when an instance get destroyed. It
             # could happen that Nova to receive an event

@@ -36,6 +36,7 @@ from nova import exception
 from nova import test
 from nova.compute import manager
 from nova.compute import power_state
+from nova.compute import task_states
 from nova.compute import vm_states
 from nova.network import model as network_model
 from nova.objects import migrate_data as nova_migrate_data
@@ -1734,6 +1735,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         profile.config = {}
         container = self.client.instances.get.return_value
         container.status = 'Stopped'
+        container.devices = {}
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
         incus_driver.attach_volume = mock.Mock()
@@ -1913,6 +1915,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         profile.config = {}
         container = self.client.instances.get.return_value
         container.status = 'Stopped'
+        container.devices = {}
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
@@ -1940,6 +1943,32 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         self.vif_driver.plug.assert_not_called()
         container.start.assert_not_called()
+
+    def test_reboot_accepts_instance_local_vif(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        device_name = driver.incus_vif.get_vif_devname(_VIF)
+        profile = self.client.profiles.get.return_value
+        profile.devices = {}
+        profile.config = {}
+        container = self.client.instances.get.return_value
+        container.status = 'Stopped'
+        container.devices = {
+            device_name: {
+                'type': 'nic',
+                'nictype': 'physical',
+                'parent': driver.incus_vif.get_vif_internal_devname(_VIF),
+                'hwaddr': _VIF['address'],
+            },
+        }
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.reboot(ctx, instance, [_VIF], 'HARD')
+
+        self.vif_driver.plug.assert_called_once_with(instance, _VIF)
+        container.start.assert_called_once_with(wait=True)
 
     def test_plug_vifs_rolls_back_partial_wiring(self):
         instance = mock.sentinel.instance
@@ -2150,20 +2179,9 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'type': 'nic',
         }
 
-        profile = mock.Mock()
-        profile.devices = {
-            'eth0': {
-                'name': 'eth0',
-                'nictype': 'bridged',
-                'parent': 'incusbr0',
-                'type': 'nic'
-            },
-            'root': {
-                'path': '/',
-                'type': 'disk'
-            },
-        }
-        self.client.profiles.get.return_value = profile
+        container = mock.Mock()
+        container.devices = {}
+        self.client.instances.get.return_value = container
 
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
@@ -2183,11 +2201,14 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         incus_driver.attach_interface(ctx, instance, image_meta, vif)
 
-        self.assertTrue('tap0123456789a' in profile.devices)
-        self.assertEqual(expected, profile.devices['tap0123456789a'])
-        profile.save.assert_called_once_with(wait=True)
+        self.assertEqual(expected, container.devices['tap0123456789a'])
+        container.save.assert_called_once_with(wait=True)
+        self.client.profiles.get.assert_not_called()
 
     def test_detach_interface_legacy(self):
+        container = mock.Mock()
+        container.devices = {}
+        self.client.instances.get.return_value = container
         profile = mock.Mock()
         profile.devices = {
             'eth0': {
@@ -2222,8 +2243,13 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             instance, vif)
         self.assertEqual(['root'], sorted(profile.devices.keys()))
         profile.save.assert_called_once_with(wait=True)
+        self.assertEqual({}, container.devices)
+        self.assertEqual(2, container.save.call_count)
 
     def test_detach_interface(self):
+        container = mock.Mock()
+        container.devices = {}
+        self.client.instances.get.return_value = container
         profile = mock.Mock()
         profile.devices = {
             'tap0123456789a': {
@@ -2258,9 +2284,200 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             instance, vif)
         self.assertEqual(['root'], sorted(profile.devices.keys()))
         profile.save.assert_called_once_with(wait=True)
+        self.assertEqual({}, container.devices)
+        self.assertEqual(2, container.save.call_count)
+
+    def test_detach_interface_local_device_retries_busy_update(self):
+        container = mock.Mock()
+        container.devices = {
+            'tap0123456789a': {
+                'nictype': 'physical',
+                'parent': 'tin0123456789a',
+                'hwaddr': '00:11:22:33:44:55',
+                'type': 'nic',
+            },
+        }
+        container.save.side_effect = [
+            incus_operation_exception(
+                400,
+                'Instance is busy running a "stop" operation'),
+            None,
+        ]
+        self.client.instances.get.return_value = container
+        profile = mock.Mock()
+        profile.devices = {}
+        self.client.profiles.get.return_value = profile
+
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        vif = {
+            'id': '0123456789abcdef',
+            'type': network_model.VIF_TYPE_OVS,
+            'address': '00:11:22:33:44:55',
+            'network': {'bridge': 'fakebr'},
+        }
+
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.detach_interface(ctx, instance, vif)
+
+        self.assertEqual({}, container.devices)
+        self.assertEqual(2, container.save.call_count)
+        profile.save.assert_not_called()
+        self.vif_driver.unplug.assert_called_once_with(instance, vif)
+
+    def test_detach_interface_removes_local_and_profile_device(self):
+        device = {
+            'nictype': 'physical',
+            'parent': 'tin0123456789a',
+            'hwaddr': '00:11:22:33:44:55',
+            'type': 'nic',
+        }
+        container = mock.Mock()
+        container.devices = {'tap0123456789a': dict(device)}
+        self.client.instances.get.return_value = container
+        profile = mock.Mock()
+        profile.devices = {'tap0123456789a': dict(device)}
+        self.client.profiles.get.return_value = profile
+
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        vif = {
+            'id': '0123456789abcdef',
+            'type': network_model.VIF_TYPE_OVS,
+            'address': '00:11:22:33:44:55',
+            'network': {'bridge': 'fakebr'},
+        }
+
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.detach_interface(ctx, instance, vif)
+
+        self.assertEqual({}, container.devices)
+        self.assertEqual({}, profile.devices)
+        self.assertEqual(2, container.save.call_count)
+        profile.save.assert_called_once_with(wait=True)
+        self.vif_driver.unplug.assert_called_once_with(instance, vif)
+
+    def test_detach_interface_masks_profile_before_different_local_name(self):
+        container = mock.Mock()
+        container.devices = {
+            'tap0123456789a': {
+                'nictype': 'physical',
+                'parent': 'tin0123456789a',
+                'hwaddr': '00:11:22:33:44:55',
+                'type': 'nic',
+            },
+        }
+        saved_devices = []
+        container.save.side_effect = lambda wait: saved_devices.append(
+            dict(container.devices))
+        self.client.instances.get.return_value = container
+        profile = mock.Mock()
+        profile.devices = {
+            'eth0': {
+                'nictype': 'physical',
+                'parent': 'tin0123456789a',
+                'hwaddr': '00:11:22:33:44:55',
+                'type': 'nic',
+            },
+        }
+        self.client.profiles.get.return_value = profile
+
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        vif = {
+            'id': '0123456789abcdef',
+            'type': network_model.VIF_TYPE_OVS,
+            'address': '00:11:22:33:44:55',
+            'network': {'bridge': 'fakebr'},
+        }
+
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.detach_interface(ctx, instance, vif)
+
+        self.assertEqual(
+            {
+                'tap0123456789a': mock.ANY,
+                'eth0': {'type': 'none'},
+            },
+            saved_devices[0])
+        self.assertEqual({'eth0': {'type': 'none'}}, saved_devices[1])
+        self.assertEqual({}, saved_devices[2])
+        self.assertEqual({}, container.devices)
+        self.assertEqual({}, profile.devices)
+        self.vif_driver.unplug.assert_called_once_with(instance, vif)
+
+    def test_detach_interface_accepts_persisted_profile_change(self):
+        container = mock.Mock()
+        container.devices = {}
+        self.client.instances.get.return_value = container
+        profile = mock.Mock()
+        profile.devices = {
+            'tap0123456789a': {
+                'nictype': 'physical',
+                'parent': 'tin0123456789a',
+                'hwaddr': '00:11:22:33:44:55',
+                'type': 'nic',
+            },
+        }
+        profile.save.side_effect = incus_operation_exception(
+            400,
+            'The following instances failed to update '
+            '(profile change still saved)')
+        saved_profile = mock.Mock()
+        saved_profile.devices = {}
+        self.client.profiles.get.side_effect = [profile, saved_profile]
+
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        vif = {
+            'id': '0123456789abcdef',
+            'type': network_model.VIF_TYPE_OVS,
+            'address': '00:11:22:33:44:55',
+            'network': {'bridge': 'fakebr'},
+        }
+
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.detach_interface(ctx, instance, vif)
+
+        self.assertEqual({}, container.devices)
+        self.assertEqual(2, container.save.call_count)
+        self.vif_driver.unplug.assert_called_once_with(instance, vif)
+
+    def test_detach_interface_during_delete_only_unplugs_vif(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0,
+            task_state=task_states.DELETING)
+        vif = {
+            'id': '0123456789abcdef',
+            'type': network_model.VIF_TYPE_OVS,
+            'address': '00:11:22:33:44:55',
+            'network': {'bridge': 'fakebr'},
+        }
+
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.detach_interface(ctx, instance, vif)
+
+        self.client.instances.get.assert_not_called()
+        self.client.profiles.get.assert_not_called()
+        self.vif_driver.unplug.assert_called_once_with(instance, vif)
 
     def test_detach_interface_not_found(self):
-        self.client.profiles.get.side_effect = incuscore_exceptions.NotFound(
+        self.client.instances.get.side_effect = incuscore_exceptions.NotFound(
             "404")
 
         ctx = context.get_admin_context()

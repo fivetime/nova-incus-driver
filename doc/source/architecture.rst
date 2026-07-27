@@ -68,6 +68,19 @@ the host VIF and OVS port; Incus only attaches the container-side interface.
 Incus must not create managed tenant OVN networks, ACLs, forwards, zones, or
 other resources that duplicate Neutron state.
 
+Interfaces attached after spawn are instance-local Incus devices. Unlike
+profile updates, an Incus instance update rolls back when a concurrent
+lifecycle operation prevents the runtime device change, so the driver can
+safely refresh state and retry it. Existing instances can still have NICs
+in their instance-specific profile. Detaching one first masks the inherited
+NIC with an instance-local ``type=none`` device, then removes the profile
+entry, confirms Incus's documented ``profile change still saved`` partial
+success when encountered, and finally removes the mask. This keeps the
+effective runtime and persistent device state aligned throughout recovery.
+A Neutron VIF-deleted event received while Nova is already deleting the
+server only performs the idempotent host VIF unplug; the owning destroy path
+removes the Incus instance and profile.
+
 Compute and security boundary
 -----------------------------
 

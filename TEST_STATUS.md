@@ -1059,3 +1059,32 @@ hardening.
   asynchronous API error shapes, retry exhaustion without cleanup, and the
   running-state refresh after a concurrent restart. The complete Python 3.12
   suite passed all 328 tests, and `tox -e pep8` passed.
+
+## 2026-07-27 concurrent VIF detach E2E
+
+- A disposable Incus 7.2 container on `incus-node-01` inherited a p2p NIC
+  from its Nova-style instance profile. The driver first applied an
+  instance-local `type=none` mask before changing the profile.
+- The E2E harness started a real asynchronous stop operation immediately
+  before the profile update. Incus returned HTTP 500 with
+  `The following instances failed to update (profile change still saved)`
+  and identified the competing stop operation.
+- The driver confirmed that the profile change was persisted, retried the
+  transactional instance update after stop settled, and removed the
+  temporary mask. The final profile, local instance devices, and expanded
+  instance devices all omitted the NIC, while the host VIF unplug ran exactly
+  once.
+- New hot-attached interfaces now use transactional instance-local devices.
+  A VIF-deleted event received with Nova task state `DELETING` does not
+  contend with Incus profile, stop, or delete operations; destroy remains
+  responsible for the instance-specific profile.
+- A second real container overrode the same NIC locally while retaining its
+  profile definition, matching a possible migration or upgrade state. Detach
+  replaced the same-name local NIC directly with `type=none`; the expanded
+  device view reported the mask after that first update and no device after
+  the final update. The profile NIC was therefore never re-exposed between
+  operations. A focused unit test also proves that a differently named local
+  NIC remains present until the profile device has been masked.
+- The focused attach, detach, destroy, and reboot suite passed 26 tests. The
+  complete Python 3.12 suite passed all 334 tests, `tox -e pep8` passed, and
+  all disposable containers and profiles were removed.
