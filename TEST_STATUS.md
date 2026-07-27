@@ -13,11 +13,11 @@ digest/revision pair.
 
 ## Dedicated test topology
 
-- `root@10.224.0.21` (`incus-node-01`) is the DevStack controller and first
+- `root@10.224.0.15` (`incus-node-01`) is the DevStack controller and first
   Incus compute node. It runs Ubuntu Noble 24.04 and Python 3.12.
 - `root@10.224.0.17` (`incus-node-02`) is the second Incus compute node. It
   runs Ubuntu Noble 24.04 and Python 3.12.
-- `root@10.224.0.22` (`incus-node-03`) is the third Incus compute node. It
+- `root@10.224.0.16` (`incus-node-03`) is the third Incus compute node. It
   runs Ubuntu Noble 24.04 and Python 3.12.
 - Stable hostnames and `/etc/hosts` self-resolution are configured on all
   three nodes as shown above.
@@ -1037,3 +1037,25 @@ hardening.
   normalizes CRLF to LF before hashing, so equivalent Windows-deployed Python
   files do not create false drift alerts while any code-character change
   remains detectable.
+
+## 2026-07-27 concurrent-operation destroy E2E
+
+- A disposable Incus 7.2 system container and instance-specific profile were
+  created on `incus-node-01` in the `nova` project. A real asynchronous
+  restart operation was held in `RUNNING` state while
+  `IncusDriver.destroy()` attempted to remove the instance.
+- The SDK returned the production failure shape from
+  `GET /1.0/operations/<id>/wait`: outer HTTP status `200`, with
+  `metadata.status_code=400` and
+  `metadata.err="... Instance is busy running a \"restart\" operation"`.
+  The driver extracted the nested status and message and classified the
+  operation as transient.
+- The first delete attempt observed the busy operation. The retry refreshed
+  the Incus instance state, stopped the instance after restart completed, and
+  deleted it. Cleanup ran exactly once and only after the instance was
+  confirmed absent; both the disposable container and its profile were gone
+  after the test.
+- The focused destroy suite passed 9 tests, including synchronous and
+  asynchronous API error shapes, retry exhaustion without cleanup, and the
+  running-state refresh after a concurrent restart. The complete Python 3.12
+  suite passed all 328 tests, and `tox -e pep8` passed.

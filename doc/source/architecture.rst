@@ -345,6 +345,12 @@ releases Cinder attachments. The Incus compute manager can automatically
 repair a marked post-claim target while preserving Nova's staged
 ``VERIFY_RESIZE`` confirm/revert contract. Real data-volume attach failure
 and container-start failure injection have validated active-target recovery.
+Destroy treats a concurrent Incus lifecycle operation as transient. Each
+attempt refreshes the instance state before stopping and deleting it, and
+profile, VIF, and volume cleanup starts only after the Incus record has been
+deleted or is confirmed absent. This preserves the original Incus error and
+leaves the complete instance state available for a safe Nova retry when the
+operation does not settle within the configured retry window.
 The marker records the intended running or stopped state, and a real stopped
 instance test proved recovery does not power it on. Reverse-revert
 data-volume failure injection also proved automatic repair after Nova restored

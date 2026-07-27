@@ -302,16 +302,21 @@ incus_opts = [
         help=(
             "Attempts for destination VIF wiring, data-volume attachment, "
             "instance start during cold migration, and asynchronous source "
-            "restore during live-migration rollback. With the default retry "
-            "interval this provides a roughly one-minute settlement window "
-            "for CRIU, OVN and Ceph operations."
+            "restore during live-migration rollback, as well as instance "
+            "destroy while another Incus operation is settling. With the "
+            "default retry interval this provides a roughly one-minute "
+            "settlement window for CRIU, OVN, Ceph and Incus lifecycle "
+            "operations."
         ),
     ),
     cfg.IntOpt(
         "migration_finish_retry_interval",
         default=2,
         min=0,
-        help="Seconds between destination cold-migration recovery attempts.",
+        help=(
+            "Seconds between transient migration recovery or instance "
+            "destroy attempts."
+        ),
     ),
     cfg.IntOpt(
         "configdrive_migration_max_bytes",
