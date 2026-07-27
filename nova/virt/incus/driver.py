@@ -819,6 +819,87 @@ def _retry_migration_finish_action(action, description, instance):
             eventlet.sleep(CONF.incus.migration_finish_retry_interval)
 
 
+def _incus_api_error_message(exc):
+    response = getattr(exc, 'response', None)
+    if response is None:
+        return str(exc)
+
+    try:
+        body = response.json()
+    except Exception:
+        return str(exc)
+
+    if isinstance(body, dict):
+        metadata = body.get('metadata')
+        if isinstance(metadata, dict):
+            error = metadata.get('err')
+            if error:
+                return str(error)
+
+        return str(body.get('error') or exc)
+
+    return str(body or exc)
+
+
+def _incus_api_status_code(exc):
+    response = getattr(exc, 'response', None)
+    status_code = getattr(response, 'status_code', None)
+    if status_code is None or not 200 <= status_code < 300:
+        return status_code
+
+    try:
+        body = response.json()
+    except Exception:
+        return status_code
+
+    if not isinstance(body, dict):
+        return status_code
+
+    metadata = body.get('metadata')
+    if not isinstance(metadata, dict):
+        return status_code
+
+    return metadata.get('status_code') or status_code
+
+
+def _is_incus_not_found(exc):
+    return _incus_api_status_code(exc) == 404
+
+
+def _is_incus_busy_operation(exc):
+    if _incus_api_status_code(exc) not in (400, 409):
+        return False
+
+    message = _incus_api_error_message(exc).lower()
+    return (
+        ('busy running' in message and 'operation' in message) or
+        'operation is currently running' in message or
+        'already has an operation' in message)
+
+
+def _retry_incus_instance_action(action, description, instance):
+    attempts = CONF.incus.migration_finish_retries
+    for attempt in range(1, attempts + 1):
+        try:
+            return action()
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_busy_operation(exc) or attempt == attempts:
+                raise
+
+            LOG.warning(
+                'Incus instance %(action)s failed because another operation '
+                'is still running on attempt %(attempt)s/%(attempts)s; '
+                'retrying',
+                {
+                    'action': description,
+                    'attempt': attempt,
+                    'attempts': attempts,
+                },
+                instance=instance,
+                exc_info=True)
+            eventlet.sleep(CONF.incus.migration_finish_retry_interval)
+
+
 def _configdrive_path(instance):
     return os.path.join(
         common.InstanceAttributes(instance).instance_dir, 'configdrive')
@@ -2010,32 +2091,40 @@ class IncusDriver(driver.ComputeDriver):
         if broker is not None:
             broker.close()
 
+        def destroy_container(name):
+            _retry_incus_instance_action(
+                lambda: stop_and_delete(name),
+                'stop and delete {}'.format(name),
+                instance)
+
+        def stop_and_delete(name):
+            try:
+                container = self.client.instances.get(name)
+            except incus_exceptions.LXDAPIException as exc:
+                if _is_incus_not_found(exc):
+                    LOG.warning(
+                        "Failed to delete instance. Container does not exist "
+                        "for %(instance)s.",
+                        {'instance': name})
+                    return
+                raise
+
+            if container.status != 'Stopped':
+                container.stop(wait=True)
+
+            container.delete(wait=True)
+
         with lockutils.lock(
                 lock_path, external=True,
                 lock_file_prefix='incus-container-{}'.format(instance.name)):
             # TODO(sahid): Each time we get a container we should
             # protect it by using a mutex.
-            try:
-                container = self.client.instances.get(instance.name)
-                if container.status != 'Stopped':
-                    container.stop(wait=True)
-                container.delete(wait=True)
-                if (instance.vm_state == vm_states.RESCUED):
-                    rescued_container = self.client.instances.get(
-                        '{}-rescue'.format(instance.name))
-                    if rescued_container.status != 'Stopped':
-                        rescued_container.stop(wait=True)
-                    rescued_container.delete(wait=True)
-            except incus_exceptions.LXDAPIException as e:
-                if e.response.status_code == 404:
-                    LOG.warning("Failed to delete instance. "
-                                "Container does not exist for {instance}."
-                                .format(instance=instance.name))
-                else:
-                    raise
-            finally:
-                self.cleanup(
-                    context, instance, network_info, block_device_info)
+            destroy_container(instance.name)
+            if instance.vm_state == vm_states.RESCUED:
+                destroy_container('{}-rescue'.format(instance.name))
+
+            self.cleanup(
+                context, instance, network_info, block_device_info)
 
     def cleanup(self, context, instance, network_info, block_device_info=None,
                 destroy_disks=True, migrate_data=None, destroy_vifs=True,

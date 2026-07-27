@@ -61,6 +61,24 @@ _VIF = {
     'address': 'ca:fe:de:ad:be:ef'}
 
 
+def incus_api_exception(status_code, message):
+    response = mock.Mock(status_code=status_code)
+    response.json.return_value = {'error': message}
+    return incuscore_exceptions.LXDAPIException(response)
+
+
+def incus_operation_exception(status_code, message):
+    response = mock.Mock(status_code=200)
+    response.json.return_value = {
+        'metadata': {
+            'status': 'Failure',
+            'status_code': status_code,
+            'err': message,
+        },
+    }
+    return incuscore_exceptions.LXDAPIException(response)
+
+
 def fake_connection_info(volume, location, iqn, auth=False, transport=None):
     dev_name = 'ip-%s-iscsi-%s-lun-1' % (location, iqn)
     if transport is not None:
@@ -1236,6 +1254,174 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             instance.name)
         mock_container.stop.assert_called_once_with(wait=True)
         mock_container.delete.assert_called_once_with(wait=True)
+
+    @mock.patch('nova.virt.incus.driver.lockutils.lock')
+    def test_destroy_retries_busy_stop_before_cleanup(self, lock):
+        mock_container = mock.Mock()
+        mock_container.status = 'Running'
+        mock_container.stop.side_effect = [
+            incus_api_exception(
+                400,
+                'Instance is busy running an "update" operation'),
+            None,
+        ]
+        self.client.instances.get.return_value = mock_container
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        network_info = [_VIF]
+
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver.cleanup = mock.Mock()
+
+        incus_driver.destroy(ctx, instance, network_info)
+
+        self.assertEqual(2, mock_container.stop.call_count)
+        mock_container.delete.assert_called_once_with(wait=True)
+        incus_driver.cleanup.assert_called_once_with(
+            ctx, instance, network_info, None)
+
+    @mock.patch('nova.virt.incus.driver.lockutils.lock')
+    def test_destroy_busy_stop_failure_does_not_cleanup(self, lock):
+        mock_container = mock.Mock()
+        mock_container.status = 'Running'
+        error = incus_api_exception(
+            400, 'Instance is busy running an "update" operation')
+        mock_container.stop.side_effect = error
+        self.client.instances.get.return_value = mock_container
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        network_info = [_VIF]
+
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver.cleanup = mock.Mock(
+            side_effect=RuntimeError('profile still in use'))
+
+        self.assertRaises(
+            incuscore_exceptions.LXDAPIException,
+            incus_driver.destroy, ctx, instance, network_info)
+
+        self.assertEqual(
+            self.CONF.incus.migration_finish_retries,
+            mock_container.stop.call_count)
+        mock_container.delete.assert_not_called()
+        incus_driver.cleanup.assert_not_called()
+
+    @mock.patch('nova.virt.incus.driver.lockutils.lock')
+    def test_destroy_retries_busy_delete_before_cleanup(self, lock):
+        mock_container = mock.Mock()
+        mock_container.status = 'Stopped'
+        mock_container.delete.side_effect = [
+            incus_api_exception(
+                409,
+                'Instance is busy running an "update" operation'),
+            None,
+        ]
+        self.client.instances.get.return_value = mock_container
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        network_info = [_VIF]
+
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver.cleanup = mock.Mock()
+
+        incus_driver.destroy(ctx, instance, network_info)
+
+        mock_container.stop.assert_not_called()
+        self.assertEqual(2, mock_container.delete.call_count)
+        incus_driver.cleanup.assert_called_once_with(
+            ctx, instance, network_info, None)
+
+    @mock.patch('nova.virt.incus.driver.lockutils.lock')
+    def test_destroy_refreshes_state_after_busy_delete(self, lock):
+        stopped_container = mock.Mock()
+        stopped_container.status = 'Stopped'
+        stopped_container.delete.side_effect = incus_operation_exception(
+            400,
+            'Failed to create instance delete operation: Instance is busy '
+            'running a "restart" operation')
+        running_container = mock.Mock()
+        running_container.status = 'Running'
+        self.client.instances.get.side_effect = [
+            stopped_container,
+            running_container,
+        ]
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        network_info = [_VIF]
+
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver.cleanup = mock.Mock()
+
+        incus_driver.destroy(ctx, instance, network_info)
+
+        self.assertEqual(2, self.client.instances.get.call_count)
+        stopped_container.stop.assert_not_called()
+        stopped_container.delete.assert_called_once_with(wait=True)
+        running_container.stop.assert_called_once_with(wait=True)
+        running_container.delete.assert_called_once_with(wait=True)
+        incus_driver.cleanup.assert_called_once_with(
+            ctx, instance, network_info, None)
+
+    @mock.patch('nova.virt.incus.driver.lockutils.lock')
+    def test_destroy_retries_async_busy_stop_before_cleanup(self, lock):
+        mock_container = mock.Mock()
+        mock_container.status = 'Running'
+        mock_container.stop.side_effect = [
+            incus_operation_exception(
+                400,
+                'Instance is busy running an "update" operation'),
+            None,
+        ]
+        self.client.instances.get.return_value = mock_container
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        network_info = [_VIF]
+
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver.cleanup = mock.Mock()
+
+        incus_driver.destroy(ctx, instance, network_info)
+
+        self.assertEqual(2, mock_container.stop.call_count)
+        mock_container.delete.assert_called_once_with(wait=True)
+        incus_driver.cleanup.assert_called_once_with(
+            ctx, instance, network_info, None)
+
+    @mock.patch('nova.virt.incus.driver.lockutils.lock')
+    def test_destroy_async_busy_stop_failure_does_not_cleanup(self, lock):
+        mock_container = mock.Mock()
+        mock_container.status = 'Running'
+        mock_container.stop.side_effect = incus_operation_exception(
+            400, 'Instance is busy running an "update" operation')
+        self.client.instances.get.return_value = mock_container
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        network_info = [_VIF]
+
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver.cleanup = mock.Mock()
+
+        self.assertRaises(
+            incuscore_exceptions.LXDAPIException,
+            incus_driver.destroy, ctx, instance, network_info)
+
+        self.assertEqual(
+            self.CONF.incus.migration_finish_retries,
+            mock_container.stop.call_count)
+        mock_container.delete.assert_not_called()
+        incus_driver.cleanup.assert_not_called()
 
     @mock.patch('nova.virt.incus.driver.lockutils.lock')
     def test_destroy_when_in_rescue(self, lock):
