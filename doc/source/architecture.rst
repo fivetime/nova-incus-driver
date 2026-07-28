@@ -164,13 +164,11 @@ complete ``instances_path`` writable: that would unnecessarily expose config
 drives and other Nova host state to the privileged daemon container.
 
 The modern Nova ``Diagnostics`` object restricts its ``driver`` field to a
-fixed list. This repository carries
-``patches/nova/0001-diagnostics-add-incus-driver.patch`` to add the existing
-``incus`` hypervisor identifier to the object field, API schema, and API
-reference. The DevStack plugin applies that small compatibility patch
-explicitly and fails if it no longer applies; the driver never identifies
-itself as libvirt. This remains a Nova integration dependency until the value
-is accepted upstream.
+closed list that does not contain ``incus``. The driver therefore uses Nova's
+existing ``libvirt`` diagnostics enum as the nearest standard system-container
+category while retaining ``hypervisor=incus``. This avoids modifying every
+Nova RPC consumer and prevents object deserialization failures in an
+unmodified conductor. It does not claim that libvirt implements this driver.
 
 Incus diagnostics provide truthful aggregate CPU time, memory, and per-NIC
 cumulative counters. Uptime is derived from the
@@ -371,9 +369,14 @@ ownership to the retained source. A persistent failure to write the durable
 marker remains fail-closed and requires the operator to inspect the retained
 owner; the driver never guesses that an external root is safe to delete.
 
-When ``[incus] storage_pool`` is configured, Nova reports ``DISK_GB`` from
-that Incus pool's resource API. LVM, Ceph, ZFS, and Btrfs capacity must not be
-inferred from the filesystem containing ``/var/lib/incus``.
+When ``[incus] storage_pool`` is a local pool, Nova reports ``DISK_GB`` from
+that Incus pool's resource API. A shared ``ceph`` or ``cephext`` pool instead
+requires an explicit per-compute
+``[incus] shared_storage_pool_capacity_gb`` budget. Reporting the whole shared
+cluster independently from every compute would multiply Placement capacity,
+so the driver fails closed when that budget is absent. LVM, Ceph, ZFS, and
+Btrfs capacity must not be inferred from the filesystem containing
+``/var/lib/incus``.
 The driver's ``update_provider_tree`` implementation publishes ``VCPU``,
 ``MEMORY_MB``, and ``DISK_GB`` inventories and preserves externally managed
 traits while adding ``CUSTOM_INCUS_SYSTEM_CONTAINER`` to the compute provider.

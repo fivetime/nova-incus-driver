@@ -125,21 +125,6 @@ function install_nova_incus {
     setup_pyproject_develop "${INCUS_PYTHON_SDK_DIR}"
     setup_develop "${NOVA_INCUS_DIR}"
 
-    if is_true "${INCUS_APPLY_NOVA_DIAGNOSTICS_PATCH}"; then
-        local diagnostics_patch
-        diagnostics_patch="${NOVA_INCUS_DIR}/patches/nova/0001-diagnostics-add-incus-driver.patch"
-        if grep -q 'INCUS = "incus"' "${NOVA_DIR}/nova/objects/fields.py" && \
-                grep -q "'incus'," \
-                    "${NOVA_DIR}/nova/api/openstack/compute/schemas/server_diagnostics.py"; then
-            echo "Nova diagnostics already accepts the incus driver"
-        elif git -C "${NOVA_DIR}" apply --check "${diagnostics_patch}"; then
-            git -C "${NOVA_DIR}" apply "${diagnostics_patch}"
-        else
-            die $LINENO \
-                "Nova diagnostics compatibility patch does not apply cleanly"
-        fi
-    fi
-
     if is_true "${INCUS_APPLY_NOVA_MANILA_SHARE_PATCH}"; then
         local manila_share_patch
         manila_share_patch="${NOVA_INCUS_DIR}/patches/nova/0002-hardware-accept-incus-manila-share-trait.patch"
@@ -400,6 +385,10 @@ function configure_nova_incus {
         iniset "${nova_target}" incus project "${INCUS_PROJECT}"
         iniset "${nova_target}" incus root_dir /var/lib/incus
         iniset "${nova_target}" incus storage_pool "${INCUS_POOL_NAME}"
+        if [[ -n "${INCUS_SHARED_STORAGE_POOL_CAPACITY_GB}" ]]; then
+            iniset "${nova_target}" incus shared_storage_pool_capacity_gb \
+                "${INCUS_SHARED_STORAGE_POOL_CAPACITY_GB}"
+        fi
         if [[ -n "${INCUS_BFV_POOL_NAME}" ]]; then
             iniset "${nova_target}" incus boot_from_volume_storage_pools \
                 "${INCUS_BFV_CEPH_POOL}:${INCUS_BFV_POOL_NAME}"

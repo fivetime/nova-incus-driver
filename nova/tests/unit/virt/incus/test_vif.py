@@ -20,6 +20,7 @@ from nova.network import model as network_model
 from nova import test
 from nova.tests.unit import fake_instance
 from nova.virt.incus import vif
+from oslo_concurrency import processutils
 
 GATEWAY = network_model.IP(address='101.168.1.1', type='gateway')
 DNS_BRIDGE = network_model.IP(address='8.8.8.8', type=None)
@@ -57,6 +58,16 @@ INSTANCE = fake_instance.fake_instance_obj(
 
 class GetVifDevnameTest(test.NoDBTestCase):
     """Tests for get_vif_devname."""
+
+    def test_get_vif_guest_devname_is_stable_and_linux_compatible(self):
+        an_vif = {
+            'id': '01234567-89ab-cdef-0123-456789abcdef',
+        }
+
+        devname = vif.get_vif_guest_devname(an_vif)
+
+        self.assertEqual('nic0123456789ab', devname)
+        self.assertLessEqual(len(devname), vif.GUEST_NIC_NAME_LEN)
 
     def test_get_vif_devname_devname_exists(self):
         an_vif = {
@@ -245,6 +256,14 @@ class PostPlugTest(test.NoDBTestCase):
 
     def setUp(self):
         super(PostPlugTest, self).setUp()
+
+    @mock.patch.object(vif.linux_net, 'delete_net_dev')
+    def test_post_unplug_logs_veth_delete_failure(self, delete_net_dev):
+        delete_net_dev.side_effect = processutils.ProcessExecutionError()
+
+        vif._post_unplug_wiring_delete_veth(INSTANCE, OVS_VIF)
+
+        delete_net_dev.assert_called_once_with('tapda5cc4bf-f1')
 
     @mock.patch('nova.virt.incus.vif._create_veth_pair')
     @mock.patch('nova.virt.incus.vif._add_bridge_port')

@@ -41,6 +41,17 @@ incus_opts = [
         default=None,
         help="Incus storage pool used for instance root filesystems.",
     ),
+    cfg.IntOpt(
+        "shared_storage_pool_capacity_gb",
+        default=None,
+        min=1,
+        help=(
+            "Per-compute Placement DISK_GB budget for a shared Ceph "
+            "storage_pool. This is required when storage_pool uses the ceph "
+            "driver. The sum configured across computes must not exceed the "
+            "operator-approved capacity of the shared pool."
+        ),
+    ),
     cfg.DictOpt(
         "root_storage_pools",
         default={},
@@ -58,6 +69,16 @@ incus_opts = [
             "Mapping of root-storage selectors to custom Placement resource "
             "classes used for capacity accounting of node-local pools. The "
             "corresponding Flavor resources:<class> value must equal root_gb."
+        ),
+    ),
+    cfg.DictOpt(
+        "shared_root_storage_pool_capacities_gb",
+        default={},
+        help=(
+            "Mapping of root-storage selectors backed by shared Ceph to "
+            "their per-compute Placement capacity budgets in GiB. Shared "
+            "pools must never publish their complete cluster capacity from "
+            "every compute node."
         ),
     ),
     cfg.DictOpt(

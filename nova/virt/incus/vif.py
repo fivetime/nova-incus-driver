@@ -30,6 +30,8 @@ CONF = conf.CONF
 
 LOG = logging.getLogger(__name__)
 
+GUEST_NIC_NAME_LEN = 15
+
 
 def get_vif_devname(vif):
     """Get device name for a given vif."""
@@ -41,6 +43,12 @@ def get_vif_devname(vif):
 def get_vif_internal_devname(vif):
     """Get the internal device name for a given vif."""
     return get_vif_devname(vif).replace('tap', 'tin')
+
+
+def get_vif_guest_devname(vif):
+    """Return a migration-stable guest interface name for a Neutron port."""
+    port_id = str(vif['id']).replace('-', '').lower()
+    return ('nic' + port_id)[:GUEST_NIC_NAME_LEN]
 
 
 def _create_veth_pair(dev1_name, dev2_name, mtu=None):
@@ -190,7 +198,7 @@ def _post_unplug_wiring_delete_veth(instance, vif):
     try:
         linux_net.delete_net_dev(v1_name)
     except processutils.ProcessExecutionError:
-        LOG.exception("Failed to delete veth for vif {}".foramt(vif),
+        LOG.exception("Failed to delete veth for vif {}".format(vif),
                       instance=instance)
 
 

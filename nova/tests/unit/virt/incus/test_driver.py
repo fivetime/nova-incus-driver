@@ -186,8 +186,10 @@ class IncusDriverTest(test.NoDBTestCase):
         self.CONF.config_drive_format = 'iso9660'
         self.CONF.force_config_drive = False
         self.CONF.incus.storage_pool = None
+        self.CONF.incus.shared_storage_pool_capacity_gb = None
         self.CONF.incus.root_storage_pools = {}
         self.CONF.incus.root_storage_pool_resource_classes = {}
+        self.CONF.incus.shared_root_storage_pool_capacities_gb = {}
         self.CONF.incus.allow_cold_migration = False
         self.CONF.incus.allow_live_migration = False
         self.CONF.incus.migration_address = None
@@ -509,20 +511,30 @@ class IncusDriverTest(test.NoDBTestCase):
             exception.InstanceNotFound,
             incus_driver.get_diagnostics, instance)
 
-    def test_get_instance_diagnostics_requires_nova_compatibility_patch(self):
+    @mock.patch.object(driver.configdrive, 'required_by', return_value=False)
+    @mock.patch.object(driver.IncusDriver, '_get_diagnostics_data')
+    def test_get_instance_diagnostics_uses_standard_rpc_enum(
+            self, get_data, required_by):
+        get_data.return_value = {
+            'state': power_state.RUNNING,
+            'uptime': 42,
+            'memory_maximum': 2 * units.Mi,
+            'memory_used': units.Mi,
+            'cpu_time': 123,
+            'disk_count': 0,
+            'nics': [],
+        }
         instance = fake_instance.fake_instance_obj(
-            context.get_admin_context(), name='test')
+            context.get_admin_context(), name='test',
+            image_ref='image-id', system_metadata={})
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
-        original = driver.obj_fields.HypervisorDriver
-        driver.obj_fields.HypervisorDriver = mock.Mock(spec=[])
-        try:
-            self.assertRaisesRegex(
-                NotImplementedError, 'incus diagnostics driver identifier',
-                incus_driver.get_instance_diagnostics, instance)
-        finally:
-            driver.obj_fields.HypervisorDriver = original
+        result = incus_driver.get_instance_diagnostics(instance)
+
+        self.assertEqual(
+            driver.obj_fields.HypervisorDriver.LIBVIRT, result.driver)
+        self.assertEqual('incus', result.hypervisor)
 
     def test_incus_disk_metrics_parses_only_requested_instance(self):
         self.client.api.metrics.get.return_value = mock.Mock(text='''
@@ -687,6 +699,106 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                 'public-keys:\n'
                 '  "tenant-key": "ssh-ed25519 AAAATEST tenant"\n'),
         }, driver._incus_cloud_init_config(instance))
+
+    def test_incus_cloud_init_network_config(self):
+        network_info = [{
+            'id': '01234567-89ab-cdef-0123-456789abcdef',
+            'address': 'CA:FE:DE:AD:BE:EF',
+            'network': {
+                'meta': {'mtu': 1450},
+                'subnets': [{
+                    'cidr': '10.0.0.0/24',
+                    'ips': [{'address': '10.0.0.10'}],
+                    'gateway': {'address': '10.0.0.1'},
+                    'routes': [],
+                    'dns': [{'address': '1.1.1.1'}],
+                }, {
+                    'cidr': '2001:db8::/64',
+                    'ips': [{'address': '2001:db8::10'}],
+                    'gateway': {'address': '2001:db8::1'},
+                    'routes': [],
+                    'dns': [
+                        {'address': '2001:4860:4860::8888'},
+                        {'address': '2001:4860:4860::8888'},
+                    ],
+                }],
+            },
+        }]
+        instance = mock.Mock(
+            uuid='instance-uuid', user_data=None, key_data=None)
+
+        config = driver._incus_cloud_init_config(
+            instance, network_info)
+
+        self.assertEqual(
+            'version: 2\n'
+            'ethernets:\n'
+            '  nic0123456789ab:\n'
+            '    mtu: 1450\n'
+            '    addresses:\n'
+            '    - 10.0.0.10/24\n'
+            '    - 2001:db8::10/64\n'
+            '    routes:\n'
+            '    - to: 0.0.0.0/0\n'
+            '      via: 10.0.0.1\n'
+            '    - to: ::/0\n'
+            '      via: 2001:db8::1\n'
+            '    nameservers:\n'
+            '      addresses:\n'
+            '      - 1.1.1.1\n'
+            '      - 2001:4860:4860::8888\n',
+            config['cloud-init.network-config'])
+        self.assertEqual(
+            driver._NETWORK_ACTIVATION_VENDOR_DATA,
+            config['cloud-init.vendor-data'])
+        self.assertIsInstance(
+            driver.yaml.safe_load(config['cloud-init.vendor-data']), dict)
+
+    def test_incus_cloud_init_network_config_names_survive_reordering(self):
+        network_info = [
+            {
+                'id': '11111111-1111-1111-1111-111111111111',
+                'address': 'ca:fe:de:ad:be:01',
+                'network': {
+                    'subnets': [{
+                        'cidr': '10.0.1.0/24',
+                        'ips': [{'address': '10.0.1.10'}],
+                    }],
+                },
+            },
+            {
+                'id': '22222222-2222-2222-2222-222222222222',
+                'address': 'ca:fe:de:ad:be:02',
+                'network': {
+                    'subnets': [{
+                        'cidr': '10.0.2.0/24',
+                        'ips': [{'address': '10.0.2.10'}],
+                    }],
+                },
+            },
+        ]
+
+        config = driver.yaml.safe_load(
+            driver._incus_network_config(network_info))
+
+        self.assertEqual(
+            ['nic111111111111', 'nic222222222222'],
+            list(config['ethernets']))
+        self.assertEqual(
+            ['10.0.1.10/24'],
+            config['ethernets']['nic111111111111']['addresses'])
+        self.assertEqual(
+            ['10.0.2.10/24'],
+            config['ethernets']['nic222222222222']['addresses'])
+
+        reordered = driver.yaml.safe_load(
+            driver._incus_network_config(list(reversed(network_info))))
+        self.assertEqual(
+            config['ethernets']['nic111111111111'],
+            reordered['ethernets']['nic111111111111'])
+        self.assertEqual(
+            config['ethernets']['nic222222222222'],
+            reordered['ethernets']['nic222222222222'])
 
     @mock.patch('nova.virt.incus.driver.IMAGE_API')
     @mock.patch('nova.virt.incus.driver.lockutils.lock')
@@ -1606,6 +1718,49 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.client.instances.get.return_value.restart.assert_called_once_with(
             force=True, wait=True)
 
+    def test_soft_reboot_is_graceful(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.reboot(ctx, instance, None, 'SOFT')
+
+        self.client.instances.get.return_value.restart.assert_called_once_with(
+            force=False, wait=True)
+
+    def test_reboot_reasserts_vifs_after_start(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        vif = mock.sentinel.vif
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.reboot(ctx, instance, [vif], 'HARD')
+
+        self.vif_driver.reassert.assert_called_once_with(instance, vif)
+
+    def test_soft_reboot_falls_back_to_hard(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        container = self.client.instances.get.return_value
+        container.restart.side_effect = [
+            incus_api_exception(400, 'guest did not shut down'),
+            None,
+        ]
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.reboot(ctx, instance, None, 'SOFT')
+
+        self.assertEqual([
+            mock.call(force=False, wait=True),
+            mock.call(force=True, wait=True),
+        ], container.restart.call_args_list)
+
     def test_cleanup_lingering_bfv_source_record(self):
         instance = fake_instance.fake_instance_obj(
             context.get_admin_context(), name='test')
@@ -1910,6 +2065,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                 'nictype': 'physical',
                 'parent': driver.incus_vif.get_vif_internal_devname(_VIF),
                 'hwaddr': _VIF['address'],
+                'name': driver.incus_vif.get_vif_guest_devname(_VIF),
             },
         }
         profile.config = {}
@@ -1960,6 +2116,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                 'nictype': 'physical',
                 'parent': driver.incus_vif.get_vif_internal_devname(_VIF),
                 'hwaddr': _VIF['address'],
+                'name': driver.incus_vif.get_vif_guest_devname(_VIF),
             },
         }
         incus_driver = driver.IncusDriver(None)
@@ -2147,6 +2304,72 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         get_pool_info.assert_called_once_with(self.client, 'local-zfs')
 
     @mock.patch('nova.virt.incus.driver._host_has_swap', return_value=False)
+    def test_update_provider_tree_slices_shared_pool_capacity(
+            self, _host_has_swap):
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+        incus_driver.get_available_resource = mock.Mock(return_value={
+            'vcpus': 8, 'memory_mb': 16384, 'local_gb': 100})
+        incus_driver._get_allocation_ratios = mock.Mock(return_value={
+            'VCPU': 4.0, 'MEMORY_MB': 1.5, 'DISK_GB': 1.0})
+        incus_driver._get_reserved_host_disk_gb_from_config = mock.Mock(
+            return_value=2)
+        provider_tree = mock.Mock()
+        provider_tree.data.return_value = mock.Mock(
+            inventory={}, traits=set())
+        pool = self.client.storage_pools.get.return_value
+        pool.driver = 'ceph'
+        self.CONF.incus.root_storage_pools = {
+            'durable': 'ceph-rootfs',
+        }
+        self.CONF.incus.root_storage_pool_resource_classes = {
+            'durable': 'CUSTOM_INCUS_STORAGE_POOL_DURABLE_DISK_GB',
+        }
+        self.CONF.incus.shared_root_storage_pool_capacities_gb = {
+            'durable': '40',
+        }
+        self.CONF.reserved_host_cpus = 0
+        self.CONF.reserved_host_memory_mb = 0
+
+        incus_driver.update_provider_tree(provider_tree, 'compute-1')
+
+        inventory = provider_tree.update_inventory.call_args.args[1]
+        self.assertEqual(
+            40,
+            inventory['CUSTOM_INCUS_STORAGE_POOL_DURABLE_DISK_GB']['total'])
+        pool.resources.get.assert_not_called()
+
+    @mock.patch('nova.virt.incus.driver._host_has_swap', return_value=False)
+    def test_update_provider_tree_rejects_unsliced_shared_pool(
+            self, _host_has_swap):
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+        incus_driver.get_available_resource = mock.Mock(return_value={
+            'vcpus': 8, 'memory_mb': 16384, 'local_gb': 100})
+        incus_driver._get_allocation_ratios = mock.Mock(return_value={
+            'VCPU': 4.0, 'MEMORY_MB': 1.5, 'DISK_GB': 1.0})
+        incus_driver._get_reserved_host_disk_gb_from_config = mock.Mock(
+            return_value=2)
+        provider_tree = mock.Mock()
+        provider_tree.data.return_value = mock.Mock(
+            inventory={}, traits=set())
+        self.client.storage_pools.get.return_value.driver = 'ceph'
+        self.CONF.incus.root_storage_pools = {
+            'durable': 'ceph-rootfs',
+        }
+        self.CONF.incus.root_storage_pool_resource_classes = {
+            'durable': 'CUSTOM_INCUS_STORAGE_POOL_DURABLE_DISK_GB',
+        }
+        self.CONF.reserved_host_cpus = 0
+        self.CONF.reserved_host_memory_mb = 0
+
+        self.assertRaises(
+            exception.InvalidConfiguration,
+            incus_driver.update_provider_tree,
+            provider_tree,
+            'compute-1')
+
+    @mock.patch('nova.virt.incus.driver._host_has_swap', return_value=False)
     def test_update_provider_tree_reports_manila_live_migration_trait(
             self, _host_has_swap):
         incus_driver = driver.IncusDriver(None)
@@ -2174,6 +2397,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     def test_attach_interface(self):
         expected = {
             'hwaddr': '00:11:22:33:44:55',
+            'name': 'nic0123456789ab',
             'parent': 'tin0123456789a',
             'nictype': 'physical',
             'type': 'nic',
@@ -2204,6 +2428,75 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertEqual(expected, container.devices['tap0123456789a'])
         container.save.assert_called_once_with(wait=True)
         self.client.profiles.get.assert_not_called()
+
+    def test_attach_interface_rolls_back_vif_after_incus_failure(self):
+        container = mock.Mock(devices={})
+        container.save.side_effect = [RuntimeError('save failed'), None]
+        self.client.instances.get.return_value = container
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        vif = {
+            'id': '0123456789abcdef',
+            'type': network_model.VIF_TYPE_OVS,
+            'address': '00:11:22:33:44:55',
+            'network': {'bridge': 'fakebr'},
+            'devname': 'tap0123456789a',
+        }
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver.firewall_driver = mock.Mock()
+
+        self.assertRaises(
+            RuntimeError,
+            incus_driver.attach_interface,
+            context.get_admin_context(),
+            instance,
+            None,
+            vif)
+
+        self.assertNotIn('tap0123456789a', container.devices)
+        incus_driver.firewall_driver.unfilter_instance.assert_called_once_with(
+            instance, [vif])
+        self.vif_driver.unplug.assert_called_once_with(instance, vif)
+
+    def test_attach_interface_retains_vif_if_incus_still_references_it(self):
+        initial = mock.Mock(devices={})
+        initial.save.side_effect = RuntimeError('save failed')
+        device = {
+            'hwaddr': '00:11:22:33:44:55',
+            'parent': 'tin0123456789a',
+            'nictype': 'physical',
+            'type': 'nic',
+        }
+        persisted = mock.Mock(devices={'tap0123456789a': device})
+        persisted.save.side_effect = RuntimeError('instance busy')
+        still_persisted = mock.Mock(
+            devices={'tap0123456789a': device})
+        self.client.instances.get.side_effect = [
+            initial, persisted, still_persisted]
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        vif = {
+            'id': '0123456789abcdef',
+            'type': network_model.VIF_TYPE_OVS,
+            'address': '00:11:22:33:44:55',
+            'network': {'bridge': 'fakebr'},
+            'devname': 'tap0123456789a',
+        }
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver.firewall_driver = mock.Mock()
+
+        self.assertRaises(
+            RuntimeError,
+            incus_driver.attach_interface,
+            context.get_admin_context(),
+            instance,
+            None,
+            vif)
+
+        incus_driver.firewall_driver.unfilter_instance.assert_not_called()
+        self.vif_driver.unplug.assert_not_called()
 
     def test_detach_interface_legacy(self):
         container = mock.Mock()
@@ -2948,6 +3241,43 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         volume_connector.disconnect_volume.assert_called_once_with(
             connection_info['data'], device_info)
 
+    @mock.patch('os.path.realpath', return_value='/dev/sdc')
+    def test_attach_volume_retains_mapping_when_profile_still_references_it(
+            self, realpath):
+        initial = mock.Mock(devices={}, config={})
+        initial.save.side_effect = RuntimeError('profile update failed')
+        persisted = mock.Mock(
+            devices={'1': {
+                'path': '/dev/sdd',
+                'required': 'true',
+                'source': '/dev/sdc',
+                'type': 'unix-block',
+            }},
+            config={'user.openstack.volume.1': '{"path":"/dev/sdc"}'})
+        persisted.save.side_effect = RuntimeError('instance is busy')
+        still_persisted = mock.Mock(
+            devices=dict(persisted.devices),
+            config=dict(persisted.config))
+        self.client.profiles.get.side_effect = [
+            initial, persisted, still_persisted]
+        volume_connector = mock.Mock()
+        volume_connector.connect_volume.return_value = {'path': '/dev/sdc'}
+        driver.brick_get_connector = mock.Mock(return_value=volume_connector)
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'}, '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaises(
+            RuntimeError, incus_driver.attach_volume,
+            context.get_admin_context(), connection_info, instance,
+            '/dev/sdd')
+
+        volume_connector.disconnect_volume.assert_not_called()
+
     def test_attach_encrypted_volume_is_rejected_before_connect(self):
         volume_connector = mock.Mock()
         driver.brick_get_connector = mock.Mock(return_value=volume_connector)
@@ -3219,6 +3549,61 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         profile.save.assert_called_once_with(wait=True)
         volume_connector.disconnect_volume.assert_called_once_with(
             connection_info['data'], {'path': '/dev/drbd1000'})
+
+    def test_detach_volume_accepts_persisted_profile_change(self):
+        device = {
+            'path': '/dev/sdc',
+            'source': '/dev/rbd0',
+            'type': 'unix-block',
+        }
+        profile = mock.Mock(devices={'1': device}, config={})
+        profile.save.side_effect = incus_operation_exception(
+            400, 'profile change still saved')
+        persisted = mock.Mock(devices={}, config={})
+        self.client.profiles.get.side_effect = [profile, persisted]
+        connector = mock.Mock()
+        driver.brick_get_connector = mock.Mock(return_value=connector)
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'}, '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.detach_volume(
+            context.get_admin_context(), connection_info, instance,
+            '/dev/sdc')
+
+        connector.disconnect_volume.assert_called_once_with(
+            connection_info['data'], {'path': '/dev/rbd0'})
+
+    def test_detach_volume_retains_mapping_when_profile_change_failed(self):
+        device = {
+            'path': '/dev/sdc',
+            'source': '/dev/rbd0',
+            'type': 'unix-block',
+        }
+        profile = mock.Mock(devices={'1': device}, config={})
+        profile.save.side_effect = RuntimeError('instance is busy')
+        persisted = mock.Mock(devices={'1': device}, config={})
+        self.client.profiles.get.side_effect = [profile, persisted]
+        connector = mock.Mock()
+        driver.brick_get_connector = mock.Mock(return_value=connector)
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'}, '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaises(
+            RuntimeError, incus_driver.detach_volume,
+            context.get_admin_context(), connection_info, instance,
+            '/dev/sdc')
+
+        connector.disconnect_volume.assert_not_called()
 
     def test_detach_volume_recovers_missing_connection_volume_id(self):
         volume_id = '8231d2e8-1111-4222-8333-123456789abc'
@@ -3778,6 +4163,23 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.client.instances.get.assert_called_once_with(instance.name)
         container.stop.assert_called_once_with(wait=True)
 
+    def test_power_off_retries_busy_operation(self):
+        container = mock.Mock(status='Running')
+        container.stop.side_effect = [
+            incus_operation_exception(
+                400, 'Instance is busy running a "update" operation'),
+            None,
+        ]
+        self.client.instances.get.return_value = container
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.power_off(instance)
+
+        self.assertEqual(2, container.stop.call_count)
+
     def test_power_on(self):
         container = mock.Mock()
         container.status = 'Stopped'
@@ -3792,6 +4194,38 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         self.client.instances.get.assert_called_once_with(instance.name)
         container.start.assert_called_once_with(wait=True)
+
+    def test_power_on_reasserts_vifs_after_start(self):
+        container = mock.Mock(status='Stopped')
+        self.client.instances.get.return_value = container
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        vif = mock.sentinel.vif
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.power_on(
+            context.get_admin_context(), instance, [vif])
+
+        self.vif_driver.reassert.assert_called_once_with(instance, vif)
+
+    def test_power_on_retries_busy_operation(self):
+        container = mock.Mock(status='Stopped')
+        container.start.side_effect = [
+            incus_operation_exception(
+                409, 'Instance is busy running a "stop" operation'),
+            None,
+        ]
+        self.client.instances.get.return_value = container
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.power_on(
+            context.get_admin_context(), instance, None)
+
+        self.assertEqual(2, container.start.call_count)
 
     @mock.patch('socket.gethostname', mock.Mock(return_value='fake_hostname'))
     @mock.patch('os.statvfs', return_value=mock.Mock(
@@ -3898,6 +4332,39 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'available': 20 * units.Gi,
         }, result)
         self.client.storage_pools.get.assert_called_once_with('tenant-rootfs')
+
+    def test_placement_storage_pool_info_uses_shared_budget(self):
+        pool = self.client.storage_pools.get.return_value
+        pool.driver = 'ceph'
+
+        result = driver._placement_storage_pool_info(
+            self.client, 'shared-rootfs', 25)
+
+        self.assertEqual({
+            'total': 25 * units.Gi,
+            'used': 0,
+            'available': 25 * units.Gi,
+        }, result)
+        pool.resources.get.assert_not_called()
+
+    def test_placement_storage_pool_info_requires_shared_budget(self):
+        self.client.storage_pools.get.return_value.driver = 'ceph'
+
+        self.assertRaises(
+            exception.InvalidConfiguration,
+            driver._placement_storage_pool_info,
+            self.client,
+            'shared-rootfs')
+
+    def test_placement_storage_pool_info_rejects_budget_for_local_pool(self):
+        self.client.storage_pools.get.return_value.driver = 'zfs'
+
+        self.assertRaises(
+            exception.InvalidConfiguration,
+            driver._placement_storage_pool_info,
+            self.client,
+            'local-rootfs',
+            25)
 
     @mock.patch('socket.gethostname', mock.Mock(return_value='fake_hostname'))
     @mock.patch('builtins.open')
@@ -4088,7 +4555,10 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
     @mock.patch('nova.virt.incus.driver.IMAGE_API')
     @mock.patch('nova.virt.incus.driver.lockutils.lock')
-    def test_snapshot(self, lock, IMAGE_API):
+    @mock.patch(
+        'nova.virt.incus.driver.compute_utils.is_volume_backed_instance',
+        return_value=False)
+    def test_snapshot(self, is_bfv, lock, IMAGE_API):
         update_task_state_expected = [
             mock.call(task_state='image_pending_upload'),
             mock.call(
@@ -4134,8 +4604,11 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
     @mock.patch('nova.virt.incus.driver.IMAGE_API')
     @mock.patch('nova.virt.incus.driver.lockutils.lock')
+    @mock.patch(
+        'nova.virt.incus.driver.compute_utils.is_volume_backed_instance',
+        return_value=False)
     def test_snapshot_upload_failure_cleans_temporary_resources(
-            self, lock, IMAGE_API):
+            self, is_bfv, lock, IMAGE_API):
         container = mock.Mock(status='Running')
         instance_snapshot = mock.Mock()
         image = mock.Mock()
@@ -4161,6 +4634,25 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         instance_snapshot.delete.assert_called_once_with(wait=True)
         container.stop.assert_not_called()
         container.start.assert_not_called()
+
+    @mock.patch(
+        'nova.virt.incus.driver.compute_utils.is_volume_backed_instance',
+        return_value=True)
+    def test_snapshot_rejects_bfv_before_incus_side_effects(self, is_bfv):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaises(
+            exception.InvalidRequest,
+            incus_driver.snapshot,
+            ctx,
+            instance,
+            'image-id',
+            mock.Mock())
+
+        self.client.instances.get.assert_not_called()
 
     def test_finish_revert_migration(self):
         ctx = context.get_admin_context()
@@ -4377,6 +4869,33 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertEqual(
             mount_path,
             profile.devices[driver._share_device_name(share)]['source'])
+
+    @mock.patch.object(driver.os.path, 'ismount')
+    @mock.patch.object(driver.privsep_fs, 'umount')
+    @mock.patch.object(driver.privsep_fs, 'mount')
+    @mock.patch.object(driver, '_ensure_share_mount_path')
+    def test_mount_share_unmounts_new_mount_when_profile_disappears(
+            self, ensure_path, mount, umount, ismount):
+        self.CONF.incus.enable_manila_shares = True
+        mount_path = '/instances/incus-shares/instance/share'
+        ensure_path.return_value = mount_path
+        ismount.side_effect = [False, True]
+        response = mock.Mock(status_code=404)
+        self.client.profiles.get.side_effect = (
+            incuscore_exceptions.LXDAPIException(response))
+        instance = mock.Mock(uuid='instance', name='instance-share')
+        share = mock.Mock(
+            share_id='share',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            share_proto='NFS')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        incus_driver.mount_share(None, instance, share)
+
+        mount.assert_called_once()
+        umount.assert_called_once_with(mount_path)
 
     @mock.patch.object(driver.os.path, 'ismount', return_value=True)
     @mock.patch.object(driver.privsep_fs, 'umount')

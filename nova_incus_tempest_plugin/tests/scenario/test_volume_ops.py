@@ -90,10 +90,12 @@ class IncusVolumeScenario(manager.ScenarioTest):
             flavor=self.flavor_ref,
             key_name=keypair['name'],
             security_groups=[{'name': security_group['name']}],
+            config_drive=True,
             wait_until='ACTIVE')
         volume = self.create_volume(
             volume_type=CONF.volume.volume_type or None)
-        ip_address = self.get_server_ip(server)
+        ip_address = self.create_floating_ip(
+            server)['floating_ip_address']
         ssh = self.get_remote_client(
             ip_address=ip_address, username=self.ssh_user,
             private_key=keypair['private_key'])
@@ -133,10 +135,12 @@ class IncusVolumeScenario(manager.ScenarioTest):
             flavor=self.flavor_ref,
             key_name=keypair['name'],
             security_groups=[{'name': security_group['name']}],
+            config_drive=True,
             wait_until='ACTIVE')
         volume = self.create_volume(
             size=1, volume_type=CONF.volume.volume_type or None)
-        ip_address = self.get_server_ip(server)
+        ip_address = self.create_floating_ip(
+            server)['floating_ip_address']
         ssh = self.get_remote_client(
             ip_address=ip_address, username=self.ssh_user,
             private_key=keypair['private_key'])

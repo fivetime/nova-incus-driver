@@ -511,6 +511,7 @@ class ToProfileTest(test.NoDBTestCase):
             'tap0123456789a': {
                 'hwaddr': '00:11:22:33:44:55',
                 'nictype': 'physical',
+                'name': 'nic0123456789ab',
                 'parent': 'tin0123456789a',
                 'type': 'nic',
                 'limits.egress': '16000Mbit',
@@ -554,6 +555,7 @@ class ToProfileTest(test.NoDBTestCase):
             'tap0123456789a': {
                 'hwaddr': '00:11:22:33:44:55',
                 'nictype': 'physical',
+                'name': 'nic0123456789ab',
                 'parent': 'tin0123456789a',
                 'type': 'nic',
                 'limits.egress': '32000Mbit',

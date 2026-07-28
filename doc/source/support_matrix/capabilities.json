@@ -100,9 +100,17 @@
       "id": "snapshot-to-glance",
       "owner": "nova+glance+driver",
       "driver_hooks": ["snapshot"],
-      "applicability": "container",
+      "applicability": "non-volume-backed-root",
       "status": "supported",
-      "evidence": "tools/openstack-incus-snapshot-e2e.sh"
+      "evidence": "tools/openstack-incus-snapshot-e2e.sh; direct driver snapshot rejects BFV roots before Incus side effects"
+    },
+    {
+      "id": "bfv-snapshot",
+      "owner": "nova+cinder",
+      "driver_hooks": [],
+      "applicability": "volume-backed-root",
+      "status": "framework",
+      "evidence": "Nova volume-backed image/snapshot orchestration and Cinder snapshot API; the Incus driver snapshot hook deliberately rejects BFV roots"
     },
     {
       "id": "rebuild",
@@ -190,7 +198,7 @@
       "driver_hooks": ["get_instance_diagnostics", "block_stats", "get_all_volume_usage"],
       "applicability": "container",
       "status": "supported",
-      "evidence": "Public Nova diagnostics E2E plus BFV root and hot-plugged Ceph data-volume io.stat delta E2E. block_stats and get_all_volume_usage map validated RBD devices to Cinder UUIDs; generic diagnostics disk fields remain null because that schema has no disk identifier"
+      "evidence": "Public Nova diagnostics E2E using standard driver=libvirt and hypervisor=incus, plus BFV root and hot-plugged Ceph data-volume io.stat delta E2E. block_stats and get_all_volume_usage map validated RBD devices to Cinder UUIDs; generic diagnostics disk fields remain null because that schema has no disk identifier"
     },
     {
       "id": "config-drive-metadata-keypair-userdata",
@@ -198,7 +206,7 @@
       "driver_hooks": ["spawn"],
       "applicability": "container",
       "status": "supported",
-      "evidence": "Spawn and rebuild expose a read-only directory with rollback on construction failure; bounded SHA-256-verified cross-host transfer, target idmap ownership, revert, confirm cleanup, stable Neutron address, and unchanged BFV root capacity passed three-node public API E2E"
+      "evidence": "Spawn supplies NoCloud user-data, public-key metadata, and Nova-derived cloud-init v2 network-config with MAC matching, IPv4/IPv6, routes, DNS, and MTU. Rebuild exposes a read-only config-drive directory with rollback on construction failure; bounded SHA-256-verified cross-host transfer, target idmap ownership, revert, and confirm cleanup are covered"
     },
     {
       "id": "rescue-unrescue",

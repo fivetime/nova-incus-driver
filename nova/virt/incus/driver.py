@@ -29,6 +29,7 @@ import socket
 import tarfile
 import tempfile
 import hashlib
+import ipaddress
 from urllib import parse
 
 import eventlet
@@ -54,6 +55,7 @@ from oslo_utils import fileutils
 from oslo_utils import timeutils
 from prometheus_client import parser as prometheus_parser
 from pylxd import exceptions as incus_exceptions
+import yaml
 
 from nova.virt.incus import vif as incus_vif
 from nova.virt.incus import client as incus_client
@@ -68,6 +70,7 @@ from nova.objects import fields as obj_fields
 from nova.virt import configdrive
 from nova.compute import power_state
 from nova.compute import vm_states
+from nova.compute import utils as compute_utils
 from nova.virt import hardware
 from oslo_utils import units
 from oslo_serialization import jsonutils
@@ -112,8 +115,42 @@ _SHARE_ID_RE = re.compile(
     r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-'
     r'[0-9a-f]{4}-[0-9a-f]{12}$')
 _SHARE_TAG_RE = re.compile(r'^[A-Za-z0-9-]{1,255}$')
-
-
+_NETWORK_ACTIVATION_VENDOR_DATA = """#cloud-config
+bootcmd:
+  - |
+    rc=0
+    backend=
+    if command -v netplan >/dev/null 2>&1; then
+      backend=netplan
+      netplan apply || rc=$?
+    elif command -v nmcli >/dev/null 2>&1; then
+      backend=NetworkManager
+      nmcli connection reload || rc=$?
+      for iface in /sys/class/net/nic*; do
+        [ -e "$iface" ] || continue
+        nmcli device connect "${iface##*/}" || rc=$?
+      done
+    elif command -v networkctl >/dev/null 2>&1; then
+      backend=systemd-networkd
+      networkctl reload || rc=$?
+      for iface in /sys/class/net/nic*; do
+        [ -e "$iface" ] || continue
+        networkctl reconfigure "${iface##*/}" || rc=$?
+      done
+    elif command -v ifup >/dev/null 2>&1; then
+      backend=ifupdown
+      ifup -a || rc=$?
+    else
+      rc=127
+    fi
+    if [ "$rc" -ne 0 ]; then
+      message="nova-incus: failed to activate guest network"
+      [ -n "$backend" ] && message="$message using $backend"
+      command -v logger >/dev/null 2>&1 && logger -t nova-incus "$message"
+      printf '%s\\n' "$message" >/dev/console 2>/dev/null || true
+      exit "$rc"
+    fi
+"""
 def _root_storage_pool_traits():
     """Return collision-free Placement traits for configured pool selectors."""
     traits = {}
@@ -1221,7 +1258,94 @@ def _profile_device_info(profile, volume_id, device):
     return {'path': device['source']} if device else None
 
 
-def _incus_cloud_init_config(instance):
+def _network_prefix(address, netmask):
+    address_version = ipaddress.ip_address(address).version
+    mask = ipaddress.ip_address(netmask)
+    if mask.version != address_version:
+        raise ValueError('Network address and netmask versions differ')
+    bits = format(int(mask), '0%db' % mask.max_prefixlen)
+    if '01' in bits:
+        raise ValueError('Network netmask is not contiguous')
+    return bits.count('1')
+
+
+def _incus_network_config(network_info):
+    """Convert Nova network metadata to cloud-init network config v2."""
+    if not network_info:
+        return None
+
+    ethernets = {}
+    for vif in network_info:
+        mac_address = vif.get('address')
+        network = vif.get('network') or {}
+        if not mac_address:
+            continue
+
+        interface_name = incus_vif.get_vif_guest_devname(vif)
+        # Incus applies this stable name to the NIC device. Avoid a MAC match
+        # here: netplan renders it as PermanentMACAddress=, which does not
+        # match a veth and leaves the interface unmanaged.
+        interface = {}
+        mtu = (network.get('meta') or {}).get('mtu')
+        if mtu:
+            interface['mtu'] = mtu
+
+        addresses = []
+        routes = []
+        nameservers = []
+        for subnet in network.get('subnets', []):
+            cidr = ipaddress.ip_network(str(subnet['cidr']), strict=False)
+            for ip in subnet.get('ips', []):
+                addresses.append('%s/%s' % (
+                    ip['address'], cidr.prefixlen))
+
+            gateway = subnet.get('gateway')
+            if gateway:
+                gateway_address = (
+                    gateway.get('address')
+                    if hasattr(gateway, 'get') else str(gateway))
+                routes.append({
+                    'to': '0.0.0.0/0' if cidr.version == 4 else '::/0',
+                    'via': gateway_address,
+                })
+
+            for route in subnet.get('routes', []):
+                route_cidr = route.get('cidr')
+                if route_cidr is None:
+                    prefix = _network_prefix(
+                        route['network'], route['netmask'])
+                    route_cidr = '%s/%s' % (route['network'], prefix)
+                route_gateway = route.get('gateway')
+                if hasattr(route_gateway, 'get'):
+                    route_gateway = route_gateway.get('address')
+                routes.append({
+                    'to': str(route_cidr),
+                    'via': str(route_gateway),
+                })
+            nameservers.extend(
+                dns.get('address') if hasattr(dns, 'get') else str(dns)
+                for dns in subnet.get('dns', []))
+
+        if addresses:
+            interface['addresses'] = addresses
+        if routes:
+            interface['routes'] = routes
+        if nameservers:
+            interface['nameservers'] = {
+                'addresses': list(dict.fromkeys(nameservers)),
+            }
+        if not interface:
+            continue
+        ethernets[interface_name] = interface
+
+    if not ethernets:
+        return None
+    return yaml.safe_dump(
+        {'version': 2, 'ethernets': ethernets},
+        default_flow_style=False, sort_keys=False)
+
+
+def _incus_cloud_init_config(instance, network_info=None):
     """Translate Nova bootstrap data to the Incus NoCloud template keys."""
     config = {'user.openstack.uuid': instance.uuid}
 
@@ -1237,6 +1361,11 @@ def _incus_cloud_init_config(instance):
         key_name = getattr(instance, 'key_name', None) or 'nova-key'
         config['user.meta-data'] = 'public-keys:\n  %s: %s\n' % (
             jsonutils.dumps(key_name), jsonutils.dumps(key_data.strip()))
+
+    network_config = _incus_network_config(network_info)
+    if network_config:
+        config['cloud-init.network-config'] = network_config
+        config['cloud-init.vendor-data'] = _NETWORK_ACTIVATION_VENDOR_DATA
 
     return config
 
@@ -1402,6 +1531,33 @@ def _get_storage_pool_info(client, pool_name):
         'used': used,
         'available': max(0, total - used),
     }
+
+
+def _placement_storage_pool_info(client, pool_name, shared_capacity_gb=None):
+    """Return node-owned capacity without duplicating a shared Ceph pool."""
+    pool = client.storage_pools.get(pool_name)
+    if pool.driver not in ('ceph', 'cephext'):
+        if shared_capacity_gb is not None:
+            raise exception.InvalidConfiguration(
+                'Shared capacity is configured for node-local Incus pool {}'
+                .format(pool_name))
+        return _get_storage_pool_info(client, pool_name)
+
+    if shared_capacity_gb is None:
+        raise exception.InvalidConfiguration(
+            'Shared Incus pool {} requires an explicit per-compute '
+            'Placement capacity budget'.format(pool_name))
+    try:
+        capacity_gb = int(shared_capacity_gb)
+    except (TypeError, ValueError):
+        capacity_gb = 0
+    if capacity_gb < 1:
+        raise exception.InvalidConfiguration(
+            'Shared Incus pool {} capacity budget must be a positive GiB '
+            'value'.format(pool_name))
+
+    total = capacity_gb * units.Gi
+    return {'total': total, 'used': 0, 'available': total}
 
 
 def _get_power_state(incus_state):
@@ -1775,14 +1931,13 @@ class IncusDriver(driver.ComputeDriver):
 
     def get_instance_diagnostics(self, instance):
         """Return the standardized diagnostics object for Incus containers."""
-        if not hasattr(obj_fields.HypervisorDriver, 'INCUS'):
-            raise NotImplementedError(
-                'Nova must include the incus diagnostics driver identifier')
-
         data = self._get_diagnostics_data(instance)
         diags = objects.Diagnostics(
             state=power_state.STATE_MAP[data['state']],
-            driver=obj_fields.HypervisorDriver.INCUS,
+            # Nova's versioned Diagnostics object has no external-driver
+            # value. Use its standard system-container-compatible driver
+            # category and retain the actual backend in ``hypervisor``.
+            driver=obj_fields.HypervisorDriver.LIBVIRT,
             config_drive=configdrive.required_by(instance),
             hypervisor='incus',
             hypervisor_os='linux',
@@ -2020,7 +2175,7 @@ class IncusDriver(driver.ComputeDriver):
             'type': 'container',
             'profiles': [profile.name],
             'config': {
-                **_incus_cloud_init_config(instance),
+                **_incus_cloud_init_config(instance, network_info),
                 # Nova must reconcile ownership before a workload resumes
                 # after a fenced compute returns.
                 'boot.autostart': 'false',
@@ -2263,9 +2418,35 @@ class IncusDriver(driver.ComputeDriver):
         if container.status == 'Stopped':
             self._validate_reboot_vifs(instance, network_info)
             self.plug_vifs(instance, network_info)
-            container.start(wait=True)
+            _retry_incus_instance_action(
+                lambda: container.start(wait=True),
+                'start stopped instance during reboot',
+                instance)
         else:
-            container.restart(force=True, wait=True)
+            if reboot_type == 'SOFT':
+                try:
+                    _retry_incus_instance_action(
+                        lambda: container.restart(
+                            force=False, wait=True),
+                        'soft reboot',
+                        instance)
+                except incus_exceptions.LXDAPIException:
+                    LOG.warning(
+                        'Incus soft reboot failed; falling back to hard '
+                        'reboot',
+                        instance=instance,
+                        exc_info=True)
+                    _retry_incus_instance_action(
+                        lambda: container.restart(
+                            force=True, wait=True),
+                        'hard reboot fallback',
+                        instance)
+            else:
+                _retry_incus_instance_action(
+                    lambda: container.restart(force=True, wait=True),
+                    'hard reboot',
+                    instance)
+        self._reassert_vifs(instance, network_info)
         self._clear_migration_recovery_marker(instance)
 
     def needs_migration_recovery(self, instance):
@@ -2427,6 +2608,7 @@ class IncusDriver(driver.ComputeDriver):
                 'nictype': 'physical',
                 'parent': incus_vif.get_vif_internal_devname(vif),
                 'hwaddr': str(vif['address']),
+                'name': incus_vif.get_vif_guest_devname(vif),
             }
             if device is None or any(
                     device.get(key) != value
@@ -2543,10 +2725,20 @@ class IncusDriver(driver.ComputeDriver):
             profile.save(wait=True)
         except Exception:
             with excutils.save_and_reraise_exception():
-                profile.devices.pop(volume_id, None)
-                profile.config.pop(metadata_key, None)
-                storage_driver.disconnect_volume(
-                    connection_info['data'], device_info)
+                if self._remove_profile_volume_reference(
+                        instance, volume_id, (metadata_key,)):
+                    storage_driver.disconnect_volume(
+                        connection_info['data'], device_info)
+                else:
+                    LOG.error(
+                        'Retaining host mapping for volume %(volume)s '
+                        'because Incus profile %(profile)s still references '
+                        'it after attach failed',
+                        {
+                            'volume': volume_id,
+                            'profile': instance.name,
+                        },
+                        instance=instance)
 
     def detach_volume(self, context, connection_info, instance, mountpoint,
                       encryption=None):
@@ -2592,7 +2784,21 @@ class IncusDriver(driver.ComputeDriver):
             del profile.devices[volume_id]
             for metadata_key in metadata_keys:
                 profile.config.pop(metadata_key, None)
-            profile.save(wait=True)
+            try:
+                profile.save(wait=True)
+            except Exception:
+                try:
+                    persisted = self.client.profiles.get(instance.name)
+                except Exception:
+                    raise
+                if volume_id in persisted.devices:
+                    raise
+                LOG.warning(
+                    'Incus reported a failed detach profile update for '
+                    'volume %(volume)s, but the persisted device is absent; '
+                    'continuing host disconnect',
+                    {'volume': volume_id},
+                    instance=instance)
 
         try:
             storage_driver.disconnect_volume(
@@ -2608,6 +2814,39 @@ class IncusDriver(driver.ComputeDriver):
                         'Failed to restore the Incus volume device after a '
                         'host disconnect failure', instance=instance)
             raise
+
+    def _remove_profile_volume_reference(
+            self, instance, volume_id, metadata_keys):
+        """Remove a failed attach after persisted profile confirmation."""
+        try:
+            profile = self.client.profiles.get(instance.name)
+        except incus_exceptions.NotFound:
+            return True
+        except Exception:
+            LOG.exception(
+                'Cannot read Incus profile while rolling back volume %s',
+                volume_id, instance=instance)
+            return False
+
+        if volume_id not in profile.devices:
+            return True
+
+        profile.devices.pop(volume_id, None)
+        for metadata_key in metadata_keys:
+            profile.config.pop(metadata_key, None)
+        try:
+            profile.save(wait=True)
+        except Exception:
+            try:
+                profile = self.client.profiles.get(instance.name)
+            except incus_exceptions.NotFound:
+                return True
+            except Exception:
+                LOG.exception(
+                    'Cannot verify Incus profile rollback for volume %s',
+                    volume_id, instance=instance)
+                return False
+        return volume_id not in profile.devices
 
     def swap_volume(self, context, old_connection_info, new_connection_info,
                     instance, mountpoint, resize_to):
@@ -2645,6 +2884,7 @@ class IncusDriver(driver.ComputeDriver):
         device = {
                 'nictype': 'physical',
                 'hwaddr': vif['address'],
+                'name': incus_vif.get_vif_guest_devname(vif),
                 'parent': incus_vif.get_vif_internal_devname(vif),
                 'type': 'nic',
         }
@@ -2656,10 +2896,57 @@ class IncusDriver(driver.ComputeDriver):
             container.devices = devices
             container.save(wait=True)
 
-        _retry_incus_instance_action(
-            add_device,
-            'attach interface {}'.format(vif['id']),
-            instance)
+        try:
+            _retry_incus_instance_action(
+                add_device,
+                'attach interface {}'.format(vif['id']),
+                instance)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                if self._remove_instance_device_reference(
+                        instance, net_device):
+                    self.firewall_driver.unfilter_instance(instance, [vif])
+                    self.vif_driver.unplug(instance, vif)
+                else:
+                    LOG.error(
+                        'Retaining VIF wiring for %(vif)s because Incus '
+                        'instance %(instance)s still references it after '
+                        'attach failed',
+                        {
+                            'vif': vif['id'],
+                            'instance': instance.name,
+                        },
+                        instance=instance)
+
+    def _remove_instance_device_reference(self, instance, device_name):
+        try:
+            container = self.client.instances.get(instance.name)
+        except incus_exceptions.NotFound:
+            return True
+        except Exception:
+            LOG.exception(
+                'Cannot read Incus instance while rolling back device %s',
+                device_name, instance=instance)
+            return False
+
+        if device_name not in container.devices:
+            return True
+        devices = dict(container.devices)
+        devices.pop(device_name, None)
+        container.devices = devices
+        try:
+            container.save(wait=True)
+        except Exception:
+            try:
+                container = self.client.instances.get(instance.name)
+            except incus_exceptions.NotFound:
+                return True
+            except Exception:
+                LOG.exception(
+                    'Cannot verify Incus device rollback for %s',
+                    device_name, instance=instance)
+                return False
+        return device_name not in container.devices
 
     def detach_interface(self, context, instance, vif):
         # A Neutron vif-deleted event races with normal server deletion. The
@@ -2853,6 +3140,11 @@ class IncusDriver(driver.ComputeDriver):
         })
 
     def snapshot(self, context, instance, image_id, update_task_state):
+        if compute_utils.is_volume_backed_instance(context, instance):
+            raise exception.InvalidRequest(
+                'The Incus image snapshot path cannot publish a Cinder '
+                'boot volume; use Nova volume-backed snapshot orchestration')
+
         lock_path = str(os.path.join(CONF.instances_path, 'locks'))
 
         with lockutils.lock(
@@ -2951,9 +3243,12 @@ class IncusDriver(driver.ComputeDriver):
         See 'nova.virt.drvier.ComputeDriver.power_off` for more
         information.
         """
-        container = self.client.instances.get(instance.name)
-        if container.status != 'Stopped':
-            container.stop(wait=True)
+        def stop():
+            container = self.client.instances.get(instance.name)
+            if container.status != 'Stopped':
+                container.stop(wait=True)
+
+        _retry_incus_instance_action(stop, 'power off', instance)
 
     def power_on(self, context, instance, network_info,
                  block_device_info=None, accel_info=None, share_info=None):
@@ -2964,9 +3259,19 @@ class IncusDriver(driver.ComputeDriver):
         """
         profile = self.client.profiles.get(instance.name)
         self._attach_share_devices(profile, instance, share_info)
-        container = self.client.instances.get(instance.name)
-        if container.status != 'Running':
-            container.start(wait=True)
+
+        def start():
+            container = self.client.instances.get(instance.name)
+            if container.status != 'Running':
+                container.start(wait=True)
+
+        _retry_incus_instance_action(start, 'power on', instance)
+        self._reassert_vifs(instance, network_info)
+
+    def _reassert_vifs(self, instance, network_info):
+        """Restore host-side VIF wiring after a container start."""
+        for vif in network_info or []:
+            self.vif_driver.reassert(instance, vif)
 
     def _attach_share_devices(self, profile, instance, share_info):
         changed = False
@@ -2999,6 +3304,13 @@ class IncusDriver(driver.ComputeDriver):
 
     def mount_share(self, context, instance, share_mapping):
         """Mount an approved Manila export and stage its Incus disk device."""
+        lock_name = 'incus-share-{}-{}'.format(
+            instance.uuid, share_mapping.share_id)
+        with lockutils.lock(lock_name):
+            return self._mount_share_locked(
+                context, instance, share_mapping)
+
+    def _mount_share_locked(self, context, instance, share_mapping):
         if not CONF.incus.enable_manila_shares:
             raise exception.ShareProtocolNotSupported(
                 share_proto=share_mapping.share_proto)
@@ -3044,6 +3356,8 @@ class IncusDriver(driver.ComputeDriver):
                 profile = self.client.profiles.get(instance.name)
             except incus_exceptions.LXDAPIException as exc:
                 if exc.response.status_code == 404:
+                    if not mounted and os.path.ismount(mount_path):
+                        privsep_fs.umount(mount_path)
                     return
                 raise
             self._attach_share_devices(profile, instance, [share_mapping])
@@ -3071,6 +3385,13 @@ class IncusDriver(driver.ComputeDriver):
 
     def umount_share(self, context, instance, share_mapping):
         """Remove the Incus share device before unmounting the host export."""
+        lock_name = 'incus-share-{}-{}'.format(
+            instance.uuid, share_mapping.share_id)
+        with lockutils.lock(lock_name):
+            return self._umount_share_locked(
+                context, instance, share_mapping)
+
+    def _umount_share_locked(self, context, instance, share_mapping):
         if not CONF.incus.enable_manila_shares:
             raise exception.ShareProtocolNotSupported(
                 share_proto=share_mapping.share_proto)
@@ -3144,8 +3465,10 @@ class IncusDriver(driver.ComputeDriver):
         #                  to support Incus storage pools
         storage_driver = incus_config['environment']['storage']
         if CONF.incus.storage_pool:
-            local_disk_info = _get_storage_pool_info(
-                self.client, CONF.incus.storage_pool)
+            local_disk_info = _placement_storage_pool_info(
+                self.client,
+                CONF.incus.storage_pool,
+                CONF.incus.shared_storage_pool_capacity_gb)
         elif storage_driver == 'zfs':
             # NOTE(ajkavanagh) - BUG/1782329 - this is temporary until storage
             # pools is implemented.  Incus 3 removed the storage.zfs_pool_name
@@ -3285,7 +3608,11 @@ class IncusDriver(driver.ComputeDriver):
                 raise exception.InvalidConfiguration(
                     'Incus root storage resource class {} must start with '
                     'CUSTOM_'.format(resource_class))
-            pool_info = _get_storage_pool_info(self.client, pool_name)
+            pool_info = _placement_storage_pool_info(
+                self.client,
+                pool_name,
+                CONF.incus.shared_root_storage_pool_capacities_gb.get(
+                    selector))
             total_gb = pool_info['total'] // units.Gi
             if total_gb < 1:
                 raise exception.InvalidConfiguration(

@@ -268,6 +268,7 @@ def _network(instance, _, network_info, __):
         devices[key] = {
             'nictype': 'physical',
             'hwaddr': str(cfg['mac_address']),
+            'name': vif.get_vif_guest_devname(vifaddr),
             'parent': vif.get_vif_internal_devname(vifaddr),
             'type': 'nic'
         }

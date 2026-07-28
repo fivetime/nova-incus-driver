@@ -78,9 +78,34 @@ The script defaults to ``images:ubuntu/noble/cloud`` and the Glance name
 ``ubuntu-noble-24.04-cloud-incus``. ``SOURCE``, ``IMAGE_NAME``, ``WORK_DIR``
 and ``LOCAL_ALIAS`` can override those values.
 
-The driver maps Nova's user-data to ``cloud-init.user-data`` and the selected
-Nova keypair to the NoCloud ``public-keys`` metadata. A tenant can therefore
-use the normal Nova API without Incus-specific options::
+The driver maps Nova's user-data to ``cloud-init.user-data``, the selected
+Nova keypair to the NoCloud ``public-keys`` metadata, and Nova
+``network_info`` to ``cloud-init.network-config``.  The generated cloud-init
+v2 network configuration assigns Neutron's fixed IPv4/IPv6 addresses,
+routes, DNS servers, and MTU to stable Incus interface names.  Each interface
+is named ``nic`` followed by the first 12 hexadecimal characters of its
+Neutron port UUID.  The same name is stored on the Incus NIC device and in
+cloud-init network-config, so removing or adding another port cannot renumber
+the remaining interfaces.  The mapping also survives reboot and migration.
+It deliberately does not use netplan's MAC matching because that is rendered
+as ``PermanentMACAddress=`` and does not match a veth.
+
+Vendor-data performs an idempotent network-manager reload for netplan,
+NetworkManager, systemd-networkd, and Debian or Alpine ifupdown images that
+generate their network configuration after the manager has started.  A
+missing activation backend or a failed activation command is reported to
+the guest console and syslog and causes cloud-init to record a failed stage.
+Nova does not wait for an in-guest readiness acknowledgement, so operators
+must monitor cloud-init and console output when guest network readiness is a
+service-level requirement.
+
+Addresses are generated from the fixed IPs allocated by Neutron, including
+fixed IPs on DHCP-enabled subnets.  A Neutron port deliberately created with
+``--no-fixed-ip`` remains an L2-only interface; the driver does not start a
+DHCP client behind Neutron's allocation and port-security model.
+
+A tenant can therefore use the normal Nova API without Incus-specific
+options::
 
     source /opt/stack/devstack/openrc demo demo
     openstack server create \
@@ -150,8 +175,10 @@ mapping entry and requires the Placement trait reported for that selector::
 
     [incus]
     storage_pool = ceph-rootfs
+    shared_storage_pool_capacity_gb = 6000
     root_storage_pools = durable:ceph-rootfs,local-nvme:local-zfs
     root_storage_pool_resource_classes = local-nvme:CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME_DISK_GB
+    shared_root_storage_pool_capacities_gb = durable:6000
 
     openstack flavor set incus-local-nvme \
       --property incus:root_storage_pool=local-nvme \
@@ -171,9 +198,14 @@ accounts each local pool independently. The standard ``DISK_GB`` request is
 still present and acts as an additional host-level ceiling.
 
 Shared Ceph capacity must not be published in full independently by every
-compute through a custom resource class. Keep shared Ceph on the standard
-``DISK_GB`` model and set ``disk_allocation_ratio`` and reserved capacity from
-an external cluster-wide capacity policy. Local pools cannot provide automatic
+compute. Assign each compute a fixed Placement slice with
+``shared_storage_pool_capacity_gb`` for the default pool and
+``shared_root_storage_pool_capacities_gb`` for selectable pools. The sum of
+all slices must not exceed the operator-approved cluster-wide budget after
+reserving capacity for Cinder, Glance, recovery and Ceph health. The driver
+reports zero local usage for a shared slice because Placement allocations are
+the accounting authority. It rejects a shared pool without a slice and rejects
+a slice configured for a local pool. Local pools cannot provide automatic
 evacuation after host loss and require remote snapshots or backups.
 
 Cinder boot-from-volume
@@ -1308,10 +1340,13 @@ removes the Incus device and os-vif/OVS state. Validate both directions with::
     SERVER=<active-server> NETWORK=private \
       tools/openstack-incus-interface-e2e.sh
 
-The guest operating system owns interface configuration. For example, an
-Ubuntu image whose netplan matches only its boot-time ``eth0`` leaves a newly
-attached ``eth1`` down until the tenant updates netplan or starts a DHCP client.
-The Nova driver must not rewrite guest network configuration during hotplug.
+The guest operating system owns interface configuration after boot. A newly
+attached interface uses its deterministic ``nic<port-id-prefix>`` name, but it
+remains unconfigured until the tenant updates the guest network configuration
+or starts an appropriate DHCP client. The Nova driver must not rewrite guest
+network configuration during hotplug. Detaching another port does not rename
+the remaining interfaces, so existing addresses cannot silently move to a
+different Neutron port.
 
 Flavor swap limits
 ------------------
@@ -1367,11 +1402,11 @@ must not be treated as the storage-safety boundary.
 Instance diagnostics
 --------------------
 
-The DevStack plugin applies the Nova compatibility patch required for the
-standard diagnostics ``driver=incus`` value by default. Set
-``INCUS_APPLY_NOVA_DIAGNOSTICS_PATCH=False`` only when the Nova tree already
-contains equivalent support. Deployment fails rather than silently applying
-a patch that no longer matches the selected Nova release.
+Nova's standardized ``Diagnostics.driver`` field is a closed enum and does not
+contain ``incus``. The driver reports the existing ``libvirt`` enum value for
+RPC and API compatibility and reports ``hypervisor=incus`` as the actual
+runtime. No Nova source patch is required, and an unmodified conductor can
+deserialize the object.
 
 For microversion 2.48 and later, ``GET /servers/{uuid}/diagnostics`` reports
 the Incus aggregate CPU time in nanoseconds, memory in MiB, and cumulative

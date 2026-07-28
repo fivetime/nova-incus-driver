@@ -48,6 +48,10 @@ INCUS_MAXIMUM_PROCESS_LIMIT=65536
 # INCUS_BFV_CEPH_POOL=cinder-volumes-rbd-pool
 # INCUS_BFV_CEPH_USER=cinder
 # INCUS_BFV_CEPH_CLUSTER_NAME=ceph
+# A shared Ceph root pool must have an explicit per-compute Placement slice.
+# The sum of all compute slices must not exceed the operator-approved Ceph
+# capacity budget. Local pools discover their capacity from Incus instead.
+# INCUS_SHARED_STORAGE_POOL_CAPACITY_GB=6000
 # For production-like BFV performance, configure Glance with an RBD store in
 # the same Ceph cluster and set show_image_direct_url=True. The Cinder CephX
 # client needs read-only access to the Glance pool so its RBD driver can clone
