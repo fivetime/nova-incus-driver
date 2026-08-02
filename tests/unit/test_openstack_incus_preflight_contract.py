@@ -228,6 +228,19 @@ class SharedCephPoolPrefixContractTest(unittest.TestCase):
         self.assertIn('storage_release_receipt_v2', self.host)
         self.assertNotIn('storage_release_receipt \\', self.host)
 
+    def test_fleet_checks_journal_directory_ownership(self):
+        """A root-owned journal directory breaks every data-volume attach.
+
+        nova-compute writes these journals as the service user, so an
+        ownership drift only surfaces much later as "Permission denied"
+        during attach. It cost a full matrix run to find once.
+        """
+        self.assertIn('incus-volume-journal', self.fleet)
+        self.assertIn('incus-share-journal', self.fleet)
+        self.assertIn('incus-spawn-attempts', self.fleet)
+        self.assertIn('journal directories', self.fleet)
+        self.assertIn('MainPID', self.fleet)
+
 
 class ReleaseSshIdentityContractTest(unittest.TestCase):
 

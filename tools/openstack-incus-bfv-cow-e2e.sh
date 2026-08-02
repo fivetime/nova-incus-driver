@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-IMAGE=${IMAGE:-alpine-3.21-cloud-incus-criu-bfv-raw}
+IMAGE=${IMAGE:-alpine-3.21-criu-bfv-fuse}
 VOLUME_TYPE=${VOLUME_TYPE:-ceph}
 CINDER_POOL=${CINDER_POOL:-cinder-volumes-rbd-pool}
 CINDER_USER=${CINDER_USER:-cinder}

@@ -736,10 +736,16 @@ class IncusComputeManager(manager.ComputeManager):
                             intent, assignment)):
                     raise incus_driver.incus_idmap.IDMapIntegrityError(
                         'Incus idmap generation changed during final delete')
+                # A re-read of None means this host is no longer in the
+                # allocation's host index, so its claim was already retired
+                # elsewhere; a migration that transferred ownership does
+                # exactly that. There is nothing left here to settle.
+                exact_claim = None
                 if local_claim is not None:
                     exact_claim = self._exact_idmap_host_claim(
                         allocator, assignment, host_id,
                         expected=local_claim)
+                if exact_claim is not None:
                     settled = self._settle_idmap_host_claim(
                         instance, exact_claim,
                         final_delete=(exact_claim.state in

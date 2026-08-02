@@ -178,6 +178,32 @@ class IncusComputeManagerTest(test.NoDBTestCase):
 
     @mock.patch.object(manager.manager.ComputeManager, '_delete_instance',
                        return_value=mock.sentinel.result)
+    def test_final_delete_tolerates_claim_retired_elsewhere(
+            self, base_delete):
+        """A migration that moved ownership already retired this claim.
+
+        _exact_idmap_host_claim returns None once this host leaves the
+        allocation's host index, and the delete path used to dereference
+        that None and abandon the release with an AttributeError.
+        """
+        instance = self._idmap_instance()
+        allocator = self.compute.driver.idmap_allocator
+        # The host left the allocation's index and its claim key is gone:
+        # that is exactly the state a completed ownership transfer leaves.
+        allocator.get.return_value = self._assignment(host_ids=())
+        allocator.get_host_claim.return_value = None
+        allocator.request_release.return_value = self.idmap_intent
+
+        result = self.compute._delete_instance(
+            mock.sentinel.context, instance, mock.sentinel.bdms)
+
+        self.assertIs(mock.sentinel.result, result)
+        self.compute.driver._settle_idmap_host_claim.assert_not_called()
+        allocator.retire_claim.assert_not_called()
+        allocator.release.assert_called_once_with(self.idmap_intent)
+
+    @mock.patch.object(manager.manager.ComputeManager, '_delete_instance',
+                       return_value=mock.sentinel.result)
     def test_final_delete_releases_lock_during_nova_deletion(
             self, base_delete):
         # driver.destroy (inside Nova's delete) takes the same per-instance

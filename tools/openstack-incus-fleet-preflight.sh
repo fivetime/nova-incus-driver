@@ -270,6 +270,35 @@ for node in "${nodes[@]}"; do
             "missing, unreadable, or overly permissive: ${idmap_password_file:-unset}"
     fi
 
+    # nova-compute writes the Cinder, Manila and spawn-attempt journals as the
+    # service user. A journal directory left owned by root silently fails every
+    # data-volume attach with "Permission denied" long after stack time.
+    journal_owner_check=$(remote "$target" \
+        "state_path=\$(crudini --get '$REMOTE_NOVA_CONFIG' DEFAULT state_path \
+             2>/dev/null); \
+         pid=\$(systemctl show devstack@n-cpu.service -p MainPID --value); \
+         user=\$(stat -c '%U' /proc/\$pid 2>/dev/null); \
+         bad=; \
+         for d in incus-volume-journal incus-share-journal \
+                 incus-spawn-attempts; do \
+             p=\"\$state_path/instances/\$d\"; \
+             test -d \"\$p\" || continue; \
+             owner=\$(stat -c '%U' \"\$p\"); \
+             mode=\$(stat -c '%a' \"\$p\"); \
+             if test \"\$owner\" != \"\$user\" || \
+                     test \$((8#\$mode & 077)) -ne 0; then \
+                 bad=\"\$bad \$d(\$owner:\$mode)\"; \
+             fi; \
+         done; \
+         if test -n \"\$bad\"; then printf 'BAD%s' \"\$bad\"; \
+         else printf 'ok:%s' \"\$user\"; fi" 2>/dev/null)
+    if [[ "$journal_owner_check" == ok:* ]]; then
+        pass "$host journal directories" "${journal_owner_check#ok:}"
+    else
+        fail "$host journal directories" \
+            "must be owned by the nova-compute user with no group/other access:${journal_owner_check#BAD}"
+    fi
+
     ceph_pool_lines=$(remote "$target" \
         "podman exec incus incus query '/1.0/storage-pools?recursion=1' | \
          jq -r '.[] | select(.driver==\"ceph\") | \

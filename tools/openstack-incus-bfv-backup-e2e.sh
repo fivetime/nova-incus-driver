@@ -3,7 +3,7 @@
 
 set -Eeuo pipefail
 
-IMAGE=${IMAGE:-alpine-3.21-cloud-incus-criu-bfv-raw}
+IMAGE=${IMAGE:-alpine-3.21-criu-bfv-fuse}
 FLAVOR=${FLAVOR:-ds512M}
 NETWORK=${NETWORK:-public}
 SOURCE_HOST=${SOURCE_HOST:-incus-node-01}
