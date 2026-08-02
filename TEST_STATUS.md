@@ -71,17 +71,43 @@ Known open items from this run:
   generation as dead; abort the attempt on every pre-check failure
   path; and make the GET/list endpoints show these records so
   ``openstack-incus-monitoring-audit.sh`` can scan for them.
-- **Live migration data path is proven; the failure is now in the
-  finalisation step.** With reservations cleared and the conductor
-  fixed (below), a real live migration transferred the instance to
-  incus-node-02: the CRIU restore log ends with ``Restore finished
-  successfully. Tasks resumed.`` and Nova's authoritative host changed.
-  The instance then went ERROR because Incus could not configure the
-  destination NIC (``ipv4: Address already assigned``) and stopped the
-  container, which Nova reports as ``CRIU-restored Incus instance is
-  not running``. Suspected ordering issue between destination VIF
-  pre-plugging and the CRIU restore; this is the next thing to
-  diagnose.
+- **Unconditional syscall interception breaks CRIU live migration for
+  every instance (regression, release blocker).**
+  ``flavor._data_volume_mounts`` is in ``_CONFIG_FILTER_MAP`` with no
+  gate, so every Nova Incus instance is created with
+  ``security.syscalls.intercept.mount=true``. After a CRIU restore LXC
+  cannot re-attach the seccomp notify proxy (``Failed to add seccomp
+  notify handler for 7 to mainloop`` -> ``lxc_poll: Failed to setup
+  seccomp proxy``) and the container is torn down, which Nova reports
+  as ``CRIU-restored Incus instance is not running``. The timeline is
+  conclusive: the live migration matrix passed on 2026-07-20 and the
+  interception was introduced on 2026-07-22 by ``611ca3d Require FUSE
+  mounts for Cinder data volumes``. Proven by experiment: unsetting
+  ``security.syscalls.intercept.mount`` and ``.mount.fuse`` on one
+  instance and restarting it made the same live migration succeed in
+  51 s, ACTIVE on incus-node-02, process and IP preserved, source
+  clean. Note that the ``ipv4/ipv6: Address already assigned`` lines in
+  the restore log are harmless noise about loopback; CRIU itself
+  reports ``Restore finished successfully. Tasks resumed.``
+  Fix requires deciding when interception is enabled — see the open
+  design question below.
+
+Open design question (needs a decision before the fix lands):
+
+- Interception is only needed by instances that actually mount Cinder
+  data volumes, and this project already refuses live migration for
+  instances that have Cinder volumes, so gating
+  ``_data_volume_mounts`` on the presence of data volumes would make
+  both capabilities coherent: volume-less instances become
+  live-migratable again, and volume-bearing instances keep interception
+  and remain barred from live migration as documented. ``to_profile``
+  already receives ``block_info``; the config filters would need their
+  signature widened to see it. The unresolved part is online attach to
+  an instance that was created without data volumes and therefore
+  without interception: either reject that attach, or rely on the
+  documented contract that guest images run ``fuse2fs`` explicitly.
+  Seccomp settings apply at container start, so enabling interception
+  later would require a restart the tenant did not ask for.
 - The matrix live case with ``INJECT_RESTORE_FAILURE=1`` has therefore
   still not produced its evidence, but the two blockers that hid the
   real behaviour are now understood (the reservation leak above and the
