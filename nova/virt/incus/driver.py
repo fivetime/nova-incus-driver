@@ -1491,6 +1491,23 @@ def _instance_storage_identity(client, instance_name):
     return identity
 
 
+def _live_migration_shares_root_storage(client, instance, container=None):
+    """Return whether this root moves by handover instead of by copy.
+
+    Both Ceph-backed drivers hand the same volume to the destination rather
+    than transferring its contents, so the source loses the right to touch
+    that volume as soon as the destination claims it.
+    """
+    try:
+        pool = _instance_root_pool(client, instance.name, container=container)
+    except Exception as exc:
+        LOG.debug(
+            'Treating the Incus root pool as unshared because its identity '
+            'could not be read: %s', exc, instance=instance)
+        return False
+    return pool.driver in ('ceph', 'cephext')
+
+
 def _preflight_shared_ceph_handover_destination(
         destination, pool_name, source_identity):
     """Prove the target supports deletion-safe shared Ceph ownership."""
@@ -11867,11 +11884,28 @@ class IncusDriver(driver.ComputeDriver):
                     reason='Incus live migration returned no source '
                            'operation UUID')
             migrate_data.source_operation_id = source_operation_id
-            with lockutils.lock(_profile_lock_name(instance)):
-                source_profile = self.client.profiles.get(instance.name)
-                source_profile.config[MIGRATION_OPERATION_KEY] = (
-                    source_operation_id)
-                source_profile.save(wait=True)
+            # Saving a profile makes Incus resync the instance's backup.yaml,
+            # which lives inside the root volume and therefore needs that
+            # volume mounted. Once a shared-storage handover has started the
+            # destination already holds the only permitted claim on it, so the
+            # write fails and takes the whole migration down with it. The
+            # operation UUID is carried to Nova in migrate_data above, and the
+            # recovery paths that consume this key enumerate the instance's
+            # migration operations themselves and treat it only as a hint, so
+            # skipping the durable copy costs nothing here.
+            if _live_migration_shares_root_storage(
+                    self.client, instance, container):
+                LOG.debug(
+                    'Skipping the source migration-operation profile write '
+                    'for a shared-storage root; the destination owns the '
+                    'volume for the rest of this migration',
+                    instance=instance)
+            else:
+                with lockutils.lock(_profile_lock_name(instance)):
+                    source_profile = self.client.profiles.get(instance.name)
+                    source_profile.config[MIGRATION_OPERATION_KEY] = (
+                        source_operation_id)
+                    source_profile.save(wait=True)
             # pylxd starts the source operation in live mode but does not
             # propagate that mode into the target InstanceSource payload.
             # Without this flag the target opens only the cold-migration

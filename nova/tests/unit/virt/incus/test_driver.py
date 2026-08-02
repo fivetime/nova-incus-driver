@@ -13264,6 +13264,39 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertIn(
             'migration_live_shared_ceph_storage', str(exc))
 
+    def test_shared_root_storage_detected_for_both_ceph_drivers(self):
+        """A shared root moves by handover, so the source must stop writing.
+
+        Saving a profile resyncs backup.yaml inside the root volume. Once
+        the destination claims a Ceph-backed root the source can no longer
+        mount it, and doing so anyway failed the whole live migration with
+        "RBD image is already in use".
+        """
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test-shared-root')
+
+        for pool_driver, shared in (
+                ('ceph', True), ('cephext', True),
+                ('zfs', False), ('dir', False)):
+            with mock.patch.object(
+                    driver, '_instance_root_pool',
+                    return_value=mock.Mock(driver=pool_driver)):
+                self.assertIs(
+                    shared,
+                    driver._live_migration_shares_root_storage(
+                        self.client, instance))
+
+    def test_shared_root_storage_unreadable_pool_is_not_shared(self):
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test-unreadable-pool')
+
+        with mock.patch.object(
+                driver, '_instance_root_pool',
+                side_effect=Exception('pool is gone')):
+            self.assertFalse(
+                driver._live_migration_shares_root_storage(
+                    self.client, instance))
+
     @mock.patch.object(driver, '_migration_client')
     def test_check_can_live_migrate_source_accepts_compatible_container(
             self, migration_client):
