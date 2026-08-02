@@ -71,8 +71,6 @@ class ToProfileTest(test.NoDBTestCase):
             'limits.processes': '1024',
             'security.idmap.isolated': 'True',
             'security.privileged': 'False',
-            'security.syscalls.intercept.mount': 'true',
-            'security.syscalls.intercept.mount.fuse': 'ext4=fuse2fs',
             'user.openstack.uuid': instance.uuid,
         })
         if 'limits.memory' in expected_config:
@@ -90,6 +88,53 @@ class ToProfileTest(test.NoDBTestCase):
         self.assertRaises(
             exception.InvalidConfiguration,
             flavor.data_volume_fuse_binaries)
+
+    def test_default_profile_carries_no_mount_interception(self):
+        """Interception must stay opt-in: it makes CRIU restore fail.
+
+        LXC cannot re-attach its seccomp notify proxy to CRIU-restored
+        processes, so an instance created with these keys can never be
+        live migrated. Enabling them by default silently destroyed live
+        migration fleet-wide once before (2026-07-22), which is what this
+        test exists to prevent.
+        """
+        ctx = context.get_admin_context()
+        instance = self._fake_instance(ctx, name='test-no-intercept')
+
+        config = flavor._data_volume_mounts(instance, self.client)
+
+        self.assertFalse(config)
+
+    def test_flavor_can_opt_into_mount_interception(self):
+        ctx = context.get_admin_context()
+        instance = self._fake_instance(ctx, name='test-intercept')
+        instance.flavor.extra_specs = {
+            flavor.MOUNT_INTERCEPT_EXTRA_SPEC: 'true'}
+
+        config = flavor._data_volume_mounts(instance, self.client)
+
+        self.assertEqual({
+            'security.syscalls.intercept.mount': 'true',
+            'security.syscalls.intercept.mount.fuse': 'ext4=fuse2fs',
+        }, config)
+
+    def test_mount_interception_opt_in_rejects_non_boolean(self):
+        ctx = context.get_admin_context()
+        instance = self._fake_instance(ctx, name='test-intercept-bad')
+        instance.flavor.extra_specs = {
+            flavor.MOUNT_INTERCEPT_EXTRA_SPEC: 'maybe'}
+
+        self.assertRaises(
+            exception.InvalidConfiguration,
+            flavor._data_volume_mounts, instance, self.client)
+
+    def test_mount_interception_opt_out_is_explicitly_honoured(self):
+        ctx = context.get_admin_context()
+        instance = self._fake_instance(ctx, name='test-intercept-off')
+        instance.flavor.extra_specs = {
+            flavor.MOUNT_INTERCEPT_EXTRA_SPEC: 'false'}
+
+        self.assertFalse(flavor._data_volume_mounts(instance, self.client))
 
     def test_to_profile(self):
         """A profile configuration is requested of the Incus client."""

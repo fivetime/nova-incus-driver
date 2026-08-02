@@ -318,6 +318,20 @@ in `TEST_STATUS.md`; this section keeps only the rules.
 - Do not enable `security.syscalls.intercept.mount.allowed=ext4`: tenant-owned
   filesystem input must not be parsed by the host kernel. Tenant images that
   mount Cinder ext4 data volumes must include `fuse2fs` and use it explicitly.
+- Seccomp mount interception (`security.syscalls.intercept.mount` plus
+  `.mount.fuse`) is off by default and must stay that way. It only adds the
+  convenience of letting a guest use plain `mount -t ext4` and `/etc/fstab`;
+  the security contract is identical either way because `fuse2fs` parses the
+  tenant filesystem in userspace in both cases. Its cost is absolute: LXC
+  cannot re-attach its seccomp notify proxy to CRIU-restored processes, so an
+  instance carrying these keys can never be live migrated. Enabling it for
+  every instance once destroyed live migration fleet-wide without any test
+  noticing. A workload that needs the convenience opts in per Flavor with
+  `incus:intercept_data_volume_mounts=true` and gives up live migration for
+  that instance; the choice is only effective at creation because seccomp
+  filters are installed when the container starts. Live migration with
+  attached Cinder data volumes is a supported, separately proven capability
+  and must not be traded away for this convenience.
 - Initial Cinder data-volume BDMs require the Glance capability property
   `hw_incus_data_volume_fuse=true`. Treat it as a fail-closed image admission
   contract; do not infer support merely from an image name. Online attachment

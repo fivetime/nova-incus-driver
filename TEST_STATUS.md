@@ -92,22 +92,40 @@ Known open items from this run:
   Fix requires deciding when interception is enabled — see the open
   design question below.
 
-Open design question (needs a decision before the fix lands):
+Correction to an earlier version of this entry: it claimed that this
+project refuses live migration for instances with Cinder volumes and
+proposed gating interception on the presence of data volumes. That
+premise is wrong. ``check_can_live_migrate_source`` calls
+``_validate_live_migration_data_volumes``, which *validates* that each
+``unix-block`` profile device matches a Nova data BDM rather than
+rejecting it, and the 2026-07-19/20 evidence below records a complete
+2x2x2 matrix passing with one Cinder data volume and one Manila share
+per case. Live migration with attached data volumes is a supported,
+previously proven capability; the AGENTS.md text about refusing Cinder
+volumes describes the original minimal scenario of the first
+implementation, not current behaviour.
 
-- Interception is only needed by instances that actually mount Cinder
-  data volumes, and this project already refuses live migration for
-  instances that have Cinder volumes, so gating
-  ``_data_volume_mounts`` on the presence of data volumes would make
-  both capabilities coherent: volume-less instances become
-  live-migratable again, and volume-bearing instances keep interception
-  and remain barred from live migration as documented. ``to_profile``
-  already receives ``block_info``; the config filters would need their
-  signature widened to see it. The unresolved part is online attach to
-  an instance that was created without data volumes and therefore
-  without interception: either reject that attach, or rely on the
-  documented contract that guest images run ``fuse2fs`` explicitly.
-  Seccomp settings apply at container start, so enabling interception
-  later would require a restart the tenant did not ask for.
+The real shape of the problem:
+
+- Seccomp mount interception and CRIU live migration are mutually
+  exclusive for a given container, because LXC cannot re-attach its
+  notify proxy to restored processes. Interception is a convenience so
+  that tenants can use plain ``mount -t ext4`` and ``/etc/fstab``; the
+  security contract is satisfied either way, because in both cases the
+  ext4 metadata is parsed by ``fuse2fs`` in userspace and never by the
+  host kernel.
+- Before 2026-07-22 no instance had interception, guests ran
+  ``fuse2fs`` explicitly as AGENTS.md documents, and live migration
+  with data volumes worked. Enabling interception for every instance
+  traded that proven capability for the convenience, silently and
+  fleet-wide.
+- The fix therefore should restore the default rather than narrow it:
+  do not enable interception by default, and if the convenience is
+  wanted for a particular workload, make it an explicit opt-in (Flavor
+  extra spec or image property) whose documented consequence is that
+  the instance cannot live migrate. Enabling it per instance also has
+  to happen at creation, because seccomp settings only apply at
+  container start.
 - The matrix live case with ``INJECT_RESTORE_FAILURE=1`` has therefore
   still not produced its evidence, but the two blockers that hid the
   real behaviour are now understood (the reservation leak above and the

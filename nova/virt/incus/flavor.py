@@ -154,7 +154,37 @@ def data_volume_fuse_binaries():
     return binaries
 
 
+MOUNT_INTERCEPT_EXTRA_SPEC = 'incus:intercept_data_volume_mounts'
+
+
+def mount_interception_requested(instance):
+    """Return whether this Flavor opted into guest mount interception.
+
+    Interception is what lets a guest use plain ``mount -t ext4`` and
+    ``/etc/fstab`` for a Cinder data volume: Incus catches the mount
+    syscall and performs it with the configured FUSE helper instead. It is
+    off by default because LXC cannot re-attach its seccomp notify proxy to
+    CRIU-restored processes, so any instance carrying it can never be live
+    migrated. Leaving it off costs no security: the guest runs the FUSE
+    helper explicitly and the tenant filesystem is still parsed in
+    userspace, never by the host kernel.
+    """
+    specs = getattr(instance.flavor, 'extra_specs', None) or {}
+    value = specs.get(MOUNT_INTERCEPT_EXTRA_SPEC)
+    if value is None:
+        return False
+    normalized = str(value).strip().lower()
+    if normalized in ('true', '1', 'yes'):
+        return True
+    if normalized in ('', 'false', '0', 'no'):
+        return False
+    raise exception.InvalidConfiguration(
+        'Flavor {} must be a boolean'.format(MOUNT_INTERCEPT_EXTRA_SPEC))
+
+
 def _data_volume_mounts(instance, _):
+    if not mount_interception_requested(instance):
+        return None
     data_volume_fuse_binaries()
     return {
         'security.syscalls.intercept.mount': 'true',
