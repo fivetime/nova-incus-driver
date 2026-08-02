@@ -49,13 +49,63 @@ Passed with archived logs (node01 ``/tmp/matrix-run4.log`` and task logs):
 
 Known open items from this run:
 
-- The matrix live case with ``INJECT_RESTORE_FAILURE=1`` fails before the
-  fork sees the migration: the destination
-  ``check_can_live_migrate_destination`` stalls >60 s after a Neutron
-  client call, the conductor RPC times out, and the reschedule excludes
-  the target (NoValidHost). Needs its own diagnosis; suspected WIP
-  destination-check fail-slow, possibly interacting with the armed CRIU
-  failpoint.
+- **Stale migration attempts are never reclaimed, and they compound.**
+  When a live migration fails during pre-check or scheduling, nothing
+  calls the attempt abort path, so the attempt stays at
+  ``state=active, finished=0`` forever. Because
+  ``GetMigrationAttemptIDMapReservations`` filters only on
+  ``finished = 0``, that isolated ID-map range stays reserved
+  permanently and every later migration of any instance whose range
+  overlaps is rejected with ``Migration attempt idmap reservation
+  overlaps another attempt``. Each failed migration locks one more
+  range. These records are also invisible to operators: ``GET
+  /1.0/migration-attempts/<token>`` answers ``not found`` for them, so
+  they can only be listed by reading the node database directly
+  (``sqlite3 /var/lib/incus/database/local.db "SELECT token,
+  resource_name, state, finished, idmap_base FROM migration_attempts
+  WHERE finished = 0;"``). Retire them through the protocol endpoint
+  (``incus query -X PUT -d '{"state":"aborted"}'
+  "/1.0/migration-attempts/<token>?project=nova"``), never by deleting
+  rows. Fix directions: use the already-present ``daemon_start`` column
+  (currently always 0) to treat attempts from a previous daemon
+  generation as dead; abort the attempt on every pre-check failure
+  path; and make the GET/list endpoints show these records so
+  ``openstack-incus-monitoring-audit.sh`` can scan for them.
+- **Live migration data path is proven; the failure is now in the
+  finalisation step.** With reservations cleared and the conductor
+  fixed (below), a real live migration transferred the instance to
+  incus-node-02: the CRIU restore log ends with ``Restore finished
+  successfully. Tasks resumed.`` and Nova's authoritative host changed.
+  The instance then went ERROR because Incus could not configure the
+  destination NIC (``ipv4: Address already assigned``) and stopped the
+  container, which Nova reports as ``CRIU-restored Incus instance is
+  not running``. Suspected ordering issue between destination VIF
+  pre-plugging and the CRIU restore; this is the next thing to
+  diagnose.
+- The matrix live case with ``INJECT_RESTORE_FAILURE=1`` has therefore
+  still not produced its evidence, but the two blockers that hid the
+  real behaviour are now understood (the reservation leak above and the
+  conductor deadlock below).
+
+Test-bed configuration requirement discovered by this run:
+
+- **``[conductor] workers`` must be at least 2 (we set 4).** DevStack
+  defaults to ``workers = 1``. The conductor blocks synchronously
+  waiting for ``check_can_live_migrate_destination``; the destination
+  compute then runs ``_claim_pci_for_instance_vifs`` ->
+  ``instance.get_network_info()``, whose lazy load has to travel back
+  to the conductor over RPC because compute processes run with
+  ``DISABLE_DB_ACCESS = True``. With a single worker that reply can
+  never be served, both sides wait out ``rpc_response_timeout``
+  (60 s by default), the conductor logs ``Skipping host: Timeout while
+  checking if we can live migrate``, and after all hosts are tried the
+  request fails with ``NoValidHost``. Cold migration is unaffected
+  because it does not nest synchronous RPCs this way. Applied on
+  incus-node-01 in both ``nova.conf`` and ``nova_cell1.conf`` (originals
+  kept as ``*.before-conductor-workers``) and reflected in
+  ``devstack/local.conf.sample``. This is a test-bed configuration
+  defect, not a driver defect, but any validation that exercises nested
+  synchronous RPC needs it.
 - Eleven defects were found and fixed by this validation (spawn attempt
   journal threading, empty RBD image-meta parse, final-delete release
   lock self-deadlock, versioned protocol extension names in production

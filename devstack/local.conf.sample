@@ -129,6 +129,18 @@ disable_service cinder c-sch c-api c-vol
 [DEFAULT]
 allow_resize_to_same_host = False
 
+[conductor]
+# Live migration needs at least two conductor workers. The conductor
+# blocks waiting for check_can_live_migrate_destination, and the
+# destination compute's get_network_info() lazy load has to travel back
+# to the conductor over RPC because compute runs with DB access
+# disabled. With DevStack's default of one worker those two waits
+# deadlock until rpc_response_timeout expires, every host is skipped
+# with "Timeout while checking if we can live migrate", and the request
+# fails with NoValidHost. Cold migration does not nest RPCs this way
+# and is unaffected.
+workers = 4
+
 [scheduler]
 discover_hosts_in_cells_interval = 2
 

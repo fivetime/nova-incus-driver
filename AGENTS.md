@@ -289,6 +289,25 @@ in `TEST_STATUS.md`; this section keeps only the rules.
   Never claim automatic BFV recovery when a compute still starts the stock
   `nova-compute` binary.
 
+### Migration attempt fencing and conductor concurrency
+
+- A migration attempt reserves its isolated ID-map range for as long as it is
+  unfinished, so every pre-check failure path must retire its own attempt.
+  An attempt left at `state=active` keeps that range reserved permanently and
+  blocks all later migrations that overlap it, one range per failed attempt.
+  Retire attempts only through the protocol endpoint (`PUT` with
+  `{"state": "aborted"}`); never delete rows from the node database. Treat an
+  attempt that the API cannot show but whose reservation still fences new
+  migrations as a defect in reclamation, not as a reason to bypass the fence.
+- Live migration requires `[conductor] workers` to be at least 2. The conductor
+  blocks waiting for `check_can_live_migrate_destination` while the destination
+  compute's `get_network_info()` lazy load travels back to the conductor over
+  RPC, because compute processes run with database access disabled. A single
+  worker cannot serve that reply, so both waits expire at
+  `rpc_response_timeout` and every candidate host is skipped with a timeout
+  until the request fails with `NoValidHost`. Cold migration does not nest
+  synchronous RPCs this way.
+
 ### Data-volume attachment and filesystem safety
 
 - Cinder data-volume attach/detach is executed by host-side os-brick, not by
