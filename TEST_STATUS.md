@@ -47,6 +47,35 @@ Passed with archived logs (node01 ``/tmp/matrix-run4.log`` and task logs):
   pending + tombstone + no instance record) converged on retry once GNU
   date was present; pool returned to pristine.
 
+Live migration re-proven on the current candidate (2026-08-02, after the
+interception fix):
+
+- ``local_basic``: three-hop ring incus-node-01 -> 02 -> 03 -> 01, PID
+  held at 649 across every hop, guest counter 19 -> 274, managed root
+  RBD ID unchanged, residual-state audit clean.
+- ``local_data`` (one Cinder data volume): same three-hop ring, PID held
+  at 653, counter 36 -> 330, the data volume followed the instance, root
+  RBD ID unchanged, residual audit clean. This restores the capability
+  the 2026-07-19/20 matrix had proven and the 2026-07-22 interception
+  commit had silently destroyed.
+
+Two test-bed defects had to be cleared to get there, neither of them in
+driver code:
+
+- The Alpine test image had no ``fuse2fs``, so the online-attach probe
+  added by the same 2026-07-22 commit rejected every data volume. In
+  Alpine ``fuse2fs`` is its own package, not part of
+  ``e2fsprogs-extra``. Rebuilt and published as
+  ``alpine-3.21-cloud-incus-criu-fuse``; the publish script only
+  understood ``apt-get`` and now has an ``apk`` branch, and it stamps
+  ``hw_incus_data_volume_fuse=true`` automatically once the binary is
+  present.
+- ``incus-volume-journal`` on incus-node-02 was owned by ``root`` with
+  mode 755 while nova-compute runs as ``stack``, so every data-volume
+  attach failed with ``Permission denied``. All three nodes are now
+  ``stack:incus-admin`` mode 700. This is exactly the kind of silent
+  environment drift that belongs in the fleet preflight.
+
 Known open items from this run:
 
 - **Stale migration attempts are never reclaimed, and they compound.**

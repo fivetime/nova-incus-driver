@@ -64,25 +64,44 @@ if [[ "$PREINSTALL_SSH" == "true" || -n "$PREINSTALL_PACKAGES" ]]; then
     mount --bind /dev "$rootfs/dev"
     mount -t proc proc "$rootfs/proc"
     mount -t sysfs sys "$rootfs/sys"
-    chroot "$rootfs" apt-get -o Acquire::ForceIPv4=true update
+
     packages=($PREINSTALL_PACKAGES)
-    if [[ "$PREINSTALL_SSH" == "true" ]]; then
-        packages+=(openssh-server)
-    fi
-    if ((${#packages[@]})); then
-        chroot "$rootfs" env DEBIAN_FRONTEND=noninteractive \
-            apt-get -o Acquire::ForceIPv4=true install -y \
-            --no-install-recommends "${packages[@]}"
-    fi
-    if [[ "$PREINSTALL_SSH" == "true" ]]; then
-        chroot "$rootfs" systemctl enable ssh
+    if [[ -x "$rootfs/sbin/apk" || -x "$rootfs/usr/bin/apk" ]]; then
+        # Alpine bases such as the CRIU test image. Package names differ from
+        # Debian: fuse2fs ships in e2fsprogs-extra.
+        if [[ "$PREINSTALL_SSH" == "true" ]]; then
+            packages+=(openssh)
+        fi
+        if ((${#packages[@]})); then
+            chroot "$rootfs" apk add --no-cache "${packages[@]}"
+        fi
+        if [[ "$PREINSTALL_SSH" == "true" ]]; then
+            chroot "$rootfs" rc-update add sshd default
+        fi
+        rm -f "$rootfs"/etc/ssh/ssh_host_*
+        rm -f "$rootfs/etc/resolv.conf"
+    else
+        chroot "$rootfs" apt-get -o Acquire::ForceIPv4=true update
+        if [[ "$PREINSTALL_SSH" == "true" ]]; then
+            packages+=(openssh-server)
+        fi
+        if ((${#packages[@]})); then
+            chroot "$rootfs" env DEBIAN_FRONTEND=noninteractive \
+                apt-get -o Acquire::ForceIPv4=true install -y \
+                --no-install-recommends "${packages[@]}"
+        fi
+        if [[ "$PREINSTALL_SSH" == "true" ]]; then
+            chroot "$rootfs" systemctl enable ssh
+        fi
+
+        # Instances must generate unique host identities on first boot.
+        rm -f "$rootfs"/etc/ssh/ssh_host_*
+        rm -rf "$rootfs/var/lib/apt/lists"/*
+        rm -f "$rootfs/etc/resolv.conf"
+        ln -s ../run/systemd/resolve/stub-resolv.conf \
+            "$rootfs/etc/resolv.conf"
     fi
 
-    # Instances must generate unique host identities on first boot.
-    rm -f "$rootfs"/etc/ssh/ssh_host_*
-    rm -rf "$rootfs/var/lib/apt/lists"/*
-    rm -f "$rootfs/etc/resolv.conf"
-    ln -s ../run/systemd/resolve/stub-resolv.conf "$rootfs/etc/resolv.conf"
     cleanup_chroot_mounts
     trap - EXIT
 fi
