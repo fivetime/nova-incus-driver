@@ -848,8 +848,18 @@ inject_and_verify_restore_rollback() {
 
     wait_status ACTIVE
     wait_host "$current_host"
-    [[ "$(incus_remote "$current_ssh" list "$instance_name" \
-        --format csv -c s)" == RUNNING ]]
+    # Nova reports ACTIVE once the control-plane rollback completes; the
+    # driver's finalize step restarts the source from its checkpoint shortly
+    # after, so observe RUNNING within the deadline instead of one-shot.
+    deadline=$((SECONDS + TIMEOUT))
+    until [[ "$(incus_remote "$current_ssh" list "$instance_name" \
+        --format csv -c s)" == RUNNING ]]; do
+        ((SECONDS < deadline)) || {
+            echo "Source instance did not return to RUNNING after rollback" >&2
+            return 1
+        }
+        sleep 2
+    done
     assert_fails "target instance must be absent after rollback" \
         incus_remote "$target_ssh" info "$instance_name" >/dev/null 2>&1
 

@@ -1229,6 +1229,28 @@ class IncusComputeManager(manager.ComputeManager):
                     context.elevated(), instance, requested_networks)
             return result
 
+    def _rollback_live_migration(self, context, instance,
+                                 dest, migrate_data=None,
+                                 migration_status='failed',
+                                 source_bdms=None,
+                                 pre_live_migration=False):
+        """Restore the source runtime after the control-plane rollback.
+
+        rollback_live_migration_at_source deliberately leaves the source
+        container fenced (stopped): Cinder attachment IDs, Neutron bindings,
+        destination os-brick mappings and Manila mounts are only reverted by
+        the base rollback that follows it. Only after those complete may the
+        driver restore shared-storage ownership and restart the source from
+        its checkpoint, so run the completion step after the base rollback.
+        """
+        super()._rollback_live_migration(
+            context, instance, dest, migrate_data=migrate_data,
+            migration_status=migration_status, source_bdms=source_bdms,
+            pre_live_migration=pre_live_migration)
+        self._complete_live_migration_rollback(
+            context, instance, migrate_data,
+            pre_live_migration=pre_live_migration)
+
     def _complete_live_migration_rollback(
             self, context, instance, migrate_data,
             pre_live_migration=False):

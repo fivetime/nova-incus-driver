@@ -1309,6 +1309,40 @@ class IncusComputeManagerTest(test.NoDBTestCase):
             (mock.sentinel.cleanup, mock.sentinel.destroy_disks), result)
         base_flags.assert_called_once_with(data, migr_ctxt=migr_ctxt)
 
+    @mock.patch.object(
+        manager.manager.ComputeManager, '_rollback_live_migration')
+    def test_rollback_live_migration_finalizes_after_base_rollback(
+            self, base_rollback):
+        ctxt = context.get_admin_context()
+        instance = mock.sentinel.instance
+        data = migrate_data.IncusLiveMigrateData()
+        calls = []
+        base_rollback.side_effect = (
+            lambda *a, **kw: calls.append('base'))
+        finalize = self.compute.driver.finalize_live_migration_rollback
+        finalize.side_effect = (
+            lambda *a, **kw: calls.append('finalize'))
+
+        self.compute._rollback_live_migration(
+            ctxt, instance, 'dest-host', migrate_data=data)
+
+        self.assertEqual(['base', 'finalize'], calls)
+        finalize.assert_called_once_with(ctxt, instance, data)
+
+    @mock.patch.object(
+        manager.manager.ComputeManager, '_rollback_live_migration')
+    def test_rollback_live_migration_pre_live_skips_finalize(
+            self, base_rollback):
+        data = migrate_data.IncusLiveMigrateData()
+
+        self.compute._rollback_live_migration(
+            mock.sentinel.context, mock.sentinel.instance, 'dest-host',
+            migrate_data=data, pre_live_migration=True)
+
+        base_rollback.assert_called_once()
+        finalize = self.compute.driver.finalize_live_migration_rollback
+        finalize.assert_not_called()
+
     def test_complete_live_migration_rollback_reasserts_network(self):
         ctxt = context.get_admin_context()
         instance = mock.sentinel.instance
