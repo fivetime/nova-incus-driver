@@ -11,6 +11,64 @@ Entries are append-mostly and are release evidence, not permanent
 configuration. Each release must re-validate against its own approved
 digest/revision pair.
 
+## 2026-08-03 BFV live-migration matrix complete (backup.yaml handover fix)
+
+Runtime: all three nodes upgraded to
+``incus-quadlet-candidate:776a23411-dirty-20260803-r5`` (r4 + the fork
+backup.yaml handover gate, fork commit ``bbb222ed3``). Podman deployment
+trap: ``docker save`` tarballs load as ``docker.io/library/...`` while the
+quadlet references ``localhost/...``, so every ``podman load`` must be
+followed by ``podman tag`` or the service loops trying to pull from a
+nonexistent localhost registry.
+
+The last BFV live-migration blocker was misdiagnosed until the Incus error
+text was read carefully: ``The following instances failed to update
+(profile change still saved)`` means the profile change — the durable
+cleanup-recovery marker Nova writes in ``post_live_migration`` — had
+already persisted in the Incus database. Only the per-instance
+``backup.yaml`` resync failed, because it mounts the root volume while the
+migration destination holds the sole RBD watcher. backup.yaml is a
+convenience copy of database state, so the fix is to not write it during
+the handover window, exactly as libvirt never writes domain metadata into
+shared volumes mid-migration:
+
+- Fork ``bbb222ed3``: ``instance.StorageHandoverInProgress`` (any of the
+  handover / receive-complete / delete-protection markers) gates both the
+  lxc and qemu ``UpdateBackupFile``; a recoverably stale backup.yaml is
+  preferred over mounting storage whose authoritative owner may be
+  remote — the same contract ``DeleteInstance`` already follows.
+- Driver ``54b97a0``: the source ``MIGRATION_OPERATION_KEY`` profile write
+  in ``live_migration`` is skipped for shared-storage roots
+  (``_live_migration_shares_root_storage``, keyed on the root pool driver
+  ceph/cephext, failing open to the write). The key is a redundant hint:
+  ``_settle_instance_migration_operations`` enumerates operations itself.
+
+With both layers deployed the full BFV half of the 2x2x2 matrix passed in
+sequence on the three-node ring (01 -> 02 -> 03 -> 01, all-confirm,
+residual-state audit clean, logs node01 ``/tmp/lmbfv5.log`` and
+``/tmp/lmbfv6.log``):
+
+- ``bfv_basic``: PID 653 held, counter 9 -> 266.
+- ``bfv_data`` (one Cinder data volume): PID 653 held, counter 22 -> 296,
+  volume followed.
+- ``bfv_manila`` (one Manila share): PID 282 held, counter 19 -> 276,
+  share followed.
+- ``bfv_data_manila``: PID 282 held, counter 36 -> 313, volume and share
+  both followed.
+
+Together with the 2026-08-02 local half this re-proves the complete
+2x2x2 live-migration matrix on the current candidate. Housekeeping: the
+two obsolete Glance images (``alpine-3.21-cloud-incus-criu`` and
+``alpine-3.21-cloud-incus-criu-bfv-raw``) are deleted; the published set
+is ``alpine-3.21-cloud-incus-criu-fuse`` and ``alpine-3.21-criu-bfv-fuse``.
+Matrix invocations from node01 need ``SSH_IDENTITY=/root/.ssh/
+openstack-incus-test`` and a sourced admin openrc.
+
+Still open from the 2026-08-02 entry: the stale-migration-attempt
+reservation leak (blocks the ``INJECT_RESTORE_FAILURE=1`` evidence), the
+stranded cleanup-token recovery gap, and the initial-data-volume console
+marker failure.
+
 ## 2026-08-02 P0 three-node fault validation (candidate still NO-GO overall)
 
 Runtime: all three nodes on locally built image
