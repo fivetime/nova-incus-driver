@@ -3399,6 +3399,27 @@ def _share_guest_path(share_mapping):
     return '/mnt/manila/' + share_mapping.tag
 
 
+def _save_profile_marker(profile):
+    """Persist a durable profile marker, tolerating backup.yaml resync noise.
+
+    Incus commits the profile change to its database before propagating it
+    into each member instance's backup.yaml; a propagation failure surfaces
+    as an API error that says "profile change still saved". The propagation
+    mounts the instance's root volume, which is impossible for records
+    inside a shared-storage handover or a migration receive/teardown
+    window, but the marker the caller needs is already durable at that
+    point, so such failures must not abort the caller's operation.
+    """
+    try:
+        profile.save(wait=True)
+    except incus_exceptions.LXDAPIException as error:
+        if 'profile change still saved' not in str(error):
+            raise
+        LOG.warning(
+            'Profile marker for %s persisted, but its backup.yaml resync '
+            'failed; continuing: %s', profile.name, error)
+
+
 def _profile_lock_name(instance):
     """Serialize full Incus profile updates for one Nova instance."""
     return 'incus-profile-{}'.format(instance.uuid)
@@ -8234,7 +8255,7 @@ class IncusDriver(driver.ComputeDriver):
         profile = self.client.profiles.get(instance.name)
         profile.config[MIGRATION_RECOVERY_KEY] = (
             'running' if power_on else 'stopped')
-        profile.save(wait=True)
+        _save_profile_marker(profile)
         LOG.warning(
             'Marked claimed migration target for automatic recovery',
             instance=instance)
@@ -8251,7 +8272,7 @@ class IncusDriver(driver.ComputeDriver):
                     'Refusing to journal cleanup on an Incus profile not '
                     'owned by the Nova instance')
             profile.config[CLEANUP_RECOVERY_KEY] = 'true'
-            profile.save(wait=True)
+            _save_profile_marker(profile)
 
     @_invalidates_instance_inventory
     def recover_migration_target(
@@ -11930,7 +11951,7 @@ class IncusDriver(driver.ComputeDriver):
                                    'token does not match')
                     target_profile.config[MIGRATION_TARGET_OPERATION_KEY] = (
                         operation_id)
-                    target_profile.save(wait=True)
+                    _save_profile_marker(target_profile)
 
             self._with_rootfs_materialization_barrier(
                 destination_materialization,

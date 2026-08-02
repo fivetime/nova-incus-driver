@@ -15313,3 +15313,33 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertFalse(assessment.release_host)
         self.assertFalse(assessment.release_placement)
         self.assertIn('mapping is uncertain', ' '.join(assessment.reasons))
+
+
+class SaveProfileMarkerTest(test.NoDBTestCase):
+    """The durable-marker save tolerates backup.yaml resync failures only."""
+
+    def test_plain_save_passes_through(self):
+        profile = mock.Mock(name='profile')
+        driver._save_profile_marker(profile)
+        profile.save.assert_called_once_with(wait=True)
+
+    def test_backup_file_resync_failure_is_tolerated(self):
+        profile = mock.Mock(name='profile')
+        profile.name = 'instance-00000001'
+        profile.save.side_effect = incus_api_exception(
+            500,
+            'The following instances failed to update (profile change '
+            'still saved):\n - Project: nova, Instance: instance-00000001: '
+            'Failed to write backup file: Failed getting instance pool: '
+            'Instance storage pool not found')
+        driver._save_profile_marker(profile)
+        profile.save.assert_called_once_with(wait=True)
+
+    def test_other_api_errors_still_raise(self):
+        profile = mock.Mock(name='profile')
+        profile.name = 'instance-00000001'
+        profile.save.side_effect = incus_api_exception(
+            404, 'Profile not found')
+        self.assertRaises(
+            incuscore_exceptions.LXDAPIException,
+            driver._save_profile_marker, profile)
