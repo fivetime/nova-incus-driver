@@ -22,7 +22,7 @@ from oslo_utils import versionutils
 class IncusLiveMigrateData(migrate_data.LiveMigrateData):
     """Incus destination facts carried through Nova's migration RPCs."""
 
-    VERSION = '1.1'
+    VERSION = '1.4'
 
     fields = {
         'destination_address': fields.StringField(),
@@ -32,9 +32,27 @@ class IncusLiveMigrateData(migrate_data.LiveMigrateData):
         # JSON keeps the nested Incus device mapping opaque to Nova objects
         # while carrying the exact source profile into destination preflight.
         'source_profile': fields.StringField(nullable=True),
+        # Per-attempt fencing token used for positive destination cleanup
+        # acknowledgement during rollback.
+        'cleanup_token': fields.StringField(),
+        # Incus operation identities are carried explicitly so rollback can
+        # cancel and prove terminal both sides before it restores the source.
+        'source_operation_id': fields.StringField(nullable=True),
+        'destination_operation_id': fields.StringField(nullable=True),
+        # Fixed isolated idmap reserved by the target-side migration fence.
+        'idmap_base': fields.IntegerField(),
+        'idmap_size': fields.IntegerField(),
     }
 
     def obj_make_compatible(self, primitive, target_version):
         super().obj_make_compatible(primitive, target_version)
         if versionutils.convert_version_to_tuple(target_version) < (1, 1):
             primitive.pop('source_profile', None)
+        if versionutils.convert_version_to_tuple(target_version) < (1, 2):
+            primitive.pop('cleanup_token', None)
+        if versionutils.convert_version_to_tuple(target_version) < (1, 3):
+            primitive.pop('source_operation_id', None)
+            primitive.pop('destination_operation_id', None)
+        if versionutils.convert_version_to_tuple(target_version) < (1, 4):
+            primitive.pop('idmap_base', None)
+            primitive.pop('idmap_size', None)

@@ -7,6 +7,7 @@ IMAGE=${IMAGE:-cirros-0.6.3-x86_64-incus}
 FLAVOR=${FLAVOR:-c1}
 NETWORK=${NETWORK:-private}
 SERVER=${SERVER:-incus-e2e-$RANDOM}
+server_id=
 TIMEOUT=${TIMEOUT:-90}
 INCUS_PROJECT=${INCUS_PROJECT:-nova}
 
@@ -19,29 +20,32 @@ wait_status() {
     local deadline=$((SECONDS + TIMEOUT))
     local current
     while ((SECONDS < deadline)); do
-        current=$(openstack server show "$SERVER" -f value -c status 2>/dev/null || true)
+        current=$(openstack server show "$server_id" -f value -c status 2>/dev/null || true)
         [[ "$current" == "$expected" ]] && return 0
         [[ "$current" == "ERROR" ]] && break
         sleep 2
     done
-    openstack server show "$SERVER" || true
+    openstack server show "$server_id" || true
     echo "Server did not reach $expected (current: ${current:-missing})" >&2
     return 1
 }
 
 cleanup() {
-    openstack server delete "$SERVER" >/dev/null 2>&1 || true
+    if [[ -n "$server_id" ]]; then
+        openstack server delete "$server_id" >/dev/null 2>&1 || true
+    fi
 }
 trap cleanup EXIT
 
-openstack server create \
+server_id=$(openstack server create \
     --flavor "$FLAVOR" \
     --image "$IMAGE" \
     --network "$NETWORK" \
-    --wait "$SERVER" >/dev/null
+    -f value -c id \
+    "$SERVER")
+[[ "$server_id" =~ ^[0-9a-fA-F-]{36}$ ]]
 wait_status ACTIVE
 
-server_id=$(openstack server show "$SERVER" -f value -c id)
 port_id=$(openstack port list --server "$server_id" -f value -c ID)
 fixed_ip=$(openstack port show "$port_id" -f json -c fixed_ips |
     python3 -c 'import ast,json,sys; value=json.load(sys.stdin)["fixed_ips"]; value=ast.literal_eval(value) if isinstance(value,str) else value; print(value[0]["ip_address"])')
@@ -73,16 +77,16 @@ iface=$(ovs-vsctl --data=bare --no-heading --columns=name find Interface \
 
 incus_nova exec "$instance_name" -- sh -c \
     "printf '%s\n' '$server_id' > /root/openstack-incus-e2e && sync"
-openstack server stop "$SERVER"
+openstack server stop "$server_id"
 wait_status SHUTOFF
-openstack server start "$SERVER"
+openstack server start "$server_id"
 wait_status ACTIVE
-openstack server reboot --hard "$SERVER"
+openstack server reboot --hard "$server_id"
 wait_status ACTIVE
 [[ "$(incus_nova exec "$instance_name" -- cat /root/openstack-incus-e2e)" == "$server_id" ]]
 
 # Rebuild must replace the rootfs while preserving the Neutron attachment.
-openstack server rebuild --image "$IMAGE" "$SERVER" >/dev/null
+openstack server rebuild --image "$IMAGE" "$server_id" >/dev/null
 wait_status ACTIVE
 [[ "$(openstack port list --server "$server_id" -f value -c ID)" == "$port_id" ]]
 ! incus_nova exec "$instance_name" -- test -e /root/openstack-incus-e2e
@@ -92,7 +96,7 @@ iface=$(ovs-vsctl --data=bare --no-heading --columns=name find Interface \
 [[ "$(ovs-vsctl get Interface "$iface" external_ids:ovn-installed)" == '"true"' ]]
 
 trap - EXIT
-openstack server delete "$SERVER"
+openstack server delete "$server_id"
 deadline=$((SECONDS + TIMEOUT))
 while openstack server show "$server_id" >/dev/null 2>&1; do
     ((SECONDS < deadline)) || { echo "Server deletion timed out" >&2; exit 1; }

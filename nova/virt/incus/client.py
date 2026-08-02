@@ -21,6 +21,9 @@ from nova.virt.incus import config
 config.register_opts()
 
 
+_CONFIGURED_PROJECT = object()
+
+
 def _client_certificate(options):
     if options.tls_cert is None and options.tls_key is None:
         return None
@@ -31,11 +34,13 @@ def _client_certificate(options):
     return options.tls_cert, options.tls_key
 
 
-def get_client(conf=cfg.CONF):
+def get_client(conf=cfg.CONF, project=_CONFIGURED_PROJECT):
     """Create an SDK client for the host-local Incus daemon."""
     options = conf.incus
     endpoint = options.endpoint
     verify = options.tls_ca if options.tls_ca else True
+    if project is _CONFIGURED_PROJECT:
+        project = options.project
 
     if endpoint.startswith("/"):
         cert = None
@@ -48,7 +53,7 @@ def get_client(conf=cfg.CONF):
         cert=cert,
         verify=verify,
         timeout=options.request_timeout,
-        project=options.project,
+        project=project,
     )
 
 

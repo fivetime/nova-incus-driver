@@ -11,6 +11,97 @@ Entries are append-mostly and are release evidence, not permanent
 configuration. Each release must re-validate against its own approved
 digest/revision pair.
 
+## 2026-08-02 P0 three-node fault validation (candidate still NO-GO overall)
+
+Runtime: all three nodes on locally built image
+``incus-quadlet-candidate:776a23411-dirty-20260802-r4`` (merged upstream +
+fork patches + empty-metadata parse fix + GNU coreutils for ``rbd trash
+mv``); driver tree deployed from this worktree; shared root pool recreated
+on every node with distinct ``ceph.rbd.image_prefix`` (node01-/node02-/
+node03-) after discovering the prefixes had been lost in the 2026-07-26
+rebuild. Registry: dedicated TLS etcd, namespace ``region-one-cell1``.
+
+Passed with archived logs (node01 ``/tmp/matrix-run4.log`` and task logs):
+
+- ``tox -e py312,pep8``: 500 driver/manager/idmap unit tests + 156 script
+  contract tests, all green on the exact deployed tree.
+- ``openstack-incus-idmap-conflict-e2e.sh`` on all three nodes:
+  destination rejects an overlapping isolated idmap without persisting
+  state. Full spawn->delete lifecycle proven around it; etcd registry
+  returned to its 2-orphan baseline afterwards (zero leakage).
+- ``openstack-incus-bfv-delete-protection-e2e.sh`` across all three
+  computes: Nova delete released but never deleted the Cinder root
+  (immutable image and pool IDs unchanged, zero attachments/watchers/
+  instances/profiles/mappings fleet-wide); Cinder delete then removed the
+  exact ``rbd_header``. Requires the re-published BFV image ``7e55e290``
+  carrying the ``.incus-idmap`` provenance marker.
+- ``openstack-incus-ceph-exact-delete-aba-e2e.sh`` (node01 orchestrator):
+  dependent-clone delete failure -> identity tombstone -> same-name
+  replacement B -> retried delete removed exactly A, preserved B, and the
+  v2 receipt digest replayed idempotently.
+- ``openstack-incus-ceph-ownership-migration-matrix.sh`` cold case:
+  node01->node02 confirm, ->node01 revert, ->node03 confirm; CRIU-visible
+  PID and counters continuous, managed root RBD ID stable across all
+  three ownership transfers.
+- Interrupted exact-delete recovery: a delete killed mid-flight (receipt
+  pending + tombstone + no instance record) converged on retry once GNU
+  date was present; pool returned to pristine.
+
+Known open items from this run:
+
+- The matrix live case with ``INJECT_RESTORE_FAILURE=1`` fails before the
+  fork sees the migration: the destination
+  ``check_can_live_migrate_destination`` stalls >60 s after a Neutron
+  client call, the conductor RPC times out, and the reschedule excludes
+  the target (NoValidHost). Needs its own diagnosis; suspected WIP
+  destination-check fail-slow, possibly interacting with the armed CRIU
+  failpoint.
+- Eleven defects were found and fixed by this validation (spawn attempt
+  journal threading, empty RBD image-meta parse, final-delete release
+  lock self-deadlock, versioned protocol extension names in production
+  preflight, busybox date breaking ``rbd trash mv``, release-ACK receipt
+  type mismatch, Cinder encryption metadata false positive, printf
+  continuation argument splitting in three e2e helpers, ``jq fromjson``
+  misuse, unqualified ``rbd clone`` destination pool, and the shared-Ceph
+  destination preflight reading redacted pool config through the
+  restricted identity). The preflight now defers exact cluster/source
+  equality to the Incus migration negotiation whenever the destination
+  redacts pool config, and rejects driver-class mismatches outright.
+- etcd registry carries two pre-existing orphans (allocation
+  ``b04e0f9e`` slot 106 with no claims; proof-less claim ``b87f9694``
+  slot 1747). Both are artifacts of pre-fix code, block nothing, and
+  require the frozen-fleet registry CLI to retire.
+- node02 retains the stale ``incus-ceph-node02`` pool whose OSD pool
+  deletion needs Ceph admin-plane credentials.
+
+## 2026-07-31 current candidate release evidence (NO-GO)
+
+- The current worktree contains the new shared-Ceph fencing/idmap changes,
+  initial-data-volume and BFV-snapshot public API scripts, Manila destination
+  staging and rollback changes, Cinder recovery journals, inventory
+  performance work, and the fail-closed 100/500/1,000 scale runner.
+- Unit, static, documentation, and script-contract results do not replace
+  destructive evidence for the exact candidate. At the time of this entry the
+  current candidate has not yet completed the three-node public API E2Es, the
+  BFV fault matrix, the complete local/BFV + Cinder + Manila migration
+  matrices, the full Tempest selection, or the real 100/500/1,000 concurrent
+  instance run.
+- Historical results below remain useful regression context, but they do not
+  authorize a production release of this candidate. The release decision
+  remains ``NO-GO`` until the aggregate gate archives failure-free evidence
+  and exact-ID cleanup for all required phases.
+- Cinder recovery journals deliberately omit credentials. Automatic
+  crash-recovery evidence applies to the production Ceph RBD connector with a
+  reusable, protected host keyring. Non-RBD connectors that depend on
+  expiring or one-time ``connection_info`` secrets remain unsupported until
+  connector-specific credential reacquisition and crash recovery are proven.
+- The release gate now requires runtime namespace inspection of every listed
+  ``nova-api`` replica and every Incus ``nova-compute`` before Manila
+  migration evidence can run. It also requires real NFS and CephFS shares,
+  snapshot-capable types, and a successful public-API snapshot/restore cycle
+  on both backends. These checks have not yet run against the current
+  candidate, so their presence does not change the ``NO-GO`` decision.
+
 ## Dedicated test topology
 
 - `root@10.224.0.15` (`incus-node-01`) is the DevStack controller and first

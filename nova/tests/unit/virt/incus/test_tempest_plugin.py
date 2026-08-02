@@ -12,7 +12,6 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import configparser
 from importlib import metadata
 import os
 
@@ -22,18 +21,14 @@ from nova import test
 class TempestPluginPackagingTest(test.NoDBTestCase):
 
     def test_entry_point_loads_packaged_plugin(self):
-        repo_root = os.path.abspath(os.path.join(
-            os.path.dirname(__file__), '..', '..', '..', '..', '..'))
-        setup_cfg = configparser.ConfigParser()
-        setup_cfg.read(os.path.join(repo_root, 'setup.cfg'))
-        configured = setup_cfg.get(
-            'entry_points', 'tempest.test_plugins').strip()
-        entry_point_name, entry_point_value = (
-            value.strip() for value in configured.split('=', 1))
-        entry_point = metadata.EntryPoint(
-            name=entry_point_name,
-            value=entry_point_value,
-            group='tempest.test_plugins')
+        entry_points = [
+            entry_point
+            for entry_point in metadata.entry_points(
+                group='tempest.test_plugins')
+            if entry_point.name == 'nova-incus-tempest-plugin'
+        ]
+        self.assertEqual(1, len(entry_points))
+        entry_point = entry_points[0]
 
         self.assertEqual('nova-incus-tempest-plugin', entry_point.name)
         self.assertEqual(

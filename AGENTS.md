@@ -81,6 +81,19 @@ implementing changes.
   access. Restricted Incus projects may be added as defense in depth, but are
   not the source of OpenStack tenant identity or a prerequisite for Nova
   multi-tenancy.
+- Fleet-wide isolated ID maps are durable ownership records, not disposable
+  spawn metadata. The shared etcd v3 registry stores an exact allocation
+  generation plus the sorted set of persistent Nova ``compute_id`` UUIDs that
+  may still retain local resources. A clean migration rollback or source
+  cleanup retires only that compute's claim. Final Nova deletion first creates
+  an immutable shared release intent, which blocks new claims; the ID range is
+  released only after Nova is deleted and every claimed compute has proved its
+  local Incus instance, profile, instance directory, Cinder journal, and Manila
+  journal absent. Never add a direct per-node release path, hostname identity,
+  TTL expiry for offline claims, or a local outbox as the safety authority.
+  Registry bootstrap and disaster restore are explicit frozen-fleet operator
+  actions; a missing namespace must fail closed rather than auto-create an
+  empty registry that could reuse ranges owned by live containers.
 - Incus 7.x `unix-block` devices have no read-only property. Reject Cinder
   `access_mode=ro` rather than relying on device-node mode bits against
   container root. Encrypted volumes and multiattach also remain unsupported.
@@ -286,6 +299,10 @@ in `TEST_STATUS.md`; this section keeps only the rules.
 - Do not enable `security.syscalls.intercept.mount.allowed=ext4`: tenant-owned
   filesystem input must not be parsed by the host kernel. Tenant images that
   mount Cinder ext4 data volumes must include `fuse2fs` and use it explicitly.
+- Initial Cinder data-volume BDMs require the Glance capability property
+  `hw_incus_data_volume_fuse=true`. Treat it as a fail-closed image admission
+  contract; do not infer support merely from an image name. Online attachment
+  additionally probes the configured FUSE helper inside a running guest.
 - Keep `linstor_volume_downsize_factor=0` so Cinder's advertised size is not
   smaller than Nova's requested byte count.
 - Keep `swap_volume` explicitly unsupported. Cinder attached-volume retype

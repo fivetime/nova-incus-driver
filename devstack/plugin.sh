@@ -125,6 +125,19 @@ function install_nova_incus {
     setup_pyproject_develop "${INCUS_PYTHON_SDK_DIR}"
     setup_develop "${NOVA_INCUS_DIR}"
 
+    local failed_build_allocation_patch
+    failed_build_allocation_patch="${NOVA_INCUS_DIR}/patches/nova/0005-compute-add-failed-build-allocation-policy.patch"
+    if git -C "${NOVA_DIR}" apply --reverse --check \
+            "${failed_build_allocation_patch}" >/dev/null 2>&1; then
+        echo "Nova already provides the failed-build allocation policy hook"
+    elif git -C "${NOVA_DIR}" apply --check \
+            "${failed_build_allocation_patch}"; then
+        git -C "${NOVA_DIR}" apply "${failed_build_allocation_patch}"
+    else
+        die $LINENO \
+            "Nova failed-build allocation policy patch does not apply cleanly"
+    fi
+
     if is_true "${INCUS_APPLY_NOVA_MANILA_SHARE_PATCH}"; then
         local manila_share_patch
         manila_share_patch="${NOVA_INCUS_DIR}/patches/nova/0002-hardware-accept-incus-manila-share-trait.patch"
@@ -331,6 +344,16 @@ function configure_nova_incus_storage {
             >/dev/null; then
             die $LINENO "Incus does not support storage_driver_cephext"
         fi
+        if ! incus_cli query /1.0 | jq -e \
+            '.api_extensions |
+             index("migration_shared_ceph_storage") and
+             index("instance_storage_handover") and
+             index("instance_storage_handover_proof") and
+             index("migration_shared_ceph_storage_ready_fence")' \
+            >/dev/null; then
+            die $LINENO \
+                "Incus does not support ready-fenced shared Ceph migration"
+        fi
         if ! incus_cli storage show "${INCUS_BFV_POOL_NAME}" \
                 >/dev/null 2>&1; then
             incus_cli storage create "${INCUS_BFV_POOL_NAME}" cephext \
@@ -409,6 +432,49 @@ function configure_nova_incus {
             "${INCUS_ALLOW_LIVE_MIGRATION}"
         iniset "${nova_target}" incus allow_bfv_evacuate \
             "${INCUS_ALLOW_BFV_EVACUATE}"
+        if [[ -n "${INCUS_IDMAP_ALLOCATOR_ENDPOINT}" ]]; then
+            [[ -n "${INCUS_IDMAP_ALLOCATOR_NAMESPACE}" ]] || \
+                die $LINENO "INCUS_IDMAP_ALLOCATOR_NAMESPACE is required"
+            [[ -n "${INCUS_IDMAP_ALLOCATOR_BASE}" ]] || \
+                die $LINENO "INCUS_IDMAP_ALLOCATOR_BASE is required"
+            [[ -n "${INCUS_IDMAP_ALLOCATOR_COUNT}" ]] || \
+                die $LINENO "INCUS_IDMAP_ALLOCATOR_COUNT is required"
+            iniset "${nova_target}" incus idmap_allocator_endpoint \
+                "${INCUS_IDMAP_ALLOCATOR_ENDPOINT}"
+            iniset "${nova_target}" incus idmap_allocator_namespace \
+                "${INCUS_IDMAP_ALLOCATOR_NAMESPACE}"
+            iniset "${nova_target}" incus idmap_allocator_base \
+                "${INCUS_IDMAP_ALLOCATOR_BASE}"
+            iniset "${nova_target}" incus idmap_allocator_size \
+                "${INCUS_IDMAP_ALLOCATOR_SIZE}"
+            iniset "${nova_target}" incus idmap_allocator_count \
+                "${INCUS_IDMAP_ALLOCATOR_COUNT}"
+            iniset "${nova_target}" incus idmap_allocator_timeout \
+                "${INCUS_IDMAP_ALLOCATOR_TIMEOUT}"
+            iniset "${nova_target}" incus idmap_allocator_allow_insecure \
+                "${INCUS_IDMAP_ALLOCATOR_ALLOW_INSECURE}"
+            if [[ -n "${INCUS_IDMAP_ALLOCATOR_CA_CERT}" ]]; then
+                iniset "${nova_target}" incus idmap_allocator_ca_cert \
+                    "${INCUS_IDMAP_ALLOCATOR_CA_CERT}"
+            fi
+            if [[ -n "${INCUS_IDMAP_ALLOCATOR_CLIENT_CERT}" ]]; then
+                iniset "${nova_target}" incus idmap_allocator_client_cert \
+                    "${INCUS_IDMAP_ALLOCATOR_CLIENT_CERT}"
+            fi
+            if [[ -n "${INCUS_IDMAP_ALLOCATOR_CLIENT_KEY}" ]]; then
+                iniset "${nova_target}" incus idmap_allocator_client_key \
+                    "${INCUS_IDMAP_ALLOCATOR_CLIENT_KEY}"
+            fi
+            if [[ -n "${INCUS_IDMAP_ALLOCATOR_USERNAME}" ]]; then
+                iniset "${nova_target}" incus idmap_allocator_username \
+                    "${INCUS_IDMAP_ALLOCATOR_USERNAME}"
+            fi
+            if [[ -n "${INCUS_IDMAP_ALLOCATOR_PASSWORD_FILE}" ]]; then
+                iniset "${nova_target}" incus \
+                    idmap_allocator_password_file \
+                    "${INCUS_IDMAP_ALLOCATOR_PASSWORD_FILE}"
+            fi
+        fi
         iniset "${nova_target}" incus migration_auto_recovery \
             "${INCUS_MIGRATION_AUTO_RECOVERY}"
         iniset "${nova_target}" incus migration_recovery_interval \
@@ -496,6 +562,66 @@ function configure_nova_incus {
     sudo install -o root -g root -m 0644 \
         "${NOVA_INCUS_DIR}"/etc/nova/rootwrap.d/*.filters \
         "${NOVA_CONF_DIR}/rootwrap.d"
+}
+
+
+function bootstrap_nova_incus_idmap_allocator {
+    if ! is_true "${INCUS_IDMAP_ALLOCATOR_BOOTSTRAP_EMPTY}"; then
+        return
+    fi
+
+    [[ -n "${INCUS_IDMAP_ALLOCATOR_ENDPOINT}" ]] || \
+        die $LINENO \
+            "INCUS_IDMAP_ALLOCATOR_ENDPOINT is required for bootstrap"
+    [[ -n "${INCUS_IDMAP_ALLOCATOR_NAMESPACE}" ]] || \
+        die $LINENO \
+            "INCUS_IDMAP_ALLOCATOR_NAMESPACE is required for bootstrap"
+    [[ -n "${INCUS_IDMAP_ALLOCATOR_BASE}" ]] || \
+        die $LINENO "INCUS_IDMAP_ALLOCATOR_BASE is required for bootstrap"
+    [[ -n "${INCUS_IDMAP_ALLOCATOR_COUNT}" ]] || \
+        die $LINENO "INCUS_IDMAP_ALLOCATOR_COUNT is required for bootstrap"
+
+    local -a allocator_args=(
+        --endpoint "${INCUS_IDMAP_ALLOCATOR_ENDPOINT}"
+        --namespace "${INCUS_IDMAP_ALLOCATOR_NAMESPACE}"
+        --base "${INCUS_IDMAP_ALLOCATOR_BASE}"
+        --size "${INCUS_IDMAP_ALLOCATOR_SIZE}"
+        --count "${INCUS_IDMAP_ALLOCATOR_COUNT}"
+        --timeout "${INCUS_IDMAP_ALLOCATOR_TIMEOUT}"
+        --bootstrap-empty
+        --confirm-frozen
+    )
+    if is_true "${INCUS_IDMAP_ALLOCATOR_ALLOW_INSECURE}"; then
+        allocator_args+=(--allow-insecure)
+    else
+        [[ -n "${INCUS_IDMAP_ALLOCATOR_CA_CERT}" ]] || \
+            die $LINENO \
+                "INCUS_IDMAP_ALLOCATOR_CA_CERT is required for TLS bootstrap"
+        [[ -n "${INCUS_IDMAP_ALLOCATOR_CLIENT_CERT}" ]] || \
+            die $LINENO \
+                "INCUS_IDMAP_ALLOCATOR_CLIENT_CERT is required for TLS bootstrap"
+        [[ -n "${INCUS_IDMAP_ALLOCATOR_CLIENT_KEY}" ]] || \
+            die $LINENO \
+                "INCUS_IDMAP_ALLOCATOR_CLIENT_KEY is required for TLS bootstrap"
+        [[ -n "${INCUS_IDMAP_ALLOCATOR_USERNAME}" ]] || \
+            die $LINENO \
+                "INCUS_IDMAP_ALLOCATOR_USERNAME is required for TLS bootstrap"
+        [[ -n "${INCUS_IDMAP_ALLOCATOR_PASSWORD_FILE}" ]] || \
+            die $LINENO \
+                "INCUS_IDMAP_ALLOCATOR_PASSWORD_FILE is required for TLS bootstrap"
+        allocator_args+=(
+            --ca-cert "${INCUS_IDMAP_ALLOCATOR_CA_CERT}"
+            --client-cert "${INCUS_IDMAP_ALLOCATOR_CLIENT_CERT}"
+            --client-key "${INCUS_IDMAP_ALLOCATOR_CLIENT_KEY}"
+            --username "${INCUS_IDMAP_ALLOCATOR_USERNAME}"
+            --password-file "${INCUS_IDMAP_ALLOCATOR_PASSWORD_FILE}"
+        )
+    fi
+
+    echo_summary "Bootstrapping the frozen Incus ID-map registry"
+    "${PYTHON:-python3}" \
+        "${NOVA_INCUS_DIR}/tools/openstack-incus-idmap-registry.py" \
+        "${allocator_args[@]}"
 }
 
 
@@ -806,6 +932,7 @@ if is_service_enabled nova-incus; then
         install_nova_incus
     elif [[ "$1" == "stack" && "$2" == "post-config" ]]; then
         configure_nova_incus
+        bootstrap_nova_incus_idmap_allocator
         configure_nova_incus_ceilometer
         configure_cinder_linstor
         configure_cinder_ceph

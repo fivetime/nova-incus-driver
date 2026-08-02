@@ -14,6 +14,7 @@ Contents:
    usage
    architecture
    api_contract
+   scale_design
    production_readiness
    contributing
    exclusive_machine

@@ -29,7 +29,7 @@ class ToProfileTest(test.NoDBTestCase):
         super(ToProfileTest, self).setUp()
         self.client = mock.Mock()
         self.client.host_info = {
-            'api_extensions': ['id_map'],
+            'api_extensions': ['id_map', 'id_map_base'],
             'environment': {
                 'storage': 'zfs'
             }
@@ -56,18 +56,24 @@ class ToProfileTest(test.NoDBTestCase):
         self.CONF2.incus.allow_live_migration = False
         self.CONF2.incus.data_volume_mount_fuse = 'ext4=fuse2fs'
 
+    def _fake_instance(self, ctxt, **kwargs):
+        kwargs.setdefault('root_gb', 1)
+        return fake_instance.fake_instance_obj(ctxt, **kwargs)
+
     def tearDown(self):
         super(ToProfileTest, self).tearDown()
         for patcher in self.patchers:
             patcher.stop()
 
-    def assert_profile_created(self, name, expected_config, expected_devices):
+    def assert_profile_created(
+            self, instance, expected_config, expected_devices):
         expected_config.update({
             'limits.processes': '1024',
             'security.idmap.isolated': 'True',
             'security.privileged': 'False',
             'security.syscalls.intercept.mount': 'true',
             'security.syscalls.intercept.mount.fuse': 'ext4=fuse2fs',
+            'user.openstack.uuid': instance.uuid,
         })
         if 'limits.memory' in expected_config:
             expected_config['limits.memory.swap'] = 'false'
@@ -75,7 +81,8 @@ class ToProfileTest(test.NoDBTestCase):
         if root.get('size') == '0GB':
             root['size'] = '1GB'
         create = self.client.profiles.create
-        create.assert_called_once_with(name, expected_config, expected_devices)
+        create.assert_called_once_with(
+            instance.name, expected_config, expected_devices)
 
     def test_data_volume_mount_fuse_rejects_unsafe_syntax(self):
         self.CONF2.incus.data_volume_mount_fuse = 'ext4=fuse2fs;touch /tmp/x'
@@ -87,7 +94,7 @@ class ToProfileTest(test.NoDBTestCase):
     def test_to_profile(self):
         """A profile configuration is requested of the Incus client."""
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
+        instance = self._fake_instance(
             ctx, name='test', memory_mb=0)
         network_info = []
         block_info = []
@@ -108,13 +115,73 @@ class ToProfileTest(test.NoDBTestCase):
         flavor.to_profile(self.client, instance, network_info, block_info)
 
         self.assert_profile_created(
-            instance.name, expected_config, expected_devices)
+            instance, expected_config, expected_devices)
+
+    def test_to_profile_applies_overrides_to_initial_create(self):
+        ctx = context.get_admin_context()
+        instance = self._fake_instance(ctx, name='test', memory_mb=0)
+        config_overrides = {
+            'user.openstack.migration_destination_prepared': 'token',
+        }
+        device_overrides = {
+            'root': {
+                'path': '/',
+                'pool': 'cinder',
+                'type': 'disk',
+            },
+        }
+
+        flavor.to_profile(
+            self.client, instance, [], [],
+            config_overrides=config_overrides,
+            device_overrides=device_overrides)
+
+        name, config, devices = self.client.profiles.create.call_args.args
+        self.assertEqual(instance.name, name)
+        self.assertEqual(
+            'token',
+            config['user.openstack.migration_destination_prepared'])
+        self.assertEqual(device_overrides['root'], devices['root'])
+
+    def test_to_profile_uses_nova_owned_fixed_idmap(self):
+        ctx = context.get_admin_context()
+        instance = self._fake_instance(ctx, name='test', memory_mb=0)
+        instance.system_metadata = {
+            'incus_idmap_base': '500000000',
+            'incus_idmap_size': '65536',
+        }
+
+        flavor.to_profile(self.client, instance, [], [])
+
+        config = self.client.profiles.create.call_args.args[1]
+        self.assertEqual('True', config['security.idmap.isolated'])
+        self.assertEqual('500000000', config['security.idmap.base'])
+        self.assertEqual('65536', config['security.idmap.size'])
+
+    def test_to_profile_rejects_incomplete_fixed_idmap(self):
+        ctx = context.get_admin_context()
+        instance = self._fake_instance(ctx, name='test', memory_mb=0)
+        instance.system_metadata = {'incus_idmap_base': '500000000'}
+
+        self.assertRaisesRegex(
+            exception.InvalidConfiguration, 'both base and size',
+            flavor.to_profile, self.client, instance, [], [])
+
+    def test_to_profile_rejects_root_disk_below_operator_minimum(self):
+        ctx = context.get_admin_context()
+        instance = self._fake_instance(
+            ctx, name='test', memory_mb=0, root_gb=0)
+
+        self.assertRaisesRegex(
+            exception.InvalidConfiguration,
+            'minimum_root_disk_gb',
+            flavor.to_profile, self.client, instance, [], [])
 
     def test_to_profile_lvm(self):
         """A profile configuration is requested of the Incus client."""
         self.client.host_info['environment']['storage'] = 'lvm'
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
+        instance = self._fake_instance(
             ctx, name='test', memory_mb=0)
         network_info = []
         block_info = []
@@ -135,13 +202,13 @@ class ToProfileTest(test.NoDBTestCase):
         flavor.to_profile(self.client, instance, network_info, block_info)
 
         self.assert_profile_created(
-            instance.name, expected_config, expected_devices)
+            instance, expected_config, expected_devices)
 
     def test_storage_pools(self):
         self.client.host_info['api_extensions'].append('storage')
         self.CONF2.incus.storage_pool = 'test_pool'
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
+        instance = self._fake_instance(
             ctx, name='test', memory_mb=0)
         network_info = []
         block_info = []
@@ -160,7 +227,7 @@ class ToProfileTest(test.NoDBTestCase):
         flavor.to_profile(self.client, instance, network_info, block_info)
 
         self.assert_profile_created(
-            instance.name, expected_config, expected_devices)
+            instance, expected_config, expected_devices)
 
     def test_flavor_selects_root_storage_pool(self):
         self.client.host_info['api_extensions'].append('storage')
@@ -170,7 +237,7 @@ class ToProfileTest(test.NoDBTestCase):
             'durable': 'ceph-rootfs',
         }
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
+        instance = self._fake_instance(
             ctx, name='test', memory_mb=1024)
         instance.flavor.extra_specs = {
             'incus:root_storage_pool': 'local-nvme',
@@ -190,7 +257,7 @@ class ToProfileTest(test.NoDBTestCase):
             'durable': 'ceph-rootfs',
         }
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
+        instance = self._fake_instance(
             ctx, name='test', memory_mb=1024)
         instance.flavor.extra_specs = {
             'incus:root_storage_pool': 'unmanaged',
@@ -200,6 +267,29 @@ class ToProfileTest(test.NoDBTestCase):
             exception.InvalidConfiguration,
             flavor.to_profile, self.client, instance, [], [])
 
+    def test_bfv_rejects_nova_managed_root_storage_pool(self):
+        self.CONF2.incus.root_storage_pools = {
+            'durable': 'ceph-rootfs',
+        }
+        ctx = context.get_admin_context()
+        instance = self._fake_instance(
+            ctx, name='test', memory_mb=1024)
+        instance.flavor.extra_specs = {
+            'incus:root_storage_pool': 'durable',
+            'trait:CUSTOM_INCUS_STORAGE_POOL_DURABLE': 'required',
+        }
+        block_info = {
+            'block_device_mapping': [{
+                'boot_index': 0,
+                'connection_info': {'driver_volume_type': 'rbd'},
+            }],
+        }
+
+        self.assertRaisesRegex(
+            exception.InvalidConfiguration,
+            'boot-from-volume storage is selected by the Cinder volume type',
+            flavor.to_profile, self.client, instance, [], block_info)
+
     def test_flavor_requires_local_pool_capacity_resource(self):
         self.CONF2.incus.root_storage_pools = {
             'local-nvme': 'local-zfs',
@@ -208,7 +298,7 @@ class ToProfileTest(test.NoDBTestCase):
             'local-nvme': 'CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME_DISK_GB',
         }
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
+        instance = self._fake_instance(
             ctx, name='test', memory_mb=1024, root_gb=20)
         instance.flavor.extra_specs = {
             'incus:root_storage_pool': 'local-nvme',
@@ -222,7 +312,7 @@ class ToProfileTest(test.NoDBTestCase):
 
     def test_to_profile_rejects_privileged(self):
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
+        instance = self._fake_instance(
             ctx, name='test', memory_mb=0)
         instance.flavor.extra_specs = {
             'incus:privileged_allowed': True,
@@ -234,7 +324,7 @@ class ToProfileTest(test.NoDBTestCase):
 
     def test_to_profile_rejects_nesting(self):
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
+        instance = self._fake_instance(
             ctx, name='test', memory_mb=0)
         instance.flavor.extra_specs = {'incus:nested_allowed': True}
 
@@ -244,7 +334,7 @@ class ToProfileTest(test.NoDBTestCase):
 
     def test_to_profile_process_limit_extra_spec(self):
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
+        instance = self._fake_instance(
             ctx, name='test', memory_mb=0)
         instance.flavor.extra_specs = {'incus:process_limit': '4096'}
 
@@ -256,7 +346,7 @@ class ToProfileTest(test.NoDBTestCase):
     def test_to_profile_prepares_new_instances_for_live_migration(self):
         self.CONF2.incus.allow_live_migration = True
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
+        instance = self._fake_instance(
             ctx, name='test', memory_mb=1024)
 
         flavor.to_profile(self.client, instance, [], [])
@@ -267,7 +357,7 @@ class ToProfileTest(test.NoDBTestCase):
     def test_to_profile_maps_flavor_swap_to_cgroup_limit(self):
         self.CONF2.incus.allow_instance_swap = True
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
+        instance = self._fake_instance(
             ctx, name='test', memory_mb=1024)
         instance.flavor.swap = 2048
 
@@ -279,7 +369,7 @@ class ToProfileTest(test.NoDBTestCase):
 
     def test_to_profile_rejects_swap_when_operator_disables_it(self):
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
+        instance = self._fake_instance(
             ctx, name='test', memory_mb=1024)
         instance.flavor.swap = 2048
 
@@ -290,7 +380,7 @@ class ToProfileTest(test.NoDBTestCase):
     def test_to_profile_rejects_invalid_process_limit(self):
         ctx = context.get_admin_context()
         for value in ('0', '-1', 'unlimited', '65537'):
-            instance = fake_instance.fake_instance_obj(
+            instance = self._fake_instance(
                 ctx, name='test', memory_mb=0)
             instance.flavor.extra_specs = {'incus:process_limit': value}
             self.client.profiles.create.reset_mock()
@@ -302,7 +392,7 @@ class ToProfileTest(test.NoDBTestCase):
     def test_to_profile_rejects_process_default_above_ceiling(self):
         self.CONF2.incus.default_process_limit = 65537
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
+        instance = self._fake_instance(
             ctx, name='test', memory_mb=0)
 
         self.assertRaises(
@@ -311,7 +401,7 @@ class ToProfileTest(test.NoDBTestCase):
 
     def test_to_profile_idmap(self):
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
+        instance = self._fake_instance(
             ctx, name='test', memory_mb=0)
         instance.flavor.extra_specs = {
             'incus:isolated': True,
@@ -336,12 +426,12 @@ class ToProfileTest(test.NoDBTestCase):
         flavor.to_profile(self.client, instance, network_info, block_info)
 
         self.assert_profile_created(
-            instance.name, expected_config, expected_devices)
+            instance, expected_config, expected_devices)
 
     def test_to_profile_idmap_unsupported(self):
         self.client.host_info['api_extensions'].remove('id_map')
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
+        instance = self._fake_instance(
             ctx, name='test', memory_mb=0)
         instance.flavor.extra_specs = {
             'incus:isolated': True,
@@ -356,7 +446,7 @@ class ToProfileTest(test.NoDBTestCase):
     def test_to_profile_quota_extra_specs_bytes(self):
         """A profile configuration is requested of the Incus client."""
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
+        instance = self._fake_instance(
             ctx, name='test', memory_mb=0)
         instance.flavor.extra_specs = {
             'quota:disk_read_bytes_sec': '3000000',
@@ -383,12 +473,12 @@ class ToProfileTest(test.NoDBTestCase):
         flavor.to_profile(self.client, instance, network_info, block_info)
 
         self.assert_profile_created(
-            instance.name, expected_config, expected_devices)
+            instance, expected_config, expected_devices)
 
     def test_to_profile_quota_extra_specs_iops(self):
         """A profile configuration is requested of the Incus client."""
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
+        instance = self._fake_instance(
             ctx, name='test', memory_mb=0)
         instance.flavor.extra_specs = {
             'quota:disk_read_iops_sec': '300',
@@ -415,11 +505,11 @@ class ToProfileTest(test.NoDBTestCase):
         flavor.to_profile(self.client, instance, network_info, block_info)
 
         self.assert_profile_created(
-            instance.name, expected_config, expected_devices)
+            instance, expected_config, expected_devices)
 
     def test_to_profile_rejects_quota_total_bytes(self):
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
+        instance = self._fake_instance(
             ctx, name='test', memory_mb=0)
         instance.flavor.extra_specs = {
             'quota:disk_total_bytes_sec': '6000000',
@@ -433,7 +523,7 @@ class ToProfileTest(test.NoDBTestCase):
 
     def test_to_profile_rejects_quota_total_iops(self):
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
+        instance = self._fake_instance(
             ctx, name='test', memory_mb=0)
         instance.flavor.extra_specs = {
             'quota:disk_total_iops_sec': '500',
@@ -447,7 +537,7 @@ class ToProfileTest(test.NoDBTestCase):
 
     def test_to_profile_rejects_bytes_and_iops_for_same_direction(self):
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
+        instance = self._fake_instance(
             ctx, name='test', memory_mb=0)
         instance.flavor.extra_specs = {
             'quota:disk_read_bytes_sec': '3000000',
@@ -460,7 +550,7 @@ class ToProfileTest(test.NoDBTestCase):
 
     def test_to_profile_rejects_non_positive_disk_quota(self):
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
+        instance = self._fake_instance(
             ctx, name='test', memory_mb=0)
         instance.flavor.extra_specs = {
             'quota:disk_write_iops_sec': '0',
@@ -487,7 +577,7 @@ class ToProfileTest(test.NoDBTestCase):
 
     def test_to_profile_network_config_average(self):
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
+        instance = self._fake_instance(
             ctx, name='test', memory_mb=0)
         instance.flavor.extra_specs = {
             'quota:vif_inbound_average': '1000000',
@@ -514,8 +604,8 @@ class ToProfileTest(test.NoDBTestCase):
                 'name': 'nic0123456789ab',
                 'parent': 'tin0123456789a',
                 'type': 'nic',
-                'limits.egress': '16000Mbit',
-                'limits.ingress': '8000Mbit',
+                'limits.egress': '16000000kbit',
+                'limits.ingress': '8000000kbit',
             },
             'root': {
                 'path': '/',
@@ -527,11 +617,11 @@ class ToProfileTest(test.NoDBTestCase):
         flavor.to_profile(self.client, instance, network_info, block_info)
 
         self.assert_profile_created(
-            instance.name, expected_config, expected_devices)
+            instance, expected_config, expected_devices)
 
-    def test_to_profile_network_config_peak(self):
+    def test_to_profile_rejects_network_peak_semantics(self):
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
+        instance = self._fake_instance(
             ctx, name='test', memory_mb=0)
         instance.flavor.extra_specs = {
             'quota:vif_inbound_peak': '3000000',
@@ -546,32 +636,12 @@ class ToProfileTest(test.NoDBTestCase):
             'devname': 'tap0123456789a'}]
         block_info = []
 
-        expected_config = {
-            'environment.product_name': 'OpenStack Nova',
-            'limits.cpu': '1',
-            'limits.memory': '0MiB',
-        }
-        expected_devices = {
-            'tap0123456789a': {
-                'hwaddr': '00:11:22:33:44:55',
-                'nictype': 'physical',
-                'name': 'nic0123456789ab',
-                'parent': 'tin0123456789a',
-                'type': 'nic',
-                'limits.egress': '32000Mbit',
-                'limits.ingress': '24000Mbit',
-            },
-            'root': {
-                'path': '/',
-                'size': '0GB',
-                'type': 'disk'
-            },
-        }
-
-        flavor.to_profile(self.client, instance, network_info, block_info)
-
-        self.assert_profile_created(
-            instance.name, expected_config, expected_devices)
+        self.assertRaisesRegex(
+            exception.InvalidConfiguration,
+            'peak/burst QoS',
+            flavor.to_profile,
+            self.client, instance, network_info, block_info)
+        self.client.profiles.create.assert_not_called()
 
     @mock.patch(
         'nova.virt.incus.flavor.driver.block_device_info_get_ephemerals')
@@ -581,7 +651,7 @@ class ToProfileTest(test.NoDBTestCase):
         ]
 
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
+        instance = self._fake_instance(
             ctx, name='test', memory_mb=0)
         network_info = []
         block_info = []

@@ -8,7 +8,10 @@ FLAVOR=${FLAVOR:-ds512M}
 NETWORK=${NETWORK:-public}
 COMPUTE_HOST=${COMPUTE_HOST:-incus-node-01}
 COMPUTE_SSH=${COMPUTE_SSH:-root@10.224.0.21}
+CONTROLLER_SSH=${CONTROLLER_SSH:-}
+CONTROLLER_OPENRC=${CONTROLLER_OPENRC:-/opt/stack/devstack/openrc admin admin}
 SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute test key}
+SSH_KNOWN_HOSTS_FILE=${SSH_KNOWN_HOSTS_FILE:-$HOME/.ssh/known_hosts}
 SHARE_TYPE=${SHARE_TYPE:-incus-nfs}
 SHARE_PROTOCOL=${SHARE_PROTOCOL:-NFS}
 SHARE_SIZE=${SHARE_SIZE:-1}
@@ -16,7 +19,21 @@ NAME=${NAME:-incus-manila-snapshot-e2e-$RANDOM}
 TIMEOUT=${TIMEOUT:-600}
 INCUS_PROJECT=${INCUS_PROJECT:-nova}
 
-SSH=(ssh -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=no)
+[[ -f "$SSH_IDENTITY" && -r "$SSH_IDENTITY" ]] || {
+    echo "SSH identity is not a readable regular file: $SSH_IDENTITY" >&2
+    exit 2
+}
+[[ -f "$SSH_KNOWN_HOSTS_FILE" && -r "$SSH_KNOWN_HOSTS_FILE" ]] || {
+    echo "SSH known_hosts is not a readable regular file: $SSH_KNOWN_HOSTS_FILE" >&2
+    exit 2
+}
+SSH=(
+    ssh
+    -i "$SSH_IDENTITY"
+    -o BatchMode=yes
+    -o StrictHostKeyChecking=yes
+    -o "UserKnownHostsFile=$SSH_KNOWN_HOSTS_FILE"
+)
 server_id=
 source_share=
 restored_share=
@@ -25,6 +42,15 @@ shares_url=
 token=
 
 remote() { "${SSH[@]}" "$COMPUTE_SSH" "$@"; }
+
+if [[ -n "$CONTROLLER_SSH" ]]; then
+    openstack() {
+        local command_line
+        printf -v command_line '%q ' "$@"
+        "${SSH[@]}" "$CONTROLLER_SSH" \
+            "source $CONTROLLER_OPENRC >/dev/null 2>&1; openstack $command_line"
+    }
+fi
 
 wait_value() {
     local command=$1 expected=$2 deadline=$((SECONDS + TIMEOUT)) current
@@ -45,7 +71,13 @@ api() {
     if [[ -n "$data" ]]; then
         args+=(-H "Content-Type: application/json" -d "$data")
     fi
-    curl "${args[@]}" "$url"
+    if [[ -n "$CONTROLLER_SSH" ]]; then
+        local command_line
+        printf -v command_line '%q ' curl "${args[@]}" "$url"
+        "${SSH[@]}" "$CONTROLLER_SSH" "$command_line"
+    else
+        curl "${args[@]}" "$url"
+    fi
 }
 
 wait_mapping() {
@@ -115,15 +147,31 @@ trap 'exit 143' TERM
 
 snapshot_support=$(openstack share type show "$SHARE_TYPE" -f json | \
     python3 -c '
+import ast
 import json
 import sys
 
-data = json.load(sys.stdin)
+data = {
+    str(key).strip().lower().replace(" ", "_"): value
+    for key, value in json.load(sys.stdin).items()
+}
 specs = data.get("optional_extra_specs") or {}
-print(str(specs.get("snapshot_support", "False")).lower())
+if isinstance(specs, str):
+    try:
+        specs = ast.literal_eval(specs)
+    except (SyntaxError, ValueError):
+        specs = {}
+if not isinstance(specs, dict):
+    specs = {}
+required = ("snapshot_support", "create_share_from_snapshot_support")
+values = [
+    str(specs.get(key, "False")).replace("<is>", "").strip().lower()
+    for key in required
+]
+print("true" if all(value == "true" for value in values) else "false")
 ')
 [[ "$snapshot_support" == true ]] || {
-    echo "Share type $SHARE_TYPE must declare snapshot_support=True" >&2
+    echo "Share type $SHARE_TYPE must support snapshots and create-from-snapshot" >&2
     exit 2
 }
 

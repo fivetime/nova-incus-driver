@@ -51,6 +51,20 @@ tar -xf "$UNIFIED_TAR" -C "$mount_dir"
     exit 1
 }
 
+data_volume_fuse=false
+for fuse2fs_path in usr/bin/fuse2fs bin/fuse2fs usr/sbin/fuse2fs sbin/fuse2fs; do
+    if [[ -x "$mount_dir/rootfs/$fuse2fs_path" ]]; then
+        data_volume_fuse=true
+        break
+    fi
+done
+
+# The marker is Incus-owned metadata beside rootfs, so it follows every RBD
+# clone, snapshot and backup without being visible inside the guest.
+printf '%s\n' '{"version":1,"state":"stable","idmap":[]}' \
+    >"$mount_dir/.incus-idmap"
+chmod 0600 "$mount_dir/.incus-idmap"
+
 # Keep enough headroom for first-boot writes and filesystem metadata.
 used_kib=$(du -sk "$mount_dir" | awk '{print $1}')
 total_kib=$((IMAGE_SIZE_MIB * 1024))
@@ -66,10 +80,17 @@ loop_device=
 e2fsck -f -n "$OUTPUT"
 file -s "$OUTPUT"
 
+image_properties=()
+if [[ "$data_volume_fuse" == true ]]; then
+    image_properties+=(--property hw_incus_data_volume_fuse=true)
+fi
+
 openstack image delete "$IMAGE_NAME" >/dev/null 2>&1 || true
 openstack image create "$IMAGE_NAME" \
     "--$VISIBILITY" --disk-format raw --container-format bare \
     --property hw_incus_boot_from_volume=true \
+    --property hw_incus_rootfs_idmap_provenance=v1 \
     --property hw_incus_rootfs_layout=rootfs-directory \
+    "${image_properties[@]}" \
     --file "$OUTPUT"
 openstack image show "$IMAGE_NAME" -c id -c status -c size -c properties

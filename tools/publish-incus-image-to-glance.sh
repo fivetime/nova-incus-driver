@@ -90,11 +90,20 @@ fi
 tar -C "$WORK_DIR/unified" -czf "$WORK_DIR/$IMAGE_NAME.tar.gz" \
     metadata.yaml templates rootfs
 
+image_properties=()
+for fuse2fs_path in usr/bin/fuse2fs bin/fuse2fs usr/sbin/fuse2fs sbin/fuse2fs; do
+    if [[ -x "$rootfs/$fuse2fs_path" ]]; then
+        image_properties+=(--property hw_incus_data_volume_fuse=true)
+        break
+    fi
+done
+
 openstack image delete "$IMAGE_NAME" >/dev/null 2>&1 || true
 # python-openstackclient does not expose Glance's root-tar extension, while
 # the driver recognizes unified Incus tars by their metadata.yaml content.
 openstack image create "$IMAGE_NAME" \
     --public --disk-format raw --container-format bare \
+    "${image_properties[@]}" \
     --file "$WORK_DIR/$IMAGE_NAME.tar.gz"
 
 openstack image show "$IMAGE_NAME" -c id -c status -c size

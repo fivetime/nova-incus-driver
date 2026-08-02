@@ -94,7 +94,11 @@ incus_opts = [
         "minimum_root_disk_gb",
         default=1,
         min=1,
-        help="Minimum enforced instance rootfs size when root_gb is zero.",
+        help=(
+            "Minimum allowed Flavor root_gb for non-BFV instances. Smaller "
+            "values are rejected so the driver cannot consume root storage "
+            "that Placement did not account for."
+        ),
     ),
     cfg.IntOpt(
         "default_process_limit",
@@ -208,6 +212,115 @@ incus_opts = [
             "Cinder RBD volume claimed through a cephext storage pool. The "
             "operator must provide external fencing that proves the source "
             "compute cannot access the volume before evacuation starts."
+        ),
+    ),
+    cfg.StrOpt(
+        "idmap_allocator_endpoint",
+        default=None,
+        help=(
+            "Endpoint of the HA etcd v3 service that owns deployment-wide "
+            "Incus idmap allocations. This is required whenever cold/live "
+            "migration or BFV evacuation is enabled; allocation failures "
+            "never fall back to Incus host-local first-fit allocation."
+        ),
+    ),
+    cfg.StrOpt(
+        "idmap_allocator_namespace",
+        default=None,
+        help=(
+            "Stable, deployment-unique namespace for Incus idmap records, "
+            "for example region-one-cell1. Every compute in one migration "
+            "domain must use the same value."
+        ),
+    ),
+    cfg.IntOpt(
+        "idmap_allocator_base",
+        default=None,
+        min=1,
+        max=4294901760,
+        help=(
+            "First subordinate UID/GID of the globally managed idmap range. "
+            "The complete configured range must be present in root's "
+            "/etc/subuid and /etc/subgid on every Incus node."
+        ),
+    ),
+    cfg.IntOpt(
+        "idmap_allocator_size",
+        default=65536,
+        min=65536,
+        max=65536,
+        help=(
+            "UID/GID count per system container. Version 1 deliberately "
+            "requires 65536 to keep one immutable slot geometry."
+        ),
+    ),
+    cfg.IntOpt(
+        "idmap_allocator_count",
+        default=None,
+        min=1,
+        help="Number of globally unique idmap slots in the migration domain.",
+    ),
+    cfg.IntOpt(
+        "idmap_allocator_timeout",
+        default=5,
+        min=1,
+        help="Timeout in seconds for etcd idmap allocation requests.",
+    ),
+    cfg.IntOpt(
+        "idmap_allocator_audit_interval",
+        default=60,
+        min=10,
+        help=(
+            "Seconds between complete idmap registry integrity audits. A "
+            "detected integrity violation permanently latches allocation and "
+            "claim operations closed in that nova-compute process; operators "
+            "must repair the registry and restart nova-compute."
+        ),
+    ),
+    cfg.BoolOpt(
+        "idmap_allocator_allow_insecure",
+        default=False,
+        help=(
+            "Allow an unauthenticated HTTP idmap allocator endpoint. This "
+            "is only for isolated development testbeds. Production must "
+            "leave this disabled and configure HTTPS plus mutual TLS."
+        ),
+    ),
+    cfg.StrOpt(
+        "idmap_allocator_ca_cert",
+        default=None,
+        help="CA certificate used to verify the idmap allocator endpoint.",
+    ),
+    cfg.StrOpt(
+        "idmap_allocator_client_cert",
+        default=None,
+        help="Client certificate for the idmap allocator endpoint.",
+    ),
+    cfg.StrOpt(
+        "idmap_allocator_client_key",
+        default=None,
+        secret=True,
+        help="Client private key for the idmap allocator endpoint.",
+    ),
+    cfg.StrOpt(
+        "idmap_allocator_username",
+        default=None,
+        help=(
+            "etcd user whose role is restricted to this allocator's exact "
+            "namespace prefix. Production requires this in addition to "
+            "mutual TLS because the etcd HTTP gateway does not authorize "
+            "requests from a client certificate common name."
+        ),
+    ),
+    cfg.StrOpt(
+        "idmap_allocator_password_file",
+        default=None,
+        secret=True,
+        help=(
+            "Absolute path to a file containing the etcd allocator user's "
+            "password. The password is reread whenever the driver obtains "
+            "or refreshes an etcd authentication token and is never "
+            "accepted inline."
         ),
     ),
     cfg.StrOpt(
@@ -372,6 +485,16 @@ incus_opts = [
         min=10,
         help="Seconds between post-claim BFV target recovery scans.",
     ),
+    cfg.IntOpt(
+        "migration_recovery_batch_size",
+        default=50,
+        min=1,
+        help=(
+            "Maximum number of marked BFV migration targets recovered during "
+            "one periodic scan. Remaining candidates are processed from a "
+            "rotating cursor on later scans."
+        ),
+    ),
     cfg.BoolOpt(
         "enable_manila_shares",
         default=False,
@@ -379,6 +502,26 @@ incus_opts = [
             "Enable NFS and CephFS Manila shares through host mounts exposed "
             "at /mnt/manila/<tag> in system containers. Requires the Nova "
             "Incus share capability patch and mount helpers on every compute."
+        ),
+    ),
+    cfg.IntOpt(
+        "share_mount_timeout",
+        default=30,
+        min=1,
+        help=(
+            "Maximum seconds allowed for one host-side Manila mount "
+            "command. A timeout fails the share operation; the driver does "
+            "not use lazy or forced recovery semantics."
+        ),
+    ),
+    cfg.IntOpt(
+        "share_unmount_timeout",
+        default=30,
+        min=1,
+        help=(
+            "Maximum seconds allowed for one host-side Manila unmount "
+            "command. A timeout retains the owner journal and ERROR state "
+            "for an explicit retry."
         ),
     ),
 ]

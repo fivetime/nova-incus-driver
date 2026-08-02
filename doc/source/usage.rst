@@ -178,7 +178,6 @@ mapping entry and requires the Placement trait reported for that selector::
     shared_storage_pool_capacity_gb = 6000
     root_storage_pools = durable:ceph-rootfs,local-nvme:local-zfs
     root_storage_pool_resource_classes = local-nvme:CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME_DISK_GB
-    shared_root_storage_pool_capacities_gb = durable:6000
 
     openstack flavor set incus-local-nvme \
       --property incus:root_storage_pool=local-nvme \
@@ -189,6 +188,25 @@ When the extra spec is absent, ``storage_pool`` is used. Unknown selectors are
 rejected during spawn. Selector characters other than letters, digits and
 underscore become underscores in the upper-case trait name; configurations
 that would produce the same trait are rejected.
+
+The ``durable`` selector above is an alias for the default ``storage_pool``.
+It deliberately has no entry in
+``root_storage_pool_resource_classes`` or
+``shared_root_storage_pool_capacities_gb``: its capacity is already published
+once as the compute provider's standard ``DISK_GB`` inventory. A physical pool
+may be reported by exactly one Placement inventory. Startup fails if two
+selectors reuse one resource class, two custom inventories resolve to the same
+driver/cluster/source identity, or a custom inventory reports the default pool
+a second time.
+
+Every selector that resolves to a physical pool other than ``storage_pool``
+must have its own entry in ``root_storage_pool_resource_classes``. This keeps
+the selected pool's capacity in the same Placement claim as the instance
+instead of silently charging only the default ``DISK_GB`` inventory.
+``incus:root_storage_pool`` is valid only for Nova-managed roots. Do not put it
+on a Flavor used for boot-from-volume: Cinder Volume Type and its RBD pool
+select the BFV backend, and ``boot_from_volume_storage_pools`` maps that RBD
+pool to the matching Incus ``cephext`` pool.
 
 The storage Trait proves that the destination has the named pool. For a
 node-local Btrfs, LVM, or ZFS pool, map its selector to a custom resource class
@@ -205,8 +223,10 @@ all slices must not exceed the operator-approved cluster-wide budget after
 reserving capacity for Cinder, Glance, recovery and Ceph health. The driver
 reports zero local usage for a shared slice because Placement allocations are
 the accounting authority. It rejects a shared pool without a slice and rejects
-a slice configured for a local pool. Local pools cannot provide automatic
-evacuation after host loss and require remote snapshots or backups.
+a slice configured for a local pool. Every selectable shared-pool slice must
+have a matching custom resource class; unused slice entries are rejected at
+``nova-compute`` startup. Local pools cannot provide automatic evacuation after
+host loss and require remote snapshots or backups.
 
 Cinder boot-from-volume
 -----------------------
@@ -309,8 +329,11 @@ bypass either supported root model with ``raw.lxc`` or host bind mounts.
 Cinder volumes are attached as block devices inside the container. The driver
 uses the connector properties reported by os-brick, connects the volume on the
 compute host, and adds the resulting path as an Incus ``unix-block`` device.
-This covers the LINSTOR DRBD driver's ``local`` connection, LINSTOR iSCSI, and
-Ceph RBD local attachment. For example::
+The production contract currently accepts only Ceph RBD connections with a
+stable ``pool/image`` name. Other os-brick protocols are rejected before any
+Incus, profile, journal, or connector side effect; accepting a volume that
+cannot be proven and reconnected after a compute restart would create an
+instance that can boot once but cannot safely start again. For example::
 
     openstack server add volume --device /dev/vdb <server> <volume>
 
@@ -318,6 +341,34 @@ The tenant operating system owns partitioning, formatting, mounting, and
 ``/etc/fstab`` configuration for the attached device. Detaching removes the
 Incus device before asking os-brick to disconnect the host path. A failed
 Incus attach rolls back the os-brick connection.
+
+When one or more data volumes are present in the initial server BDM, the
+Glance image must advertise ``hw_incus_data_volume_fuse=true``. This is a
+fail-closed declaration that the guest contains the configured userspace
+filesystem helper; the production default requires an executable
+``fuse2fs``. Nova preserves the property as
+``image_hw_incus_data_volume_fuse`` in instance system metadata. The gate is
+not required for a server created without initial data volumes. Online attach
+also verifies the helper inside a running guest before os-brick changes host
+state.
+
+Before creating an Incus profile or invoking os-brick, spawn validates the
+complete initial data-volume set: unique Cinder volume IDs and guest paths,
+read-write access, RBD protocol and stable image identity, supported QoS, and
+non-multiattach ownership. Nova queries Cinder's authoritative encryption
+metadata for every initial root and data ``DriverVolumeBlockDevice``; it does
+not trust an optional flag in the BDM. Any deterministic rejection aborts the
+build without rescheduling it to another identical compute host.
+
+Release acceptance exercises both root models with zero, one, and three
+initial data volumes. Use distinct admitted Glance images for the unified local
+root and raw ext4 BFV formats::
+
+    RUN_DESTRUCTIVE=true \
+      LOCAL_IMAGE=ubuntu-noble-incus \
+      BFV_IMAGE=ubuntu-noble-incus-bfv \
+      FLAVOR=incus.small NETWORK=private VOLUME_TYPE=ceph \
+      tools/openstack-incus-initial-data-volume-matrix.sh
 
 Data-volume Cinder front-end QoS requires the Incus fork's
 ``unix_block_limits`` API extension. Without it the driver rejects QoS before
@@ -352,6 +403,14 @@ Encrypted Cinder volumes and multiattach are currently rejected. They must
 not be advertised until os-brick encryptor lifecycle and concurrent device
 ownership have dedicated end-to-end coverage.
 
+Every ordinary power-on, including host-boot resume, reconciles the complete
+desired Cinder BDM set before starting the container. A stopped instance may
+remove an extra mapping only when Nova's profile metadata or fsync'd host
+journal proves ownership. An opaque ``unix-block`` device, missing BDM payload,
+or any mismatch on a running instance fails closed without cleanup. Successful
+reconciliation requires the profile devices, recovery metadata, journal set,
+and stable RBD mappings to match Nova exactly.
+
 Cold migration
 --------------
 
@@ -360,6 +419,11 @@ supported capability after the BFV migration release matrix passes on every
 enabled compute pair. Image-backed roots use Incus pull data transfer and are
 intended only for development. Cinder BFV roots use the fork's shared-Ceph
 handover to claim the same authoritative RBD without copying it.
+Both source and destination must advertise
+``migration_shared_ceph_storage_ready_fence``. This fail-closed protocol
+allows the target to claim only after the source has durably recorded the
+attempt and unmounted the root; mixed versions cannot silently negotiate the
+older handover.
 Both paths retain the stopped source record until Nova confirms the operation.
 On confirm, the source record and profile are deleted; an explicit Nova revert
 performs the reverse BFV handover and restores Cinder and Neutron ownership
@@ -387,6 +451,15 @@ cleanup. The marker preserves ``running`` versus ``stopped`` so recovery does
 not power on a SHUTOFF instance. Production enablement requires this suite to
 pass on every compute pair and the fail-closed recovery procedure in
 :doc:`production_readiness` to be accepted by operations.
+
+Migration destinations also carry
+``user.openstack.migration_destination_prepared`` from the initial profile
+create. This marker is independent of host-side Manila journals, so restarting
+``nova-compute`` after a journal was consumed does not turn a mounted share or
+partially wired target into an untracked orphan. Do not clear this marker by
+hand. Automatic recovery validates its migration UUID, instance UUID, fixed
+idmap and Incus attempt state. A committed attempt is never cleanup authority;
+an ownership conflict is deliberately retained rather than guessed.
 
 Fail-closed BFV recovery
 ------------------------
@@ -547,6 +620,18 @@ network and set both options::
 
     [incus]
     allow_cold_migration = true
+    idmap_allocator_endpoint = https://etcd.example:2379
+    idmap_allocator_namespace = region-one-cell1
+    idmap_allocator_base = 500000000
+    idmap_allocator_size = 65536
+    idmap_allocator_count = 10000
+    idmap_allocator_audit_interval = 60
+    idmap_allocator_allow_insecure = false
+    idmap_allocator_ca_cert = /etc/nova/idmap-etcd/ca.crt
+    idmap_allocator_client_cert = /etc/nova/idmap-etcd/client.crt
+    idmap_allocator_client_key = /etc/nova/idmap-etcd/client.key
+    idmap_allocator_username = nova-incus
+    idmap_allocator_password_file = /etc/nova/idmap-etcd/password
     migration_address = https://192.0.2.10:8443
     migration_preflight_tls_cert = /etc/nova/incus-preflight/client.crt
     migration_preflight_tls_key = /etc/nova/incus-preflight/client.key
@@ -555,10 +640,198 @@ network and set both options::
     migration_preflight_server_names = 192.0.2.10:compute-1,192.0.2.11:compute-2
     migration_preflight_tls_ca_by_server = 192.0.2.10:/etc/nova/incus-preflight/compute-1.crt,192.0.2.11:/etc/nova/incus-preflight/compute-2.crt
 
+The allocator directory must be searchable and every configured TLS or password
+file must be readable by the effective ``User=`` and ``Group=`` of the
+``nova-compute`` systemd service. A deployment that runs ``User=stack`` with
+``Group=incus-admin`` can use ``root:incus-admin`` ownership, mode ``0750`` on
+the directory, ``0644`` on public certificates, and ``0640`` on the private key
+and password. Testing with ``sudo -u stack`` alone is insufficient because it
+can retain supplementary groups that the service process does not have; the
+production preflight checks the credentials from the running process.
+
 ``migration_address`` must be an HTTPS origin without a path. Firewall the
 listener so it is reachable only from Nova compute nodes. The ordinary driver
 connection remains the local Unix socket; tenants must never receive Incus API
 or migration credentials.
+
+Every compute in one migration domain must use the same idmap allocator
+configuration. Mutual TLS authenticates the transport, while an etcd user and
+role must restrict the identity to the exact
+``/openstack-incus/idmaps/v3/<namespace>/`` prefix. Client-certificate common
+name authentication is not supported by the etcd HTTP gateway used by
+``etcd3gw`` and is not a substitute for this RBAC policy. The
+registry stores permanent instance-to-slot and slot-to-instance records with a
+single compare-and-swap transaction; UUID hashing selects only the first probe
+slot and is not the uniqueness mechanism. Each allocation indexes exact host
+claims. A claim binds the allocation UUID (``A``), persistent Nova
+``compute_id`` (``H``), per-materialization UUID (``T``), and Nova instance
+UUID (``U``), and has one of ``unmaterialized``, ``possible``, or ``cleaned``
+states. An allocator outage rejects new
+spawn, migration, unshelve, and evacuation without falling back to Incus
+first-fit allocation. Existing running workloads continue and stop remains
+available, but starting or rebooting a stopped generation fails closed because
+Nova must prove that the exact local claim remains authoritative. Immediately
+before each Incus create request, the driver creates an ``unmaterialized``
+claim and, immediately before the POST, changes that exact ``T`` to
+``possible`` through etcd CAS. Spawn, migration receive, evacuation, start,
+and reboot therefore cannot race slot release or reuse an earlier create
+attempt's proof.
+
+Final Nova deletion first writes an exact-generation release intent to HA
+etcd. That intent atomically blocks new claims and transitions to
+``possible``. A claim cannot be retired merely because a local lookup is
+empty. Incus must provide either a digest-bound materialization-attempt proof
+(``not-materialized`` or ``reconciled-clean``), or a complete
+``storage_release_receipt_v2`` for the same ``A/H/T/U`` and ID map.
+Materialization proofs must include ``baseline_clean=true`` in their canonical
+digest. This proves Incus checked that the exact root-storage binding was clean
+before registering ``T``; a missing or false value is rejected rather than
+treated as an older compatible proof. Receipt outcomes are ``deleted``,
+``normalized``, or ``detached``; retained-storage
+outcomes require immutable storage identity and prove only that the local
+claim was released, not that the external volume was deleted. Nova first
+persists the exact proof in etcd and only then acknowledges it to Incus. Lost
+POST, proof-persist, receipt ACK, and claim-retirement responses are replayed
+idempotently. Every compute can replay the shared
+intent, which survives loss of the deleting node's local disk. A claim owned
+by an offline or decommissioned node deliberately prevents reuse until the
+node returns or an operator supplies external fencing proof. Uncertain or
+corrupt records remain reserved for reconciliation rather than reuse.
+
+``state_path`` must still be node-persistent because Nova stores its immutable
+``compute_id`` there and Cinder/Manila cleanup journals live below the instance
+directory. ``emptyDir``, tmpfs, and a container-writable overlay are invalid.
+HTTPS with a trusted CA, a client certificate/key, and an etcd username plus
+password file is enforced by the driver. Keep the password file readable only
+by the ``nova-compute`` service account. Inline passwords and endpoint userinfo
+are rejected. ``idmap_allocator_allow_insecure=true`` permits HTTP without
+RBAC only for an isolated DevStack testbed and is rejected by the production
+preflight.
+
+The supported etcd 3.4, 3.5, and 3.6 gateway listener intentionally combines
+these settings::
+
+    listen-client-urls: https://127.0.0.1:2379
+    cert-file: /etc/etcd/pki/server.crt
+    key-file: /etc/etcd/pki/server.key
+    trusted-ca-file: /etc/etcd/pki/nova-client-ca.crt
+    client-cert-auth: false
+    enable-grpc-gateway: true
+    auth-token: jwt,pub-key=/etc/etcd/pki/auth.pub,priv-key=/etc/etcd/pki/auth.key,sign-method=RS256,ttl=15m
+
+This is not a plaintext or one-way TLS configuration. In all three supported
+etcd series, a non-empty ``trusted-ca-file`` makes the TLS listener require and
+verify a client certificate even when ``client-cert-auth`` is false. The false
+value only disables deriving an etcd user from the certificate common name,
+which the JSON gRPC gateway cannot forward correctly. The subsequent etcd
+username/password exchange supplies the authorization identity and returns a
+token whose role is restricted to the allocator prefix. Use a client CA
+dedicated to Nova computes and enable etcd RBAC. Do not set
+``client-cert-auth=true`` on this gateway listener.
+
+The idmap registry should use a dedicated etcd cluster. A second listener or a
+reverse proxy is neither required nor a substitute for the two checks above;
+``client-cert-auth`` is member-wide rather than per-listener, and a proxy
+cannot restore the gateway's lost client-CN identity. Other applications on
+the same etcd cluster must also use token authentication instead of CN
+authentication. If that cannot be changed, isolate the idmap registry in a
+separate cluster.
+
+Prefer JWT tokens in production and distribute the same protected signing
+material to every etcd member. Simple tokens are member-local and are intended
+for development. The allocator reauthenticates exactly once when etcd reports
+``invalid auth token`` (for example after member restart, token expiry, or an
+auth-policy change), rereading the protected password file so credential
+rotation does not require restarting ``nova-compute``. Permission failures and
+transport errors are not treated as token expiry and remain fail closed.
+
+Treat etcd restore as an allocation freeze, not as an online rollback. Disable
+all computes for new ownership-changing work, inventory Nova system metadata
+and every Incus project, rebuild both sides of every allocation record, and
+only then re-enable scheduling. A Nova generation whose registry record is
+missing fails closed and is never recreated implicitly. Restoring an older
+snapshot and immediately admitting new instances can otherwise reuse a slot
+owned by a container created after that snapshot.
+
+Create a registry only for a new, proven-empty migration domain while all
+Nova creates, deletes, migrations, evacuations, and returning-host workflows
+are frozen::
+
+    tools/openstack-incus-idmap-registry.py \
+      --endpoint https://etcd.example:2379 \
+      --namespace region-one-cell1 \
+      --base 500000000 --size 65536 --count 10000 \
+      --ca-cert /etc/nova/idmap-etcd/ca.crt \
+      --client-cert /etc/nova/idmap-etcd/client.crt \
+      --client-key /etc/nova/idmap-etcd/client.key \
+      --username nova-incus \
+      --password-file /etc/nova/idmap-etcd/password \
+      --bootstrap-empty --confirm-frozen
+
+The command refuses a namespace containing any orphan key and verifies that
+no concurrent writer appeared while it created the immutable configuration.
+Normal driver initialization never performs this bootstrap. For DevStack,
+``INCUS_IDMAP_ALLOCATOR_BOOTSTRAP_EMPTY=True`` invokes the same operation and
+must be enabled for one initial frozen ``stack.sh`` run only, then disabled.
+A missing configuration afterwards is treated as possible registry loss and
+keeps ownership-changing operations unavailable.
+
+Take a canonical registry audit after each rollout and retain it with the etcd
+backup set::
+
+    tools/openstack-incus-idmap-registry.py \
+      --endpoint https://etcd.example:2379 \
+      --namespace region-one-cell1 \
+      --base 500000000 --size 65536 --count 10000 \
+      --ca-cert /etc/nova/idmap-etcd/ca.crt \
+      --client-cert /etc/nova/idmap-etcd/client.crt \
+      --client-key /etc/nova/idmap-etcd/client.key \
+      --username nova-incus \
+      --password-file /etc/nova/idmap-etcd/password \
+      > idmap-registry.json
+
+The audit is one read-only prefix query and rejects an unexpected, duplicate,
+or one-sided instance/slot/host-index record. The export schema is explicitly
+``openstack-incus-idmap-registry/v3`` and contains every claim's exact ``T``,
+state, and cleanup proof. A v2 document is rejected; there is no automatic
+upgrade. During a documented allocation freeze, an operator can restore the
+exact allocation generations, host claims, proofs, and release intents without
+overwriting any existing key::
+
+    tools/openstack-incus-idmap-registry.py <same connection options> \
+      --restore-file idmap-registry.json --confirm-frozen
+
+Restore is idempotent and atomically writes each allocation pair together with
+its exact host indexes and optional release intent. It rejects a partial pair,
+a different owner, configuration drift, or a registry allocation absent from
+the frozen input document. The confirmation flag does not freeze Nova by
+itself; the operator must first disable scheduling and prove there are no
+creates, deletes, migrations, evacuations, or returning hosts in progress.
+
+Manual retirement is limited to a claim that is already ``cleaned`` and whose
+exact Incus proof is present in a frozen v3 document. Fencing alone is not
+cleanup proof. Freeze the fleet, take a fresh canonical audit, and then retire
+only the exact proven claim recorded in that audit::
+
+    tools/openstack-incus-idmap-registry.py <same connection options> \
+      --restore-file idmap-registry.json --confirm-frozen \
+      --retire-host-claim <instance-uuid> --host-id <compute-uuid>
+
+The command rejects ``unmaterialized`` and ``possible`` claims. A permanently
+lost compute without a durable exact proof continues to reserve its range
+until the host and storage state can be reconciled; an operator assertion or
+TTL is never accepted as a substitute.
+
+Enabling the allocator on a fleet with existing instances requires an offline
+inventory/import operation. Distinct UUIDs that already reuse a range on
+different computes cannot be imported as globally unique. Those legacy
+instances must be stopped and rebased during maintenance before migration is
+enabled. New and old allocation modes must not run concurrently in one
+migration domain. Rebase is a data-changing operation: Incus recursively
+unshifts and shifts a non-idmapped rootfs on its next start. Take a
+storage-native rollback point first. BFV roots require explicit Cinder
+snapshot/attachment coordination and must not be batch-rebased as ordinary
+Incus-owned Ceph roots.
 
 For OpenStack-Helm, combine the selected storage override with
 ``values_overrides/nova/incus-migration.yaml``. The DaemonSet derives each
@@ -629,19 +902,10 @@ block device directly, the updated capacity is visible without a QEMU resize
 layer. The tenant still owns filesystem growth, for example ``resize2fs`` or
 ``xfs_growfs`` after the block device has expanded.
 
-For iSCSI, Fibre Channel, or NVMe backends with redundant paths, configure
-os-brick through the Incus driver group::
-
-    [incus]
-    volume_use_multipath = true
-    volume_enforce_multipath = true
-    num_volume_scan_tries = 7
-
-``volume_enforce_multipath`` prevents a silent fallback to a single path and
-requires ``volume_use_multipath``. Keep both disabled for a backend such as
-Ceph RBD that does not use host multipath. Every compute node must use the
-same policy and have the required initiator, multipath daemon, and os-brick
-privileged-command dependencies installed.
+The multipath connector options are reserved for a future, separately
+certified non-RBD data-volume contract. Keep ``volume_use_multipath`` and
+``volume_enforce_multipath`` disabled for the currently supported Ceph RBD
+path.
 
 After a Cinder backend is configured, maintainers can validate attach,
 filesystem persistence, cross-compute cold migration, and detach cleanup::
@@ -693,7 +957,9 @@ must use a userspace filesystem implementation. The production default is
 mount syscall interception in every instance profile and rejects attachment to
 a running guest that does not provide ``fuse2fs``. Install the Ubuntu/Debian
 ``fuse2fs`` package (or the distribution equivalent) in every supported base
-image. Do not replace this with
+image, and publish it with ``hw_incus_data_volume_fuse=true``. The supplied
+Glance publishing tools add the property only after finding an executable
+``fuse2fs`` in the rootfs. Do not replace this with
 ``security.syscalls.intercept.mount.allowed=ext4`` for untrusted tenants;
 that passes tenant-controlled filesystem data into the host kernel and can
 expose the compute node to filesystem-parser vulnerabilities. Cinder
@@ -1027,8 +1293,9 @@ destination-local os-brick mapping.
 
 Incus-managed roots on a shared ``ceph`` pool also use zero-copy ordered
 handover. Both computes must advertise
-``migration_live_shared_ceph_storage`` and expose the same Ceph FSID, OSD pool,
-and ``ceph`` driver. Local ``dir``, LVM, Btrfs, and ZFS roots instead transfer
+``migration_live_shared_ceph_storage`` and
+``migration_shared_ceph_storage_ready_fence``, and expose the same Ceph FSID,
+OSD pool, and ``ceph`` driver. Local ``dir``, LVM, Btrfs, and ZFS roots instead transfer
 their rootfs data; they cannot use shared-storage handover.
 The source profile's host-specific ``unix-block source`` paths are excluded
 from migration data and rebuilt from the destination connection information.
@@ -1045,6 +1312,31 @@ computes; a per-host default prevents cross-node migration::
 
     [DEFAULT]
     my_shared_fs_storage_ip = 10.224.0.0/24
+
+Every compute that enables Manila must provide GNU coreutils ``timeout`` at
+``/usr/bin/timeout``. BusyBox ``timeout`` is rejected during ``init_host``
+because it does not provide the termination contract used around privileged
+mount helpers. Configure independent bounds for mount and unmount::
+
+    [incus]
+    enable_manila_shares = true
+    share_mount_timeout = 30
+    share_unmount_timeout = 30
+
+On expiry GNU ``timeout`` sends ``TERM`` and, after a five-second grace period,
+``KILL``. The driver never uses lazy or forced unmount. A timed-out unmount
+retains the fsync'd owner journal and leaves the Nova mapping in ``ERROR`` for
+an explicit retry. The compute image must install GNU coreutils even when the
+base distribution already provides a BusyBox applet with the same command
+name.
+
+The attach and migration paths fetch access rules for every mapping before the
+first host mount. CephFS credentials remain memory-only apart from the
+short-lived mode ``0600`` secret file consumed by the kernel mount helper; the
+journal never contains a Ceph secret. A later failure rolls back only changes
+made by the current transaction and does so in reverse order. Detach attempts
+all mappings before reporting failures, and Manila access is revoked only
+after the Incus device and host mount have been removed.
 
 With the DevStack plugin set ``INCUS_MANILA_ACCESS_CIDR`` to that CIDR.
 Firewall the share network so tenants cannot originate traffic from this

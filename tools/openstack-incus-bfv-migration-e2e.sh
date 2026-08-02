@@ -25,10 +25,34 @@ KEEP_RESOURCES_ON_FAILURE=${KEEP_RESOURCES_ON_FAILURE:-false}
 CONTROLLER_SSH=${CONTROLLER_SSH:-$SOURCE_SSH}
 CONTROLLER_OPENRC=${CONTROLLER_OPENRC:-/opt/stack/devstack/openrc admin admin}
 SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute test key}
+SSH_KNOWN_HOSTS_FILE=${SSH_KNOWN_HOSTS_FILE:-$HOME/.ssh/known_hosts}
 TIMEOUT=${TIMEOUT:-600}
+COMMAND_TIMEOUT=${COMMAND_TIMEOUT:-30}
 NAME=${NAME:-incus-bfv-migration-$RANDOM}
 
-SSH=(ssh -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=no)
+[[ -f "$SSH_IDENTITY" && -r "$SSH_IDENTITY" ]] || {
+    echo "SSH identity is not a readable regular file: $SSH_IDENTITY" >&2
+    exit 2
+}
+[[ -f "$SSH_KNOWN_HOSTS_FILE" && -r "$SSH_KNOWN_HOSTS_FILE" ]] || {
+    echo "SSH known_hosts is not a readable regular file: $SSH_KNOWN_HOSTS_FILE" >&2
+    exit 2
+}
+[[ "$COMMAND_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || {
+    echo "COMMAND_TIMEOUT must be a positive number of seconds" >&2
+    exit 2
+}
+command -v timeout >/dev/null || {
+    echo "timeout command is required" >&2
+    exit 2
+}
+SSH=(
+    ssh
+    -i "$SSH_IDENTITY"
+    -o BatchMode=yes
+    -o StrictHostKeyChecking=yes
+    -o "UserKnownHostsFile=$SSH_KNOWN_HOSTS_FILE"
+)
 server_id=
 volume_id=
 data_volume_id=
@@ -41,7 +65,13 @@ start_failpoint_pid=
 remote() {
     local host=$1
     shift
-    "${SSH[@]}" "$host" "$@"
+    if [[ -n "${ACTIVE_COMMAND_TIMEOUT:-}" ]]; then
+        timeout --foreground "${ACTIVE_COMMAND_TIMEOUT}s" \
+            "${SSH[@]}" -o "ConnectTimeout=$ACTIVE_COMMAND_TIMEOUT" \
+            "$host" "$@"
+    else
+        "${SSH[@]}" "$host" "$@"
+    fi
 }
 
 openstack() {
@@ -64,13 +94,31 @@ incus() {
     fi
 }
 
+# Run a polling command without allowing one unavailable remote API to exceed
+# either COMMAND_TIMEOUT or the caller's remaining wait deadline.
+run_until_deadline() {
+    local deadline=$1
+    shift
+    local remaining=$((deadline - SECONDS))
+    ((remaining > 0)) || return 124
+
+    local ACTIVE_COMMAND_TIMEOUT=$COMMAND_TIMEOUT
+    ((ACTIVE_COMMAND_TIMEOUT > remaining)) && ACTIVE_COMMAND_TIMEOUT=$remaining
+    "$@"
+}
+
 wait_incus_ready() {
     local host=$1 deadline=$((SECONDS + 60)) server
     while ((SECONDS < deadline)); do
-        server=$(incus "$host" query /1.0 2>/dev/null || true)
+        server=$(run_until_deadline "$deadline" \
+            incus "$host" query /1.0 2>/dev/null || true)
         if grep -q storage_driver_cephext <<<"$server" &&
                 grep -q migration_shared_ceph_storage <<<"$server" &&
-                incus "$host" storage show cinder-bfv 2>/dev/null |
+                grep -q instance_storage_handover_proof <<<"$server" &&
+                grep -q migration_shared_ceph_storage_ready_fence \
+                    <<<"$server" &&
+                run_until_deadline "$deadline" \
+                    incus "$host" storage show cinder-bfv 2>/dev/null |
                     grep -q '^driver: cephext$'; then
             return 0
         fi
@@ -89,12 +137,13 @@ wait_value() {
     shift
     local deadline=$((SECONDS + TIMEOUT)) current migration_status
     while ((SECONDS < deadline)); do
-        current=$("$@" 2>/dev/null || true)
+        current=$(run_until_deadline "$deadline" "$@" 2>/dev/null || true)
         [[ "$current" == "$expected" ]] && return 0
         [[ "$current" == ERROR ]] && break
         if [[ "$expected" == VERIFY_RESIZE && "$current" == ACTIVE &&
               -n "$server_id" ]]; then
-            migration_status=$(latest_migration_status 2>/dev/null || true)
+            migration_status=$(run_until_deadline "$deadline" \
+                latest_migration_status 2>/dev/null || true)
             if [[ "$migration_status" == error ]]; then
                 fail "migration entered error while waiting for VERIFY_RESIZE"
             fi
@@ -107,7 +156,7 @@ wait_value() {
 wait_absent() {
     local deadline=$((SECONDS + TIMEOUT))
     while ((SECONDS < deadline)); do
-        "$@" >/dev/null 2>&1 || return 0
+        run_until_deadline "$deadline" "$@" >/dev/null 2>&1 || return 0
         sleep 2
     done
     fail "timed out waiting for resource deletion"
@@ -116,7 +165,7 @@ wait_absent() {
 wait_host_rbd_unmapped() {
     local host=$1 volume=$2 deadline=$((SECONDS + TIMEOUT)) mappings
     while ((SECONDS < deadline)); do
-        mappings=$(remote "$host" \
+        mappings=$(run_until_deadline "$deadline" remote "$host" \
             "rbd device list --format json --id cinder 2>/dev/null | \
              jq -r '.[] | select(.name == \"volume-$volume\") | .device'" ||
             true)
@@ -129,8 +178,10 @@ wait_host_rbd_unmapped() {
 wait_incus_instance_absent() {
     local host=$1 deadline=$((SECONDS + TIMEOUT))
     while ((SECONDS < deadline)); do
-        if ! incus "$host" info "$instance_name" >/dev/null 2>&1 &&
-                ! incus "$host" profile show "$instance_name" \
+        if ! run_until_deadline "$deadline" \
+                incus "$host" info "$instance_name" >/dev/null 2>&1 &&
+                ! run_until_deadline "$deadline" \
+                    incus "$host" profile show "$instance_name" \
                     >/dev/null 2>&1; then
             return 0
         fi
@@ -197,7 +248,7 @@ dump_network_diagnostics() {
 wait_port_active() {
     local deadline=$((SECONDS + TIMEOUT)) current
     while ((SECONDS < deadline)); do
-        current=$(port_status 2>/dev/null || true)
+        current=$(run_until_deadline "$deadline" port_status 2>/dev/null || true)
         [[ "$current" == ACTIVE ]] && return 0
         sleep 2
     done
@@ -285,6 +336,10 @@ wait_value ACTIVE server_status
 instance_name=$(openstack server show "$server_id" -f value \
     -c OS-EXT-SRV-ATTR:instance_name)
 port_id=$(openstack port list --server "$server_id" -f value -c ID)
+guest_iface="nic${port_id//-/}"
+guest_iface=${guest_iface,,}
+guest_iface=${guest_iface:0:15}
+[[ -n "$guest_iface" ]] || fail "unable to derive guest interface from port ID"
 if [[ "$TEST_DATA_VOLUME_RECOVERY" == true ]]; then
     data_volume_id=$(openstack volume create --type "$VOLUME_TYPE" --size 1 \
         -f value -c id "${NAME}-data")
@@ -293,9 +348,13 @@ if [[ "$TEST_DATA_VOLUME_RECOVERY" == true ]]; then
     openstack server add volume "$server_id" "$data_volume_id" >/dev/null
     wait_value attached attachment_status "$data_volume_id"
 fi
+incus "$SOURCE_SSH" exec "$instance_name" -- \
+    ip link show dev "$guest_iface" >/dev/null || \
+    fail "source instance is missing guest interface $guest_iface"
 fixed_ip=$(incus "$SOURCE_SSH" exec "$instance_name" -- sh -c \
-    "ip -4 -o addr show eth0 | awk '{print \$4}'")
-[[ -n "$fixed_ip" ]] || fail "source instance has no eth0 IPv4 address"
+    "ip -4 -o addr show dev '$guest_iface' | awk '{print \$4}'")
+[[ -n "$fixed_ip" ]] || \
+    fail "source instance has no IPv4 address on $guest_iface"
 marker="bfv-migration-$server_id"
 incus "$SOURCE_SSH" exec "$instance_name" -- sh -c \
     "printf %s '$marker' > /root/nova-bfv-migration-marker; sync"
@@ -408,8 +467,11 @@ wait_value VERIFY_RESIZE server_status
 [[ "$(incus "$DEST_SSH" exec "$instance_name" -- \
     cat /root/nova-bfv-migration-marker)" == "$marker" ]] || \
     fail "root marker missing on destination"
+incus "$DEST_SSH" exec "$instance_name" -- \
+    ip link show dev "$guest_iface" >/dev/null || \
+    fail "destination instance is missing guest interface $guest_iface"
 [[ "$(incus "$DEST_SSH" exec "$instance_name" -- sh -c \
-    "ip -4 -o addr show eth0 | awk '{print \$4}'")" == "$fixed_ip" ]] || \
+    "ip -4 -o addr show dev '$guest_iface' | awk '{print \$4}'")" == "$fixed_ip" ]] || \
     fail "fixed IP changed after migration"
 openstack server resize confirm "$server_id"
 wait_value ACTIVE server_status

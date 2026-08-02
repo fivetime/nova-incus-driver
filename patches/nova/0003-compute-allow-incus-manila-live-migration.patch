@@ -1,56 +1,501 @@
 From: OpenStack Incus maintainers <openstack-incus@example.invalid>
-Subject: [PATCH] compute: Allow capability-gated Incus Manila live migration
+Subject: [PATCH] compute: Schedule Manila migrations by capability
 
-Nova rejects every live migration when an instance has a share mapping.
-The Incus driver can mount the share on the destination before CRIU restore
-and unmount it on the source after handoff. Allow that path only when the
-source resource provider explicitly advertises the dedicated capability.
-Other drivers and Incus nodes without the capability remain blocked.
+Nova rejects every live migration, cold migration, and resize when an
+instance has a share mapping. The Incus driver can pre-mount the share on
+the destination and unmount it on the source after handoff.
 
+Require the source resource provider to advertise the operation-specific
+capability. Add that same trait to RequestSpec.root_required so Placement
+only returns capable destination providers. The legacy forced live migration
+path bypasses the scheduler, so validate its explicit destination provider
+directly. Other actions, drivers, and Incus nodes remain blocked.
+
+Also reject share attach/detach while an instance task is active and expose
+small ComputeManager transaction hooks for destination preparation, access
+revocation, and rollback completion. The base hooks are no-ops, so existing
+drivers retain their behavior while an out-of-tree manager can keep Manila
+mount ownership and migration task state ordered durably.
+
+diff --git a/nova/api/openstack/compute/server_shares.py b/nova/api/openstack/compute/server_shares.py
+index c7d85e0358..786656b7bd 100644
+--- a/nova/api/openstack/compute/server_shares.py
++++ b/nova/api/openstack/compute/server_shares.py
+@@ -53,6 +53,16 @@ class ServerSharesController(wsgi.Controller):
+ 
+     def _check_instance_in_valid_state(self, context, server_id, action):
+         instance = self._get_instance_from_server_uuid(context, server_id)
++        if instance.task_state is not None:
++            exc = exception.InstanceInvalidState(
++                attr="task_state",
++                instance_uuid=instance.uuid,
++                state=instance.task_state,
++                method=action,
++            )
++            common.raise_http_conflict_for_instance_invalid_state(
++                exc, action, server_id
++            )
+         if (
+             (action == "create share" and
+              instance.vm_state not in vm_states.STOPPED) or
 diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 6db7588236..be9487d9b1 100644
 --- a/nova/compute/api.py
 +++ b/nova/compute/api.py
-@@ -410,14 +410,30 @@ def block_port_accelerators():
+@@ -410,6 +410,27 @@ def block_port_accelerators():
      return inner
-
-
--def block_shares_not_supported():
-+def _supports_share_live_migration(context, instance):
-+    node = objects.ComputeNode.get_first_node_by_host_for_old_compat(
-+        context, instance.host)
+ 
+ 
++def _provider_supports_trait(context, provider_uuid, capability_trait):
 +    trait_info = report.report_client_singleton().get_provider_traits(
-+        context, node.uuid)
-+    return (
-+        'CUSTOM_INCUS_MANILA_LIVE_MIGRATION' in trait_info.traits
-+    )
++        context, provider_uuid)
++    return capability_trait in trait_info.traits
 +
 +
-+def block_shares_not_supported(allow_capability_gated_live_migration=False):
++def _require_share_migration_capability(
++        context, instance, capability_trait):
++    """Require source support and return the target scheduling trait."""
++    if not instance_has_share(context, instance):
++        return None
++
++    node = objects.ComputeNode.get_by_host_and_nodename(
++        context, instance.host, instance.node)
++    if not _provider_supports_trait(
++            context, node.uuid, capability_trait):
++        raise exception.ForbiddenWithShare()
++
++    return capability_trait
++
++
+ def block_shares_not_supported():
      """Block actions not allowed if the instance has a share.
      """
-     def inner(func):
-         @functools.wraps(func)
-         def wrapper(self, context, instance, *args, **kwargs):
-             # Check if instance has a share mapped
--            if instance_has_share(context, instance):
-+            has_share = instance_has_share(context, instance)
-+            if (
-+                has_share and not (
-+                    allow_capability_gated_live_migration and
-+                    _supports_share_live_migration(context, instance)
-+                )
-+            ):
-                 raise exception.ForbiddenWithShare()
-             return func(self, context, instance, *args, **kwargs)
-         return wrapper
-@@ -5544,7 +5560,9 @@ class API:
-
-         return _metadata
-
+@@ -4263,7 +4284,6 @@ class API:
+                     "other TPM secret security modes is not supported.")
+             raise exception.OperationNotSupportedForVTPM(msg)
+ 
 -    @block_shares_not_supported()
-+    @block_shares_not_supported(
-+        allow_capability_gated_live_migration=True
-+    )
+     # TODO(stephenfin): This logic would be so much easier to grok if we
+     # finally split resize and cold migration into separate code paths
+     @block_extended_resource_request
+@@ -4283,6 +4303,9 @@ class API:
+         host_name can be set in the cold migration case only.
+         """
+ 
++        share_migration_trait = _require_share_migration_capability(
++            context, instance, 'CUSTOM_INCUS_MANILA_COLD_MIGRATION')
++
+         # Only lookup the minimum compute version once
+         min_comp_ver = objects.service.get_minimum_version_all_cells(
+             context, ["nova-compute"])
+@@ -4397,6 +4420,8 @@ class API:
+         request_spec = objects.RequestSpec.get_by_instance_uuid(
+             context, instance.uuid)
+         request_spec.ignore_hosts = filter_properties['ignore_hosts']
++        if share_migration_trait:
++            request_spec.root_required.add(share_migration_trait)
+ 
+         # don't recalculate the NUMA topology unless the flavor has changed
+         if not same_flavor:
+@@ -5544,7 +5569,6 @@ class API:
+ 
+         return _metadata
+ 
+-    @block_shares_not_supported()
      @block_extended_resource_request
      @block_port_accelerators()
      @reject_vdpa_instances(
+@@ -5559,6 +5583,9 @@ class API:
+     def live_migrate(self, context, instance, block_migration,
+                      disk_over_commit, host_name, force=None, async_=False):
+         """Migrate a server lively to a new host."""
++        share_migration_trait = _require_share_migration_capability(
++            context, instance, 'CUSTOM_INCUS_MANILA_LIVE_MIGRATION')
++
+         LOG.debug("Going to try to live migrate instance to %s",
+                   host_name or "another host", instance=instance)
+ 
+@@ -5566,9 +5593,17 @@ class API:
+             # Validate the specified host before changing the instance task
+             # state.
+             nodes = objects.ComputeNodeList.get_all_by_host(context, host_name)
++            if (
++                share_migration_trait and force is not False and
++                not _provider_supports_trait(
++                    context, nodes[0].uuid, share_migration_trait)
++            ):
++                raise exception.ForbiddenWithShare()
+ 
+         request_spec = objects.RequestSpec.get_by_instance_uuid(
+             context, instance.uuid)
++        if share_migration_trait:
++            request_spec.root_required.add(share_migration_trait)
+ 
+         instance.task_state = task_states.MIGRATING
+         instance.save(expected_task_state=[None])
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index ce6b98ddcd..f8df55b087 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -4809,6 +4809,9 @@ class ComputeManager(manager.Manager):
+             instance.save()
+             LOG.warning("Image not found during snapshot", instance=instance)
+ 
++    def _pre_deny_share(self, context, instance, share_mapping):
++        """Remove driver-owned share state before Manila access revocation."""
++
+     @messaging.expected_exceptions(NotImplementedError)
+     @wrap_exception()
+     def volume_snapshot_create(self, context, instance, volume_id,
+@@ -5035,6 +5038,11 @@ class ComputeManager(manager.Manager):
+                     share_id=share_mapping.share_id,
+                 )
+ 
++                # Run inside the same notification, fault and per-share lock
++                # as access revocation and mapping deletion. Subclasses use
++                # this to remove host state while access still exists.
++                self._pre_deny_share(context, instance, share_mapping)
++
+                 still_used = check_share_usage(context, instance.uuid)
+ 
+                 share_mapping.set_access_according_to_protocol()
+@@ -9210,6 +9218,11 @@ class ComputeManager(manager.Manager):
+             delattr(dest_check_data, 'dst_supports_numa_live_migration')
+         return dest_check_data
+ 
++    def _prepare_live_migration_check_data(
++            self, context, instance, dest_check_data, migration):
++        """Allow a manager subclass to bind data to this migration record."""
++        return dest_check_data
++
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+     @wrap_instance_fault
+@@ -9254,6 +9267,8 @@ class ComputeManager(manager.Manager):
+             block_migration, disk_over_commit)
+         dest_check_data = self._dest_can_numa_live_migrate(dest_check_data,
+                                                            migration)
++        dest_check_data = self._prepare_live_migration_check_data(
++            ctxt, instance, dest_check_data, migration)
+         LOG.debug('destination check data is %s', dest_check_data)
+         try:
+             allocs = self.reportclient.get_allocations_for_consumer(
+@@ -10478,6 +10493,16 @@ class ComputeManager(manager.Manager):
+                                   "BDM for volume %s.", bdm.volume_id,
+                                   instance=instance)
+ 
++    def _complete_live_migration_rollback(
++            self, context, instance, migrate_data, pre_live_migration=False):
++        """Wait for subclass-specific rollback work before releasing state.
++
++        Most drivers complete rollback in the callbacks above. A compute
++        manager subclass may override this hook when asynchronous destination
++        cleanup must be positively acknowledged before Nova clears the
++        migration task state.
++        """
++
+     @wrap_exception()
+     @wrap_instance_fault
+     def _rollback_live_migration(self, context, instance,
+@@ -10622,6 +10647,13 @@ class ComputeManager(manager.Manager):
+             self.compute_rpcapi.drop_move_claim_at_destination(context,
+                                                                instance, dest)
+ 
++        # Keep MIGRATING and the migration context durable until any
++        # subclass-specific asynchronous destination cleanup has been proven.
++        # An exception here deliberately leaves the rollback retryable.
++        self._complete_live_migration_rollback(
++            context, instance, migrate_data,
++            pre_live_migration=pre_live_migration)
++
+         # NOTE(luyao): We only update instance info after rollback operations
+         # are complete
+         instance.task_state = None
+diff --git a/nova/tests/unit/api/openstack/compute/test_server_shares.py b/nova/tests/unit/api/openstack/compute/test_server_shares.py
+index a7327b9d8e..3d5b8f10b4 100644
+--- a/nova/tests/unit/api/openstack/compute/test_server_shares.py
++++ b/nova/tests/unit/api/openstack/compute/test_server_shares.py
+@@ -13,6 +13,7 @@
+ import webob
+ 
+ from nova.api.openstack.compute import server_shares
++from nova.compute import task_states
+ from nova.compute import vm_states
+ from nova import context
+ from nova.db.main import models
+@@ -78,6 +79,21 @@ class ServerSharesTest(BaseTestCase):
+                     projects=[]),
+                 vm_state=vm_states.STOPPED)
+ 
++    @mock.patch('nova.api.openstack.common.get_instance')
++    def test_share_operation_rejected_during_instance_task(
++            self, mock_get_instance):
++        instance = self.fake_get_instance()
++        instance.task_state = task_states.MIGRATING
++        mock_get_instance.return_value = instance
++
++        exc = self.assertRaises(
++            webob.exc.HTTPConflict,
++            self.controller._check_instance_in_valid_state,
++            self.req.environ['nova.context'], instance.uuid, 'create share')
++
++        self.assertIn('task_state', str(exc))
++        self.assertIn(task_states.MIGRATING, str(exc))
++
+     @mock.patch(
+         'nova.virt.hardware.check_shares_supported', return_value=None
+     )
+diff --git a/nova/tests/unit/compute/test_api.py b/nova/tests/unit/compute/test_api.py
+index 4dd95f797b..7b908b1e4a 100644
+--- a/nova/tests/unit/compute/test_api.py
++++ b/nova/tests/unit/compute/test_api.py
+@@ -117,6 +117,56 @@ class _ComputeAPIUnitTestMixIn(object):
+             exclude_states = set()
+         return vm_state - exclude_states
+ 
++    @mock.patch.object(compute_api, 'instance_has_share', return_value=False)
++    @mock.patch.object(objects.ComputeNode, 'get_by_host_and_nodename')
++    def test_share_migration_capability_not_required_without_share(
++            self, get_node, has_share):
++        instance = self._create_instance_obj()
++
++        result = compute_api._require_share_migration_capability(
++            self.context, instance,
++            'CUSTOM_INCUS_MANILA_LIVE_MIGRATION')
++
++        self.assertIsNone(result)
++        get_node.assert_not_called()
++
++    @mock.patch.object(compute_api, '_provider_supports_trait',
++                       return_value=False)
++    @mock.patch.object(objects.ComputeNode, 'get_by_host_and_nodename')
++    @mock.patch.object(compute_api, 'instance_has_share', return_value=True)
++    def test_share_migration_capability_rejects_unsupported_source(
++            self, has_share, get_node, supports_trait):
++        instance = self._create_instance_obj()
++        get_node.return_value.uuid = uuids.compute_node
++
++        self.assertRaises(
++            exception.ForbiddenWithShare,
++            compute_api._require_share_migration_capability,
++            self.context, instance,
++            'CUSTOM_INCUS_MANILA_COLD_MIGRATION')
++
++        get_node.assert_called_once_with(
++            self.context, instance.host, instance.node)
++        supports_trait.assert_called_once_with(
++            self.context, uuids.compute_node,
++            'CUSTOM_INCUS_MANILA_COLD_MIGRATION')
++
++    @mock.patch.object(compute_api, '_provider_supports_trait',
++                       return_value=True)
++    @mock.patch.object(objects.ComputeNode, 'get_by_host_and_nodename')
++    @mock.patch.object(compute_api, 'instance_has_share', return_value=True)
++    def test_share_migration_capability_returns_target_trait(
++            self, has_share, get_node, supports_trait):
++        instance = self._create_instance_obj()
++        get_node.return_value.uuid = uuids.compute_node
++
++        result = compute_api._require_share_migration_capability(
++            self.context, instance,
++            'CUSTOM_INCUS_MANILA_COLD_MIGRATION')
++
++        self.assertEqual(
++            'CUSTOM_INCUS_MANILA_COLD_MIGRATION', result)
++
+     def _create_flavor(self, **updates):
+         flavor = {'id': 1,
+                   'flavorid': 1,
+@@ -1968,7 +2018,8 @@ class _ComputeAPIUnitTestMixIn(object):
+                      host_name=None,
+                      request_spec=True,
+                      requested_destination=False,
+-                     allow_cross_cell_resize=False):
++                     allow_cross_cell_resize=False,
++                     share_migration_trait=None):
+ 
+         self.flags(allow_resize_to_same_host=allow_same_host)
+         mock_allow_resize_to_same_host.return_value = allow_same_host
+@@ -2049,24 +2100,30 @@ class _ComputeAPIUnitTestMixIn(object):
+                 self.compute_api, '_allow_cross_cell_resize')).mock
+         mock_allow_cross_cell_resize.return_value = allow_cross_cell_resize
+ 
+-        if flavor_id_passed:
+-            self.compute_api.resize(self.context, fake_inst,
+-                                    flavor_id='new-flavor-id',
+-                                    clean_shutdown=clean_shutdown,
+-                                    host_name=host_name)
+-        else:
+-            if request_spec:
++        with mock.patch.object(
++                compute_api, '_require_share_migration_capability',
++                return_value=share_migration_trait):
++            if flavor_id_passed:
+                 self.compute_api.resize(self.context, fake_inst,
++                                        flavor_id='new-flavor-id',
+                                         clean_shutdown=clean_shutdown,
+                                         host_name=host_name)
+             else:
+-                self.assertRaises(exception.RequestSpecNotFound,
+-                                  self.compute_api.resize,
+-                                  self.context, fake_inst,
+-                                  clean_shutdown=clean_shutdown,
+-                                  host_name=host_name)
++                if request_spec:
++                    self.compute_api.resize(self.context, fake_inst,
++                                            clean_shutdown=clean_shutdown,
++                                            host_name=host_name)
++                else:
++                    self.assertRaises(exception.RequestSpecNotFound,
++                                      self.compute_api.resize,
++                                      self.context, fake_inst,
++                                      clean_shutdown=clean_shutdown,
++                                      host_name=host_name)
+ 
+         if request_spec:
++            expected_traits = (
++                {share_migration_trait} if share_migration_trait else set())
++            self.assertEqual(expected_traits, fake_spec.root_required)
+             if allow_same_host:
+                 self.assertEqual([], fake_spec.ignore_hosts)
+             else:
+@@ -2276,6 +2333,10 @@ class _ComputeAPIUnitTestMixIn(object):
+         self._test_migrate(host_name='target_host',
+                            allow_cross_cell_resize=True)
+ 
++    def test_migrate_with_share_requires_destination_trait(self):
++        self._test_migrate(
++            share_migration_trait='CUSTOM_INCUS_MANILA_COLD_MIGRATION')
++
+     @mock.patch('nova.servicegroup.api.API.service_is_up',
+                 new=mock.Mock(return_value=True))
+     @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host',
+@@ -2767,22 +2828,73 @@ class _ComputeAPIUnitTestMixIn(object):
+     @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
+     @mock.patch.object(objects.Instance, 'save')
+     @mock.patch.object(objects.InstanceAction, 'action_start')
+-    def _live_migrate_instance(self, instance, _save, _action, get_spec):
++    def _live_migrate_instance(
++            self, instance, _save, _action, get_spec,
++            share_migration_trait=None, destination_support=True,
++            force=None):
+         api = conductor.api.ComputeTaskAPI
+         fake_spec = objects.RequestSpec()
+         get_spec.return_value = fake_spec
+-        with mock.patch.object(api, 'live_migrate_instance') as task:
+-            self.compute_api.live_migrate(self.context, instance,
+-                                          block_migration=True,
+-                                          disk_over_commit=True,
+-                                          host_name='fake_dest_host')
++        with (
++            mock.patch.object(
++                compute_api, '_require_share_migration_capability',
++                return_value=share_migration_trait),
++            mock.patch.object(
++                compute_api, '_provider_supports_trait',
++                return_value=destination_support) as supports_trait,
++            mock.patch.object(api, 'live_migrate_instance') as task,
++        ):
++            if share_migration_trait and not destination_support:
++                self.assertRaises(
++                    exception.ForbiddenWithShare,
++                    self.compute_api.live_migrate,
++                    self.context, instance, block_migration=True,
++                    disk_over_commit=True, host_name='fake_dest_host')
++                task.assert_not_called()
++                supports_trait.assert_called_once_with(
++                    self.context, mock.ANY, share_migration_trait)
++                return
++
++            self.compute_api.live_migrate(
++                self.context, instance, block_migration=True,
++                disk_over_commit=True, host_name='fake_dest_host',
++                force=force)
+             self.assertEqual(task_states.MIGRATING, instance.task_state)
+-            task.assert_called_once_with(self.context, instance,
+-                                         'fake_dest_host',
++            expected_host = None if force is False else 'fake_dest_host'
++            task.assert_called_once_with(self.context, instance, expected_host,
+                                          block_migration=True,
+                                          disk_over_commit=True,
+                                          request_spec=fake_spec,
+                                          async_=False)
++            expected_traits = (
++                {share_migration_trait} if share_migration_trait else set())
++            self.assertEqual(expected_traits, fake_spec.root_required)
++            if share_migration_trait and force is not False:
++                supports_trait.assert_called_once_with(
++                    self.context, mock.ANY, share_migration_trait)
++            else:
++                supports_trait.assert_not_called()
++
++    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
++    def test_live_migrate_with_share_requires_destination_trait(
++            self, mock_nodelist):
++        instance = self._create_instance_obj()
++        mock_nodelist.return_value = [objects.ComputeNode(
++            uuid=uuids.compute_node, host='fake_dest_host',
++            hypervisor_hostname='fake_dest_node')]
++        self._live_migrate_instance(
++            instance,
++            share_migration_trait='CUSTOM_INCUS_MANILA_LIVE_MIGRATION',
++            force=False)
++
++    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
++    def test_forced_live_migrate_with_share_rejects_destination_without_trait(
++            self, mock_nodelist):
++        instance = self._create_instance_obj()
++        self._live_migrate_instance(
++            instance,
++            share_migration_trait='CUSTOM_INCUS_MANILA_LIVE_MIGRATION',
++            destination_support=False)
+ 
+     def _get_volumes_for_test_swap_volume(self):
+         volumes = {}
+diff --git a/nova/tests/unit/compute/test_compute.py b/nova/tests/unit/compute/test_compute.py
+index 18c4f33d3a..3b0babd974 100644
+--- a/nova/tests/unit/compute/test_compute.py
++++ b/nova/tests/unit/compute/test_compute.py
+@@ -7150,6 +7150,7 @@ class ComputeTestCase(BaseTestCase,
+                                      migration_status=None):
+         c = context.get_admin_context()
+         instance = mock.MagicMock()
++        instance.task_state = task_states.MIGRATING
+         migration = objects.Migration(uuid=uuids.migration)
+         migrate_data = objects.LibvirtLiveMigrateData(
+             migration=migration,
+@@ -7173,15 +7174,25 @@ class ComputeTestCase(BaseTestCase,
+                   mock_mig_save, mock_notify, mock_get_pci):
+             mock_get_pci.return_value = objects.InstancePCIRequests()
+             mock_lmcf.return_value = False, False
+-            if migration_status:
+-                self.compute._rollback_live_migration(
+-                    c, instance, 'foo', migrate_data=migrate_data,
+-                    migration_status=migration_status,
+-                    source_bdms=source_bdms)
+-            else:
+-                self.compute._rollback_live_migration(
+-                    c, instance, 'foo', migrate_data=migrate_data,
+-                    source_bdms=source_bdms)
++
++            def complete_rollback(*args, **kwargs):
++                self.assertEqual(
++                    task_states.MIGRATING, instance.task_state)
++
++            with mock.patch.object(
++                    self.compute, '_complete_live_migration_rollback',
++                    side_effect=complete_rollback) as complete:
++                if migration_status:
++                    self.compute._rollback_live_migration(
++                        c, instance, 'foo', migrate_data=migrate_data,
++                        migration_status=migration_status,
++                        source_bdms=source_bdms)
++                else:
++                    self.compute._rollback_live_migration(
++                        c, instance, 'foo', migrate_data=migrate_data,
++                        source_bdms=source_bdms)
++            complete.assert_called_once_with(
++                c, instance, migrate_data, pre_live_migration=False)
+             mock_drop_claim.assert_called_once_with(c, instance, 'foo')
+             mock_notify.assert_has_calls([
+                 mock.call(c, instance, self.compute.host,

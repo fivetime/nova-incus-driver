@@ -40,12 +40,18 @@ access.
 
 Every Nova-created Incus instance stores its authoritative Nova UUID in
 ``user.openstack.uuid``. Startup reconciliation ignores Incus instances
-without that marker and all Incus virtual machines.
+without that marker and all Incus virtual machines. The configured Incus
+project is a private driver backend and must not be used for manual containers,
+CRIU experiments, or other workloads. Those operations require a separate
+Incus project. An administrator can copy or forge ``user.openstack.uuid``;
+therefore the marker is an ownership assertion inside this trusted boundary,
+not an authentication credential. If multiple containers claim one Nova UUID,
+the driver reports an integrity error and returns the UUID only once during
+Nova reconciliation. It never guesses which record is safe to delete.
 
-The first milestone retains the existing host-local Incus ``default`` project.
-OpenStack tenant identity is not duplicated in Incus. Restricted Incus projects
-can be added later as optional defense in depth, subordinate to Nova's identity
-and authorization model.
+OpenStack tenant identity is not duplicated in Incus. The host-local driver
+project isolates Nova-managed records from other host administration, but
+remains subordinate to Nova's identity and authorization model.
 
 Network boundary
 ----------------
@@ -103,8 +109,10 @@ values must be identical on every compute so migration cannot change the
 effective fallback or validation policy. PID limits are cgroup isolation, not
 a Placement resource inventory; operators must still monitor aggregate host
 PID consumption.
-For block and copy-on-write storage pools, a zero-disk flavor still receives
-the positive ``[incus] minimum_root_disk_gb`` limit, which defaults to 1 GiB.
+For non-BFV instances, the Flavor ``root_gb`` must be at least the positive
+``[incus] minimum_root_disk_gb`` limit, which defaults to 1 GiB. The driver
+rejects smaller values instead of silently consuming storage that Placement
+did not account for. BFV root capacity remains owned and metered by Cinder.
 Only driver-generated raw LXC settings are permitted; tenant-supplied raw LXC
 configuration remains prohibited.
 
@@ -112,11 +120,104 @@ Keystone projects and Nova ownership are the authoritative tenant boundary;
 Neutron projects own the corresponding OVN logical networks and ports. Each
 compute host uses a host-local Incus project as a private driver backend, not
 as a tenant-facing control plane. Tenants receive neither the Incus socket nor
-Incus API credentials. Nova API policy prevents cross-project instance access,
-Neutron isolates overlapping tenant CIDRs, and Incus allocates a distinct host
-UID/GID range for every instance through ``security.idmap.isolated``. The
-compute service account remains trusted infrastructure and can inspect all
-host-local instances, just as a conventional hypervisor can inspect its VMs.
+Incus API credentials. That Incus project is dedicated to one
+``nova-compute`` driver: operators and test tools must not create unrelated
+containers or VMs in it. The frequent Nova name inventory intentionally uses
+the Incus non-recursive list endpoint; ownership and recovery audits use the
+expanded ``user.openstack.uuid`` metadata and report duplicate claims as
+integrity errors. Nova API policy prevents cross-project instance access,
+Neutron isolates overlapping tenant CIDRs. In a migration-enabled deployment,
+the driver allocates a fixed UID/GID range for every instance from a persistent
+HA etcd registry, stores the result in Nova ``system_metadata``, and writes
+``security.idmap.base`` and ``security.idmap.size`` explicitly. Incus still
+performs the node-local overlap check. Host-local Incus first-fit allocation is
+not globally unique and must never be used as a migration fallback. The
+allocator range, slot size, namespace, and subordinate UID/GID ranges are an
+immutable migration-domain contract. The compute service account remains
+trusted infrastructure and can inspect all host-local instances, just as a
+conventional hypervisor can inspect its VMs.
+
+Each allocation also carries a sorted set of persistent Nova compute-node
+UUID claims. A source, destination, or evacuation target adds its claim before
+creating any profile, VIF, storage attachment, or container. Claims never
+expire by time. Cleanup removes a claim only after that node positively proves
+that its Incus record, profile, instance directory, Cinder journals, and Manila
+mount journals are absent. Final Nova deletion first writes an exact-generation
+release intent into the same HA etcd namespace. Creating that intent and adding
+a new host claim are mutually exclusive compare-and-swap operations. The slot
+is reusable only after Nova is finally deleted and the claim set is empty.
+Thus an offline former source or a returning evacuated host causes a bounded,
+visible capacity leak instead of host UID/GID reuse. Retiring such a claim
+requires explicit STONITH evidence; a hostname or elapsed timeout is never
+sufficient authority.
+
+A compute may later receive the same allocation generation after its previous
+host materialization has an acknowledged ``cleaned`` proof. The allocator
+replaces that old host claim with the new materialization token in one etcd
+compare-and-swap while keeping the host index present. Concurrent periodic
+retirement either removes the old token first, after which the new claim is
+added, or loses its exact-token CAS to the replacement; it can never remove the
+new claim through an empty-index ABA window. Periodic reconciliation performs
+Incus inventory and storage-proof I/O outside the cross-process instance lock,
+then takes a short lock only to re-read Nova ownership, revalidate the exact
+allocation/host/materialization token, and retire it.
+
+Each generation also has a one-way ``rootfs_materialized`` barrier. It starts
+false. Immediately before the first Incus create request, Nova holds the same
+instance UUID lock used by final deletion, revalidates the exact local claim,
+sets the barrier through etcd CAS, and keeps the lock until Incus accepts or
+rejects the create request. The spawn, cold-migration target, evacuation
+target, and live-migration receive paths all use this transaction. Every start
+or restart requires the barrier to be true, the exact local host claim to
+exist, and both release-intent and release-proof keys to be absent.
+
+Final deletion of a materialized generation is a distributed evidence chain.
+Nova first writes the immutable release intent, then sends the Incus instance
+DELETE with the allocation UUID as release token and the Nova instance UUID as
+owner. Incus deletes or normalizes the root storage and returns a complete,
+digest-bound storage receipt. Nova persists the complete receipt as immutable
+etcd proof before acknowledging the node-local receipt; only then may it
+retire the host claim and release the slot. Lost DELETE and ACK responses are
+replayed from those two durable records. A generation that never crossed the
+materialization barrier may be released without a storage receipt, but only
+after the complete local and all-project Incus inventory is proven absent.
+Uncertain state always retains the claim and slot.
+
+Host claims use Nova's node-persistent ``$state_path/compute_id`` UUID rather
+than ``CONF.host``. Reinstalling a compute creates a new identity and cannot
+silently inherit an old host claim. The production fleet gate requires this
+file on every compute and rejects duplicate UUIDs.
+
+The allocator client enforces HTTPS, mutual TLS, and etcd username/password
+authentication by default. The etcd role grants read/write access only to the
+configured namespace prefix; the HTTP gateway cannot derive this authorization
+from the client certificate common name. Transport authentication and prefix
+authorization are both part of the isolation boundary, not optional
+deployment hardening. ``idmap_allocator_allow_insecure=true`` exists only for an
+isolated development testbed and fails the production preflight. If Nova
+already has an allocation generation in ``system_metadata`` but either etcd
+record is absent, the driver does not create a replacement generation. It
+freezes spawn and migration until the registry is explicitly recovered from a
+complete Nova and Incus inventory. This prevents a stale etcd restore from
+silently authorizing reuse of a live container's host UID/GID range.
+The allocator audits the complete bidirectional registry before and after a
+slot-changing transaction, and every ownership transaction compares the
+immutable namespace configuration. A partial instance/slot pair therefore
+blocks admission instead of allowing a second instance to reuse its range.
+Normal operations use exact keys. A low-frequency full audit detects unrelated
+registry corruption and permanently latches that ``nova-compute`` process
+fail-closed; repair requires an operator audit followed by a compute restart.
+The gateway listener keeps ``client-cert-auth=false`` while setting a dedicated
+``trusted-ca-file``. etcd 3.4 through 3.6 still require and verify the client
+certificate in this combination; false disables only the unsupported gateway
+CN-to-user mapping. Token authentication supplies the prefix-restricted etcd
+identity. An invalid token triggers one synchronized reauthentication and one
+request retry; permission and transport failures never trigger that replay.
+The all-project inventory proof uses a separate unscoped local SDK client.
+Reusing the Nova-project client would send both ``project=nova`` and
+``all-projects=true`` and Incus correctly rejects that ambiguous request.
+Admission also verifies the allocator credentials with the running compute
+process's effective UID, GID, and supplementary groups.
 
 ``[incus] allow_instance_swap`` defaults to false, so tenant memory cannot
 spill into host swap unless the compute operator explicitly changes that
@@ -143,6 +244,15 @@ Without this bind mount, Nova can build the config-drive directory on the
 host but Incus correctly rejects the disk device because its source is not
 visible inside the daemon container.
 
+``instances_path`` is also the durable transaction store for Cinder
+connect/disconnect recovery and Manila staging ownership. A containerized
+``nova-compute`` must therefore mount the node's persistent host directory at
+the configured absolute path. An ``emptyDir`` is not valid: deleting or
+restarting the compute pod would discard the only host-side record needed to
+finish an uncertain os-brick disconnect or prove ownership of a staged share.
+The Nova and incusd containers must see the same path, but only Nova receives
+write access to the complete directory.
+
 When Manila shares are enabled, Nova mounts each export below the dedicated
 ``incus-shares`` subtree. That subtree must also be passed to incusd at the
 same absolute path with recursive mount propagation:
@@ -162,6 +272,88 @@ cannot list staged shares. Every parent above ``incus-shares`` must likewise
 grant other execute/search permission (or an equivalent ACL). Do not make the
 complete ``instances_path`` writable: that would unnecessarily expose config
 drives and other Nova host state to the privileged daemon container.
+
+Manila migration capability is enforced on both sides of every move. The
+source provider must advertise ``CUSTOM_INCUS_MANILA_COLD_MIGRATION`` for a
+cold migration or resize and ``CUSTOM_INCUS_MANILA_LIVE_MIGRATION`` for a live
+migration. For scheduler-mediated moves the Nova API adds the corresponding
+trait to ``RequestSpec.root_required``; Placement therefore returns only
+destination compute resource providers with the same capability. The legacy
+forced live-migration path bypasses scheduler selection, so the API checks the
+specified destination provider directly before changing instance task state.
+The checks use the exact source and destination compute-node UUIDs. They do
+not rely on aggregate homogeneity, and instances without Manila mappings do
+not inherit either constraint. The scheduling half of this Nova-core patch
+runs in ``nova-api``; every API replica must use the patched Nova build before
+either migration capability is advertised. The transaction hooks
+``_pre_deny_share``, ``_prepare_live_migration_check_data``, and
+``_complete_live_migration_rollback`` run in every ``nova-compute`` and the
+service must start through ``nova-incus-compute`` so
+``IncusComputeManager`` overrides them. Updating only the API or only the
+Incus compute image leaves half of the ordering contract absent.
+
+The fleet preflight enters the mount namespace of every running API and
+compute process and imports Nova with that runtime's Python environment. It
+checks the API capability gates, all three core hooks, the Incus manager
+overrides and its actual entry point. It then checks the provider's advertised
+``CUSTOM_INCUS_MANILA_SHARE``, ``CUSTOM_INCUS_MANILA_COLD_MIGRATION``, and
+``CUSTOM_INCUS_MANILA_LIVE_MIGRATION`` traits through Placement. Comparing a
+source-tree hash or finding a patch file on disk is not runtime evidence.
+
+Share mount and migration staging use one fail-closed transaction per Nova
+instance. Before the first mount, the compute manager hydrates every mapping
+with Manila's protocol-specific access data and obtains ephemeral CephFS
+credentials. A failure in this phase has no host mount side effect. For each
+mapping the driver then writes and fsyncs an ownership journal, performs the
+host mount, updates the Incus profile, and removes the journal only after the
+durable profile update is observed. If a later mapping fails, mappings changed
+by that transaction are detached and unmounted in reverse order. An uncertain
+failing mapping retains its journal rather than guessing whether a profile
+update committed.
+
+Unmount is deliberately exhaustive: every requested mapping is attempted even
+when an earlier mapping fails. Nova reports the original single failure, or a
+recognizable aggregate after multiple failures, and retains the affected
+mapping and instance in ``ERROR``. ``deny_share`` removes the profile device
+and normal host mount before it asks Manila to revoke access or deletes the
+Nova mapping. Therefore an unmount failure cannot silently revoke the only
+credential while a host mount remains active.
+
+Periodic journal recovery is not an orphan reaper. It considers only journals
+owned by a UUID migration token, takes the same per-instance external lock as
+migration staging, and requires a live non-local Nova instance with no task,
+no pending verify-resize, and only terminal migration records involving the
+current compute. The driver then rechecks that neither the local Incus
+instance nor its profile exists and that the exact journal set is unchanged.
+Deleted instances, ordinary attach journals, active mounts with no matching
+ownership proof, and ambiguous migration records are retained for operator
+inspection.
+
+The destination profile is an independent recovery record. Live and cold
+migration write ``user.openstack.migration_destination_prepared`` in the
+initial profile create, before VIF wiring, instance receive, or removal of a
+Manila staging journal. Its value must equal the cleanup token and the same
+profile must bind the Nova instance UUID and fixed idmap base and size. This
+closes the crash window in which mounted shares survived but their journal had
+already been consumed. A separate periodic pass re-reads the profile, the
+exact Nova migration UUID, the Incus migration-attempt fence, and the instance
+record under the per-instance recovery lock.
+
+Only a terminal, non-committed attempt whose Nova instance is still owned by
+the source authorizes target deletion, VIF and volume rollback, Manila
+unmount, and a token-bound cleanup acknowledgement. A committed attempt never
+authorizes cleanup: recovery requires both the target instance and Nova
+destination ownership, then converges ownership without unmounting storage.
+Missing or conflicting ownership, an active Nova task, ``VERIFY_RESIZE``, a
+deleted instance, a non-terminal migration, or an uncertain Incus result is
+retained for inspection. The prepared marker is removed only by the durable
+cleanup acknowledgement or committed-attempt finalization. A failed marker
+save therefore remains visible to the next periodic retry.
+
+The manager builds one normalized mount-table index for a complete share
+transaction. Lookup is then constant time per mapping, so 32- and 64-share
+attach, detach, and migration staging do not rescan the host mount table once
+per share.
 
 The modern Nova ``Diagnostics`` object restricts its ``driver`` field to a
 closed list that does not contain ``incus``. The driver therefore uses Nova's
@@ -332,6 +524,52 @@ volume UUID, RBD image name, configured ``cephext`` pool, and Cinder Ceph pool
 agree before asking Incus to claim it. Cinder/os-brick remains authoritative
 for separately attached data volumes.
 
+Every BFV filesystem also carries ``.incus-idmap`` beside ``rootfs/``. This
+versioned, fsync'd journal records the physical UID/GID map on the filesystem
+and is not visible inside the guest. The BFV publishing tool writes a
+``stable`` namespace-owned marker into the raw Glance image before upload.
+RBD clones, Cinder snapshots, backups, restores, and deep-copy fallbacks then
+carry the marker with the data. On claim, ``cephext`` replays any interrupted
+transition and remaps from the recorded map to the instance's exact global
+idmap before the workload can start.
+
+A markerless external root with no compatible legacy Incus record is rejected;
+it is never guessed to be namespace-owned. Existing BFV images must therefore
+be republished, and a retained pre-upgrade volume requires an explicit offline
+operator repair after its current ownership has been established. Final Nova
+deletion normalizes the retained Cinder filesystem and commits ``stable`` with
+an empty map before its global idmap slot can be released. Read-only historical
+snapshots can still contain shifted numeric IDs, but are inert while unmounted;
+any restored clone used as a root must pass through the same ``cephext`` journal
+replay. Host-kernel mounts that bypass this protocol are unsupported.
+
+Data-volume connect and disconnect operations use a host-persistent journal
+below ``instances_path``. The journal is written and fsync'd before os-brick
+changes host state, and retained until the matching Incus profile update and
+host cleanup have reached their commit points. It deliberately removes
+passwords, keys, keyrings, secrets, and tokens; neither Incus configuration nor
+the recovery journal is a credential store. An interrupted ``connecting``
+phase recovers the cleanup handle by repeating the same idempotent connector
+request.
+
+That recovery contract is production-supported for the tested Ceph RBD
+connector, whose scoped CephX identity remains available from the compute
+host's protected keyring. The first production contract therefore rejects
+every non-RBD data volume before attach side effects, both during spawn and
+online attach. A connector that requires an expiring, single-use, or otherwise
+non-reacquirable value from ``connection_info`` cannot guarantee automatic
+recovery across a ``nova-compute`` process or pod crash. Such a connector stays
+unsupported until credential reacquisition and idempotent reconnect behavior
+pass the same crash matrix. Persisting its secret in the Incus profile or
+journal is not an acceptable workaround.
+
+Power-on reconciliation treats Nova's BDMs as the desired set and the Incus
+profile, host journal, and ``unix-block`` devices as independent observations.
+It starts a guest only after those observations converge exactly. Stopped
+instances may discard an extra attachment only when durable Nova ownership
+metadata proves it; opaque devices and running-instance mismatches are never
+mutated automatically.
+
 Independent Incus daemons do not share database metadata and must not register
 the same ordinary Ceph OSD pool. ``ceph.osd.force_reuse=true`` only bypasses the
 ownership guard; it does not make volume metadata coherent. Distinct
@@ -346,7 +584,13 @@ unmount and unmap the volume, and release its lock before the destination can
 attach and mount that same volume. Fencing must prevent simultaneous ownership,
 and every failure point must have a deterministic rollback or operator recovery
 record. The fork implements the required externally owned root-volume claim
-and handover mechanisms. BFV spawn/destroy and Nova's staged confirm/revert
+and handover mechanisms. New migrations require both daemons to advertise
+``migration_shared_ceph_storage_ready_fence``. The source emits the
+versioned readiness marker only after its pending attempt is durable and the
+root is unmounted; the destination persists deletion protection, waits for
+that marker, rechecks the attempt fence, and only then claims the RBD. A mixed
+old/new daemon pair is therefore rejected instead of entering the legacy
+zero-copy path. BFV spawn/destroy and Nova's staged confirm/revert
 paths have been validated through standard OpenStack APIs and move the same RBD
 with no rootfs copy. Destination reachability is checked before source
 shutdown. The target retries transient finish operations, retains a claimed
@@ -436,8 +680,11 @@ is checkpointable. Force-complete and post-copy remain unsupported.
 An Incus-managed root on a shared ``ceph`` pool uses the same ordered CRIU
 cutover principle as BFV without changing ownership layers. The source writes
 ``volatile.migration.storage_handover=pending``, checkpoints the container,
-unmounts the RBD, and only then lets a standalone target using the same Ceph
-FSID, OSD pool, and ``ceph`` driver claim the existing root. Success transfers
+unmounts the RBD, and only then emits the authenticated readiness marker that
+lets a standalone target using the same Ceph FSID, OSD pool, and ``ceph``
+driver claim the existing root. The target revalidates the durable migration
+attempt after receiving the marker, closing the claim-before-unmount race.
+Success transfers
 Incus ownership to the target without copying data. A failed target restore
 unmounts the claim and removes only the target database record before the
 source resumes; it must not delete the RBD. Nova requires the

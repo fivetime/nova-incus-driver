@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Validate conditional CRIU live migration through the native Nova API.
+# Validate live or cold migration through the native Nova API.
 
 set -Eeuo pipefail
 
@@ -13,10 +13,17 @@ DEST_SSH=${DEST_SSH:-root@10.224.0.17}
 # Ordered host=ssh pairs. For example:
 # incus-node-02=root@10.224.0.17,incus-node-03=root@10.224.0.22,incus-node-01=root@10.224.0.21
 MIGRATION_TARGETS=${MIGRATION_TARGETS:-$DEST_HOST=$DEST_SSH}
+# live keeps the source process identity; cold uses Nova's
+# VERIFY_RESIZE/confirm/revert state machine.
+MIGRATION_MODE=${MIGRATION_MODE:-live}
+# Comma- or space-separated cold actions, one per MIGRATION_TARGETS entry.
+# Empty means confirm every cold-migration hop.
+MIGRATION_ACTIONS=${MIGRATION_ACTIONS:-}
 CONTROLLER_SSH=${CONTROLLER_SSH:-}
 CONTROLLER_OPENRC=${CONTROLLER_OPENRC:-/opt/stack/devstack/openrc admin admin}
 SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute test key}
-SERVER=${SERVER:-incus-live-migration-e2e-$RANDOM}
+SSH_KNOWN_HOSTS_FILE=${SSH_KNOWN_HOSTS_FILE:-$HOME/.ssh/known_hosts}
+SERVER=${SERVER:-incus-${MIGRATION_MODE}-migration-e2e-$RANDOM}
 TIMEOUT=${TIMEOUT:-300}
 INCUS_PROJECT=${INCUS_PROJECT:-nova}
 KEEP_FAILED=${KEEP_FAILED:-0}
@@ -36,15 +43,30 @@ MANILA_TAG=${MANILA_TAG:-tenant-data}
 MANILA_SHARES=${MANILA_SHARES:-$MANILA_SHARE}
 MANILA_TAGS=${MANILA_TAGS:-}
 INJECT_RESTORE_FAILURE=${INJECT_RESTORE_FAILURE:-0}
+REQUIRE_MANAGED_CEPH_ROOT=${REQUIRE_MANAGED_CEPH_ROOT:-0}
 E2E_LOCK_FILE=${E2E_LOCK_FILE:-/run/lock/openstack-incus-live-migration-e2e.lock}
 
 exec 9>"$E2E_LOCK_FILE"
 if ! flock -n 9; then
-    echo "Another Incus live-migration E2E owns $E2E_LOCK_FILE" >&2
+    echo "Another Incus migration E2E owns $E2E_LOCK_FILE" >&2
     exit 2
 fi
 
-SSH=(ssh -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=no)
+[[ -f "$SSH_IDENTITY" && -r "$SSH_IDENTITY" ]] || {
+    echo "SSH identity is not a readable regular file: $SSH_IDENTITY" >&2
+    exit 2
+}
+[[ -f "$SSH_KNOWN_HOSTS_FILE" && -r "$SSH_KNOWN_HOSTS_FILE" ]] || {
+    echo "SSH known_hosts is not a readable regular file: $SSH_KNOWN_HOSTS_FILE" >&2
+    exit 2
+}
+SSH=(
+    ssh
+    -i "$SSH_IDENTITY"
+    -o BatchMode=yes
+    -o StrictHostKeyChecking=yes
+    -o "UserKnownHostsFile=$SSH_KNOWN_HOSTS_FILE"
+)
 server_id=
 instance_name=
 port_id=
@@ -67,10 +89,48 @@ managed_root_ceph_pool=
 managed_root_ceph_user=
 managed_root_rbd_image=
 managed_root_rbd_id=
+managed_root_pool_id=
+root_marker=
 read -r -a requested_data_devices <<<"$DATA_DEVICES"
 read -r -a requested_manila_shares <<<"$MANILA_SHARES"
 read -r -a requested_manila_tags <<<"$MANILA_TAGS"
 IFS=',' read -r -a migration_targets <<<"$MIGRATION_TARGETS"
+case "$MIGRATION_MODE" in
+    live)
+        [[ -z "$MIGRATION_ACTIONS" ]] || {
+            echo "MIGRATION_ACTIONS is valid only for cold migration" >&2
+            exit 2
+        }
+        migration_actions=()
+        ;;
+    cold)
+        normalized_actions=${MIGRATION_ACTIONS//,/ }
+        read -r -a migration_actions <<<"$normalized_actions"
+        if ((${#migration_actions[@]} == 0)); then
+            for _ in "${migration_targets[@]}"; do
+                migration_actions+=(confirm)
+            done
+        fi
+        ((${#migration_actions[@]} == ${#migration_targets[@]})) || {
+            echo "MIGRATION_ACTIONS must match MIGRATION_TARGETS count" >&2
+            exit 2
+        }
+        for action in "${migration_actions[@]}"; do
+            [[ "$action" == confirm || "$action" == revert ]] || {
+                echo "Unsupported cold-migration action: $action" >&2
+                exit 2
+            }
+        done
+        ;;
+    *)
+        echo "MIGRATION_MODE must be live or cold" >&2
+        exit 2
+        ;;
+esac
+if [[ "$MIGRATION_MODE" == cold && "$INJECT_RESTORE_FAILURE" == "1" ]]; then
+    echo "INJECT_RESTORE_FAILURE is supported only for live migration" >&2
+    exit 2
+fi
 test_sshs=("$SOURCE_SSH")
 for target in "${migration_targets[@]}"; do
     [[ "$target" == *=* ]] || {
@@ -138,6 +198,87 @@ managed_root_image_id() {
         "$managed_root_ceph_user" "$managed_root_ceph_pool" \
         "$managed_root_rbd_image"
     remote "$host" "$command_line"
+}
+
+managed_root_pool_identity() {
+    local host=$1 command_line
+    printf -v command_line \
+        'rados --id %q df --format json | jq -er --arg pool %q %q' \
+        "$managed_root_ceph_user" "$managed_root_ceph_pool" \
+        '.pools[] | select(.name == $pool) | .id'
+    remote "$host" "$command_line"
+}
+
+managed_root_exact_mapping_count() {
+    local host=$1 command_line python_program
+    python_program='import json,pathlib,sys
+pool,image,image_id,pool_id=sys.argv[1:]
+count=0
+for row in json.load(sys.stdin):
+    if row.get("pool") != pool or row.get("name") != image:
+        continue
+    root=pathlib.Path("/sys/bus/rbd/devices") / str(row["id"])
+    observed_image=(root / "image_id").read_text().strip()
+    observed_pool=(root / "pool_id").read_text().strip()
+    if observed_image == image_id and observed_pool == pool_id:
+        count += 1
+print(count)'
+    printf -v command_line \
+        'set -o pipefail; rbd --id %q device list --format json | python3 -c %q %q %q %q %q' \
+        "$managed_root_ceph_user" "$python_program" \
+        "$managed_root_ceph_pool" "$managed_root_rbd_image" \
+        "$managed_root_rbd_id" "$managed_root_pool_id"
+    remote "$host" "$command_line"
+}
+
+managed_root_exact_watcher_count() {
+    local host=$1 command_line
+    printf -v command_line \
+        "set -euo pipefail; rados --id %q --pool %q listwatchers %q | awk 'NF {count++} END {print count + 0}'" \
+        "$managed_root_ceph_user" "$managed_root_ceph_pool" \
+        "rbd_header.$managed_root_rbd_id"
+    remote "$host" "$command_line"
+}
+
+managed_root_exact_object_exists() {
+    local host=$1 command_line
+    printf -v command_line '%q ' rados --id "$managed_root_ceph_user" \
+        --pool "$managed_root_ceph_pool" stat \
+        "rbd_header.$managed_root_rbd_id"
+    remote "$host" "$command_line" >/dev/null
+}
+
+assert_managed_root_owner() {
+    local active_ssh=$1 inactive_ssh=$2
+    local active_count inactive_count watcher_count current_id current_pool_id
+
+    [[ -n "$managed_root_rbd_id" ]] || return 0
+    current_id=$(managed_root_image_id "$active_ssh")
+    current_pool_id=$(managed_root_pool_identity "$active_ssh")
+    [[ "$current_id" == "$managed_root_rbd_id" ]] || {
+        echo "Managed root image ID changed: $current_id != $managed_root_rbd_id" >&2
+        return 1
+    }
+    [[ "$current_pool_id" == "$managed_root_pool_id" ]] || {
+        echo "Managed root pool ID changed: $current_pool_id != $managed_root_pool_id" >&2
+        return 1
+    }
+
+    active_count=$(managed_root_exact_mapping_count "$active_ssh")
+    inactive_count=$(managed_root_exact_mapping_count "$inactive_ssh")
+    watcher_count=$(managed_root_exact_watcher_count "$active_ssh")
+    [[ "$active_count" == 1 ]] || {
+        echo "Active host has $active_count exact managed-root mappings" >&2
+        return 1
+    }
+    [[ "$inactive_count" == 0 ]] || {
+        echo "Inactive host retained $inactive_count exact managed-root mappings" >&2
+        return 1
+    }
+    ((watcher_count <= 1)) || {
+        echo "Managed root has $watcher_count exact Ceph watchers" >&2
+        return 1
+    }
 }
 
 wait_status() {
@@ -317,12 +458,29 @@ cleanup() {
         openstack volume delete "$root_volume_id" >/dev/null 2>&1 || true
     fi
     if [[ -n "$instance_name" ]]; then
-        local host
+        local host observed_uuid profile_uuid
         for host in "${test_sshs[@]}"; do
-            incus_remote "$host" delete "$instance_name" --force \
-                >/dev/null 2>&1 || true
-            incus_remote "$host" profile delete "$instance_name" \
-                >/dev/null 2>&1 || true
+            observed_uuid=$(incus_remote "$host" config get \
+                "$instance_name" user.openstack.uuid 2>/dev/null || true)
+            if [[ -n "$observed_uuid" && "$observed_uuid" == "$server_id" ]]; then
+                incus_remote "$host" delete "$instance_name" --force \
+                    >/dev/null 2>&1 || true
+            elif incus_remote "$host" info "$instance_name" \
+                    >/dev/null 2>&1; then
+                echo "Refusing cleanup of $host/$instance_name: " \
+                    "Nova UUID is ${observed_uuid:-missing}, expected $server_id" >&2
+            fi
+
+            profile_uuid=$(incus_remote "$host" profile get \
+                "$instance_name" user.openstack.uuid 2>/dev/null || true)
+            if [[ -n "$profile_uuid" && "$profile_uuid" == "$server_id" ]]; then
+                incus_remote "$host" profile delete "$instance_name" \
+                    >/dev/null 2>&1 || true
+            elif incus_remote "$host" profile show "$instance_name" \
+                    >/dev/null 2>&1; then
+                echo "Refusing cleanup of $host profile $instance_name: " \
+                    "Nova UUID is ${profile_uuid:-missing}, expected $server_id" >&2
+            fi
         done
     fi
     return "$rc"
@@ -333,16 +491,25 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 for host in "${test_sshs[@]}"; do
-    remote "$host" incus query /1.0 |
-        grep -q migration_stateful_shifted_root
-    if [[ "$BOOT_FROM_VOLUME" == "1" ]]; then
-        remote "$host" incus query /1.0 |
-            grep -q migration_live_shared_cephext_storage
+    server_extensions=$(remote "$host" incus query /1.0)
+    if [[ "$MIGRATION_MODE" == live ]]; then
+        grep -q migration_stateful_shifted_root <<<"$server_extensions"
+        if [[ "$BOOT_FROM_VOLUME" == "1" ]]; then
+            grep -q migration_live_shared_cephext_storage \
+                <<<"$server_extensions"
+        fi
+        # Recover from a test process killed before its EXIT trap could remove
+        # the restore failpoint. On an unmodified mount this returns EINVAL.
+        clear_restore_failpoint "$host" || true
+        remote "$host" "podman exec incus criu check --extra" >/dev/null
+    elif [[ "$BOOT_FROM_VOLUME" == "1" ]]; then
+        for extension in storage_driver_cephext \
+                migration_shared_ceph_storage \
+                instance_storage_handover_proof \
+                migration_shared_ceph_storage_ready_fence; do
+            grep -q "$extension" <<<"$server_extensions"
+        done
     fi
-    # Recover from a test process killed before its EXIT trap could remove the
-    # restore failpoint. On an unmodified mount this harmlessly returns EINVAL.
-    clear_restore_failpoint "$host" || true
-    remote "$host" "podman exec incus criu check --extra" >/dev/null
 done
 
 user_data=$(mktemp)
@@ -435,6 +602,12 @@ until incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
     sleep 2
 done
 
+root_marker="INCUS_${MIGRATION_MODE^^}_ROOT_${RANDOM}_$(date +%s)"
+incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
+    sh -c "printf '%s' '$root_marker' >/root/incus-migration-e2e-marker; sync"
+[[ "$(incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
+    cat /root/incus-migration-e2e-marker)" == "$root_marker" ]]
+
 if [[ "$BOOT_FROM_VOLUME" != "1" ]]; then
     managed_root_pool=$(incus_remote "$SOURCE_SSH" profile device get \
         "$instance_name" root pool)
@@ -453,8 +626,38 @@ if [[ "$BOOT_FROM_VOLUME" != "1" ]]; then
         managed_root_ceph_user=${managed_root_ceph_user:-admin}
         managed_root_rbd_image="container_${INCUS_PROJECT}_${instance_name}"
         managed_root_rbd_id=$(managed_root_image_id "$SOURCE_SSH")
-        [[ -n "$managed_root_rbd_id" ]]
+        managed_root_pool_id=$(managed_root_pool_identity "$SOURCE_SSH")
+        [[ -n "$managed_root_rbd_id" &&
+           "$managed_root_pool_id" =~ ^[0-9]+$ ]]
+    elif [[ "$REQUIRE_MANAGED_CEPH_ROOT" == "1" ]]; then
+        echo "Instance root pool $managed_root_pool uses " \
+            "${managed_root_driver:-an unknown driver}, expected ceph" >&2
+        exit 1
     fi
+fi
+
+if [[ -n "$managed_root_rbd_id" ]]; then
+    for host in "${test_sshs[@]}"; do
+        server_extensions=$(remote "$host" incus query /1.0)
+        required_extensions=(
+            storage_materialization_attempt_v1
+            storage_release_receipt_v2
+            migration_shared_ceph_storage_ready_fence
+        )
+        if [[ "$MIGRATION_MODE" == live ]]; then
+            required_extensions+=(migration_live_shared_ceph_storage)
+        else
+            required_extensions+=(migration_shared_ceph_storage)
+        fi
+        for extension in "${required_extensions[@]}"; do
+            grep -Fq "\"$extension\"" <<<"$server_extensions" || {
+                echo "$host does not advertise required extension $extension" >&2
+                exit 1
+            }
+        done
+    done
+    assert_managed_root_owner \
+        "$SOURCE_SSH" "${migration_targets[0]#*=}"
 fi
 
 if ((${#requested_manila_shares[@]} > 0)); then
@@ -690,106 +893,360 @@ inject_and_verify_restore_rollback() {
         assert_fails "target Manila staging mount must be absent after rollback" \
             remote "$target_ssh" findmnt -rn "$share_mount" >/dev/null
     done
+    assert_managed_root_owner "$current_ssh" "$target_ssh"
     echo "PASS injected live-restore failure rolled back to $current_host"
 }
 
-migrate_and_verify() {
-    local target_host=$1 target_ssh=$2
-    local dest_pid dest_counter index volume_id data_device volume_marker
-    local restored_marker target_volume_source restored_manila_marker share_mount
-    local guest_iface dest_ovs_iface root_image manila_marker_path manila_marker
+wait_incus_absent() {
+    local host=$1 deadline=$((SECONDS + TIMEOUT))
+    local names
+    while true; do
+        names=$(incus_remote "$host" list --format csv -c n)
+        ! grep -Fqx -- "$instance_name" <<<"$names" && return 0
+        ((SECONDS < deadline)) || {
+            echo "Incus instance remained on $host after migration action" >&2
+            return 1
+        }
+        sleep 2
+    done
+}
 
-    openstack server migrate --live-migration --host "$target_host" \
-        --wait "$server_id"
-    wait_migration
-    wait_status ACTIVE
+wait_profile_absent() {
+    local host=$1 deadline=$((SECONDS + TIMEOUT))
+    local names
+    while true; do
+        names=$(incus_remote "$host" profile list --format csv -c n)
+        ! grep -Fqx -- "$instance_name" <<<"$names" && return 0
+        ((SECONDS < deadline)) || {
+            echo "Incus profile remained on $host after cleanup" >&2
+            return 1
+        }
+        sleep 2
+    done
+}
+
+assert_rbd_mapping_owner() {
+    local active_ssh=$1 inactive_ssh=$2 image_name=$3
+    local deadline=$((SECONDS + TIMEOUT)) mappings
+
+    remote "$active_ssh" \
+        "rbd device list --format json --id cinder | jq -e \
+         '.[] | select(.name == \"$image_name\")'" >/dev/null
+    while true; do
+        mappings=$(remote "$inactive_ssh" \
+            "rbd device list --format json --id cinder | jq -r \
+             '.[] | select(.name == \"$image_name\") | .device'")
+        [[ -z "$mappings" ]] && return 0
+        ((SECONDS < deadline)) || {
+            echo "Inactive host retained RBD mapping $image_name" >&2
+            return 1
+        }
+        sleep 2
+    done
+}
+
+wait_mount_absent() {
+    local host=$1 mount_path=$2 deadline=$((SECONDS + TIMEOUT))
+    local mounts
+
+    while true; do
+        mounts=$(remote "$host" findmnt -rn -o TARGET)
+        ! grep -Fqx -- "$mount_path" <<<"$mounts" && return 0
+        ((SECONDS < deadline)) || {
+            echo "Inactive host retained Manila mount $mount_path" >&2
+            return 1
+        }
+        sleep 2
+    done
+}
+
+wait_ovs_port_absent() {
+    local host=$1 deadline=$((SECONDS + TIMEOUT)) interfaces
+
+    while true; do
+        interfaces=$(remote "$host" \
+            "ovs-vsctl --data=bare --no-heading --columns=name \
+             find Interface external_ids:iface-id='$port_id'")
+        [[ -z "$interfaces" ]] && return 0
+        ((SECONDS < deadline)) || {
+            echo "Inactive host retained OVS port for $port_id" >&2
+            return 1
+        }
+        sleep 2
+    done
+}
+
+verify_guest_persistent_state() {
+    local host=$1
+    local index volume_id data_device volume_marker restored_marker
+    local target_volume_source manila_marker_path manila_marker share_mount
+    local restored_manila_marker
+
+    [[ "$(incus_remote "$host" exec "$instance_name" -- \
+        cat /root/incus-migration-e2e-marker)" == "$root_marker" ]]
+    for index in "${!volume_ids[@]}"; do
+        volume_id=${volume_ids[index]}
+        data_device=${volume_devices[index]}
+        volume_marker=${volume_markers[index]}
+        [[ "$(openstack volume show "$volume_id" -f value -c status)" == \
+            "in-use" ]]
+        incus_remote "$host" exec "$instance_name" -- test -b "$data_device"
+        restored_marker=$(incus_remote "$host" exec "$instance_name" -- \
+            dd if="$data_device" bs=1 count="${#volume_marker}" status=none)
+        [[ "$restored_marker" == "$volume_marker" ]]
+        target_volume_source=$(incus_remote "$host" profile device get \
+            "$instance_name" "$volume_id" source)
+        [[ "$target_volume_source" == /dev/* ]]
+        remote "$host" test -b "$target_volume_source"
+    done
+    for index in "${!share_ids[@]}"; do
+        manila_marker_path=${manila_marker_paths[index]}
+        manila_marker=${share_markers[index]}
+        share_mount=${share_mounts[index]}
+        restored_manila_marker=$(incus_remote "$host" \
+            exec "$instance_name" -- cat "$manila_marker_path")
+        [[ "$restored_manila_marker" == "$manila_marker" ]]
+        remote "$host" findmnt -rn "$share_mount" >/dev/null
+    done
+}
+
+verify_openstack_volume_attachments() {
+    local expected=()
+    local server_volumes attachments
+
+    if [[ "$BOOT_FROM_VOLUME" == "1" ]]; then
+        expected+=("$root_volume_id")
+    fi
+    expected+=("${volume_ids[@]}")
+    server_volumes=$(openstack server volume list "$server_id" -f json)
+    printf '%s' "$server_volumes" | python3 -c '
+import json
+import sys
+
+server_id = sys.argv[1]
+expected = sys.argv[2:]
+rows = json.load(sys.stdin)
+actual = [row["Volume ID"] for row in rows]
+if len(actual) != len(set(actual)) or sorted(actual) != sorted(expected):
+    raise SystemExit(
+        "server {} volume set differs: actual={} expected={}".format(
+            server_id, actual, expected))' "$server_id" "${expected[@]}"
+
+    ((${#expected[@]} > 0)) || return 0
+    attachments=$(openstack volume attachment list -f json \
+        -c 'Volume ID' -c 'Server ID' -c Status)
+    printf '%s' "$attachments" | python3 -c '
+import json
+import sys
+
+server_id = sys.argv[1]
+all_rows = json.load(sys.stdin)
+for volume_id in sys.argv[2:]:
+    rows = [
+        row for row in all_rows
+        if row["Volume ID"] == volume_id
+    ]
+    if len(rows) != 1:
+        raise SystemExit(
+            "volume {} attachment cardinality is {}".format(
+                volume_id, len(rows)))
+    row = rows[0]
+    if row["Server ID"] != server_id or row["Status"].lower() != "attached":
+        raise SystemExit(
+            "volume {} attachment is not owned by {}: {}".format(
+                volume_id, server_id, row))' "$server_id" "${expected[@]}"
+}
+
+verify_share_api_active() {
+    local body
+
+    ((${#share_ids[@]} > 0)) || return 0
+    body=$(share_api GET "$shares_url")
+    printf '%s' "$body" | python3 -c '
+import json
+import sys
+
+expected = sys.argv[1:]
+rows = json.load(sys.stdin)["shares"]
+matches = [row for row in rows if row["share_id"] in expected]
+if len(matches) != len(expected):
+    raise SystemExit(
+        "share mapping cardinality differs: actual={} expected={}".format(
+            matches, expected))
+if any(row["status"] != "active" for row in matches):
+    raise SystemExit(
+        "share mapping is not active: {}".format(matches))' "${share_ids[@]}"
+}
+
+assert_inactive_storage_absent() {
+    local active_ssh=$1 inactive_ssh=$2
+    local index volume_id share_mount
+
+    if [[ "$BOOT_FROM_VOLUME" == "1" ]]; then
+        assert_rbd_mapping_owner "$active_ssh" "$inactive_ssh" \
+            "volume-$root_volume_id"
+    fi
+    for volume_id in "${volume_ids[@]}"; do
+        assert_rbd_mapping_owner "$active_ssh" "$inactive_ssh" \
+            "volume-$volume_id"
+    done
+    for index in "${!share_ids[@]}"; do
+        share_mount=${share_mounts[index]}
+        wait_mount_absent "$inactive_ssh" "$share_mount"
+    done
+}
+
+verify_active_network() {
+    local active_host=$1 active_ssh=$2
+    local guest_iface ovs_iface
+
+    # The driver names the guest NIC device nic<port-id-hex> truncated to
+    # the kernel IFNAMSIZ budget; the in-guest interface carries that name.
+    guest_iface="nic${port_id//-/}"
+    guest_iface=${guest_iface:0:15}
+    [[ -n "$guest_iface" ]]
+    incus_remote "$active_ssh" exec "$instance_name" -- \
+        ip link show "$guest_iface" >/dev/null
+    incus_remote "$active_ssh" exec "$instance_name" -- \
+        ip -o addr show "$guest_iface" | grep -Fq "$fixed_ip"
+    ovs_iface=$(remote "$active_ssh" \
+        "ovs-vsctl --data=bare --no-heading --columns=name find Interface \
+         external_ids:iface-id='$port_id'")
+    [[ -n "$ovs_iface" ]]
+    [[ "$(remote "$active_ssh" \
+        "ovs-vsctl get Interface '$ovs_iface' \
+         external_ids:ovn-installed")" == '"true"' ]]
+    [[ "$(openstack port show "$port_id" -f value -c binding_host_id)" == \
+        "$active_host" ]]
+    [[ "$(openstack port show "$port_id" -f value -c status)" == ACTIVE ]]
+}
+
+verify_network_owner() {
+    local active_host=$1 active_ssh=$2 inactive_ssh=$3
+
+    verify_active_network "$active_host" "$active_ssh"
+    wait_ovs_port_absent "$inactive_ssh"
+}
+
+migrate_and_verify() {
+    local target_host=$1 target_ssh=$2 action=${3:-confirm}
+    local dest_pid dest_counter rollback_counter root_image volume_id
+
+    if [[ "$MIGRATION_MODE" == live ]]; then
+        openstack server migrate --live-migration --host "$target_host" \
+            --wait "$server_id"
+        wait_migration
+        wait_status ACTIVE
+    else
+        openstack --os-compute-api-version 2.56 server migrate \
+            --host "$target_host" --wait "$server_id"
+        wait_status VERIFY_RESIZE
+    fi
     wait_host "$target_host"
 
-    assert_fails "source instance must be absent after migration" \
-        incus_remote "$current_ssh" info "$instance_name" >/dev/null 2>&1
+    if [[ "$MIGRATION_MODE" == live ]]; then
+        wait_incus_absent "$current_ssh"
+    else
+        [[ "$(incus_remote "$current_ssh" list "$instance_name" \
+            --format csv -c s)" == STOPPED ]]
+    fi
     [[ "$(incus_remote "$target_ssh" list "$instance_name" \
         --format csv -c s)" == RUNNING ]]
     dest_pid=$(incus_remote "$target_ssh" exec "$instance_name" -- \
         cat /run/criu-counter.pid)
     dest_counter=$(incus_remote "$target_ssh" exec "$instance_name" -- \
         cat /root/criu-counter)
-    [[ "$dest_pid" == "$source_pid" ]]
-    ((dest_counter > current_counter))
+    [[ "$dest_pid" =~ ^[0-9]+$ ]]
+    [[ "$dest_counter" =~ ^[0-9]+$ ]]
+    if [[ "$MIGRATION_MODE" == live ]]; then
+        [[ "$dest_pid" == "$source_pid" ]]
+        ((dest_counter > current_counter))
+    else
+        ((dest_counter >= current_counter))
+    fi
 
     if [[ "$BOOT_FROM_VOLUME" == "1" ]]; then
         [[ "$(openstack volume show "$root_volume_id" -f value -c status)" == \
             "in-use" ]]
         root_image="volume-$root_volume_id"
-        assert_fails "source BFV mapping must be absent after migration" \
-            remote "$current_ssh" \
-            "rbd device list --format json --id cinder | jq -e \
-             '.[] | select(.name == \"$root_image\")'" >/dev/null
         remote "$target_ssh" \
             "rbd device list --format json --id cinder | jq -e \
              '.[] | select(.name == \"$root_image\")'" >/dev/null
+        if [[ "$MIGRATION_MODE" == live ]]; then
+            assert_fails "source BFV mapping must be absent after migration" \
+                remote "$current_ssh" \
+                "rbd device list --format json --id cinder | jq -e \
+                 '.[] | select(.name == \"$root_image\")'" >/dev/null
+        fi
     fi
-    if [[ -n "$managed_root_rbd_id" ]]; then
-        [[ "$(managed_root_image_id "$target_ssh")" == \
-            "$managed_root_rbd_id" ]]
-    fi
+    verify_guest_persistent_state "$target_ssh"
+    verify_openstack_volume_attachments
+    verify_share_api_active
     sleep 3
     later_counter=$(incus_remote "$target_ssh" exec "$instance_name" -- \
         cat /root/criu-counter)
     ((later_counter > dest_counter))
+    verify_active_network "$target_host" "$target_ssh"
 
-    if [[ "$WITH_DATA_VOLUME" == "1" ]]; then
-        for index in "${!volume_ids[@]}"; do
-            volume_id=${volume_ids[index]}
-            data_device=${volume_devices[index]}
-            volume_marker=${volume_markers[index]}
-            [[ "$(openstack volume show "$volume_id" -f value -c status)" == \
-                "in-use" ]]
-            incus_remote "$target_ssh" exec "$instance_name" -- \
-                test -b "$data_device"
-            restored_marker=$(incus_remote "$target_ssh" \
-                exec "$instance_name" -- \
-                dd if="$data_device" bs=1 count="${#volume_marker}" \
-                status=none)
-            [[ "$restored_marker" == "$volume_marker" ]]
-            target_volume_source=$(incus_remote "$target_ssh" \
-                profile device get "$instance_name" "$volume_id" source)
-            [[ "$target_volume_source" == /dev/* ]]
-            remote "$target_ssh" test -b "$target_volume_source"
-        done
+    # Cold migration retains the source until confirm/revert, including any
+    # source-side OVS and Manila staging state. Only live migration can prove
+    # the old endpoint absent before this point.
+    if [[ "$MIGRATION_MODE" == live ]]; then
+        assert_inactive_storage_absent "$target_ssh" "$current_ssh"
+        verify_network_owner "$target_host" "$target_ssh" "$current_ssh"
+        assert_managed_root_owner "$target_ssh" "$current_ssh"
+        current_host=$target_host
+        current_ssh=$target_ssh
+        current_counter=$later_counter
+        return
     fi
 
-    for index in "${!share_ids[@]}"; do
-        manila_marker_path=${manila_marker_paths[index]}
-        manila_marker=${share_markers[index]}
-        share_mount=${share_mounts[index]}
-        restored_manila_marker=$(incus_remote "$target_ssh" \
-            exec "$instance_name" -- cat "$manila_marker_path")
-        [[ "$restored_manila_marker" == "$manila_marker" ]]
-        remote "$target_ssh" findmnt -rn "$share_mount" >/dev/null
-        assert_fails "source Manila staging mount must be absent after migration" \
-            remote "$current_ssh" findmnt -rn "$share_mount" >/dev/null
-    done
+    # At VERIFY_RESIZE shared-root authority has already moved: the target owns
+    # sole exact pool/image mapping and the stopped source owns none.
+    assert_managed_root_owner "$target_ssh" "$current_ssh"
 
-    guest_iface=$(incus_remote "$target_ssh" config get "$instance_name" \
-        "volatile.tap${port_id:0:11}.name")
-    [[ -n "$guest_iface" ]]
-    incus_remote "$target_ssh" exec "$instance_name" -- \
-        ip link show "$guest_iface" >/dev/null
-    dest_ovs_iface=$(remote "$target_ssh" \
-        "ovs-vsctl --data=bare --no-heading --columns=name find Interface \
-         external_ids:iface-id='$port_id'")
-    [[ -n "$dest_ovs_iface" ]]
-    [[ "$(remote "$target_ssh" \
-        "ovs-vsctl get Interface '$dest_ovs_iface' \
-         external_ids:ovn-installed")" == '"true"' ]]
-    [[ "$(openstack port show "$port_id" -f value -c binding_host_id)" == \
-        "$target_host" ]]
-    [[ "$(openstack port show "$port_id" -f value -c status)" == ACTIVE ]]
-    assert_no_ovs_port "$current_ssh"
-
-    current_host=$target_host
-    current_ssh=$target_ssh
-    current_counter=$later_counter
+    # At VERIFY_RESIZE the target must already expose every persistent marker.
+    # The action then decides which side is authoritative and which side must
+    # be completely cleaned.
+    case "$action" in
+        confirm)
+            openstack server resize confirm "$server_id"
+            wait_status ACTIVE
+            wait_host "$target_host"
+            wait_incus_absent "$current_ssh"
+            verify_guest_persistent_state "$target_ssh"
+            verify_openstack_volume_attachments
+            verify_share_api_active
+            assert_inactive_storage_absent "$target_ssh" "$current_ssh"
+            verify_network_owner "$target_host" "$target_ssh" "$current_ssh"
+            assert_managed_root_owner "$target_ssh" "$current_ssh"
+            current_host=$target_host
+            current_ssh=$target_ssh
+            current_counter=$later_counter
+            echo "PASS cold-migration confirm target=$target_host"
+            ;;
+        revert)
+            openstack server resize revert "$server_id"
+            wait_status ACTIVE
+            wait_host "$current_host"
+            wait_incus_absent "$target_ssh"
+            [[ "$(incus_remote "$current_ssh" list "$instance_name" \
+                --format csv -c s)" == RUNNING ]]
+            verify_guest_persistent_state "$current_ssh"
+            verify_openstack_volume_attachments
+            verify_share_api_active
+            rollback_counter=$(incus_remote "$current_ssh" \
+                exec "$instance_name" -- cat /root/criu-counter)
+            [[ "$rollback_counter" =~ ^[0-9]+$ ]]
+            ((rollback_counter >= current_counter))
+            assert_inactive_storage_absent "$current_ssh" "$target_ssh"
+            verify_network_owner "$current_host" "$current_ssh" "$target_ssh"
+            assert_managed_root_owner "$current_ssh" "$target_ssh"
+            current_counter=$rollback_counter
+            later_counter=$rollback_counter
+            echo "PASS cold-migration revert target=$target_host"
+            ;;
+    esac
 }
 
 if [[ "$INJECT_RESTORE_FAILURE" == "1" ]]; then
@@ -797,8 +1254,10 @@ if [[ "$INJECT_RESTORE_FAILURE" == "1" ]]; then
         "${migration_targets[0]%%=*}" "${migration_targets[0]#*=}"
 fi
 
-for target in "${migration_targets[@]}"; do
-    migrate_and_verify "${target%%=*}" "${target#*=}"
+for index in "${!migration_targets[@]}"; do
+    target=${migration_targets[index]}
+    migrate_and_verify "${target%%=*}" "${target#*=}" \
+        "${migration_actions[index]:-confirm}"
 done
 
 rm -f "$user_data"
@@ -849,16 +1308,16 @@ fi
 assert_fails "Neutron port must be absent after server delete" \
     openstack port show "$port_id" >/dev/null 2>&1
 for host in "${test_sshs[@]}"; do
-    assert_fails "Incus instance must be absent after server delete" \
-        incus_remote "$host" info "$instance_name" >/dev/null 2>&1
-    assert_no_ovs_port "$host"
+    wait_incus_absent "$host"
+    wait_profile_absent "$host"
+    wait_ovs_port_absent "$host"
 done
 if [[ -n "$managed_root_rbd_id" ]]; then
-    assert_fails "managed Ceph root RBD must be absent after server delete" \
-        managed_root_image_id "$SOURCE_SSH" >/dev/null 2>&1
+    assert_fails "exact managed Ceph root RBD must be absent after server delete" \
+        managed_root_exact_object_exists "$SOURCE_SSH" >/dev/null 2>&1
 fi
 
-result="PASS server=$server_id instance=$instance_name ip=$fixed_ip pid=$source_pid counter=$source_counter->$later_counter hops=${#migration_targets[@]} root_volume=${root_volume_id:-local} managed_root_rbd_id=${managed_root_rbd_id:-none} data_volumes=${volume_ids[*]:-none} manila_shares=${share_ids[*]:-none}"
+result="PASS mode=$MIGRATION_MODE server=$server_id instance=$instance_name ip=$fixed_ip pid=$source_pid counter=$source_counter->$later_counter hops=${#migration_targets[@]} actions=${MIGRATION_ACTIONS:-all-confirm} root_volume=${root_volume_id:-local} managed_root_pool_id=${managed_root_pool_id:-none} managed_root_rbd_id=${managed_root_rbd_id:-none} data_volumes=${volume_ids[*]:-none} manila_shares=${share_ids[*]:-none}"
 server_id=
 instance_name=
 port_id=

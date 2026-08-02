@@ -57,6 +57,20 @@ class IncusClientTest(unittest.TestCase):
         )
 
     @mock.patch.object(client.pylxd, "Client")
+    def test_unscoped_local_client(self, mock_client):
+        conf = _config(project="nova")
+
+        client.get_client(conf, project=None)
+
+        mock_client.assert_called_once_with(
+            endpoint="/var/lib/incus/unix.socket",
+            cert=None,
+            verify=True,
+            timeout=300,
+            project=None,
+        )
+
+    @mock.patch.object(client.pylxd, "Client")
     def test_https_client(self, mock_client):
         conf = _config(
             endpoint="https://incus.example.test:8443",

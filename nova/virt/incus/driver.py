@@ -17,9 +17,15 @@ from __future__ import absolute_import
 
 import base64
 import copy
+from contextlib import closing
+import dataclasses
+from dataclasses import dataclass
 import errno
+import functools
 import glob
+import hashlib
 import io
+import ipaddress
 import json
 import os
 import platform
@@ -28,15 +34,15 @@ import shutil
 import socket
 import tarfile
 import tempfile
-import hashlib
-import ipaddress
+import threading
+import time
+import types
 from urllib import parse
+import uuid
 
 import eventlet
 import nova.conf
-import nova.context
 import os_resource_classes as orc
-from contextlib import closing
 
 from nova import exception
 from nova import i18n
@@ -45,14 +51,17 @@ from nova.image import glance
 from nova.network import neutron
 from nova.network import model as network_model
 from nova import objects
-from nova.privsep import fs as privsep_fs
 from nova.privsep import path as privsep_path
 from nova.virt import driver
+from nova.volume import cinder
+from os_brick import exception as brick_exception
 from os_brick.initiator import connector
 from oslo_concurrency import processutils
 from oslo_log import log as logging
 from oslo_utils import fileutils
 from oslo_utils import timeutils
+from oslo_utils import versionutils
+from oslo_utils import uuidutils
 from prometheus_client import parser as prometheus_parser
 from pylxd import exceptions as incus_exceptions
 import yaml
@@ -62,8 +71,11 @@ from nova.virt.incus import client as incus_client
 from nova.virt.incus import common
 from nova.virt.incus import console as incus_console
 from nova.virt.incus import flavor
+from nova.virt.incus import idmap as incus_idmap
 from nova.virt.incus import migrate_data as incus_migrate_data
+from nova.virt.incus import privsep as incus_privsep
 from nova.virt.incus import storage
+from nova.virt.incus import storage_protocol as incus_storage_protocol
 
 from nova.api.metadata import base as instance_metadata
 from nova.objects import fields as obj_fields
@@ -72,6 +84,7 @@ from nova.compute import power_state
 from nova.compute import vm_states
 from nova.compute import utils as compute_utils
 from nova.virt import hardware
+from nova.virt import node as virt_node
 from oslo_utils import units
 from oslo_serialization import jsonutils
 from nova import utils
@@ -90,20 +103,115 @@ MAX_CONSOLE_BYTES = 100 * units.Ki
 NOVA_CONF = nova.conf.CONF
 
 ACCEPTABLE_IMAGE_FORMATS = {'raw', 'root-tar', 'squashfs'}
+INCUS_DATA_VOLUME_IMAGE_PROPERTY = 'hw_incus_data_volume_fuse'
 INCUS_SYSTEM_CONTAINER_TRAIT = 'CUSTOM_INCUS_SYSTEM_CONTAINER'
 INCUS_SWAP_TRAIT = 'CUSTOM_INCUS_SWAP'
 INCUS_MANILA_SHARE_TRAIT = 'CUSTOM_INCUS_MANILA_SHARE'
 INCUS_MANILA_LIVE_MIGRATION_TRAIT = (
     'CUSTOM_INCUS_MANILA_LIVE_MIGRATION')
+INCUS_MANILA_COLD_MIGRATION_TRAIT = (
+    'CUSTOM_INCUS_MANILA_COLD_MIGRATION')
 INCUS_STATEFUL_MIGRATION_EXTENSION = 'migration_stateful_shifted_root'
 INCUS_LIVE_BFV_MIGRATION_EXTENSION = (
     'migration_live_shared_cephext_storage')
 INCUS_LIVE_CEPH_MIGRATION_EXTENSION = (
     'migration_live_shared_ceph_storage')
+INCUS_STORAGE_HANDOVER_EXTENSION = 'instance_storage_handover'
+INCUS_STORAGE_HANDOVER_PROOF_EXTENSION = (
+    'instance_storage_handover_proof')
+INCUS_STORAGE_READY_FENCE_EXTENSION = (
+    'migration_shared_ceph_storage_ready_fence')
+INCUS_MIGRATION_ATTEMPT_EXTENSION = 'migration_attempt_fencing'
+INCUS_STORAGE_MATERIALIZATION_ATTEMPT_EXTENSION = (
+    incus_storage_protocol.STORAGE_MATERIALIZATION_ATTEMPT_EXTENSION)
+INCUS_STORAGE_RELEASE_RECEIPT_EXTENSION = (
+    incus_storage_protocol.STORAGE_RELEASE_RECEIPT_EXTENSION)
 MIGRATION_RECOVERY_KEY = 'user.openstack.recovery_required'
+MIGRATION_DESTINATION_KEY = 'user.openstack.migration_destination_address'
+MIGRATION_RECEIVE_COMPLETE_KEY = (
+    'volatile.migration.storage_receive_complete')
+MIGRATION_CLEANUP_TOKEN_KEY = 'user.openstack.migration_cleanup_token'
+MIGRATION_CLEANUP_COMPLETE_KEY = (
+    'user.openstack.migration_cleanup_complete')
+MIGRATION_DESTINATION_PREPARED_KEY = (
+    'user.openstack.migration_destination_prepared')
+MIGRATION_OPERATION_KEY = 'user.openstack.migration_operation_id'
+MIGRATION_TARGET_OPERATION_KEY = (
+    'user.openstack.migration_target_operation_id')
+MIGRATION_ROLLBACK_COMPLETE_KEY = (
+    'user.openstack.migration_rollback_complete')
+MIGRATION_IDMAP_RETIREMENT_KEY = (
+    'user.openstack.migration_idmap_retirement')
+CLEANUP_RECOVERY_KEY = 'user.openstack.cleanup_required'
+IDMAP_BASE_METADATA_KEY = 'incus_idmap_base'
+IDMAP_SIZE_METADATA_KEY = 'incus_idmap_size'
+IDMAP_ALLOCATION_METADATA_KEY = 'incus_idmap_allocation_id'
+IDMAP_FINGERPRINT_METADATA_KEY = 'incus_idmap_fingerprint'
+IDMAP_ALLOCATION_CONFIG_KEY = 'user.openstack.idmap_allocation_id'
+IDMAP_COMPUTE_CONFIG_KEY = 'user.openstack.compute_id'
+IDMAP_MATERIALIZATION_CONFIG_KEY = (
+    'user.openstack.rootfs_materialization_id')
 _PRE_LIVE_DISCONNECTED_KEY = 'incus_pre_live_disconnected'
+_VOLUME_ATTACHMENT_RECORD_VERSION = 2
+_VOLUME_JOURNAL_VERSION = 1
+_SHARE_JOURNAL_VERSION = 1
+_SPAWN_ATTEMPT_JOURNAL_VERSION = 1
+_SPAWN_ATTEMPT_PHASES = frozenset({'preflight', 'opening'})
 BASE_DIR = os.path.join(
     CONF.instances_path, CONF.image_cache.subdirectory_name)
+_HOST_RESOURCE_CACHE_TTL = 60
+_INSTANCE_INVENTORY_CACHE_TTL = 10
+
+
+@dataclass(frozen=True)
+class _IDMapMaterialization:
+    assignment: object
+    claim: object
+    binding: object
+    client: object
+
+
+@dataclass(frozen=True)
+class FailedBuildCleanupAssessment:
+    """Resource-release decisions after an uncertain failed build cleanup."""
+
+    release_network: bool
+    release_cinder: bool
+    release_host: bool
+    release_placement: bool
+    reasons: tuple = ()
+
+    @classmethod
+    def unsafe(cls, reason):
+        return cls(False, False, False, False, (str(reason),))
+
+
+def _canonical_materialization_id(value, label='materialization ID'):
+    try:
+        canonical = str(uuid.UUID(value))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise incus_idmap.IDMapConfigurationError(
+            '{} must be a canonical UUID'.format(label)) from exc
+    if not isinstance(value, str) or canonical != value:
+        raise incus_idmap.IDMapConfigurationError(
+            '{} must be a canonical lowercase UUID'.format(label))
+    return value
+
+
+def _incus_instance_storage_volume(project_name, instance_name):
+    """Return Incus project.Instance's internal storage volume name."""
+    if project_name == 'default':
+        return instance_name
+    return '{}_{}'.format(project_name, instance_name)
+
+
+def _idmap_host_claim_lock_name(instance_uuid):
+    return 'incus-idmap-release-{}'.format(instance_uuid)
+
+
+def _idmap_host_claim_lock_path():
+    return CONF.state_path
+
 
 _DEVICE_PATH_RE = re.compile(r'^/dev/[A-Za-z0-9][A-Za-z0-9._-]*$')
 _VOLUME_MOUNTPOINT_RE = re.compile(
@@ -115,6 +223,8 @@ _SHARE_ID_RE = re.compile(
     r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-'
     r'[0-9a-f]{4}-[0-9a-f]{12}$')
 _SHARE_TAG_RE = re.compile(r'^[A-Za-z0-9-]{1,255}$')
+_STORAGE_RELEASE_RECEIPT_DIGEST_RE = re.compile(
+    r'^sha256:[0-9a-f]{64}$')
 _NETWORK_ACTIVATION_VENDOR_DATA = """#cloud-config
 bootcmd:
   - |
@@ -151,6 +261,8 @@ bootcmd:
       exit "$rc"
     fi
 """
+
+
 def _root_storage_pool_traits():
     """Return collision-free Placement traits for configured pool selectors."""
     traits = {}
@@ -163,6 +275,47 @@ def _root_storage_pool_traits():
                 'same Placement trait {}'.format(previous, selector, trait))
         traits[trait] = selector
     return set(traits)
+
+
+def _invalidates_instance_inventory(action):
+    """Keep short-lived bulk inventory caches coherent around host writes."""
+    @functools.wraps(action)
+    def wrapped(self, *args, **kwargs):
+        self._invalidate_instance_inventory_cache()
+        try:
+            return action(self, *args, **kwargs)
+        finally:
+            # A concurrent periodic read may have populated an intermediate
+            # state while the Incus operation was in flight.
+            self._invalidate_instance_inventory_cache()
+
+    return wrapped
+
+
+def _guards_serial_console_destroy(action):
+    """Prevent console listeners from racing with instance destruction."""
+    @functools.wraps(action)
+    def wrapped(self, context, instance, *args, **kwargs):
+        with self._serial_consoles_lock:
+            self._serial_console_destroying.add(instance.uuid)
+            broker = self._serial_consoles.pop(instance.uuid, None)
+        if broker is not None:
+            try:
+                broker.close()
+            except Exception:
+                LOG.exception(
+                    'Failed to close the Incus serial console broker before '
+                    'destroying the instance',
+                    instance=instance)
+        try:
+            return action(self, context, instance, *args, **kwargs)
+        finally:
+            # A failed destroy must not permanently block a later console
+            # request. That request re-reads the authoritative Incus state.
+            with self._serial_consoles_lock:
+                self._serial_console_destroying.discard(instance.uuid)
+
+    return wrapped
 
 
 def _validate_block_device_path(path, description):
@@ -192,6 +345,15 @@ def _validate_profile_volume_slot(profile, volume_id, mountpoint,
         if (device_id != replacing_volume_id and
                 device.get('path') == mountpoint):
             raise exception.DevicePathInUse(path=mountpoint)
+
+
+def _validate_profile_volume_owner(profile, instance):
+    config = profile.config if isinstance(profile.config, dict) else {}
+    if (config.get('environment.product_name') != 'OpenStack Nova' or
+            config.get('user.openstack.uuid') != instance.uuid):
+        raise exception.InvalidVolume(
+            reason='Incus profile is not owned by Nova instance %s' %
+                   instance.uuid)
 
 
 def _validate_volume_access_mode(connection_info):
@@ -297,6 +459,180 @@ def _is_boot_volume(bdm):
         return False
 
 
+def _boot_volume_mountpoints(volume_bdms, root_device_name=None):
+    """Validate and reserve every Nova root-volume device path."""
+    mountpoints = set()
+    authoritative_root = None
+    boot_volumes = [bdm for bdm in volume_bdms if _is_boot_volume(bdm)]
+    if len(boot_volumes) > 1:
+        raise exception.InvalidConfiguration(
+            'An Incus instance may have only one boot_index=0 volume')
+    if boot_volumes and root_device_name is not None:
+        authoritative_root = _validate_volume_mountpoint(root_device_name)
+        mountpoints.add(authoritative_root)
+    for bdm in boot_volumes:
+        mountpoint = bdm.get('mount_device')
+        if mountpoint is None:
+            continue
+        mountpoint = _validate_volume_mountpoint(mountpoint)
+        if mountpoint in mountpoints and mountpoint != authoritative_root:
+            raise exception.DevicePathInUse(path=mountpoint)
+        mountpoints.add(mountpoint)
+    return mountpoints
+
+
+def _spawn_data_volume_bdms(block_device_info, root_device_name=None):
+    """Validate and return Cinder data volumes delegated to spawn()."""
+    if not isinstance(block_device_info, dict):
+        return []
+    volume_bdms = list(
+        driver.block_device_info_get_mapping(block_device_info))
+    data_volumes = []
+    volume_ids = set()
+    mountpoints = _boot_volume_mountpoints(
+        volume_bdms, root_device_name=root_device_name)
+    for bdm in volume_bdms:
+        connection_info = bdm.get('connection_info')
+        if not connection_info:
+            raise exception.InvalidVolume(
+                reason='Spawn-time Cinder block-device mapping has no '
+                       'connection information')
+
+        volume_id = _bdm_volume_id(bdm)
+        if volume_id in volume_ids:
+            raise exception.InvalidVolume(
+                reason='Cinder volume %s appears more than once in the '
+                       'instance block-device mapping' % volume_id)
+        volume_ids.add(volume_id)
+
+        if _is_boot_volume(bdm):
+            continue
+
+        mountpoint = _validate_volume_mountpoint(bdm.get('mount_device'))
+        if mountpoint in mountpoints:
+            raise exception.DevicePathInUse(path=mountpoint)
+        mountpoints.add(mountpoint)
+        data_volumes.append(bdm)
+
+    return data_volumes
+
+
+def _reboot_data_volume_bdms(block_device_info, root_device_name=None):
+    """Return validated non-root BDMs from Nova's power/reboot payload."""
+    if not isinstance(block_device_info, dict):
+        return []
+    volume_bdms = list(
+        driver.block_device_info_get_mapping(block_device_info))
+    data_volumes = []
+    volume_ids = set()
+    mountpoints = _boot_volume_mountpoints(
+        volume_bdms, root_device_name=root_device_name)
+    for bdm in volume_bdms:
+        if _is_boot_volume(bdm):
+            continue
+        connection_info = bdm.get('connection_info')
+        if not connection_info:
+            raise exception.InvalidVolume(
+                reason='Power-on Cinder block-device mapping has no '
+                       'connection information')
+        volume_id = _bdm_volume_id(bdm)
+        if volume_id in volume_ids:
+            raise exception.InvalidVolume(
+                reason='Duplicate Cinder volume in power-on block mapping: '
+                       '%s' % volume_id)
+        volume_ids.add(volume_id)
+        mountpoint = _validate_volume_mountpoint(bdm.get('mount_device'))
+        if mountpoint in mountpoints:
+            raise exception.DevicePathInUse(path=mountpoint)
+        mountpoints.add(mountpoint)
+        data_volumes.append(bdm)
+    return data_volumes
+
+
+def _bdm_volume_id(bdm):
+    """Return the authoritative volume ID from a real or legacy driver BDM."""
+    volume_id = getattr(bdm, 'volume_id', None)
+    if not volume_id and hasattr(bdm, 'get'):
+        volume_id = bdm.get('volume_id')
+    if not volume_id:
+        volume_id = _volume_id(bdm.get('connection_info') or {})
+    if not str(volume_id).strip():
+        raise exception.InvalidVolume(
+            reason='Cinder block-device mapping has no volume identifier')
+    return str(volume_id)
+
+
+def _rbd_namespace(connection_data):
+    """Return one unambiguous RBD namespace identity."""
+    rbd_namespace = connection_data.get('rbd_namespace')
+    legacy_namespace = connection_data.get('namespace')
+    if (rbd_namespace is not None and legacy_namespace is not None and
+            rbd_namespace != legacy_namespace):
+        raise exception.InvalidVolume(
+            reason='RBD connection information contains conflicting '
+                   'namespace values')
+    namespace = (
+        rbd_namespace if rbd_namespace is not None else legacy_namespace)
+    if namespace is None:
+        return ''
+    if not isinstance(namespace, str):
+        raise exception.InvalidVolume(
+            reason='RBD connection namespace must be a string')
+    return namespace
+
+
+def _validate_recoverable_data_volume(connection_info, volume_id):
+    """Require the exact Cinder RBD identity used by reconciliation."""
+    protocol = connection_info.get('driver_volume_type')
+    if protocol != 'rbd':
+        raise exception.InvalidVolume(
+            reason='Incus data volumes currently require the Cinder RBD '
+                   'protocol so their identity can be recovered after a '
+                   'compute restart (volume %s uses %s)' %
+                   (volume_id, protocol or 'no protocol'))
+
+    connection_data = connection_info.get('data') or {}
+    image = connection_data.get('name')
+    if not isinstance(image, str) or image.count('/') != 1:
+        raise exception.InvalidVolume(
+            reason='Cinder RBD data volume %s has no stable pool/image name' %
+                   volume_id)
+    pool, image_name = image.split('/', 1)
+    if not pool or not image_name:
+        raise exception.InvalidVolume(
+            reason='Cinder RBD data volume %s has an invalid pool/image name' %
+                   volume_id)
+    match = _CINDER_RBD_IMAGE_RE.fullmatch(image_name)
+    if not match:
+        raise exception.InvalidVolume(
+            reason='Cinder RBD data volume image must use the canonical '
+                   'volume-<UUID> name')
+    if match.group(1) != str(volume_id).lower():
+        raise exception.InvalidVolume(
+            reason='Cinder RBD data volume image UUID does not match the '
+                   'authoritative BDM volume ID')
+    return image, _rbd_namespace(connection_data)
+
+
+def _is_explicit_true(value):
+    if value is True:
+        return True
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value == 1
+    if isinstance(value, str):
+        return value.strip().lower() in ('1', 'true', 'yes', 'on')
+    return False
+
+
+def _has_encryption_marker(value):
+    """Treat every non-empty encryption marker as unsupported."""
+    if value is None or value is False:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in ('', '0', 'false', 'no', 'off')
+    return bool(value)
+
+
 def _cinder_rbd_root(bdm):
     connection_info = bdm.get('connection_info') or {}
     if connection_info.get('driver_volume_type') != 'rbd':
@@ -386,6 +722,9 @@ def _require_bfv_migration_support(client, root_bdm):
     extensions = client.host_info.get('api_extensions', [])
     required = {
         'migration_shared_ceph_storage',
+        INCUS_STORAGE_HANDOVER_EXTENSION,
+        INCUS_STORAGE_HANDOVER_PROOF_EXTENSION,
+        INCUS_STORAGE_READY_FENCE_EXTENSION,
         'storage_driver_cephext',
     }
     missing = sorted(required.difference(extensions))
@@ -447,6 +786,9 @@ def _preflight_bfv_migration_destination(
         extensions = set(remote.host_info.get('api_extensions', []))
         required = {
             'migration_shared_ceph_storage',
+            INCUS_STORAGE_HANDOVER_EXTENSION,
+            INCUS_STORAGE_HANDOVER_PROOF_EXTENSION,
+            INCUS_STORAGE_READY_FENCE_EXTENSION,
             'storage_driver_cephext',
         }
         if live:
@@ -503,6 +845,1138 @@ def _migration_client(address):
         parsed.hostname, CONF.incus.migration_tls_ca)
     return incus_client.get_migration_client(
         _migration_endpoint(address), verify=verify)
+
+
+def _live_migration_destination_address(migrate_data):
+    if not isinstance(
+            migrate_data, incus_migrate_data.IncusLiveMigrateData):
+        return None
+    if not migrate_data.obj_attr_is_set('destination_address'):
+        return None
+    return migrate_data.destination_address
+
+
+def _live_migration_cleanup_token(migrate_data):
+    if not isinstance(
+            migrate_data, incus_migrate_data.IncusLiveMigrateData):
+        raise exception.MigrationError(
+            reason='Missing Incus live migration data')
+    if (not migrate_data.obj_attr_is_set('cleanup_token') or
+            not uuidutils.is_uuid_like(migrate_data.cleanup_token)):
+        raise exception.MigrationError(
+            reason='Missing or invalid Incus live migration cleanup token')
+    return migrate_data.cleanup_token
+
+
+def _cold_migration_cleanup_token(context, instance):
+    """Return the canonical Nova Migration UUID for a cold migration."""
+    migration_context = getattr(instance, 'migration_context', None)
+    if migration_context is None:
+        raise exception.MigrationError(
+            reason='Incus cold migration has no Nova migration context')
+    migration_id = getattr(migration_context, 'migration_id', None)
+    if (not isinstance(migration_id, int) or
+            isinstance(migration_id, bool) or migration_id <= 0):
+        raise exception.MigrationError(
+            reason='Incus cold migration has no valid Nova migration ID')
+
+    migration = objects.Migration.get_by_id_and_instance(
+        context, migration_id, instance.uuid)
+    token = getattr(migration, 'uuid', None)
+    try:
+        canonical_token = str(uuid.UUID(token))
+    except (AttributeError, TypeError, ValueError):
+        canonical_token = None
+    if (not isinstance(token, str) or canonical_token != token or
+            not _SHARE_ID_RE.fullmatch(token)):
+        raise exception.MigrationError(
+            reason='Incus cold migration has no canonical Nova Migration '
+                   'UUID')
+    return token
+
+
+def _live_migration_idmap(migrate_data):
+    if not isinstance(
+            migrate_data, incus_migrate_data.IncusLiveMigrateData):
+        raise exception.MigrationError(
+            reason='Missing Incus live migration data')
+    try:
+        base = int(migrate_data.idmap_base)
+        size = int(migrate_data.idmap_size)
+    except (AttributeError, TypeError, ValueError):
+        raise exception.MigrationError(
+            reason='Missing or invalid Incus live migration idmap')
+    if base < 0 or size <= 0:
+        raise exception.MigrationError(
+            reason='Missing or invalid Incus live migration idmap')
+    return base, size
+
+
+def prepare_cold_migration_share_info(disk_info, share_info):
+    """Bind destination Manila staging to one cold-migration attempt."""
+    try:
+        transfer = jsonutils.loads(disk_info)
+        if transfer.get('format') != 'incus-pull-v1':
+            raise ValueError('unsupported migration data format')
+        cleanup_token = transfer['cleanup_token']
+        if not uuidutils.is_uuid_like(cleanup_token):
+            raise ValueError('invalid migration cleanup token')
+    except (TypeError, ValueError, KeyError) as exc:
+        raise exception.MigrationError(
+            reason='Invalid Incus migration data: %s' % exc)
+    share_ids = []
+    for share_mapping in share_info or []:
+        if not _SHARE_ID_RE.fullmatch(share_mapping.share_id):
+            raise exception.ShareMountError(
+                share_id=share_mapping.share_id,
+                server_id=share_mapping.instance_uuid,
+                reason='share ID is not a canonical UUID')
+        share_ids.append(share_mapping.share_id)
+    if len(set(share_ids)) != len(share_ids):
+        raise exception.MigrationError(
+            reason='Cold migration contains duplicate Manila share mappings')
+    transfer['manila_share_ids'] = sorted(share_ids)
+    return jsonutils.dumps(transfer), cleanup_token
+
+
+def _cold_migration_share_ids(transfer):
+    share_ids = transfer.get('manila_share_ids', [])
+    valid = (
+        isinstance(share_ids, list) and
+        all(
+            isinstance(share_id, str) and
+            bool(_SHARE_ID_RE.fullmatch(share_id))
+            for share_id in share_ids
+        ) and
+        len(set(share_ids)) == len(share_ids)
+    )
+    if not valid:
+        raise ValueError('invalid Manila share mapping list')
+    return share_ids
+
+
+def _parse_cold_migration_transfer(disk_info):
+    """Validate and normalize the source-owned cold-migration envelope."""
+    try:
+        transfer = jsonutils.loads(disk_info)
+        if transfer.get('format') != 'incus-pull-v1':
+            raise ValueError('unsupported migration data format')
+        migration_data = transfer['migration_data']
+        cleanup_token = transfer['cleanup_token']
+        if not uuidutils.is_uuid_like(cleanup_token):
+            raise ValueError('invalid migration cleanup token')
+        idmap_base = int(transfer['idmap_base'])
+        idmap_size = int(transfer['idmap_size'])
+        if idmap_base < 0 or idmap_size <= 0:
+            raise ValueError('invalid migration idmap reservation')
+        expected_share_ids = _cold_migration_share_ids(transfer)
+        migration_data.setdefault('config', {})[
+            'boot.autostart'] = 'false'
+    except (TypeError, ValueError, KeyError) as exc:
+        raise exception.MigrationError(
+            reason='Invalid Incus migration data: %s' % exc) from exc
+    return (
+        transfer, migration_data, cleanup_token,
+        idmap_base, idmap_size, expected_share_ids,
+    )
+
+
+def _bind_migration_instance_local_owner(migration_data, instance):
+    """Bind migration payloads to the receipt owner in local config."""
+    if not isinstance(migration_data, dict):
+        raise exception.MigrationError(
+            reason='Incus migration payload is not an object')
+    config = migration_data.setdefault('config', {})
+    if not isinstance(config, dict):
+        raise exception.MigrationError(
+            reason='Incus migration payload config is not an object')
+    owner = config.get('user.openstack.uuid')
+    if owner not in (None, instance.uuid):
+        raise exception.MigrationError(
+            reason='Incus migration payload belongs to another OpenStack '
+                   'instance UUID')
+    config['user.openstack.uuid'] = instance.uuid
+
+
+def _migration_address_for_host(host):
+    """Build the Incus migration origin advertised by another compute."""
+    if not isinstance(host, str) or not host.strip():
+        raise exception.MigrationError(
+            reason='Migration destination host is missing')
+    normalized = host.strip()
+    if ':' in normalized and not normalized.startswith('['):
+        normalized = '[%s]' % normalized
+    return 'https://%s:%d' % (normalized, CONF.incus.migration_port)
+
+
+def _instance_migration_idmap(container, profile=None):
+    """Return the fixed isolated idmap that must be reserved on a target."""
+    config = (
+        container.config if isinstance(container.config, dict) else {})
+    expanded = (
+        getattr(container, 'expanded_config', None)
+        if isinstance(getattr(container, 'expanded_config', None), dict)
+        else {})
+    profile_config = (
+        profile.config
+        if profile is not None and isinstance(profile.config, dict) else {})
+    try:
+        base = int(
+            config.get('volatile.idmap.base') or
+            config.get('security.idmap.base') or
+            expanded.get('volatile.idmap.base') or
+            expanded.get('security.idmap.base'))
+        size_value = (
+            config.get('security.idmap.size') or
+            expanded.get('security.idmap.size') or
+            profile_config.get('security.idmap.size') or 65536)
+        if str(size_value).lower() == 'auto':
+            size_value = 65536
+        size = int(size_value)
+    except (TypeError, ValueError):
+        raise exception.MigrationPreCheckError(
+            reason='Source container has no valid fixed isolated idmap')
+    if base < 0 or size <= 0:
+        raise exception.MigrationPreCheckError(
+            reason='Source container has no valid fixed isolated idmap')
+    return base, size
+
+
+def _instance_nova_uuid(container):
+    """Return Nova ownership from Incus expanded or local instance config."""
+    owners = set()
+    for attribute in ('expanded_config', 'config'):
+        config = getattr(container, attribute, None)
+        if isinstance(config, dict):
+            instance_uuid = config.get('user.openstack.uuid')
+            if instance_uuid:
+                owners.add(instance_uuid)
+    if len(owners) == 1:
+        return owners.pop()
+    return None
+
+
+def _require_migration_attempt_fencing(client):
+    extensions = set(client.host_info.get('api_extensions', []))
+    if INCUS_MIGRATION_ATTEMPT_EXTENSION not in extensions:
+        raise exception.MigrationError(
+            reason='Incus migration requires API extension: %s' %
+            INCUS_MIGRATION_ATTEMPT_EXTENSION)
+
+
+def _migration_attempt_metadata(response):
+    try:
+        metadata = response.json()['metadata']
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise exception.MigrationError(
+            reason='Incus migration attempt returned invalid metadata') from (
+                exc)
+    if not isinstance(metadata, dict):
+        raise exception.MigrationError(
+            reason='Incus migration attempt returned invalid metadata')
+    return metadata
+
+
+def _validate_migration_attempt(
+        attempt, instance, token, idmap_base, idmap_size):
+    """Reject a token response that does not match its exact registration."""
+    if (
+            attempt.get('token') != token or
+            attempt.get('project') != CONF.incus.project or
+            attempt.get('resource_type') != 'instance' or
+            attempt.get('resource_name') != instance.name):
+        raise exception.MigrationError(
+            reason='Incus migration attempt binding does not match the '
+                   'requested Nova instance')
+    try:
+        attempt_base = int(attempt.get('idmap_base'))
+        attempt_size = int(attempt.get('idmap_size'))
+    except (TypeError, ValueError) as exc:
+        raise exception.MigrationError(
+            reason='Incus migration attempt has no fixed idmap '
+                   'reservation') from exc
+    if (attempt_base, attempt_size) != (idmap_base, idmap_size):
+        raise exception.MigrationError(
+            reason='Incus migration attempt idmap reservation does not '
+                   'match the source instance')
+    if attempt.get('state') not in (
+            'active', 'aborted', 'committed', 'failed'):
+        raise exception.MigrationError(
+            reason='Incus migration attempt returned unsupported state %r' %
+            attempt.get('state'))
+    return attempt
+
+
+def _destination_prepared_profile_binding(config):
+    """Return the exact crash-recovery binding for a target profile."""
+    if not isinstance(config, dict):
+        raise exception.MigrationError(
+            reason='Incus migration destination profile config is malformed')
+    marker = config.get(MIGRATION_DESTINATION_PREPARED_KEY)
+    cleanup_token = config.get(MIGRATION_CLEANUP_TOKEN_KEY)
+    instance_uuid = config.get('user.openstack.uuid')
+    if (config.get('environment.product_name') != 'OpenStack Nova' or
+            not uuidutils.is_uuid_like(instance_uuid) or
+            not uuidutils.is_uuid_like(cleanup_token) or
+            marker != cleanup_token or
+            config.get(MIGRATION_DESTINATION_KEY)):
+        raise exception.MigrationError(
+            reason='Incus migration destination profile has an invalid '
+                   'prepared-owner binding')
+    try:
+        idmap_base = int(config.get('security.idmap.base'))
+        idmap_size = int(config.get('security.idmap.size'))
+    except (TypeError, ValueError) as exc:
+        raise exception.MigrationError(
+            reason='Incus migration destination profile has no fixed idmap '
+                   'binding') from exc
+    if idmap_base < 0 or idmap_size <= 0:
+        raise exception.MigrationError(
+            reason='Incus migration destination profile has an invalid '
+                   'fixed idmap binding')
+    return {
+        'uuid': instance_uuid,
+        'operation_token': cleanup_token,
+        'idmap_base': idmap_base,
+        'idmap_size': idmap_size,
+    }
+
+
+def _get_migration_attempt(
+        client, instance, token, idmap_base, idmap_size):
+    _require_migration_attempt_fencing(client)
+    response = client.api['migration-attempts'][token].get(
+        params={'project': CONF.incus.project})
+    return _validate_migration_attempt(
+        _migration_attempt_metadata(response),
+        instance, token, idmap_base, idmap_size)
+
+
+def _register_migration_attempt(
+        client, instance, token, idmap_base, idmap_size):
+    """Durably reserve one target name and idmap before starting receive."""
+    if not uuidutils.is_uuid_like(token):
+        raise exception.MigrationError(
+            reason='Missing or invalid Incus migration attempt token')
+    _require_migration_attempt_fencing(client)
+    response = client.api['migration-attempts'][token].put(
+        params={'project': CONF.incus.project},
+        json={
+            'state': 'active',
+            'resource_type': 'instance',
+            'resource_name': instance.name,
+            'idmap_base': idmap_base,
+            'idmap_size': idmap_size,
+        })
+    attempt = _validate_migration_attempt(
+        _migration_attempt_metadata(response),
+        instance, token, idmap_base, idmap_size)
+    if attempt['state'] != 'active':
+        raise exception.MigrationError(
+            reason='Incus migration attempt is not active')
+    return attempt
+
+
+def _migration_attempt_instance(client, instance):
+    container = client.instances.get(instance.name)
+    if _instance_nova_uuid(container) != instance.uuid:
+        raise exception.MigrationError(
+            reason='Incus migration target UUID does not match the Nova '
+                   'instance')
+    return container
+
+
+def _wait_migration_attempt_finished(
+        client, instance, token, idmap_base, idmap_size, states):
+    """Wait for an attempt to reach one of the requested terminal states."""
+    expected_states = set(states)
+
+    def attempt_is_finished():
+        attempt = _get_migration_attempt(
+            client, instance, token, idmap_base, idmap_size)
+        if attempt['state'] == 'committed':
+            return attempt
+        if (attempt['state'] not in expected_states or
+                not attempt.get('finished')):
+            raise _MigrationStateNotReady(
+                'Incus migration attempt is not settled '
+                '(state=%s, finished=%s)' % (
+                    attempt['state'], attempt.get('finished')))
+        return attempt
+
+    return _wait_migration_finish_condition(
+        attempt_is_finished, 'migration attempt settlement', instance)
+
+
+def _abort_migration_attempt(
+        client, instance, token, idmap_base, idmap_size,
+        target_cleanup=None):
+    """Fence a target before cancelling operations or accepting absence."""
+    _require_migration_attempt_fencing(client)
+    try:
+        response = client.api['migration-attempts'][token].put(
+            params={'project': CONF.incus.project},
+            json={'state': 'aborted'})
+        attempt = _validate_migration_attempt(
+            _migration_attempt_metadata(response),
+            instance, token, idmap_base, idmap_size)
+    except incus_exceptions.LXDAPIException as exc:
+        # A 409 can only be treated as a commit race after an exact GET proves
+        # this token belongs to this instance and fixed idmap.
+        if _incus_api_status_code(exc) != 409:
+            raise
+        attempt = _get_migration_attempt(
+            client, instance, token, idmap_base, idmap_size)
+        if attempt['state'] != 'committed':
+            raise
+
+    if attempt['state'] == 'committed':
+        return attempt
+    if attempt['state'] not in ('aborted', 'failed'):
+        raise exception.MigrationError(
+            reason='Incus migration attempt abort returned state %s' %
+            attempt['state'])
+
+    # PUT aborted is the irreversible fence. Only after it succeeds may Nova
+    # ask Incus to cancel the operation and use target absence as evidence.
+    operation_id = attempt.get('operation_uuid')
+    _settle_instance_migration_operations(
+        client, instance, operation_ids=(operation_id,))
+    if target_cleanup is not None:
+        # Incus deliberately keeps an aborted attempt unfinished when a
+        # partially received target still exists after its operation
+        # reverter. Delete that fenced record before waiting for settlement;
+        # otherwise Nova and Incus would wait on each other indefinitely.
+        target_cleanup()
+    try:
+        return _wait_migration_attempt_finished(
+            client, instance, token, idmap_base, idmap_size,
+            ('aborted', 'failed'))
+    except _MigrationConditionTimeout as wait_error:
+        # The normal receive reverter marks an aborted attempt finished. The
+        # only exceptional path is an incusd restart that lost the in-memory
+        # operation. Ask the server to settle that record only after Nova has
+        # independently proved both the operation and target instance absent.
+        try:
+            client.instances.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+        else:
+            raise wait_error
+
+        try:
+            response = client.api['migration-attempts'][token].put(
+                params={'project': CONF.incus.project},
+                json={'state': 'settled'})
+        except incus_exceptions.LXDAPIException as exc:
+            raise wait_error from exc
+        attempt = _validate_migration_attempt(
+            _migration_attempt_metadata(response),
+            instance, token, idmap_base, idmap_size)
+        if (attempt['state'] not in ('aborted', 'failed') or
+                not attempt.get('finished')):
+            raise wait_error
+        return attempt
+
+
+def _retire_migration_attempt(
+        client, instance, token, idmap_base, idmap_size):
+    """Garbage collect a terminal attempt while Incus retains its tombstone."""
+    try:
+        attempt = _get_migration_attempt(
+            client, instance, token, idmap_base, idmap_size)
+    except incus_exceptions.LXDAPIException as exc:
+        if _is_incus_not_found(exc):
+            return
+        raise
+    if not attempt.get('finished'):
+        raise exception.MigrationError(
+            reason='Refusing to retire an unfinished Incus migration attempt')
+    client.api['migration-attempts'][token].delete(
+        params={'project': CONF.incus.project})
+
+
+def _finalize_committed_migration_attempt(
+        client, instance, token, idmap_base, idmap_size):
+    """Clear staging metadata and retire a committed target token."""
+    attempt = _get_migration_attempt(
+        client, instance, token, idmap_base, idmap_size)
+    if attempt['state'] != 'committed' or not attempt.get('finished'):
+        raise exception.MigrationError(
+            reason='Incus migration attempt is not committed')
+    profile = client.profiles.get(instance.name)
+    config = profile.config if isinstance(profile.config, dict) else {}
+    if (config.get('user.openstack.uuid') != instance.uuid or
+            config.get(MIGRATION_CLEANUP_TOKEN_KEY) != token):
+        raise exception.MigrationError(
+            reason='Incus migration target profile changed before attempt '
+                   'retirement')
+    original_config = dict(profile.config)
+    updated_config = dict(profile.config)
+    updated_config.pop(MIGRATION_CLEANUP_TOKEN_KEY, None)
+    updated_config.pop(MIGRATION_CLEANUP_COMPLETE_KEY, None)
+    updated_config.pop(MIGRATION_DESTINATION_PREPARED_KEY, None)
+    updated_config.pop(MIGRATION_TARGET_OPERATION_KEY, None)
+    profile.config = updated_config
+    try:
+        profile.save(wait=True)
+    except Exception:
+        # Keep this in-memory object consistent with the durable server state.
+        # A later inventory pass must continue to see the prepared marker.
+        profile.config = original_config
+        raise
+    _retire_migration_attempt(
+        client, instance, token, idmap_base, idmap_size)
+
+
+def _instance_root_pool(client, instance_name, container=None):
+    """Return the root storage pool object for one Incus instance."""
+    if container is None:
+        container = client.instances.get(instance_name)
+    devices = (
+        getattr(container, 'expanded_devices', None) or
+        getattr(container, 'devices', {}) or {})
+    root = devices.get('root') or {}
+    pool_name = root.get('pool')
+    if not pool_name:
+        raise exception.InvalidConfiguration(
+            'Incus instance %s has no root storage pool' % instance_name)
+    return client.storage_pools.get(pool_name)
+
+
+def _storage_pool_identity(pool):
+    config = pool.config or {}
+    source = (
+        config.get('source') or
+        config.get('ceph.osd.pool_name') or '')
+    return {
+        'shared': pool.driver in ('ceph', 'cephext'),
+        'driver': pool.driver,
+        'cluster': config.get('ceph.cluster_name', 'ceph'),
+        'source': source,
+    }
+
+
+def _placement_pool_identity(pool, pool_name):
+    """Return a hashable physical identity for Placement accounting."""
+    identity = _storage_pool_identity(pool)
+    source = identity['source']
+    if not source:
+        raise exception.InvalidConfiguration(
+            'Capacity-tracked Incus storage pool {} does not expose a '
+            'stable source identity'.format(pool_name))
+    return (
+        identity['driver'],
+        identity['cluster'] if identity['shared'] else '',
+        source,
+    )
+
+
+def _validate_root_storage_pool_accounting(client):
+    """Reject Placement mappings that can duplicate physical capacity."""
+    selectors = CONF.incus.root_storage_pools
+    resource_classes = CONF.incus.root_storage_pool_resource_classes
+    shared_capacities = CONF.incus.shared_root_storage_pool_capacities_gb
+
+    unused_capacities = set(shared_capacities) - set(resource_classes)
+    if unused_capacities:
+        raise exception.InvalidConfiguration(
+            'shared_root_storage_pool_capacities_gb contains selectors '
+            'without a capacity resource class: {}'.format(
+                ', '.join(sorted(unused_capacities))))
+
+    default_identity = None
+    if CONF.incus.storage_pool and selectors:
+        default_pool = client.storage_pools.get(CONF.incus.storage_pool)
+        default_identity = _placement_pool_identity(
+            default_pool, CONF.incus.storage_pool)
+
+    selector_pools = {}
+    for selector, pool_name in sorted(selectors.items()):
+        pool = client.storage_pools.get(pool_name)
+        pool_identity = _placement_pool_identity(pool, pool_name)
+        selector_pools[selector] = (pool, pool_identity)
+        if (pool_identity != default_identity and
+                selector not in resource_classes):
+            raise exception.InvalidConfiguration(
+                'Non-default Incus root storage selector {} requires a '
+                'dedicated Placement capacity resource class'.format(
+                    selector))
+
+    seen_classes = {}
+    seen_pools = {}
+    for selector, resource_class in sorted(resource_classes.items()):
+        pool_name = selectors.get(selector)
+        if not pool_name:
+            raise exception.InvalidConfiguration(
+                'Capacity-tracked Incus root storage selector {} is not '
+                'present in root_storage_pools'.format(selector))
+        if not resource_class.startswith('CUSTOM_'):
+            raise exception.InvalidConfiguration(
+                'Incus root storage resource class {} must start with '
+                'CUSTOM_'.format(resource_class))
+
+        previous = seen_classes.get(resource_class)
+        if previous is not None:
+            raise exception.InvalidConfiguration(
+                'Incus root storage selectors {} and {} reuse Placement '
+                'resource class {}'.format(
+                    previous, selector, resource_class))
+        seen_classes[resource_class] = selector
+
+        pool, pool_identity = selector_pools[selector]
+        previous = seen_pools.get(pool_identity)
+        if previous is not None:
+            raise exception.InvalidConfiguration(
+                'Incus root storage selectors {} and {} report the same '
+                'physical pool through separate Placement inventories'.format(
+                    previous, selector))
+        if default_identity == pool_identity:
+            raise exception.InvalidConfiguration(
+                'Incus root storage selector {} reports the default '
+                'storage_pool {} a second time through {}'.format(
+                    selector, CONF.incus.storage_pool, resource_class))
+        seen_pools[pool_identity] = selector
+
+        shared_capacity = shared_capacities.get(selector)
+        shared = pool.driver in ('ceph', 'cephext')
+        if shared and shared_capacity is None:
+            raise exception.InvalidConfiguration(
+                'Shared Incus root storage selector {} requires an explicit '
+                'per-compute Placement capacity budget'.format(selector))
+        if not shared and shared_capacity is not None:
+            raise exception.InvalidConfiguration(
+                'Shared capacity is configured for node-local Incus root '
+                'storage selector {}'.format(selector))
+        if shared:
+            try:
+                capacity_gb = int(shared_capacity)
+            except (TypeError, ValueError):
+                capacity_gb = 0
+            if capacity_gb < 1:
+                raise exception.InvalidConfiguration(
+                    'Shared Incus root storage selector {} capacity budget '
+                    'must be a positive GiB value'.format(selector))
+
+
+def _instance_has_negotiated_handover(container):
+    config = getattr(container, 'config', {}) or {}
+    if not isinstance(config, dict):
+        return False
+    return bool(
+        config.get('volatile.migration.storage_handover') or
+        _instance_migration_receive_complete(container) or
+        str(config.get(
+            'volatile.migration.storage_delete_protection', '')).lower() in (
+                '1', 'true', 'yes', 'on'))
+
+
+def _instance_migration_receive_complete(container):
+    config = getattr(container, 'config', {}) or {}
+    return str(config.get(
+        MIGRATION_RECEIVE_COMPLETE_KEY, '')).lower() in (
+            '1', 'true', 'yes', 'on')
+
+
+def _instance_storage_identity(client, instance_name):
+    """Return a stable comparison tuple for an Incus root storage pool."""
+    container = client.instances.get(instance_name)
+    identity = _storage_pool_identity(
+        _instance_root_pool(
+            client, instance_name, container=container))
+    identity['shared'] = (
+        identity['shared'] and
+        _instance_has_negotiated_handover(container))
+    return identity
+
+
+def _preflight_shared_ceph_handover_destination(
+        destination, pool_name, source_identity):
+    """Prove the target supports deletion-safe shared Ceph ownership."""
+    remote = _migration_client(_migration_address_for_host(destination))
+    extensions = set(remote.host_info.get('api_extensions', []))
+    required = {
+        INCUS_STORAGE_HANDOVER_EXTENSION,
+        INCUS_STORAGE_HANDOVER_PROOF_EXTENSION,
+        INCUS_STORAGE_READY_FENCE_EXTENSION,
+    }
+    missing = sorted(required - extensions)
+    if missing:
+        raise exception.MigrationError(
+            reason='Incus migration destination does not advertise required '
+            'shared Ceph handover extensions: %s' % ', '.join(missing))
+    try:
+        destination_pool = remote.storage_pools.get(pool_name)
+    except Exception as exc:
+        raise exception.MigrationError(
+            reason='Cannot verify destination shared Ceph pool %s: %s' %
+            (pool_name, exc)) from exc
+    destination_identity = _storage_pool_identity(destination_pool)
+    if (not destination_identity['shared'] or
+            destination_identity['driver'] != source_identity['driver']):
+        raise exception.MigrationError(
+            reason='Source and destination Incus Ceph pool identities differ')
+    if not (destination_pool.config or {}):
+        # Incus redacts pool config for non-admin clients such as the
+        # restricted migration preflight identity. Cluster and OSD pool
+        # equality is then enforced authoritatively by the Incus fork's
+        # migration negotiation, which refuses an in-place claim unless
+        # the FSID, pool and driver all match exactly.
+        LOG.debug(
+            'Destination pool %s config is redacted for the preflight '
+            'identity; deferring exact pool identity equality to the '
+            'Incus migration negotiation', pool_name)
+        return
+    if destination_identity != source_identity:
+        raise exception.MigrationError(
+            reason='Source and destination Incus Ceph pool identities differ')
+
+
+def _storage_handover_ownership_proof(
+        client, instance_name, migration_attempt=None, operation_uuid=None):
+    """Return the durable target receive proof required for ownership."""
+    if migration_attempt is None or operation_uuid is None:
+        profile = client.profiles.get(instance_name)
+        config = profile.config if isinstance(profile.config, dict) else {}
+        migration_attempt = (
+            migration_attempt or
+            config.get(MIGRATION_CLEANUP_TOKEN_KEY))
+        operation_uuid = (
+            operation_uuid or
+            config.get(MIGRATION_TARGET_OPERATION_KEY))
+
+    operation_uuid = _migration_operation_id(operation_uuid)
+    if (not uuidutils.is_uuid_like(migration_attempt) or
+            operation_uuid is None):
+        raise exception.MigrationError(
+            reason='Incus shared-storage ownership requires a committed '
+                   'migration attempt and its target receive operation UUID')
+    return migration_attempt, operation_uuid
+
+
+def _set_storage_handover_state(
+        client, instance_name, state, container=None,
+        migration_attempt=None, operation_uuid=None):
+    """Set deletion ownership for an Incus-managed shared Ceph root."""
+    if container is None:
+        container = client.instances.get(instance_name)
+
+    pool = _instance_root_pool(
+        client, instance_name, container=container)
+    if pool.driver not in ('ceph', 'cephext'):
+        return False
+
+    config = (
+        container.config if isinstance(container.config, dict) else {})
+    handover = config.get('volatile.migration.storage_handover')
+    delete_protected = str(config.get(
+        'volatile.migration.storage_delete_protection', '')).lower() in (
+            '1', 'true', 'yes', 'on')
+    receive_complete = _instance_migration_receive_complete(container)
+
+    if state == 'protected':
+        # cephext never owns deletion of the external Cinder RBD. Ordinary
+        # Ceph protection is valid only when Incus itself negotiated this
+        # record as one side of the shared-volume handover.
+        if pool.driver == 'cephext':
+            return False
+        if not (
+                handover in ('pending', 'committed') or delete_protected):
+            raise exception.MigrationError(
+                reason='Refusing to delete an unprotected shared Ceph '
+                       'instance record')
+    elif state == 'owned':
+        # A committed source or a destination whose complete receive was
+        # durably recorded may become the sole deletion owner. Pool names
+        # alone are never ownership proof.
+        if (not handover and not delete_protected and
+                not receive_complete and
+                not config.get('volatile.migration.storage_handover_role')):
+            return True
+        if handover != 'committed' and not receive_complete:
+            raise exception.MigrationError(
+                reason='Incus shared-storage target has no completed receive '
+                       'proof')
+        migration_attempt, operation_uuid = (
+            _storage_handover_ownership_proof(
+                client, instance_name,
+                migration_attempt=migration_attempt,
+                operation_uuid=operation_uuid))
+    elif state == 'source-owned':
+        # Only the original source can abandon a pending or committed
+        # handover, and only after Nova has independently fenced the
+        # destination operation and record.
+        if (not handover and not delete_protected and
+                not receive_complete and
+                not config.get('volatile.migration.storage_handover_role')):
+            return True
+        if (handover not in ('pending', 'committed') or
+                config.get(
+                    'volatile.migration.storage_handover_role') != 'source' or
+                receive_complete):
+            raise exception.MigrationError(
+                reason='Incus shared-storage source does not have a '
+                       'restorable handover state')
+    else:
+        raise exception.MigrationError(
+            reason='Unsupported Incus storage handover state %s' % state)
+
+    extensions = set(client.host_info.get('api_extensions', []))
+    required = {INCUS_STORAGE_HANDOVER_EXTENSION}
+    if state in ('owned', 'source-owned'):
+        required.add(INCUS_STORAGE_HANDOVER_PROOF_EXTENSION)
+    missing = sorted(required - extensions)
+    if missing:
+        raise exception.MigrationError(
+            reason='Incus-managed Ceph migration requires API extensions: %s'
+            % ', '.join(missing))
+
+    request = {'state': state}
+    if state == 'owned':
+        request.update({
+            'migration_attempt': migration_attempt,
+            'operation_uuid': operation_uuid,
+        })
+    client.api.instances[instance_name]['storage-handover'].put(
+        params={'project': CONF.incus.project},
+        json=request)
+    current = client.instances.get(instance_name)
+    current_config = (
+        current.config if isinstance(current.config, dict) else {})
+    if state == 'protected':
+        if str(current_config.get(
+                'volatile.migration.storage_delete_protection', '')
+               ).lower() not in ('1', 'true', 'yes', 'on'):
+            raise exception.MigrationError(
+                reason='Incus did not persist shared-storage delete '
+                       'protection')
+    elif not _storage_handover_is_owned(
+            client, instance_name, container=current):
+        raise exception.MigrationError(
+            reason='Incus did not persist shared-storage ownership')
+    return True
+
+
+def _restore_source_storage_ownership(client, instance):
+    """Restore one fenced source after the destination is conclusively gone."""
+    container = client.instances.get(instance.name)
+    return _set_storage_handover_state(
+        client, instance.name, 'source-owned', container=container)
+
+
+def _migration_operation_id(operation):
+    """Return one validated Incus operation UUID from a URL or UUID."""
+    if not isinstance(operation, str) or not operation:
+        return None
+    operation_id = os.path.basename(parse.urlsplit(operation).path)
+    return operation_id if uuidutils.is_uuid_like(operation_id) else None
+
+
+def _operation_targets_instance(operation, instance_name):
+    resources = operation.get('resources') or {}
+    if not isinstance(resources, dict):
+        return False
+    for resource in resources.get('instances') or []:
+        if (isinstance(resource, str) and
+                parse.unquote(os.path.basename(
+                    parse.urlsplit(resource).path)) == instance_name):
+            return True
+    return False
+
+
+def _operation_is_terminal(operation):
+    try:
+        return int(operation.get('status_code')) >= 200
+    except (TypeError, ValueError):
+        return operation.get('status') in (
+            'Success', 'Failure', 'Cancelled', 'Canceled')
+
+
+def _incus_operation(client, operation_id):
+    response = client.api.operations[operation_id].get(
+        params={'project': CONF.incus.project})
+    metadata = response.json().get('metadata')
+    if not isinstance(metadata, dict):
+        raise exception.MigrationError(
+            reason='Incus operation %s returned invalid metadata' %
+            operation_id)
+    return metadata
+
+
+def _instance_migration_operations(client, instance_name):
+    response = client.api.operations.get(params={
+        'project': CONF.incus.project,
+        'recursion': 1,
+    })
+    grouped = response.json().get('metadata') or {}
+    if not isinstance(grouped, dict) or not all(
+            isinstance(operations, list)
+            for operations in grouped.values()):
+        raise exception.MigrationError(
+            reason='Incus operation listing returned invalid metadata')
+    operations = [
+        operation
+        for status_operations in grouped.values()
+        for operation in status_operations
+    ]
+    return {
+        operation.get('id'): operation
+        for operation in operations
+        if (isinstance(operation, dict) and
+            isinstance(operation.get('id'), str) and
+            _operation_targets_instance(operation, instance_name) and
+            not _operation_is_terminal(operation))
+    }
+
+
+def _settle_instance_migration_operations(
+        client, instance, operation_ids=()):
+    """Cancel and prove terminal all migration operations for one instance."""
+    pending = _instance_migration_operations(client, instance.name)
+    for operation_id in operation_ids:
+        operation_id = _migration_operation_id(operation_id)
+        if operation_id and operation_id not in pending:
+            try:
+                operation = _incus_operation(client, operation_id)
+            except incus_exceptions.LXDAPIException as exc:
+                if _is_incus_not_found(exc):
+                    continue
+                raise
+            if not _operation_is_terminal(operation):
+                pending[operation_id] = operation
+
+    for operation_id, operation in pending.items():
+        if operation.get('may_cancel'):
+            try:
+                client.api.operations[operation_id].delete(
+                    params={'project': CONF.incus.project})
+            except incus_exceptions.LXDAPIException as exc:
+                if not _is_incus_not_found(exc):
+                    raise
+
+        def operation_is_terminal():
+            try:
+                current = _incus_operation(client, operation_id)
+            except incus_exceptions.LXDAPIException as exc:
+                if _is_incus_not_found(exc):
+                    return
+                raise
+            if not _operation_is_terminal(current):
+                raise _MigrationStateNotReady(
+                    'Incus migration operation %s is still active' %
+                    operation_id)
+
+        _wait_migration_finish_condition(
+            operation_is_terminal,
+            'operation %s settlement' % operation_id, instance)
+
+    # A destination create can become visible after the request that listed
+    # operations. A second empty scan is the barrier before absence is accepted
+    # as proof that no late target can materialize.
+    remaining = _instance_migration_operations(client, instance.name)
+    if remaining:
+        raise exception.MigrationError(
+            reason='Incus still has active migration operations for %s: %s' %
+            (instance.name, ', '.join(sorted(remaining))))
+
+
+def _create_migration_target(
+        client, config, instance, attempt_token, idmap_base, idmap_size,
+        operation_started=None):
+    """Start a fenced receive and recover a lost response from its token."""
+    attempt = _get_migration_attempt(
+        client, instance, attempt_token, idmap_base, idmap_size)
+    if attempt['state'] == 'committed':
+        return (
+            _migration_attempt_instance(client, instance),
+            attempt.get('operation_uuid') or None)
+    if attempt['state'] != 'active':
+        raise exception.MigrationError(
+            reason='Incus migration attempt cannot start in state %s' %
+            attempt['state'])
+
+    request = copy.deepcopy(config)
+    request.setdefault('source', {})['migration_attempt'] = attempt_token
+    operation_id = None
+    original_error = None
+    try:
+        response = client.api.instances.post(json=request)
+        body = response.json()
+        operation_id = _migration_operation_id(body.get('operation'))
+        if operation_id is None:
+            raise exception.MigrationError(
+                reason='Incus migration target did not return an operation '
+                       'UUID')
+        if operation_started is not None:
+            operation_started(operation_id)
+        client.operations.wait_for_operation(operation_id)
+    except Exception as exc:
+        original_error = exc
+
+    # The HTTP response and operation wait are not the commit record. A lost
+    # response can still mean the target durably received the instance.
+    attempt = _get_migration_attempt(
+        client, instance, attempt_token, idmap_base, idmap_size)
+    attempt_operation_id = _migration_operation_id(
+        attempt.get('operation_uuid'))
+    operation_id = attempt_operation_id or operation_id
+    if attempt['state'] == 'active' and attempt_operation_id:
+        try:
+            client.operations.wait_for_operation(attempt_operation_id)
+        except Exception as exc:
+            if original_error is None:
+                original_error = exc
+        attempt = _get_migration_attempt(
+            client, instance, attempt_token, idmap_base, idmap_size)
+
+    if attempt['state'] == 'committed' and attempt.get('finished'):
+        if operation_started is not None and operation_id is not None:
+            operation_started(operation_id)
+        return _migration_attempt_instance(client, instance), operation_id
+    if original_error is not None:
+        raise original_error
+    raise exception.MigrationError(
+        reason='Incus migration receive did not commit '
+               '(state=%s, finished=%s)' % (
+                   attempt['state'], attempt.get('finished')))
+
+
+def _delete_migration_target_record(remote, instance):
+    """Delete a migration target without deleting its shared Ceph root."""
+    try:
+        container = remote.instances.get(instance.name)
+    except incus_exceptions.LXDAPIException as exc:
+        if _is_incus_not_found(exc):
+            return
+        raise
+
+    _set_storage_handover_state(
+        remote, instance.name, 'protected', container=container)
+    if container.status != 'Stopped':
+        try:
+            container.stop(timeout=-1, force=True, wait=True)
+        except incus_exceptions.LXDAPIException as exc:
+            if 'instance is already stopped' not in str(exc).lower():
+                raise
+    container.delete(wait=True)
+
+
+def _mark_remote_migration_recovery(
+        remote, instance_name, desired_state):
+    """Leave a durable target-side repair request after an ambiguous commit."""
+    profile = remote.profiles.get(instance_name)
+    profile.config[MIGRATION_RECOVERY_KEY] = desired_state
+    profile.save(wait=True)
+
+
+def _storage_handover_is_owned(client, instance_name, container=None):
+    """Return whether a shared root has no remaining handover state."""
+    if container is None:
+        container = client.instances.get(instance_name)
+    pool = _instance_root_pool(
+        client, instance_name, container=container)
+    if pool.driver not in ('ceph', 'cephext'):
+        return True
+
+    config = (
+        container.config if isinstance(container.config, dict) else {})
+    return (
+        not config.get('volatile.migration.storage_handover') and
+        not config.get('volatile.migration.storage_handover_role') and
+        str(config.get(
+            'volatile.migration.storage_delete_protection', '')).lower()
+        not in ('1', 'true', 'yes', 'on') and
+        not _instance_migration_receive_complete(container)
+    )
+
+
+def _converge_migration_target_ownership(
+        client, instance, desired_state=None):
+    """Commit or verify target ownership after a lost Nova callback."""
+    container = client.instances.get(instance.name)
+    if desired_state is None:
+        desired_state = (
+            'running' if container.status == 'Running' else 'stopped')
+    if _instance_nova_uuid(container) != instance.uuid:
+        raise exception.MigrationError(
+            reason='Incus migration destination UUID does not match the '
+                   'Nova instance')
+
+    profile = client.profiles.get(instance.name)
+    profile_config = (
+        profile.config if isinstance(profile.config, dict) else {})
+    if (profile_config.get('environment.product_name') != 'OpenStack Nova' or
+            profile_config.get('user.openstack.uuid') != instance.uuid):
+        raise exception.MigrationError(
+            reason='Incus migration destination profile is not owned by '
+                   'the Nova instance')
+
+    cleanup_token = profile_config.get(MIGRATION_CLEANUP_TOKEN_KEY)
+    if _storage_handover_is_owned(
+            client, instance.name, container=container):
+        # The ownership transition precedes profile/attempt retirement. A
+        # process can die in that interval, so finish it when proof remains.
+        if uuidutils.is_uuid_like(cleanup_token):
+            idmap_base, idmap_size = _instance_migration_idmap(
+                container, profile)
+            try:
+                _finalize_committed_migration_attempt(
+                    client, instance, cleanup_token,
+                    idmap_base, idmap_size)
+            except Exception:
+                LOG.critical(
+                    'Migration target owns shared storage but its staging '
+                    'metadata could not be retired; queued recovery',
+                    instance=instance, exc_info=True)
+                _mark_remote_migration_recovery(
+                    client, instance.name, desired_state)
+        return
+
+    if not uuidutils.is_uuid_like(cleanup_token):
+        raise exception.MigrationError(
+            reason='Protected Incus migration target has no valid cleanup '
+                   'token')
+    idmap_base, idmap_size = _instance_migration_idmap(container, profile)
+    attempt = _get_migration_attempt(
+        client, instance, cleanup_token, idmap_base, idmap_size)
+    if attempt['state'] != 'committed' or not attempt.get('finished'):
+        raise exception.MigrationError(
+            reason='Protected Incus migration target has no committed '
+                   'migration attempt')
+
+    try:
+        _retry_migration_finish_action(
+            lambda: _set_storage_handover_state(
+                client, instance.name, 'owned', container=container,
+                migration_attempt=cleanup_token,
+                operation_uuid=attempt.get('operation_uuid')),
+            'recovered destination shared-storage ownership commit',
+            instance)
+    except Exception as ownership_error:
+        try:
+            _mark_remote_migration_recovery(
+                client, instance.name, desired_state)
+        except Exception:
+            LOG.critical(
+                'Protected migration target could neither commit ownership '
+                'nor persist a recovery marker',
+                instance=instance, exc_info=True)
+            raise exception.MigrationError(
+                reason='Protected Incus migration target has no durable '
+                       'ownership recovery marker') from ownership_error
+        return
+
+    try:
+        _finalize_committed_migration_attempt(
+            client, instance, cleanup_token, idmap_base, idmap_size)
+    except Exception:
+        LOG.critical(
+            'Recovered migration target ownership but could not retire its '
+            'staging metadata; queued recovery',
+            instance=instance, exc_info=True)
+        _mark_remote_migration_recovery(
+            client, instance.name, desired_state)
 
 
 def _live_migration_share_mappings(context, instance, profile):
@@ -647,31 +2121,52 @@ def _remove_live_migration_target(remote, instance):
     try:
         _delete_migration_target_resource(
             remote, 'instances', instance.name, CONF.incus.project, wait=True)
-    except incus_exceptions.NotFound:
-        pass
+    except incus_exceptions.LXDAPIException as exc:
+        if not _is_incus_not_found(exc):
+            raise
     try:
         _delete_migration_target_resource(
             remote, 'profiles', instance.name, CONF.incus.project)
-    except incus_exceptions.NotFound:
-        pass
+    except incus_exceptions.LXDAPIException as exc:
+        if not _is_incus_not_found(exc):
+            raise
 
 
 def _remove_stale_live_migration_profile(client, instance):
     """Remove an unused profile left by an earlier failed migration."""
     try:
         client.instances.get(instance.name)
-    except incus_exceptions.NotFound:
-        pass
+    except incus_exceptions.LXDAPIException as exc:
+        if not _is_incus_not_found(exc):
+            raise
     else:
         raise exception.DestinationDiskExists(path=instance.name)
 
     try:
         profile = client.profiles.get(instance.name)
-    except incus_exceptions.NotFound:
-        return
+    except incus_exceptions.LXDAPIException as exc:
+        if _is_incus_not_found(exc):
+            return
+        raise
 
-    if (profile.config.get('environment.product_name') !=
-            'OpenStack Nova' or profile.used_by):
+    profile_config = (
+        profile.config if isinstance(profile.config, dict) else {})
+    profile_devices = (
+        profile.devices if isinstance(profile.devices, dict) else {})
+    if (profile_config.get('environment.product_name') !=
+            'OpenStack Nova' or
+            profile_config.get('user.openstack.uuid') != instance.uuid or
+            profile.used_by):
+        raise exception.DestinationDiskExists(path=instance.name)
+    mounted_manila_devices = any(
+        name.startswith('manila-') and
+        device.get('source') and
+        os.path.ismount(device['source'])
+        for name, device in profile_devices.items())
+    if (profile_config.get(MIGRATION_DESTINATION_PREPARED_KEY) or
+            _profile_has_volume_connections(profile) or
+            _volume_journal_records(instance) or
+            mounted_manila_devices):
         raise exception.DestinationDiskExists(path=instance.name)
     profile.delete()
 
@@ -679,32 +2174,43 @@ def _remove_stale_live_migration_profile(client, instance):
 def _stateful_migration_profile_config(container, profile):
     """Copy a profile while pinning the source user namespace mapping."""
     config = dict(profile.config)
-    idmap_base = container.config.get('volatile.idmap.base')
     try:
-        idmap_base_value = int(idmap_base)
-    except (TypeError, ValueError):
-        raise exception.MigrationPreCheckError(
-            reason='Source container has no valid isolated idmap base')
-    if idmap_base_value <= 0:
-        raise exception.MigrationPreCheckError(
-            reason='Source container has no valid isolated idmap base')
+        idmap_base, idmap_size = _instance_migration_idmap(
+            container, profile)
+    except exception.MigrationPreCheckError:
+        raise
 
     # CRIU records the source user namespace IDs in its checkpoint. Incus
     # would otherwise allocate a new isolated range on the independent target
     # daemon and shift the checkpoint files to IDs that CRIU cannot access.
-    config['security.idmap.base'] = str(idmap_base_value)
+    config['security.idmap.base'] = str(idmap_base)
+    config['security.idmap.size'] = str(idmap_size)
     return config
 
 
 def _live_migration_source_profile(container, profile):
     """Serialize the source profile without host-specific block paths."""
+    config = _stateful_migration_profile_config(container, profile)
+    for key in list(config):
+        if key.startswith((
+                'user.openstack.volume.',
+                'user.openstack.volume_device_info.')):
+            config.pop(key)
+    config.pop(MIGRATION_RECOVERY_KEY, None)
+    config.pop(MIGRATION_DESTINATION_KEY, None)
+    config.pop(MIGRATION_OPERATION_KEY, None)
+    config.pop(MIGRATION_TARGET_OPERATION_KEY, None)
+    config.pop(MIGRATION_ROLLBACK_COMPLETE_KEY, None)
+    config.pop(CLEANUP_RECOVERY_KEY, None)
+    config.pop(MIGRATION_DESTINATION_PREPARED_KEY, None)
+
     devices = copy.deepcopy(profile.devices)
     for name, device in list(devices.items()):
         if device.get('type') == 'unix-block':
             devices.pop(name)
 
     return jsonutils.dumps({
-        'config': _stateful_migration_profile_config(container, profile),
+        'config': config,
         'devices': devices,
     })
 
@@ -736,6 +2242,404 @@ def _volume_device_info_keys(volume_id):
             _legacy_volume_device_info_key(volume_id))
 
 
+def _sanitize_volume_connection_data(value, key=None):
+    """Copy connector data without persisting credentials in Incus."""
+    sensitive = {
+        'auth_password', 'password', 'key', 'keyring', 'secret', 'token',
+    }
+    if key == _PRE_LIVE_DISCONNECTED_KEY:
+        return None
+    if key is not None and (
+            key.lower() in sensitive or
+            key.lower().endswith(('_password', '_token'))):
+        return None
+    if isinstance(value, dict):
+        sanitized = {}
+        for child_key, child_value in value.items():
+            if not isinstance(child_key, str):
+                continue
+            cleaned = _sanitize_volume_connection_data(
+                child_value, child_key)
+            if cleaned is not None:
+                sanitized[child_key] = cleaned
+        return sanitized
+    if isinstance(value, (list, tuple)):
+        return [
+            cleaned for child in value
+            if (cleaned := _sanitize_volume_connection_data(child))
+            is not None
+        ]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise exception.InvalidVolume(
+        reason='Cinder connection data contains an unsupported value type')
+
+
+def _serialize_volume_attachment(
+        connection_info, device_info, mountpoint, phase='connected'):
+    """Serialize a durable, credential-free os-brick cleanup record."""
+    protocol = connection_info.get('driver_volume_type')
+    if not isinstance(protocol, str) or not protocol:
+        raise exception.InvalidVolume(
+            reason='Cinder connection information has no driver_volume_type')
+    record = {
+        'version': _VOLUME_ATTACHMENT_RECORD_VERSION,
+        'phase': phase,
+        'driver_volume_type': protocol,
+        'connection_data': _sanitize_volume_connection_data(
+            connection_info.get('data') or {}),
+        'device_info': device_info,
+        'mountpoint': mountpoint,
+    }
+    return _serialize_device_info(record)
+
+
+def _volume_journal_directory(instance):
+    return os.path.join(
+        CONF.instances_path, 'incus-volume-journal', instance.uuid)
+
+
+def _volume_journal_path(instance, volume_id):
+    digest = hashlib.sha256(str(volume_id).encode('utf-8')).hexdigest()
+    return os.path.join(_volume_journal_directory(instance), digest + '.json')
+
+
+def _fsync_directory(path):
+    flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _spawn_attempt_journal_directory():
+    return os.path.join(CONF.instances_path, 'incus-spawn-attempts')
+
+
+def _spawn_attempt_journal_path(instance):
+    return os.path.join(_spawn_attempt_journal_directory(), instance.uuid)
+
+
+def _spawn_attempt_payload(
+        instance, compute_id, attempt_id, phase='preflight', generation=None):
+    if phase not in _SPAWN_ATTEMPT_PHASES:
+        raise incus_idmap.IDMapIntegrityError(
+            'Incus spawn attempt has an invalid phase')
+    if generation is None:
+        allocation_id = None
+        base = None
+        size = None
+        slot = None
+        fingerprint = None
+    else:
+        getter = (
+            generation.get if isinstance(generation, dict)
+            else lambda key: getattr(generation, key))
+        allocation_id = _canonical_materialization_id(
+            getter('allocation_id'), 'allocation ID')
+        base = int(getter('base'))
+        size = int(getter('size'))
+        slot = int(getter('slot'))
+        fingerprint = str(getter('fingerprint'))
+        if (base < 0 or size <= 0 or slot < 0 or
+                not re.fullmatch(r'[0-9a-f]{64}', fingerprint)):
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus spawn attempt has an invalid allocation generation')
+    return {
+        'version': _SPAWN_ATTEMPT_JOURNAL_VERSION,
+        'phase': phase,
+        'instance_uuid': _canonical_materialization_id(
+            instance.uuid, 'instance UUID'),
+        'instance_name': instance.name,
+        'compute_uuid': _canonical_materialization_id(
+            compute_id, 'compute UUID'),
+        'attempt_uuid': _canonical_materialization_id(
+            attempt_id, 'spawn attempt UUID'),
+        'allocation_id': allocation_id,
+        'base': base,
+        'size': size,
+        'slot': slot,
+        'fingerprint': fingerprint,
+    }
+
+
+def _validate_spawn_attempt_payload(instance, payload):
+    required = {
+        'version', 'phase', 'instance_uuid', 'instance_name',
+        'compute_uuid', 'attempt_uuid', 'allocation_id', 'base', 'size',
+        'slot', 'fingerprint',
+    }
+    try:
+        if not isinstance(payload, dict) or set(payload) != required:
+            raise ValueError('invalid schema')
+        generation_values = (
+            payload['allocation_id'], payload['base'], payload['size'],
+            payload['slot'], payload['fingerprint'])
+        generation = None
+        if any(value is not None for value in generation_values):
+            if any(value is None for value in generation_values):
+                raise ValueError('incomplete allocation generation')
+            generation = payload
+        expected = _spawn_attempt_payload(
+            instance, payload['compute_uuid'], payload['attempt_uuid'],
+            phase=payload['phase'], generation=generation)
+    except (AttributeError, TypeError, ValueError,
+            incus_idmap.IDMapError) as exc:
+        raise incus_idmap.IDMapIntegrityError(
+            'Host Incus spawn attempt journal is invalid') from exc
+    if payload != expected:
+        raise incus_idmap.IDMapIntegrityError(
+            'Host Incus spawn attempt journal ownership is invalid')
+    return payload
+
+
+def _read_spawn_attempt_journal(instance):
+    try:
+        with open(
+                _spawn_attempt_journal_path(instance),
+                encoding='utf-8') as stream:
+            payload = json.load(stream)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise incus_idmap.IDMapIntegrityError(
+            'Host Incus spawn attempt journal is unreadable') from exc
+    return _validate_spawn_attempt_payload(instance, payload)
+
+
+def _spawn_attempt_has_generation(attempt):
+    return attempt.get('allocation_id') is not None
+
+
+def _spawn_attempt_generation_matches(attempt, generation):
+    return (
+        _spawn_attempt_has_generation(attempt) and
+        attempt['allocation_id'] == generation.allocation_id and
+        attempt['base'] == generation.base and
+        attempt['size'] == generation.size and
+        attempt['slot'] == generation.slot and
+        attempt['fingerprint'] == generation.fingerprint)
+
+
+def _write_spawn_attempt_journal(
+        instance, compute_id, attempt_id, phase, expected_phase=None,
+        generation=None):
+    """Atomically persist the side-effect boundary for one spawn attempt."""
+    journal_dir = _spawn_attempt_journal_directory()
+    directory_created = not os.path.isdir(journal_dir)
+    os.makedirs(journal_dir, mode=0o700, exist_ok=True)
+    os.chmod(journal_dir, 0o700)
+    existing = _read_spawn_attempt_journal(instance)
+    if expected_phase is None:
+        if existing is not None:
+            raise incus_idmap.IDMapConflict(
+                reason='Another durable Incus spawn attempt exists')
+    else:
+        expected = _spawn_attempt_payload(
+            instance, compute_id, attempt_id, phase=expected_phase,
+            generation=generation)
+        if existing != expected:
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus spawn attempt changed before its phase transition')
+
+    payload = _spawn_attempt_payload(
+        instance, compute_id, attempt_id, phase=phase,
+        generation=generation)
+    fd, temporary = tempfile.mkstemp(
+        prefix='.spawn-', suffix='.tmp', dir=journal_dir)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            fd = None
+            json.dump(payload, stream, sort_keys=True, separators=(',', ':'))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, _spawn_attempt_journal_path(instance))
+        _fsync_directory(journal_dir)
+        if directory_created:
+            _fsync_directory(os.path.dirname(journal_dir))
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+    return payload
+
+
+def _remove_spawn_attempt_journal(instance, expected):
+    current = _read_spawn_attempt_journal(instance)
+    if current is None:
+        return False
+    if current != expected:
+        raise incus_idmap.IDMapIntegrityError(
+            'Incus spawn attempt changed before durable cleanup')
+    os.unlink(_spawn_attempt_journal_path(instance))
+    _fsync_directory(_spawn_attempt_journal_directory())
+    return True
+
+
+def _write_volume_journal(
+        instance, volume_id, connection_info, device_info, mountpoint, phase):
+    """Atomically persist host connector ownership outside the Incus DB."""
+    journal_dir = _volume_journal_directory(instance)
+    journal_root = os.path.dirname(journal_dir)
+    root_created = not os.path.isdir(journal_root)
+    instance_created = not os.path.isdir(journal_dir)
+    os.makedirs(journal_dir, mode=0o700, exist_ok=True)
+    os.chmod(journal_root, 0o700)
+    os.chmod(journal_dir, 0o700)
+    payload = {
+        'version': _VOLUME_JOURNAL_VERSION,
+        'instance_uuid': instance.uuid,
+        'instance_name': instance.name,
+        'volume_id': str(volume_id),
+        'attachment': jsonutils.loads(_serialize_volume_attachment(
+            connection_info, device_info, mountpoint, phase=phase)),
+    }
+    fd, temporary = tempfile.mkstemp(
+        prefix='.volume-', suffix='.tmp', dir=journal_dir)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            fd = None
+            json.dump(payload, stream, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, _volume_journal_path(instance, volume_id))
+        _fsync_directory(journal_dir)
+        if instance_created:
+            _fsync_directory(journal_root)
+        if root_created:
+            _fsync_directory(os.path.dirname(journal_root))
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _read_volume_journal(instance, volume_id):
+    path = _volume_journal_path(instance, volume_id)
+    try:
+        with open(path, encoding='utf-8') as stream:
+            payload = json.load(stream)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise exception.InvalidVolume(
+            reason='Host Cinder cleanup journal is unreadable: %s' % exc)
+    if (not isinstance(payload, dict) or
+            payload.get('version') != _VOLUME_JOURNAL_VERSION or
+            payload.get('instance_uuid') != instance.uuid or
+            payload.get('instance_name') != instance.name or
+            payload.get('volume_id') != str(volume_id) or
+            not isinstance(payload.get('attachment'), dict)):
+        raise exception.InvalidVolume(
+            reason='Host Cinder cleanup journal ownership is invalid')
+    return payload['attachment']
+
+
+def _volume_journal_records(instance):
+    journal_dir = _volume_journal_directory(instance)
+    try:
+        names = os.listdir(journal_dir)
+    except FileNotFoundError:
+        return {}
+    records = {}
+    for name in names:
+        if not name.endswith('.json'):
+            continue
+        path = os.path.join(journal_dir, name)
+        try:
+            with open(path, encoding='utf-8') as stream:
+                payload = json.load(stream)
+        except (OSError, ValueError) as exc:
+            raise exception.InvalidVolume(
+                reason='Host Cinder cleanup journal is unreadable: %s' % exc)
+        if (not isinstance(payload, dict) or
+                payload.get('version') != _VOLUME_JOURNAL_VERSION or
+                payload.get('instance_uuid') != instance.uuid or
+                payload.get('instance_name') != instance.name or
+                not isinstance(payload.get('volume_id'), str) or
+                not isinstance(payload.get('attachment'), dict) or
+                os.path.basename(_volume_journal_path(
+                    instance, payload['volume_id'])) != name):
+            raise exception.InvalidVolume(
+                reason='Host Cinder cleanup journal ownership is invalid')
+        records[payload['volume_id']] = payload['attachment']
+    return records
+
+
+def _remove_volume_journal(instance, volume_id):
+    journal_dir = _volume_journal_directory(instance)
+    try:
+        os.unlink(_volume_journal_path(instance, volume_id))
+    except FileNotFoundError:
+        return
+    _fsync_directory(journal_dir)
+    try:
+        os.rmdir(journal_dir)
+    except OSError as exc:
+        if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST, errno.ENOENT):
+            raise
+    else:
+        _fsync_directory(os.path.dirname(journal_dir))
+
+
+def _profile_volume_record(profile, volume_id, device=None):
+    """Decode current and legacy profile volume metadata."""
+    encoded = next((
+        profile.config[key]
+        for key in _volume_device_info_keys(volume_id)
+        if key in profile.config), None)
+    if not encoded:
+        return {
+            'version': 0,
+            'phase': 'connected',
+            'driver_volume_type': None,
+            'connection_data': {},
+            'device_info': (
+                {'path': device['source']} if device else None),
+            'mountpoint': (device or {}).get('path'),
+        }
+    try:
+        decoded = jsonutils.loads(encoded)
+    except (TypeError, ValueError) as exc:
+        raise exception.InvalidVolume(
+            reason='Stored os-brick volume metadata is invalid: %s' % exc)
+    if not isinstance(decoded, dict):
+        raise exception.InvalidVolume(
+            reason='Stored os-brick volume metadata is not a mapping')
+    if decoded.get('version') == _VOLUME_ATTACHMENT_RECORD_VERSION:
+        device_info = decoded.get('device_info')
+        connection_data = decoded.get('connection_data')
+        if (decoded.get('phase') not in (
+                'connecting', 'connected', 'disconnecting') or
+                not isinstance(device_info, dict) or
+                not isinstance(connection_data, dict) or
+                not isinstance(decoded.get('driver_volume_type'), str)):
+            raise exception.InvalidVolume(
+                reason='Stored os-brick attachment record is incomplete')
+        return decoded
+    if decoded.get('version') == 1:
+        decoded['phase'] = 'connected'
+        return decoded
+    # Before record version 1, this value contained device_info directly.
+    return {
+        'version': 0,
+        'phase': 'connected',
+        'driver_volume_type': None,
+        'connection_data': {},
+        'device_info': decoded,
+        'mountpoint': (device or {}).get('path'),
+    }
+
+
 def _profile_has_volume_connections(profile):
     """Return whether a profile retains an os-brick volume connection."""
     if not isinstance(profile.config, dict):
@@ -764,10 +2668,30 @@ def _serialize_device_info(device_info):
             exc)
 
 
-def _disk_metric_device(profile, instance, disk_id):
+def _mapped_cinder_rbd_devices():
+    """Return Cinder RBD symlinks indexed by image name.
+
+    A host-wide volume-usage poll can include thousands of BFV roots. Building
+    this index once avoids scanning every RBD pool directory for each BDM.
+    The selected path is still resolved and validated by
+    ``_disk_metric_device`` before it is trusted.
+    """
+    devices = {}
+    for path in glob.glob('/dev/rbd/*/volume-*'):
+        image_name = os.path.basename(path)
+        if not _CINDER_RBD_IMAGE_RE.fullmatch(image_name):
+            continue
+        devices.setdefault(image_name, []).append(path)
+    return devices
+
+
+def _disk_metric_device(profile, instance, disk_id, rbd_devices=None):
     """Map a Nova disk ID to the host block name used by Incus metrics."""
+    devices = (
+        profile.get('devices', {}) if isinstance(profile, dict)
+        else profile.devices)
     normalized = str(disk_id).removeprefix('/dev/')
-    for device in profile.devices.values():
+    for device in devices.values():
         if device.get('type') != 'unix-block':
             continue
         if str(device.get('path', '')).removeprefix('/dev/') != normalized:
@@ -781,11 +2705,15 @@ def _disk_metric_device(profile, instance, disk_id):
     if normalized != root_device:
         return None
 
-    root = profile.devices.get('root', {})
+    root = devices.get('root', {})
     image_name = root.get('initial.ceph.rbd.image_name')
     if not image_name or not _CINDER_RBD_IMAGE_RE.fullmatch(image_name):
         return None
-    candidates = glob.glob('/dev/rbd/*/%s' % image_name)
+    candidates = (
+        rbd_devices.get(image_name, [])
+        if rbd_devices is not None
+        else glob.glob('/dev/rbd/*/%s' % image_name)
+    )
     if len(candidates) != 1:
         LOG.warning(
             'Expected one mapped RBD device for root volume %(image)s, '
@@ -798,8 +2726,8 @@ def _disk_metric_device(profile, instance, disk_id):
     return os.path.basename(source)
 
 
-def _incus_disk_metrics(client, instance_name):
-    """Return cumulative cgroup block counters keyed by host device name."""
+def _incus_all_disk_metrics(client):
+    """Return cumulative block counters keyed by instance and host device."""
     response = client.api.metrics.get(is_api=False)
     wanted = {
         'incus_disk_read_bytes_total': 'rd_bytes',
@@ -812,13 +2740,20 @@ def _incus_disk_metrics(client, instance_name):
             response.text):
         for sample in family.samples:
             field = wanted.get(sample.name)
-            if field is None or sample.labels.get('name') != instance_name:
+            if field is None:
                 continue
+            instance_name = sample.labels.get('name')
             device = sample.labels.get('device')
-            if not device:
+            if not instance_name or not device:
                 continue
-            metrics.setdefault(device, {})[field] = int(sample.value)
+            metrics.setdefault(instance_name, {}).setdefault(
+                device, {})[field] = int(sample.value)
     return metrics
+
+
+def _incus_disk_metrics(client, instance_name):
+    """Return cumulative block counters for one Incus instance."""
+    return _incus_all_disk_metrics(client).get(instance_name, {})
 
 
 def _nova_block_stats(counters):
@@ -834,14 +2769,35 @@ def _nova_block_stats(counters):
     ]
 
 
+class _MigrationStateNotReady(Exception):
+    """Signal that an asynchronous migration condition has not converged."""
+
+
+class _MigrationConditionTimeout(exception.MigrationError):
+    """An asynchronous migration condition did not converge in time."""
+
+
+def _is_retryable_migration_exception(exc):
+    """Return whether retrying a migration side effect is safe and useful."""
+    if isinstance(exc, (OSError, TimeoutError, socket.timeout,
+                        incus_exceptions.ClientConnectionFailed)):
+        return True
+    if not isinstance(exc, incus_exceptions.LXDAPIException):
+        return False
+    return (
+        _is_incus_busy_operation(exc) or
+        _incus_api_status_code(exc) in (408, 429, 500, 502, 503, 504))
+
+
 def _retry_migration_finish_action(action, description, instance):
-    """Retry a target-side migration action without weakening ownership."""
+    """Retry a side effect only for explicit transient failures."""
     attempts = CONF.incus.migration_finish_retries
     for attempt in range(1, attempts + 1):
         try:
             return action()
-        except Exception:
-            if attempt == attempts:
+        except Exception as exc:
+            if (attempt == attempts or
+                    not _is_retryable_migration_exception(exc)):
                 raise
             LOG.warning(
                 'Incus migration target %(action)s failed on attempt '
@@ -854,6 +2810,31 @@ def _retry_migration_finish_action(action, description, instance):
                 instance=instance,
                 exc_info=True)
             eventlet.sleep(CONF.incus.migration_finish_retry_interval)
+
+
+def _wait_migration_finish_condition(action, description, instance):
+    """Poll a read-only migration condition without retrying bad metadata."""
+    attempts = CONF.incus.migration_finish_retries
+    for attempt in range(1, attempts + 1):
+        try:
+            return action()
+        except _MigrationStateNotReady as exc:
+            if attempt == attempts:
+                raise _MigrationConditionTimeout(reason=str(exc)) from exc
+        except Exception as exc:
+            if (attempt == attempts or
+                    not _is_retryable_migration_exception(exc)):
+                raise
+        LOG.debug(
+            'Incus migration %(action)s is not ready on attempt '
+            '%(attempt)s/%(attempts)s',
+            {
+                'action': description,
+                'attempt': attempt,
+                'attempts': attempts,
+            },
+            instance=instance)
+        eventlet.sleep(CONF.incus.migration_finish_retry_interval)
 
 
 def _incus_api_error_message(exc):
@@ -900,7 +2881,10 @@ def _incus_api_status_code(exc):
 
 
 def _is_incus_not_found(exc):
-    return _incus_api_status_code(exc) == 404
+    return (
+        isinstance(exc, incus_exceptions.NotFound) or
+        _incus_api_status_code(exc) == 404
+    )
 
 
 def _is_incus_busy_operation(exc):
@@ -914,26 +2898,27 @@ def _is_incus_busy_operation(exc):
         'already has an operation' in message)
 
 
-def _is_incus_profile_change_saved(exc):
-    return (
-        'profile change still saved' in
-        _incus_api_error_message(exc).lower()
-    )
-
-
-def _retry_incus_instance_action(action, description, instance):
+def _retry_incus_instance_action(
+        action, description, instance, retry_transient=False):
     attempts = CONF.incus.migration_finish_retries
     for attempt in range(1, attempts + 1):
         try:
             return action()
-        except incus_exceptions.LXDAPIException as exc:
-            if not _is_incus_busy_operation(exc) or attempt == attempts:
+        except Exception as exc:
+            retryable = (
+                _is_retryable_migration_exception(exc)
+                if retry_transient
+                else (
+                    isinstance(exc, incus_exceptions.LXDAPIException) and
+                    _is_incus_busy_operation(exc)
+                )
+            )
+            if not retryable or attempt == attempts:
                 raise
 
             LOG.warning(
-                'Incus instance %(action)s failed because another operation '
-                'is still running on attempt %(attempt)s/%(attempts)s; '
-                'retrying',
+                'Incus instance %(action)s hit a transient failure on attempt '
+                '%(attempt)s/%(attempts)s; retrying',
                 {
                     'action': description,
                     'attempt': attempt,
@@ -965,14 +2950,395 @@ def _remove_instance_directory(instance):
 
 
 def _share_mount_path(instance, share_mapping):
-    if not _SHARE_ID_RE.fullmatch(share_mapping.share_id):
+    instance_uuid = str(instance.uuid)
+    share_id = str(share_mapping.share_id)
+    if not _SHARE_ID_RE.fullmatch(instance_uuid):
         raise exception.ShareMountError(
-            share_id=share_mapping.share_id,
+            share_id=share_id,
+            server_id=instance_uuid,
+            reason='instance ID is not a canonical UUID')
+    if not _SHARE_ID_RE.fullmatch(share_id):
+        raise exception.ShareMountError(
+            share_id=share_id,
+            server_id=instance_uuid,
+            reason='share ID is not a canonical UUID')
+    return os.path.join(
+        CONF.instances_path, 'incus-shares', instance_uuid, share_id)
+
+
+def _validate_share_mount_path(
+        mount_path, instance_uuid, share_id, error_cls):
+    """Reject non-canonical or symlinked Manila staging paths."""
+    instance_uuid = str(instance_uuid)
+    share_id = str(share_id)
+    expected = os.path.abspath(os.path.join(
+        CONF.instances_path, 'incus-shares', instance_uuid, share_id))
+    requested = os.path.abspath(mount_path)
+    expected_real = os.path.join(
+        os.path.realpath(os.path.abspath(CONF.instances_path)),
+        'incus-shares', instance_uuid, share_id)
+    reason = None
+    if (not _SHARE_ID_RE.fullmatch(instance_uuid) or
+            not _SHARE_ID_RE.fullmatch(share_id)):
+        reason = 'staging path does not contain canonical UUIDs'
+    elif requested != expected:
+        reason = 'staging path is not canonical'
+    elif os.path.realpath(requested) != expected_real:
+        reason = 'staging path contains a symbolic-link escape'
+    else:
+        current = os.path.join(
+            os.path.abspath(CONF.instances_path), 'incus-shares')
+        for component in (instance_uuid, share_id):
+            if os.path.lexists(current) and os.path.islink(current):
+                reason = 'staging path contains a symbolic link'
+                break
+            current = os.path.join(current, component)
+        if reason is None and os.path.lexists(current) and os.path.islink(
+                current):
+            reason = 'staging path contains a symbolic link'
+    if reason is not None:
+        raise error_cls(
+            share_id=share_id, server_id=instance_uuid, reason=reason)
+    return expected_real
+
+
+def _share_journal_directory(instance):
+    return os.path.join(
+        CONF.instances_path, 'incus-share-journal', instance.uuid)
+
+
+def _share_journal_path(instance, share_id):
+    if not _SHARE_ID_RE.fullmatch(str(share_id)):
+        raise exception.ShareMountError(
+            share_id=share_id,
             server_id=instance.uuid,
             reason='share ID is not a canonical UUID')
     return os.path.join(
-        CONF.instances_path, 'incus-shares', instance.uuid,
-        share_mapping.share_id)
+        _share_journal_directory(instance), '%s.json' % share_id)
+
+
+def _share_mapping_owner_token(instance, share_mapping):
+    """Return a stable owner for ordinary attach and restart retries."""
+    identity = getattr(share_mapping, 'id', None)
+    material = 'mapping:%s:%s:%s' % (
+        instance.uuid, share_mapping.share_id, identity)
+    return hashlib.sha256(material.encode('utf-8')).hexdigest()
+
+
+def _share_journal_payload(
+        instance, share_mapping, operation_token, phase):
+    if not isinstance(operation_token, str) or not operation_token:
+        raise exception.ShareMountError(
+            share_id=share_mapping.share_id,
+            server_id=instance.uuid,
+            reason='share staging owner token is missing')
+    identity = {
+        'instance_uuid': instance.uuid,
+        'instance_name': instance.name,
+        'share_id': share_mapping.share_id,
+        'share_proto': share_mapping.share_proto,
+        'export_location': share_mapping.export_location,
+        'tag': share_mapping.tag,
+    }
+    if any(not isinstance(value, str) or not value
+           for value in identity.values()):
+        raise exception.ShareMountError(
+            share_id=getattr(share_mapping, 'share_id', 'unknown'),
+            server_id=getattr(instance, 'uuid', 'unknown'),
+            reason='share staging identity contains an invalid value')
+    # access_key is deliberately absent. In particular, a CephFS secret must
+    # remain in memory and in the short-lived 0600 secretfile only.
+    return {
+        'version': _SHARE_JOURNAL_VERSION,
+        'instance_uuid': identity['instance_uuid'],
+        'instance_name': identity['instance_name'],
+        'share_id': identity['share_id'],
+        'operation_token': operation_token,
+        'phase': phase,
+        'share_proto': identity['share_proto'],
+        'export_location': identity['export_location'],
+        'tag': identity['tag'],
+    }
+
+
+def _write_share_journal(
+        instance, share_mapping, operation_token, phase):
+    """Atomically persist host-side Manila mount ownership.
+
+    The caller holds the per-instance/share operation lock. An existing
+    record is a compare-and-set guard: only its phase may change. Ownership
+    and the complete share binding are immutable until the record is removed.
+    """
+    journal_dir = _share_journal_directory(instance)
+    journal_root = os.path.dirname(journal_dir)
+    root_created = not os.path.isdir(journal_root)
+    instance_created = not os.path.isdir(journal_dir)
+    os.makedirs(journal_dir, mode=0o700, exist_ok=True)
+    os.chmod(journal_root, 0o700)
+    os.chmod(journal_dir, 0o700)
+    payload = _share_journal_payload(
+        instance, share_mapping, operation_token, phase)
+    _validate_share_journal_payload(
+        instance, payload, share_mapping=share_mapping,
+        operation_token=operation_token)
+    journal_path = _share_journal_path(instance, share_mapping.share_id)
+    try:
+        with open(journal_path, encoding='utf-8') as stream:
+            current = jsonutils.loads(stream.read())
+    except FileNotFoundError:
+        current = None
+    except (OSError, ValueError) as exc:
+        raise exception.ShareMountError(
+            share_id=share_mapping.share_id,
+            server_id=instance.uuid,
+            reason='host Manila staging journal is unreadable: %s' % exc)
+    if current is not None:
+        _validate_share_journal_payload(
+            instance, current, share_mapping=share_mapping,
+            operation_token=operation_token)
+    fd, temporary = tempfile.mkstemp(
+        prefix='.share-', suffix='.tmp', dir=journal_dir)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            fd = None
+            jsonutils.dump(payload, stream, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, journal_path)
+        _fsync_directory(journal_dir)
+        if instance_created:
+            _fsync_directory(journal_root)
+        if root_created:
+            _fsync_directory(os.path.dirname(journal_root))
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _validate_share_journal_payload(
+        instance, payload, share_mapping=None, operation_token=None):
+    share_id = (
+        share_mapping.share_id if share_mapping is not None
+        else payload.get('share_id'))
+    valid = (
+        isinstance(payload, dict) and
+        payload.get('version') == _SHARE_JOURNAL_VERSION and
+        payload.get('instance_uuid') == instance.uuid and
+        payload.get('instance_name') == instance.name and
+        payload.get('share_id') == share_id and
+        isinstance(payload.get('operation_token'), str) and
+        bool(payload.get('operation_token')) and
+        payload.get('phase') in ('staging', 'mounted', 'unmounting') and
+        isinstance(payload.get('share_proto'), str) and
+        isinstance(payload.get('export_location'), str) and
+        isinstance(payload.get('tag'), str) and
+        'access_key' not in payload)
+    if share_mapping is not None:
+        valid = valid and (
+            payload.get('share_proto') == share_mapping.share_proto and
+            payload.get('export_location') ==
+            share_mapping.export_location and
+            payload.get('tag') == share_mapping.tag)
+    if operation_token is not None:
+        valid = valid and (
+            payload.get('operation_token') == operation_token)
+    if not valid:
+        raise exception.ShareMountError(
+            share_id=share_id or 'unknown',
+            server_id=instance.uuid,
+            reason='host Manila staging journal ownership is invalid')
+    return payload
+
+
+def _read_share_journal(
+        instance, share_mapping, operation_token=None):
+    path = _share_journal_path(instance, share_mapping.share_id)
+    try:
+        with open(path, encoding='utf-8') as stream:
+            payload = json.load(stream)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise exception.ShareMountError(
+            share_id=share_mapping.share_id,
+            server_id=instance.uuid,
+            reason='host Manila staging journal is unreadable: %s' % exc)
+    return _validate_share_journal_payload(
+        instance, payload, share_mapping=share_mapping,
+        operation_token=operation_token)
+
+
+def _share_journal_records(instance, operation_token=None):
+    journal_dir = _share_journal_directory(instance)
+    try:
+        names = os.listdir(journal_dir)
+    except FileNotFoundError:
+        return []
+    records = []
+    for name in names:
+        if not name.endswith('.json'):
+            continue
+        path = os.path.join(journal_dir, name)
+        try:
+            with open(path, encoding='utf-8') as stream:
+                payload = json.load(stream)
+        except (OSError, ValueError) as exc:
+            raise exception.ShareMountError(
+                share_id=name.removesuffix('.json'),
+                server_id=instance.uuid,
+                reason='host Manila staging journal is unreadable: %s' % exc)
+        payload = _validate_share_journal_payload(
+            instance, payload, operation_token=operation_token)
+        if os.path.basename(
+                _share_journal_path(instance, payload['share_id'])) != name:
+            raise exception.ShareMountError(
+                share_id=payload['share_id'],
+                server_id=instance.uuid,
+                reason='host Manila staging journal path is invalid')
+        records.append(payload)
+    return sorted(records, key=lambda record: record['share_id'])
+
+
+def _share_journal_recovery_candidates():
+    """List migration-owned journals without authorizing their cleanup."""
+    journal_root = os.path.join(
+        CONF.instances_path, 'incus-share-journal')
+    try:
+        with os.scandir(journal_root) as entries:
+            owner_entries = sorted(entries, key=lambda entry: entry.name)
+    except FileNotFoundError:
+        return []
+
+    candidates = []
+    for owner_entry in owner_entries:
+        if (owner_entry.is_symlink() or
+                not owner_entry.is_dir(follow_symlinks=False) or
+                not _SHARE_ID_RE.fullmatch(owner_entry.name)):
+            LOG.error(
+                'Ignoring invalid Incus Manila journal owner path %s',
+                owner_entry.path)
+            continue
+        try:
+            with os.scandir(owner_entry.path) as entries:
+                journal_entries = sorted(
+                    (entry for entry in entries
+                     if entry.name.endswith('.json')),
+                    key=lambda entry: entry.name)
+            if not journal_entries:
+                continue
+            if any(entry.is_symlink() or
+                   not entry.is_file(follow_symlinks=False)
+                   for entry in journal_entries):
+                raise exception.MigrationError(
+                    reason='journal directory contains a non-file')
+            with open(journal_entries[0].path, encoding='utf-8') as stream:
+                first = json.load(stream)
+            instance_name = first.get('instance_name')
+            if not isinstance(instance_name, str) or not instance_name:
+                raise exception.MigrationError(
+                    reason='journal has no instance name')
+            owner = types.SimpleNamespace(
+                uuid=owner_entry.name, name=instance_name)
+            records = _share_journal_records(owner)
+        except Exception:
+            LOG.exception(
+                'Ignoring an invalid Incus Manila journal transaction in %s',
+                owner_entry.path)
+            continue
+
+        by_token = {}
+        for record in records:
+            token = record['operation_token']
+            # Ordinary attach journals use a SHA-256 owner. Only a UUID
+            # migration transaction can ever be replayed automatically.
+            if not uuidutils.is_uuid_like(token):
+                continue
+            candidate = by_token.setdefault(token, {
+                'uuid': owner.uuid,
+                'name': owner.name,
+                'operation_token': token,
+                'share_ids': [],
+            })
+            candidate['share_ids'].append(record['share_id'])
+        for candidate in by_token.values():
+            candidate['share_ids'] = tuple(sorted(candidate['share_ids']))
+            candidates.append(candidate)
+    return sorted(
+        candidates,
+        key=lambda candidate: (
+            candidate['uuid'], candidate['operation_token']))
+
+
+def _remove_share_journal(instance, share_id, operation_token=None):
+    path = _share_journal_path(instance, share_id)
+    if operation_token is not None:
+        try:
+            with open(path, encoding='utf-8') as stream:
+                payload = json.load(stream)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as exc:
+            raise exception.ShareUmountError(
+                share_id=share_id,
+                server_id=instance.uuid,
+                reason='host Manila staging journal is unreadable: %s' % exc)
+        try:
+            _validate_share_journal_payload(
+                instance, payload, operation_token=operation_token)
+        except exception.ShareMountError as exc:
+            raise exception.ShareUmountError(
+                share_id=share_id,
+                server_id=instance.uuid,
+                reason=exc) from exc
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return
+    journal_dir = _share_journal_directory(instance)
+    _fsync_directory(journal_dir)
+    try:
+        os.rmdir(journal_dir)
+    except OSError as exc:
+        if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST, errno.ENOENT):
+            raise
+    else:
+        _fsync_directory(os.path.dirname(journal_dir))
+
+
+def _share_mapping_from_journal(instance, record):
+    return type('JournaledShareMapping', (), {
+        'share_id': record['share_id'],
+        'instance_uuid': instance.uuid,
+        'share_proto': record['share_proto'],
+        'export_location': record['export_location'],
+        'tag': record['tag'],
+    })()
+
+
+def _journaled_share_mappings(
+        instance, operation_token, expected_share_ids=None):
+    records = _share_journal_records(
+        instance, operation_token=operation_token)
+    actual_ids = {record['share_id'] for record in records}
+    if expected_share_ids is not None and actual_ids != set(
+            expected_share_ids):
+        raise exception.MigrationError(
+            reason='Destination Manila staging journals do not match the '
+                   'cold migration request')
+    mappings = []
+    mount_table = _share_mount_table_index()
+    for record in records:
+        mapping = _share_mapping_from_journal(instance, record)
+        _validate_existing_share_mount(
+            _share_mount_path(instance, mapping), mapping,
+            mount_table=mount_table)
+        mappings.append(mapping)
+    return mappings
 
 
 def _ensure_share_mount_path(instance, share_mapping):
@@ -980,6 +3346,9 @@ def _ensure_share_mount_path(instance, share_mapping):
     share_root = os.path.join(CONF.instances_path, 'incus-shares')
     instance_root = os.path.join(share_root, instance.uuid)
     mount_path = _share_mount_path(instance, share_mapping)
+    _validate_share_mount_path(
+        mount_path, instance.uuid, share_mapping.share_id,
+        exception.ShareMountError)
     mounted = os.path.ismount(mount_path)
 
     # CRIU opens external mounts after entering the instance user namespace.
@@ -990,6 +3359,9 @@ def _ensure_share_mount_path(instance, share_mapping):
     fileutils.ensure_tree(instance_root, mode=0o711)
     os.chmod(instance_root, 0o711)
     fileutils.ensure_tree(mount_path, mode=0o700)
+    _validate_share_mount_path(
+        mount_path, instance.uuid, share_mapping.share_id,
+        exception.ShareMountError)
     # Once mounted, chmod would target the remote filesystem. In particular,
     # an NFS export with root_squash correctly rejects that operation.
     if not mounted:
@@ -1008,6 +3380,97 @@ def _share_guest_path(share_mapping):
             server_id=share_mapping.instance_uuid,
             reason='share tag contains unsupported characters')
     return '/mnt/manila/' + share_mapping.tag
+
+
+def _profile_lock_name(instance):
+    """Serialize full Incus profile updates for one Nova instance."""
+    return 'incus-profile-{}'.format(instance.uuid)
+
+
+def _volume_topology_lock_name(instance):
+    """Serialize all Cinder device topology changes for one instance."""
+    return 'incus-volume-topology-{}'.format(instance.uuid)
+
+
+def _volume_topology_lock_path():
+    return CONF.state_path
+
+
+def _share_operation_lock_name(instance, share_id):
+    digest = hashlib.sha256(str(share_id).encode('utf-8')).hexdigest()
+    return 'incus-share-{}-{}'.format(instance.uuid, digest)
+
+
+def _share_mount_fstypes(share_mapping):
+    if share_mapping.share_proto == obj_fields.ShareMappingProto.NFS:
+        # A mount requested as "nfs" is commonly reported as "nfs4".
+        return {'nfs', 'nfs4'}
+    if share_mapping.share_proto == obj_fields.ShareMappingProto.CEPHFS:
+        return {'ceph'}
+    raise exception.ShareProtocolNotSupported(
+        share_proto=share_mapping.share_proto)
+
+
+def _normalize_share_export(export):
+    normalized = str(export).strip()
+    if normalized != '/':
+        normalized = normalized.rstrip('/')
+    return normalized
+
+
+def _share_mount_table_index():
+    """Return one normalized mount-table snapshot keyed by mountpoint."""
+    return {
+        os.path.realpath(partition.mountpoint): {
+            'device': _normalize_share_export(partition.device),
+            'fstype': partition.fstype,
+            'opts': frozenset(filter(None, partition.opts.split(','))),
+        }
+        for partition in psutil.disk_partitions(all=True)
+    }
+
+
+def _validate_existing_share_mount(
+        mount_path, share_mapping, mount_table=None):
+    """Fail closed if a staged path is mounted from another export."""
+    expected_export = _normalize_share_export(
+        share_mapping.export_location)
+    expected_fstypes = _share_mount_fstypes(share_mapping)
+    real_mount_path = _validate_share_mount_path(
+        mount_path, share_mapping.instance_uuid, share_mapping.share_id,
+        exception.ShareMountError)
+
+    if mount_table is None:
+        mount_table = _share_mount_table_index()
+    mounted = mount_table.get(real_mount_path)
+    if mounted is not None:
+        actual_export = mounted['device']
+        actual_options = frozenset(mounted.get('opts') or ())
+        required_options = {'rw', 'nosuid', 'nodev'}
+        if (mounted['fstype'] not in expected_fstypes or
+                actual_export != expected_export or
+                not required_options.issubset(actual_options)):
+            raise exception.ShareMountError(
+                share_id=share_mapping.share_id,
+                server_id=share_mapping.instance_uuid,
+                reason=(
+                    'existing host mount uses source %(actual)s and '
+                    'filesystem %(fstype)s and options %(options)s; '
+                    'expected source %(expected)s, filesystem '
+                    '%(expected_fstypes)s and rw,nosuid,nodev' % {
+                        'actual': actual_export,
+                        'fstype': mounted['fstype'],
+                        'expected': expected_export,
+                        'expected_fstypes': ','.join(
+                            sorted(expected_fstypes)),
+                        'options': ','.join(sorted(actual_options)),
+                    }))
+        return
+
+    raise exception.ShareMountError(
+        share_id=share_mapping.share_id,
+        server_id=share_mapping.instance_uuid,
+        reason='existing host mount is absent from the mount table')
 
 
 def _profile_share_mounts(profile, instance):
@@ -1032,17 +3495,115 @@ def _profile_share_mounts(profile, instance):
     return mounts
 
 
+def _profile_has_share_devices(profile):
+    devices = profile.devices
+    return (
+        isinstance(devices, dict) and
+        any(name.startswith('manila-') for name in devices)
+    )
+
+
 def _cleanup_profile_share_mounts(profile, instance):
     """Unmount host-side Manila staging paths after migration handoff."""
     instance_root = os.path.realpath(os.path.join(
         CONF.instances_path, 'incus-shares', instance.uuid))
+    failures = []
+    removed_devices = {}
+    mount_table = _share_mount_table_index()
     for mount_path in reversed(_profile_share_mounts(profile, instance)):
-        if os.path.ismount(mount_path):
-            privsep_fs.umount(mount_path)
-        if os.path.isdir(mount_path):
-            os.rmdir(mount_path)
+        share_id = os.path.basename(mount_path)
+        real_mount_path = os.path.realpath(mount_path)
+        try:
+            if real_mount_path in mount_table:
+                incus_privsep.umount(
+                    mount_path, CONF.incus.share_unmount_timeout)
+                mount_table.pop(real_mount_path, None)
+            if os.path.isdir(mount_path):
+                os.rmdir(mount_path)
+            _remove_share_journal(instance, share_id)
+            device_name = 'manila-' + share_id
+            if device_name in profile.devices:
+                removed_devices[device_name] = profile.devices.pop(
+                    device_name)
+        except Exception as exc:
+            failures.append((share_id, exc))
+            LOG.exception(
+                'Failed to clean destination Manila staging path %s',
+                mount_path, instance=instance)
     if os.path.isdir(instance_root):
-        os.rmdir(instance_root)
+        try:
+            os.rmdir(instance_root)
+        except OSError as exc:
+            # A failed child cleanup legitimately keeps this directory busy.
+            if (
+                    not failures or
+                    exc.errno not in (errno.ENOTEMPTY, errno.EEXIST)):
+                failures.append(('instance-root', exc))
+
+    if removed_devices:
+        try:
+            profile.save(wait=True)
+        except Exception as exc:
+            profile.devices.update(removed_devices)
+            failures.append(('profile-devices', exc))
+            LOG.exception(
+                'Failed to persist Manila profile device cleanup',
+                instance=instance)
+
+    if failures:
+        share_id, first_error = failures[0]
+        raise exception.ShareUmountError(
+            share_id=share_id,
+            server_id=instance.uuid,
+            reason='{} Manila staging cleanup operation(s) failed; '
+                   'first error: {}'.format(len(failures), first_error))
+
+
+def _cleanup_share_journal_mounts(instance, operation_token=None):
+    """Retry mounts which were persisted before an Incus profile existed."""
+    failures = []
+    mount_table = _share_mount_table_index()
+    for record in reversed(
+            _share_journal_records(
+                instance, operation_token=operation_token)):
+        share_id = record['share_id']
+        mount_path = os.path.join(
+            CONF.instances_path, 'incus-shares', instance.uuid, share_id)
+        real_mount_path = os.path.realpath(mount_path)
+        try:
+            if real_mount_path in mount_table:
+                mapping = _share_mapping_from_journal(instance, record)
+                _validate_existing_share_mount(
+                    mount_path, mapping, mount_table=mount_table)
+                incus_privsep.umount(
+                    mount_path, CONF.incus.share_unmount_timeout)
+                mount_table.pop(real_mount_path, None)
+            if os.path.isdir(mount_path):
+                os.rmdir(mount_path)
+            _remove_share_journal(
+                instance, share_id, record['operation_token'])
+        except Exception as exc:
+            failures.append((share_id, exc))
+            LOG.exception(
+                'Failed to clean journaled Manila staging path %s',
+                mount_path, instance=instance)
+    instance_root = os.path.join(
+        CONF.instances_path, 'incus-shares', instance.uuid)
+    if os.path.isdir(instance_root):
+        try:
+            os.rmdir(instance_root)
+        except OSError as exc:
+            if (
+                    not failures or
+                    exc.errno not in (errno.ENOTEMPTY, errno.EEXIST)):
+                failures.append(('instance-root', exc))
+    if failures:
+        share_id, first_error = failures[0]
+        raise exception.ShareUmountError(
+            share_id=share_id,
+            server_id=instance.uuid,
+            reason='{} journaled Manila cleanup operation(s) failed; '
+                   'first error: {}'.format(len(failures), first_error))
 
 
 def _live_migration_share_sources(devices):
@@ -1054,6 +3615,60 @@ def _live_migration_share_sources(devices):
             device.get('recursive') == 'true' and
             device.get('source'))
     ]
+
+
+def _prepare_live_migration_destination_profile(
+        client, instance, config, devices, cleanup_token):
+    config = dict(config)
+    config[MIGRATION_DESTINATION_PREPARED_KEY] = cleanup_token
+    share_sources = _live_migration_share_sources(devices)
+    expected_share_ids = {
+        name.removeprefix('manila-')
+        for name in devices
+        if name.startswith('manila-')
+    }
+    share_journals = _share_journal_records(
+        instance, operation_token=cleanup_token)
+    if {record['share_id'] for record in share_journals} != (
+            expected_share_ids):
+        raise exception.MigrationError(
+            reason='Destination Manila staging journals do not match '
+                   'the source profile')
+    mount_table = _share_mount_table_index()
+    for record in share_journals:
+        mapping = _share_mapping_from_journal(instance, record)
+        _validate_existing_share_mount(
+            _share_mount_path(instance, mapping), mapping,
+            mount_table=mount_table)
+    for attempt_number in range(CONF.incus.migration_finish_retries):
+        try:
+            client.profiles.create(instance.name, config, devices)
+            break
+        except incus_exceptions.LXDAPIException as exc:
+            if _incus_api_status_code(exc) == 409:
+                raise exception.DestinationDiskExists(path=instance.name)
+            mount_visibility_race = (
+                share_sources and
+                all(os.path.ismount(path) for path in share_sources) and
+                'recursive option is only supported for additional '
+                'bind-mounted paths' in str(exc))
+            if (
+                    not mount_visibility_race or
+                    attempt_number + 1 >=
+                    CONF.incus.migration_finish_retries):
+                raise
+            LOG.warning(
+                'Waiting for destination Manila mounts to propagate into '
+                'the Incus daemon namespace before creating profile %s '
+                '(attempt %d/%d)',
+                instance.name, attempt_number + 1,
+                CONF.incus.migration_finish_retries,
+                instance=instance)
+            eventlet.sleep(CONF.incus.migration_finish_retry_interval)
+    # Profile creation is the durable consumer of all destination mounts.
+    for record in share_journals:
+        _remove_share_journal(
+            instance, record['share_id'], cleanup_token)
 
 
 def _pack_configdrive_for_migration(instance, container):
@@ -1241,21 +3856,270 @@ def _commit_staged_configdrive(instance, container, staging):
 
 
 def _profile_device_info(profile, volume_id, device):
-    encoded = next((profile.config[key]
-                    for key in _volume_device_info_keys(volume_id)
-                    if key in profile.config), None)
-    if encoded:
+    return _profile_volume_record(
+        profile, volume_id, device=device)['device_info']
+
+
+def _profile_has_volume_connection(profile, volume_id):
+    devices = profile.devices if isinstance(profile.devices, dict) else {}
+    config = profile.config if isinstance(profile.config, dict) else {}
+    return (
+        volume_id in devices or
+        any(key in config
+            for key in _volume_device_info_keys(volume_id)))
+
+
+def _profile_volume_ids(profile):
+    """Return volume IDs with durable connector metadata."""
+    config = profile.config if isinstance(profile.config, dict) else {}
+    prefixes = (
+        'user.openstack.volume.',
+        'user.openstack.volume_device_info.',
+    )
+    volume_ids = set()
+    for key in config:
+        for prefix in prefixes:
+            if key.startswith(prefix) and key[len(prefix):]:
+                volume_ids.add(key[len(prefix):])
+                break
+    return sorted(volume_ids)
+
+
+def _data_volume_topology(profile, journal_records):
+    """Return proven and opaque unix-block ownership for one Nova profile."""
+    devices = profile.devices if isinstance(profile.devices, dict) else {}
+    profile_ids = set(_profile_volume_ids(profile))
+    journal_ids = set(journal_records)
+    unix_block_ids = {
+        name for name, device in devices.items()
+        if isinstance(device, dict) and device.get('type') == 'unix-block'
+    }
+    proven_ids = profile_ids | journal_ids
+    return {
+        'profile_ids': profile_ids,
+        'journal_ids': journal_ids,
+        'unix_block_ids': unix_block_ids,
+        'proven_ids': proven_ids,
+        'opaque_ids': unix_block_ids - proven_ids,
+    }
+
+
+def _rbd_mapping_matches(connection_data, mapping_cache=None):
+    """Return local RBD mappings matching one stable pool/image identity."""
+    image = connection_data.get('name')
+    if not isinstance(image, str) or image.count('/') != 1:
+        raise exception.InvalidVolume(
+            reason='RBD connection information has no pool/image name')
+    pool, image_name = image.split('/', 1)
+    namespace = _rbd_namespace(connection_data)
+    command = ['rbd', 'showmapped', '--format=json']
+    user = connection_data.get('auth_username')
+    if user:
+        command.extend(['--id', str(user)])
+    hosts = connection_data.get('hosts') or []
+    ports = connection_data.get('ports') or []
+    if hosts and ports:
+        monitors = []
+        for host, port in zip(hosts, ports):
+            host = str(host)
+            if ':' in host and not host.startswith('['):
+                host = '[%s]' % host
+            monitors.append('%s:%s' % (host, port))
+        command.extend(['--mon_host', ','.join(monitors)])
+    cache_key = tuple(command)
+    mapping_index = (
+        mapping_cache.get(cache_key)
+        if mapping_cache is not None else None)
+    if mapping_index is None:
         try:
-            device_info = jsonutils.loads(encoded)
-        except (TypeError, ValueError) as exc:
+            # `rbd showmapped` reads the kernel's local mapping table and does
+            # not require a privileged helper. Keeping it unprivileged avoids
+            # granting nova-compute a broad executable rootwrap rule for the
+            # rbd binary.
+            output, _error = processutils.execute(*command)
+            mappings = jsonutils.loads(output)
+        except Exception as exc:
             raise exception.InvalidVolume(
-                reason='Stored os-brick device information is invalid: %s' %
-                exc)
-        if not isinstance(device_info, dict):
+                reason='Cannot verify the local RBD mapping for %s: %s' %
+                       (image, exc)) from exc
+        if isinstance(mappings, dict):
+            mappings = list(mappings.values())
+        if not isinstance(mappings, list):
             raise exception.InvalidVolume(
-                reason='Stored os-brick device information is not a mapping')
-        return device_info
-    return {'path': device['source']} if device else None
+                reason='rbd showmapped returned an invalid mapping list')
+        mapping_index = {}
+        for mapping in mappings:
+            if not isinstance(mapping, dict):
+                continue
+            identity = (
+                mapping.get('pool'),
+                mapping.get('name'),
+                mapping.get('namespace') or '',
+            )
+            mapping_index.setdefault(identity, []).append(mapping)
+        if mapping_cache is not None:
+            mapping_cache[cache_key] = mapping_index
+    return image, mapping_index.get((pool, image_name, namespace), [])
+
+
+def _mapped_rbd_device(connection_data, mapping_cache=None):
+    """Resolve one RBD mapping by stable pool/image identity."""
+    image, matches = _rbd_mapping_matches(
+        connection_data, mapping_cache=mapping_cache)
+    if len(matches) != 1:
+        raise exception.InvalidVolume(
+            reason='Expected exactly one local RBD mapping for %s, found %d' %
+                   (image, len(matches)))
+    device = os.path.realpath(matches[0].get('device', ''))
+    return _validate_block_device_path(
+        device, 'rbd showmapped device')
+
+
+def _failed_build_rbd_mapping_ownership(
+        volume_bdms, container, profile, root_bdm):
+    """Return Cinder/host release safety from Nova BDM and KRBD state."""
+    release_cinder = True
+    release_host = True
+    reasons = set()
+    if root_bdm is not None and (container is not None or profile is not None):
+        release_cinder = False
+        reasons.add('BFV root is still claimed by Incus')
+    mapping_cache = {}
+    for bdm in volume_bdms:
+        is_root = _is_boot_volume(bdm)
+        connection_info = bdm.get('connection_info')
+        if not isinstance(connection_info, dict):
+            release_cinder = False
+            release_host = False
+            reasons.add('Cinder connection information is unavailable')
+            continue
+        if container is not None and not is_root:
+            release_cinder = False
+            reasons.add('running Incus ownership may retain a data volume')
+        if connection_info.get('driver_volume_type') != 'rbd':
+            continue
+        try:
+            image, matches = _rbd_mapping_matches(
+                connection_info.get('data') or {},
+                mapping_cache=mapping_cache)
+        except Exception as exc:
+            release_cinder = False
+            release_host = False
+            reasons.add('local RBD mapping is uncertain: {}'.format(exc))
+            continue
+        if matches:
+            release_cinder = False
+            release_host = False
+            reasons.add(
+                'local {} RBD mapping still exists for {}'.format(
+                    'BFV root' if is_root else 'data-volume', image))
+    return release_cinder, release_host, reasons
+
+
+def _validate_volume_recovery_record(
+        record, volume_id, mountpoint, connection_info):
+    """Prove that an unfinished journal belongs to this attach request."""
+    if not isinstance(record, dict):
+        raise exception.InvalidVolume(
+            reason='Cinder volume %s has an invalid recovery record' %
+                   volume_id)
+    phase = record.get('phase')
+    if phase not in ('connecting', 'connected', 'disconnecting'):
+        raise exception.InvalidVolume(
+            reason='Cinder volume %s has an invalid recovery phase' %
+                   volume_id)
+    recorded_mountpoint = record.get('mountpoint')
+    if recorded_mountpoint and recorded_mountpoint != mountpoint:
+        raise exception.InvalidVolume(
+            reason='Cinder volume %s recovery record uses %s instead of %s' %
+                   (volume_id, recorded_mountpoint, mountpoint))
+    requested_protocol = connection_info.get('driver_volume_type')
+    recorded_protocol = record.get('driver_volume_type')
+    if recorded_protocol and recorded_protocol != requested_protocol:
+        raise exception.InvalidVolume(
+            reason='Cinder volume %s recovery record uses a different '
+                   'connector protocol' % volume_id)
+    if requested_protocol == 'rbd':
+        requested_data = connection_info.get('data') or {}
+        recorded_data = record.get('connection_data') or {}
+        requested_name = requested_data.get('name')
+        recorded_name = recorded_data.get('name')
+        if (recorded_name and
+                (not requested_name or recorded_name != requested_name)):
+            raise exception.InvalidVolume(
+                reason='Cinder volume %s recovery record uses a different '
+                       'RBD image' % volume_id)
+        if _rbd_namespace(recorded_data) != _rbd_namespace(requested_data):
+            raise exception.InvalidVolume(
+                reason='Cinder volume %s recovery record uses a different '
+                       'RBD namespace' % volume_id)
+    return phase
+
+
+def _profile_volume_attachment_matches(
+        profile, volume_id, mountpoint, qos_limits, connection_info,
+        rbd_mapping_cache=None):
+    """Validate an already-connected volume for idempotent retries."""
+    device = profile.devices.get(volume_id)
+    metadata = [
+        key for key in _volume_device_info_keys(volume_id)
+        if key in profile.config
+    ]
+    if device is None and not metadata:
+        return False
+    if device is None or not metadata:
+        raise exception.InvalidVolume(
+            reason='Incus profile contains an incomplete connection for '
+                   'Cinder volume %s' % volume_id)
+    if (device.get('type') != 'unix-block' or
+            device.get('path') != mountpoint or
+            device.get('required') != 'true'):
+        raise exception.InvalidVolume(
+            reason='Existing Incus device for Cinder volume %s does not '
+                   'match the requested attachment' % volume_id)
+
+    source = os.path.realpath(device.get('source', ''))
+    _validate_block_device_path(source, 'Existing os-brick connector path')
+    record = _profile_volume_record(profile, volume_id, device=device)
+    if record.get('phase') != 'connected':
+        raise exception.InvalidVolume(
+            reason='Cinder volume %s has an unfinished %s journal record' %
+                   (volume_id, record.get('phase')))
+    requested_protocol = connection_info.get('driver_volume_type')
+    stored_protocol = record.get('driver_volume_type')
+    if stored_protocol and stored_protocol != requested_protocol:
+        raise exception.InvalidVolume(
+            reason='Existing Incus connector protocol for Cinder volume %s '
+                   'does not match the requested attachment' % volume_id)
+    if requested_protocol == 'rbd':
+        requested_data = connection_info.get('data') or {}
+        stored_data = record.get('connection_data') or {}
+        requested_name = requested_data.get('name')
+        stored_name = stored_data.get('name')
+        if not isinstance(requested_name, str) or '/' not in requested_name:
+            raise exception.InvalidVolume(
+                reason='RBD connection information has no pool/image name')
+        if stored_name and stored_name != requested_name:
+            raise exception.InvalidVolume(
+                reason='Stored RBD identity for Cinder volume %s does not '
+                       'match the requested pool/image' % volume_id)
+        if _rbd_namespace(stored_data) != _rbd_namespace(requested_data):
+            raise exception.InvalidVolume(
+                reason='Stored RBD namespace for Cinder volume %s does not '
+                       'match the requested namespace' % volume_id)
+        expected_source = _mapped_rbd_device(
+            connection_info.get('data') or {},
+            mapping_cache=rbd_mapping_cache)
+        if source != expected_source:
+            raise exception.InvalidVolume(
+                reason='Existing Incus source for Cinder volume %s resolves '
+                       'to a different RBD mapping' % volume_id)
+    for key in ('limits.read', 'limits.write'):
+        if device.get(key) != qos_limits.get(key):
+            raise exception.InvalidVolume(
+                reason='Existing Incus QoS for Cinder volume %s does not '
+                       'match the requested attachment' % volume_id)
+    return True
 
 
 def _network_prefix(address, netmask):
@@ -1521,9 +4385,11 @@ def _get_zpool_info(pool_or_dataset):
             'used': used}
 
 
-def _get_storage_pool_info(client, pool_name):
+def _get_storage_pool_info(client, pool_name, pool=None):
     """Return capacity reported by the configured Incus storage pool."""
-    resources = client.storage_pools.get(pool_name).resources.get()
+    if pool is None:
+        pool = client.storage_pools.get(pool_name)
+    resources = pool.resources.get()
     total = resources.space['total']
     used = resources.space['used']
     return {
@@ -1533,15 +4399,17 @@ def _get_storage_pool_info(client, pool_name):
     }
 
 
-def _placement_storage_pool_info(client, pool_name, shared_capacity_gb=None):
+def _placement_storage_pool_info(
+        client, pool_name, shared_capacity_gb=None, pool=None):
     """Return node-owned capacity without duplicating a shared Ceph pool."""
-    pool = client.storage_pools.get(pool_name)
+    if pool is None:
+        pool = client.storage_pools.get(pool_name)
     if pool.driver not in ('ceph', 'cephext'):
         if shared_capacity_gb is not None:
             raise exception.InvalidConfiguration(
                 'Shared capacity is configured for node-local Incus pool {}'
                 .format(pool_name))
-        return _get_storage_pool_info(client, pool_name)
+        return _get_storage_pool_info(client, pool_name, pool=pool)
 
     if shared_capacity_gb is None:
         raise exception.InvalidConfiguration(
@@ -1560,14 +4428,36 @@ def _placement_storage_pool_info(client, pool_name, shared_capacity_gb=None):
     return {'total': total, 'used': 0, 'available': total}
 
 
+def _quiesced_inventory(current_inventory, resource_class):
+    """Preserve an existing Placement inventory while blocking new claims."""
+    previous = current_inventory.get(resource_class)
+    if previous is None:
+        return None
+    quiesced = copy.deepcopy(previous)
+    quiesced['reserved'] = quiesced['total']
+    return quiesced
+
+
+def _incus_hypervisor_version(host_info):
+    """Return Incus' server version in Nova's integer version format."""
+    server_version = host_info.get('environment', {}).get('server_version')
+    try:
+        return versionutils.convert_version_to_int(server_version)
+    except (TypeError, ValueError):
+        LOG.warning(
+            'Incus returned an invalid server version %r; reporting 0',
+            server_version)
+        return 0
+
+
 def _get_power_state(incus_state):
     """Take a incus state code and translate it to nova power state."""
     state_map = [
         (power_state.RUNNING, {100, 101, 103, 200}),
         (power_state.SHUTDOWN, {102, 104, 107}),
-        (power_state.NOSTATE, {105, 106, 401}),
-        (power_state.CRASHED, {108, 400}),
-        (power_state.SUSPENDED, {109, 110, 111}),
+        (power_state.NOSTATE, {105, 106, 109, 111, 113, 401}),
+        (power_state.CRASHED, {108, 112, 400}),
+        (power_state.PAUSED, {110}),
     ]
     for nova_state, incus_states in state_map:
         if incus_state in incus_states:
@@ -1597,7 +4487,7 @@ def _sync_glance_image_to_incus(client, context, image_ref):
             client.images.get_by_alias(image_ref)
             return
         except incus_exceptions.LXDAPIException as e:
-            if e.response.status_code != 404:
+            if not _is_incus_not_found(e):
                 raise
 
         try:
@@ -1756,6 +4646,256 @@ def brick_get_connector(protocol, driver=None,
         *args, **kwargs)
 
 
+def _loaded_instance_system_metadata(instance):
+    attr_is_set = getattr(instance, 'obj_attr_is_set', None)
+    if callable(attr_is_set) and not attr_is_set('system_metadata'):
+        return {}
+    return getattr(instance, 'system_metadata', None) or {}
+
+
+def _all_project_idmap_resources_absent(
+        client, instance_uuid, idmap_base, idmap_size,
+        allowed_profile_name=None):
+    """Prove no Incus project retains this UUID or exact idmap range."""
+    expected_range = (str(int(idmap_base)), str(int(idmap_size)))
+    params = {'recursion': 1, 'all-projects': True}
+    for endpoint, resource_type in (
+            ('instances', 'instance'), ('profiles', 'profile')):
+        response = getattr(client.api, endpoint).get(params=params)
+        try:
+            body = response.json()
+        except Exception as exc:
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus all-project {} inventory is not JSON'.format(
+                    resource_type)) from exc
+        records = body.get('metadata') if isinstance(body, dict) else None
+        if not isinstance(records, list):
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus all-project {} inventory is malformed'.format(
+                    resource_type))
+
+        for record in records:
+            if not isinstance(record, dict):
+                raise incus_idmap.IDMapIntegrityError(
+                    'Incus all-project {} inventory contains a malformed '
+                    'record'.format(resource_type))
+            configs = [
+                value for value in (
+                    record.get('config'), record.get('expanded_config'))
+                if isinstance(value, dict)
+            ]
+            uuid_match = any(
+                config.get('user.openstack.uuid') == instance_uuid
+                for config in configs)
+            range_match = any(
+                (str(config.get('security.idmap.base')),
+                 str(config.get('security.idmap.size'))) == expected_range
+                for config in configs)
+            if not uuid_match and not range_match:
+                continue
+
+            name = record.get('name')
+            project = record.get('project')
+            if (resource_type == 'profile' and allowed_profile_name and
+                    name == allowed_profile_name and
+                    project == CONF.incus.project):
+                continue
+            LOG.critical(
+                'Incus %(resource)s %(project)s/%(name)s still matches '
+                'Nova instance %(uuid)s or idmap %(base)s:%(size)s; '
+                'retaining its idmap host claim',
+                {
+                    'resource': resource_type,
+                    'project': project or '<unknown>',
+                    'name': name or '<unknown>',
+                    'uuid': instance_uuid,
+                    'base': expected_range[0],
+                    'size': expected_range[1],
+                })
+            return False
+    return True
+
+
+def _all_project_spawn_attempt_resources_absent(client, attempt):
+    """Prove a preflight attempt has no Incus-local resource or token."""
+    params = {'recursion': 1, 'all-projects': True}
+    for endpoint, resource_type in (
+            ('instances', 'instance'), ('profiles', 'profile')):
+        response = getattr(client.api, endpoint).get(params=params)
+        try:
+            body = response.json()
+        except Exception as exc:
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus all-project {} inventory is not JSON'.format(
+                    resource_type)) from exc
+        records = body.get('metadata') if isinstance(body, dict) else None
+        if not isinstance(records, list):
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus all-project {} inventory is malformed'.format(
+                    resource_type))
+
+        for record in records:
+            if not isinstance(record, dict):
+                raise incus_idmap.IDMapIntegrityError(
+                    'Incus all-project {} inventory contains a malformed '
+                    'record'.format(resource_type))
+            configs = [
+                value for value in (
+                    record.get('config'), record.get('expanded_config'))
+                if isinstance(value, dict)
+            ]
+            named_resource = (
+                record.get('name') == attempt['instance_name'] and
+                record.get('project') == CONF.incus.project)
+            owner_match = any(
+                config.get('user.openstack.uuid') ==
+                attempt['instance_uuid'] for config in configs)
+            token_match = any(
+                config.get(IDMAP_MATERIALIZATION_CONFIG_KEY) ==
+                attempt['attempt_uuid'] for config in configs)
+            if not any((named_resource, owner_match, token_match)):
+                continue
+            LOG.critical(
+                'Incus %(resource)s %(project)s/%(name)s still matches '
+                'preflight spawn attempt %(attempt)s for Nova instance '
+                '%(uuid)s',
+                {
+                    'resource': resource_type,
+                    'project': record.get('project') or '<unknown>',
+                    'name': record.get('name') or '<unknown>',
+                    'attempt': attempt['attempt_uuid'],
+                    'uuid': attempt['instance_uuid'],
+                })
+            return False
+    return True
+
+
+def _initial_data_volume_image_capability(instance, image_meta):
+    """Read a custom Glance capability without changing Nova objects."""
+    metadata_key = 'image_{}'.format(INCUS_DATA_VOLUME_IMAGE_PROPERTY)
+    value = _loaded_instance_system_metadata(instance).get(metadata_key)
+    if value is None:
+        properties = getattr(image_meta, 'properties', None)
+        getter = getattr(properties, 'get', None)
+        if callable(getter):
+            value = getter(INCUS_DATA_VOLUME_IMAGE_PROPERTY)
+        elif isinstance(image_meta, dict):
+            properties = image_meta.get('properties') or {}
+            value = properties.get(INCUS_DATA_VOLUME_IMAGE_PROPERTY)
+    return _is_explicit_true(value)
+
+
+def _require_initial_data_volume_image_capability(
+        instance, image_meta, data_volume_bdms):
+    if not data_volume_bdms:
+        return
+    if _initial_data_volume_image_capability(instance, image_meta):
+        return
+    raise exception.ImageUnacceptable(
+        image_id=instance.image_ref or 'unknown',
+        reason=(
+            'Initial Cinder data volumes require Glance image property '
+            '{}=true and the configured guest FUSE mount helpers'.format(
+                INCUS_DATA_VOLUME_IMAGE_PROPERTY)))
+
+
+def _instance_idmap_metadata(instance):
+    """Return the Nova-owned idmap assignment stored on an instance."""
+    metadata = _loaded_instance_system_metadata(instance)
+    values = (
+        metadata.get(IDMAP_BASE_METADATA_KEY),
+        metadata.get(IDMAP_SIZE_METADATA_KEY),
+        metadata.get(IDMAP_ALLOCATION_METADATA_KEY),
+        metadata.get(IDMAP_FINGERPRINT_METADATA_KEY),
+    )
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        raise incus_idmap.IDMapIntegrityError(
+            'Nova instance has an incomplete Incus idmap assignment')
+    try:
+        base = int(values[0])
+        size = int(values[1])
+    except (TypeError, ValueError) as exc:
+        raise incus_idmap.IDMapIntegrityError(
+            'Nova instance has invalid Incus idmap metadata') from exc
+    return {
+        'base': base,
+        'size': size,
+        'allocation_id': str(values[2]),
+        'fingerprint': str(values[3]),
+    }
+
+
+def _idmap_generation_matches_metadata(generation, metadata):
+    return (
+        metadata is not None and
+        generation.base == metadata['base'] and
+        generation.size == metadata['size'] and
+        generation.allocation_id == metadata['allocation_id'] and
+        generation.fingerprint == metadata['fingerprint']
+    )
+
+
+def _same_idmap_generation(left, right):
+    fields = (
+        'instance_uuid', 'base', 'size', 'slot', 'allocation_id',
+        'fingerprint')
+    return all(getattr(left, field) == getattr(right, field)
+               for field in fields)
+
+
+def _idmap_retirement_proof(generation, host_id, materialization_id):
+    """Return canonical proof that one host retired an exact generation."""
+    materialization_id = _canonical_materialization_id(materialization_id)
+    return json.dumps({
+        'allocation_id': generation.allocation_id,
+        'base': generation.base,
+        'fingerprint': generation.fingerprint,
+        'host_id': host_id,
+        'instance_uuid': generation.instance_uuid,
+        'materialization_id': materialization_id,
+        'schema': 2,
+        'size': generation.size,
+        'slot': generation.slot,
+    }, sort_keys=True, separators=(',', ':'))
+
+
+def _parse_idmap_retirement_proof(raw):
+    required = {
+        'allocation_id', 'base', 'fingerprint', 'host_id', 'instance_uuid',
+        'materialization_id', 'schema', 'size', 'slot',
+    }
+    try:
+        value = json.loads(raw)
+        if not isinstance(value, dict) or set(value) != required:
+            raise ValueError('invalid schema')
+        host_id = str(uuid.UUID(value['host_id']))
+        instance_uuid = str(uuid.UUID(value['instance_uuid']))
+        allocation_id = str(uuid.UUID(value['allocation_id']))
+        materialization_id = str(uuid.UUID(value['materialization_id']))
+        proof = incus_idmap.IDMapHostClaim(
+            host_id=host_id,
+            materialization_id=materialization_id,
+            instance_uuid=instance_uuid,
+            base=int(value['base']),
+            size=int(value['size']),
+            slot=int(value['slot']),
+            allocation_id=allocation_id,
+            fingerprint=str(value['fingerprint']),
+            state='cleaned')
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise incus_idmap.IDMapIntegrityError(
+            'Incus cleanup acknowledgement has invalid idmap retirement '
+            'proof') from exc
+    if value['schema'] != 2 or raw != _idmap_retirement_proof(
+            proof, host_id, materialization_id):
+        raise incus_idmap.IDMapIntegrityError(
+            'Incus cleanup acknowledgement has non-canonical idmap '
+            'retirement proof')
+    return proof
+
+
 class IncusDriver(driver.ComputeDriver):
     """A Incus driver for nova.
 
@@ -1792,11 +4932,118 @@ class IncusDriver(driver.ComputeDriver):
         self.capabilities['supports_evacuate'] = (
             CONF.incus.allow_bfv_evacuate)
         self.client = None  # Initialized by init_host
+        self.inventory_client = None  # Unscoped all-project safety queries.
+        self.idmap_allocator = None
+        self.storage_ownership = None
+        self.volume_api = cinder.API()
         self.host = NOVA_CONF.host
         self.network_api = neutron.API()
         self.vif_driver = incus_vif.IncusGenericVifDriver()
         self.firewall_driver = _NeutronFirewallDriver()
         self._serial_consoles = {}
+        self._serial_consoles_lock = threading.Lock()
+        self._serial_console_destroying = set()
+        self._host_resource_cache = {}
+        self._host_resource_cache_lock = threading.Lock()
+        self._disk_metrics_cache = None
+        self._metric_devices_cache = None
+        self._metric_instance_devices_cache = {}
+        self._instance_inventory_cache = None
+        # All mutable-inventory caches share one generation and condition.
+        # Fetchers claim a generation while holding this condition, perform
+        # Incus I/O after releasing it, and publish only if the generation is
+        # still current.  This avoids both lock-order cycles and network I/O
+        # under a process mutex while retaining one in-flight fetch per cache.
+        self._inventory_cache_condition = threading.Condition()
+        self._inventory_cache_generation = 0
+        self._instance_inventory_fetch_generation = None
+        self._disk_metrics_fetch_generation = None
+        self._metric_devices_fetch_generation = None
+        self._metric_instance_devices_fetch_generations = {}
+
+    def _validate_initial_volume_encryption(
+            self, context, root_bdm, data_volume_bdms):
+        """Reject every encrypted initial Cinder BDM before side effects."""
+        bdms = ([root_bdm] if root_bdm is not None else [])
+        bdms.extend(data_volume_bdms)
+        encrypted = []
+        for bdm in bdms:
+            connection_info = bdm.get('connection_info') or {}
+            volume_id = _bdm_volume_id(bdm)
+            encryption = self.volume_api.get_volume_encryption_metadata(
+                context, volume_id)
+            # Cinder returns a truthy resource object even for unencrypted
+            # volumes; only a populated encryption provider or key ID marks
+            # the volume as encrypted.
+            if not isinstance(encryption, dict):
+                encryption = {
+                    key: getattr(encryption, key, None)
+                    for key in ('provider', 'encryption_key_id')}
+            volume_encrypted = bool(
+                encryption.get('provider') or
+                encryption.get('encryption_key_id'))
+            if (volume_encrypted or _has_encryption_marker(
+                    (connection_info.get('data') or {}).get('encrypted'))):
+                encrypted.append((
+                    connection_info.get('driver_volume_type', 'unknown'),
+                    volume_id))
+        if encrypted:
+            volume_type, volume_id = encrypted[0]
+            raise exception.VolumeEncryptionNotSupported(
+                volume_type=volume_type, volume_id=volume_id)
+
+    def _preflight_data_volume_bdms(
+            self, data_volume_bdms, validate_connectors=True):
+        """Validate every initial data BDM before any connector is invoked."""
+        extensions = self.client.host_info.get('api_extensions', [])
+        protocols = set()
+        for bdm in data_volume_bdms:
+            connection_info = bdm.get('connection_info') or {}
+            volume_id = _bdm_volume_id(bdm)
+            connection_volume_id = _volume_id(connection_info)
+            if connection_volume_id != volume_id:
+                raise exception.InvalidVolume(
+                    reason='Cinder block-device mapping volume ID %s does not '
+                           'match connection_info volume ID %s' %
+                           (volume_id, connection_volume_id))
+            mountpoint = _validate_volume_mountpoint(bdm.get('mount_device'))
+            _validate_volume_access_mode(connection_info)
+            _data_volume_qos(connection_info, extensions)
+
+            protocol = connection_info.get('driver_volume_type')
+            if not isinstance(protocol, str) or not protocol.strip():
+                raise exception.InvalidVolume(
+                    reason='Cinder volume %s has no driver_volume_type' %
+                           volume_id)
+            _validate_recoverable_data_volume(connection_info, volume_id)
+            if (connection_info.get('multiattach') or
+                    (connection_info.get('data') or {}).get('multiattach')):
+                raise exception.MultiattachNotSupportedByVirtDriver(
+                    volume_id=volume_id)
+
+            # This also proves the recovery record can be serialized before
+            # the first os-brick connection creates host state.
+            _serialize_volume_attachment(
+                connection_info, {}, mountpoint, phase='connecting')
+            protocols.add(protocol)
+
+        if not validate_connectors:
+            return
+        for protocol in sorted(protocols):
+            try:
+                brick_get_connector(protocol)
+            except brick_exception.InvalidConnectorProtocol as exc:
+                raise exception.InvalidVolume(
+                    reason='Cinder connector protocol %s is unsupported' %
+                           protocol) from exc
+
+    @staticmethod
+    def _spawn_build_abort(instance, exc):
+        reason = (
+            exc.format_message()
+            if hasattr(exc, 'format_message') else str(exc))
+        raise exception.BuildAbortException(
+            instance_uuid=instance.uuid, reason=reason) from exc
 
     def init_host(self, host):
         """Initialize the driver on the host.
@@ -1816,12 +5063,1225 @@ class IncusDriver(driver.ComputeDriver):
             raise exception.InvalidConfiguration(
                 '[incus] volume_enforce_multipath requires '
                 'volume_use_multipath')
+        if CONF.incus.enable_manila_shares:
+            try:
+                incus_privsep.validate_gnu_timeout()
+            except Exception as exc:
+                raise exception.InvalidConfiguration(
+                    'Incus Manila shares require GNU coreutils timeout at '
+                    '{}: {}'.format(
+                        incus_privsep.GNU_TIMEOUT_PATH, exc)) from exc
         try:
             self.client = incus_client.get_client(CONF)
+            self.inventory_client = incus_client.get_client(
+                CONF, project=None)
         except incus_exceptions.ClientConnectionFailed as e:
             msg = _("Unable to connect to Incus daemon: {}").format(e)
             raise exception.HostNotFound(msg)
-        self._after_reboot()
+        self.storage_ownership = (
+            incus_storage_protocol.StorageOwnershipClient(self.client))
+        _validate_root_storage_pool_accounting(self.client)
+
+        migration_enabled = any((
+            CONF.incus.allow_cold_migration,
+            CONF.incus.allow_live_migration,
+            CONF.incus.allow_bfv_evacuate,
+        ))
+        endpoint = CONF.incus.idmap_allocator_endpoint
+        if migration_enabled and not endpoint:
+            raise exception.InvalidConfiguration(
+                '[incus] idmap_allocator_endpoint is required when cold/live '
+                'migration or BFV evacuation is enabled')
+        if endpoint:
+            extensions = set(self.client.host_info.get('api_extensions', []))
+            missing = sorted({
+                'id_map', 'id_map_base',
+                INCUS_STORAGE_MATERIALIZATION_ATTEMPT_EXTENSION,
+                INCUS_STORAGE_RELEASE_RECEIPT_EXTENSION,
+            } - extensions)
+            if missing:
+                raise exception.InvalidConfiguration(
+                    'Incus global idmap allocation requires API extensions: '
+                    '{}'.format(', '.join(missing)))
+            try:
+                self.idmap_allocator = incus_idmap.IDMapAllocator(
+                    endpoint=endpoint,
+                    namespace=CONF.incus.idmap_allocator_namespace,
+                    base=CONF.incus.idmap_allocator_base,
+                    size=CONF.incus.idmap_allocator_size,
+                    count=CONF.incus.idmap_allocator_count,
+                    timeout=CONF.incus.idmap_allocator_timeout,
+                    ca_cert=CONF.incus.idmap_allocator_ca_cert,
+                    cert_cert=CONF.incus.idmap_allocator_client_cert,
+                    cert_key=CONF.incus.idmap_allocator_client_key,
+                    username=CONF.incus.idmap_allocator_username,
+                    password_file=(
+                        CONF.incus.idmap_allocator_password_file),
+                    allow_insecure=(
+                        CONF.incus.idmap_allocator_allow_insecure),
+                )
+            except incus_idmap.IDMapError as exc:
+                raise exception.InvalidConfiguration(
+                    'Invalid Incus idmap allocator configuration: {}'.format(
+                        exc)) from exc
+            try:
+                self.idmap_allocator.initialize()
+                # Do not admit this compute against a partially restored or
+                # otherwise inconsistent registry. Allocation repeats the
+                # audit around its CAS, while startup gives operators an
+                # immediate, fail-closed signal before any workload changes.
+                # Normal operations use exact keys; the compute manager's
+                # low-frequency full audit detects unrelated registry damage.
+                self.idmap_allocator.audit()
+            except incus_idmap.IDMapBackendError:
+                # Existing running workloads and stop remain available while
+                # etcd is temporarily unavailable. Start, reboot, allocation,
+                # migration and evacuation revalidate ownership and fail
+                # closed.
+                LOG.critical(
+                    'Incus idmap allocator is unavailable; new instances, '
+                    'start, reboot, migration and evacuation will fail '
+                    'closed until it recovers', exc_info=True)
+
+    def _storage_ownership_client(self, client=None):
+        client = client or self.client
+        if client is self.client and self.storage_ownership is not None:
+            return self.storage_ownership
+        return incus_storage_protocol.StorageOwnershipClient(client)
+
+    def _create_spawn_preflight_attempt(self, instance, attempt_id):
+        """Persist exact proof that spawn has not crossed its side effects."""
+        if self.idmap_allocator is None:
+            return None
+        host_id = virt_node.read_local_node_uuid()
+        if not host_id:
+            raise incus_idmap.IDMapConfigurationError(
+                'Nova has no persistent compute-node UUID')
+        with lockutils.lock(
+                _idmap_host_claim_lock_name(instance.uuid), external=True,
+                lock_path=_idmap_host_claim_lock_path()):
+            if self.idmap_allocator.get_release_intent(
+                    instance.uuid) is not None:
+                raise incus_idmap.IDMapConflict(
+                    reason='Incus spawn is blocked by an idmap release intent')
+            assignment = self.idmap_allocator.get(instance.uuid)
+            stored = _instance_idmap_metadata(instance)
+            if assignment is None:
+                if stored is not None:
+                    raise incus_idmap.IDMapIntegrityError(
+                        'Nova idmap metadata has no allocator generation')
+            else:
+                if (assignment.instance_uuid != instance.uuid or
+                        not _idmap_generation_matches_metadata(
+                            assignment, stored)):
+                    raise incus_idmap.IDMapIntegrityError(
+                        'Rescheduled Incus spawn does not match its exact '
+                        'idmap generation')
+                for claimed_host in assignment.host_ids:
+                    claim = self.idmap_allocator.get_host_claim(
+                        instance.uuid, claimed_host)
+                    if (claim is None or claim.host_id != claimed_host or
+                            not _same_idmap_generation(claim, assignment) or
+                            claim.state != 'cleaned' or claim.proof is None):
+                        raise incus_idmap.IDMapConflict(
+                            reason='Rescheduled Incus spawn has an uncleared '
+                                   'idmap host claim')
+            return _write_spawn_attempt_journal(
+                instance, host_id, attempt_id, phase='preflight',
+                generation=assignment)
+
+    def _open_spawn_attempt(self, instance, attempt):
+        """Durably close the no-side-effect path before allocator mutation."""
+        if attempt is None:
+            return None
+        with lockutils.lock(
+                _idmap_host_claim_lock_name(instance.uuid), external=True,
+                lock_path=_idmap_host_claim_lock_path()):
+            return _write_spawn_attempt_journal(
+                instance, attempt['compute_uuid'], attempt['attempt_uuid'],
+                phase='opening', expected_phase='preflight',
+                generation=(attempt if _spawn_attempt_has_generation(attempt)
+                            else None))
+
+    def _finish_spawn_attempt_open(self, instance, attempt):
+        """Remove a phase credential after its exact claim is durable."""
+        if attempt is None:
+            return
+        with lockutils.lock(
+                _idmap_host_claim_lock_name(instance.uuid), external=True,
+                lock_path=_idmap_host_claim_lock_path()):
+            current = self.idmap_allocator.get(instance.uuid)
+            claim = self.idmap_allocator.get_host_claim(
+                instance.uuid, attempt['compute_uuid'])
+            if (current is None or claim is None or
+                    claim.materialization_id != attempt['attempt_uuid'] or
+                    not _same_idmap_generation(current, claim)):
+                raise incus_idmap.IDMapIntegrityError(
+                    'Incus spawn opening has no exact durable host claim')
+            if (_spawn_attempt_has_generation(attempt) and
+                    not _spawn_attempt_generation_matches(
+                        attempt, current)):
+                raise incus_idmap.IDMapIntegrityError(
+                    'Incus spawn opening changed allocator generation')
+            _remove_spawn_attempt_journal(instance, attempt)
+
+    def _remove_spawn_attempt_for_claim(self, instance, claim):
+        """Remove a leftover opening journal only for an exact live claim."""
+        with lockutils.lock(
+                _idmap_host_claim_lock_name(instance.uuid), external=True,
+                lock_path=_idmap_host_claim_lock_path()):
+            attempt = _read_spawn_attempt_journal(instance)
+            if attempt is None:
+                return
+            expected = _spawn_attempt_payload(
+                instance, claim.host_id, claim.materialization_id,
+                phase='opening',
+                generation=(attempt if _spawn_attempt_has_generation(attempt)
+                            else None))
+            if attempt != expected:
+                raise incus_idmap.IDMapIntegrityError(
+                    'Host spawn attempt does not match the exact idmap claim')
+            if (_spawn_attempt_has_generation(attempt) and
+                    not _spawn_attempt_generation_matches(attempt, claim)):
+                raise incus_idmap.IDMapIntegrityError(
+                    'Host spawn attempt has another idmap generation')
+            current = self.idmap_allocator.get_host_claim(
+                instance.uuid, claim.host_id)
+            if (current is None or
+                    current.materialization_id != claim.materialization_id or
+                    not _same_idmap_generation(current, claim)):
+                raise incus_idmap.IDMapIntegrityError(
+                    'Host spawn attempt has no exact idmap claim')
+            _remove_spawn_attempt_journal(instance, expected)
+
+    def _consume_spawn_preflight_noop(self, instance):
+        """Consume one exact preflight-only attempt as an empty destroy."""
+        if self.idmap_allocator is None:
+            return False
+        attempt = _read_spawn_attempt_journal(instance)
+        if attempt is None:
+            return False
+        host_id = virt_node.read_local_node_uuid()
+        if not host_id or attempt['compute_uuid'] != host_id:
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus spawn preflight belongs to another compute')
+
+        with lockutils.lock(
+                _idmap_host_claim_lock_name(instance.uuid), external=True,
+                lock_path=_idmap_host_claim_lock_path()):
+            current = _read_spawn_attempt_journal(instance)
+            if current != attempt:
+                raise incus_idmap.IDMapIntegrityError(
+                    'Incus spawn preflight changed during destroy')
+            assignment = self.idmap_allocator.get(instance.uuid)
+            if attempt['phase'] == 'opening':
+                claim = self.idmap_allocator.get_host_claim(
+                    instance.uuid, host_id)
+                if (assignment is not None and claim is not None and
+                        claim.materialization_id == attempt['attempt_uuid'] and
+                        _same_idmap_generation(assignment, claim) and
+                        (not _spawn_attempt_has_generation(attempt) or
+                         _spawn_attempt_generation_matches(
+                             attempt, assignment))):
+                    # register_materialization() may have committed server
+                    # state even when its HTTP response was lost. The exact
+                    # claim lets the ordinary destroy path discover and
+                    # settle that attempt by token.
+                    return False
+                raise incus_idmap.IDMapConflict(
+                    reason='Incus spawn crossed the durable opening boundary '
+                           'without an exact host claim; refusing destroy')
+            release_intent = self.idmap_allocator.get_release_intent(
+                instance.uuid)
+            if release_intent is not None:
+                raise incus_idmap.IDMapIntegrityError(
+                    'Incus spawn preflight unexpectedly has a release intent')
+            stored = _instance_idmap_metadata(instance)
+            if _spawn_attempt_has_generation(attempt):
+                if (assignment is None or
+                        not _spawn_attempt_generation_matches(
+                            attempt, assignment) or
+                        not _idmap_generation_matches_metadata(
+                            assignment, stored)):
+                    raise incus_idmap.IDMapIntegrityError(
+                        'Incus reschedule preflight does not match its exact '
+                        'idmap generation')
+                local_claim = self.idmap_allocator.get_host_claim(
+                    instance.uuid, host_id)
+                if local_claim is not None or host_id in assignment.host_ids:
+                    raise incus_idmap.IDMapConflict(
+                        reason='Incus reschedule preflight already has a '
+                               'local idmap host claim')
+                for claimed_host in assignment.host_ids:
+                    claim = self.idmap_allocator.get_host_claim(
+                        instance.uuid, claimed_host)
+                    if (claim is None or claim.host_id != claimed_host or
+                            not _same_idmap_generation(claim, assignment) or
+                            claim.state != 'cleaned' or
+                            claim.proof is None):
+                        raise incus_idmap.IDMapConflict(
+                            reason='Incus reschedule preflight has an '
+                                   'uncleared historical idmap host claim')
+            else:
+                if assignment is not None:
+                    raise incus_idmap.IDMapIntegrityError(
+                        'Incus spawn preflight unexpectedly has an idmap '
+                        'allocation')
+                if stored is not None:
+                    raise incus_idmap.IDMapIntegrityError(
+                        'Incus spawn preflight unexpectedly has Nova idmap '
+                        'metadata')
+            if (_volume_journal_records(instance) or
+                    _share_journal_records(instance)):
+                raise incus_idmap.IDMapIntegrityError(
+                    'Incus spawn preflight unexpectedly has host attachment '
+                    'journals')
+            retained_paths = (
+                common.InstanceAttributes(instance).instance_dir,
+                _volume_journal_directory(instance),
+                _share_journal_directory(instance),
+            )
+            if any(os.path.lexists(path) for path in retained_paths):
+                raise incus_idmap.IDMapIntegrityError(
+                    'Incus spawn preflight unexpectedly has a local host '
+                    'resource path')
+            if not _all_project_spawn_attempt_resources_absent(
+                    self.inventory_client, attempt):
+                raise incus_idmap.IDMapIntegrityError(
+                    'Incus spawn preflight still has an Incus resource or '
+                    'configuration token')
+            if _read_spawn_attempt_journal(instance) != attempt:
+                raise incus_idmap.IDMapIntegrityError(
+                    'Incus spawn preflight changed before final cleanup')
+            _remove_spawn_attempt_journal(instance, attempt)
+            return True
+
+    @staticmethod
+    def _idmap_materialization_config(binding):
+        return {
+            IDMAP_ALLOCATION_CONFIG_KEY: binding.allocation_id,
+            IDMAP_COMPUTE_CONFIG_KEY: binding.compute_id,
+            IDMAP_MATERIALIZATION_CONFIG_KEY: binding.token,
+            'user.openstack.uuid': binding.owner,
+            'security.idmap.base': str(binding.idmap_base),
+            'security.idmap.size': str(binding.idmap_size),
+        }
+
+    @staticmethod
+    def _materialization_identity(instance_name, claim):
+        return incus_storage_protocol.StorageMaterializationIdentity(
+            token=claim.materialization_id,
+            allocation_id=claim.allocation_id,
+            compute_id=claim.host_id,
+            owner=claim.instance_uuid,
+            project=CONF.incus.project,
+            instance_name=instance_name,
+            idmap_base=claim.base,
+            idmap_size=claim.size,
+        )
+
+    @staticmethod
+    def _materialization_binding_from_proof(proof):
+        return incus_storage_protocol.StorageMaterializationBinding(
+            token=proof.token,
+            allocation_id=proof.allocation_id,
+            compute_id=proof.compute_id,
+            owner=proof.owner,
+            project=proof.project,
+            instance_name=proof.instance_name,
+            idmap_base=proof.idmap_base,
+            idmap_size=proof.idmap_size,
+            storage_driver=proof.storage_driver,
+            storage_pool=proof.storage_pool,
+            storage_volume=proof.storage_volume,
+            cleanup_disposition=proof.cleanup_disposition,
+            rbd_image=proof.rbd_image,
+        )
+
+    def _root_storage_materialization_binding(
+            self, client, instance, assignment, compute_id,
+            materialization_id, root_device, shared_migration=False):
+        if not isinstance(root_device, dict):
+            raise incus_idmap.IDMapConfigurationError(
+                'Incus root materialization has no root disk device')
+        pool_name = root_device.get('pool')
+        if not isinstance(pool_name, str) or not pool_name:
+            raise incus_idmap.IDMapConfigurationError(
+                'Global idmap allocation requires an explicit Incus root '
+                'storage pool')
+        pool = client.storage_pools.get(pool_name)
+        storage_driver = getattr(pool, 'driver', None)
+        if not isinstance(storage_driver, str) or not storage_driver:
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus root storage pool returned no driver identity')
+        rbd_image = root_device.get('initial.ceph.rbd.image_name', '')
+        if not isinstance(rbd_image, str):
+            raise incus_idmap.IDMapConfigurationError(
+                'Incus root RBD image name is invalid')
+        if storage_driver == 'cephext' and not rbd_image:
+            raise incus_idmap.IDMapConfigurationError(
+                'Incus cephext root materialization requires an RBD image')
+        if storage_driver != 'cephext' and rbd_image:
+            raise incus_idmap.IDMapConfigurationError(
+                'Only an Incus cephext root may claim an external RBD image')
+        cleanup_disposition = 'delete'
+        if storage_driver == 'cephext':
+            cleanup_disposition = 'detach'
+        elif shared_migration and storage_driver == 'ceph':
+            cleanup_disposition = 'handover'
+        return incus_storage_protocol.StorageMaterializationBinding(
+            token=_canonical_materialization_id(materialization_id),
+            allocation_id=assignment.allocation_id,
+            compute_id=_canonical_materialization_id(
+                compute_id, 'compute ID'),
+            owner=instance.uuid,
+            project=CONF.incus.project,
+            instance_name=instance.name,
+            idmap_base=assignment.base,
+            idmap_size=assignment.size,
+            storage_driver=storage_driver,
+            storage_pool=pool_name,
+            storage_volume=_incus_instance_storage_volume(
+                CONF.incus.project, instance.name),
+            cleanup_disposition=cleanup_disposition,
+            rbd_image=rbd_image,
+        )
+
+    def _exact_idmap_host_claim(self, instance, claim):
+        if not isinstance(claim, incus_idmap.IDMapHostClaim):
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus idmap reconciliation requires an exact host claim')
+        if instance is not None and claim.instance_uuid != instance.uuid:
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus idmap host claim belongs to another instance')
+        assignment = self.idmap_allocator.get(claim.instance_uuid)
+        if assignment is None or not _same_idmap_generation(
+                assignment, claim):
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus idmap host claim has no exact allocation generation')
+        current = self.idmap_allocator.get_host_claim(
+            claim.instance_uuid, claim.host_id)
+        if current is None:
+            return assignment, None
+        if (current.materialization_id != claim.materialization_id or
+                not _same_idmap_generation(current, claim)):
+            raise incus_idmap.IDMapConflict(
+                reason='Another materialization owns the Incus host claim')
+        if instance is not None:
+            stored = _instance_idmap_metadata(instance)
+            if (stored is None or
+                    not _idmap_generation_matches_metadata(
+                        assignment, stored)):
+                raise incus_idmap.IDMapIntegrityError(
+                    'Nova metadata does not match the Incus host claim')
+        return assignment, current
+
+    def _begin_idmap_materialization(
+            self, instance, materialization_id, root_device,
+            observed_base=None, observed_size=None,
+            shared_migration=False):
+        """Claim and register a pristine root before any host side effect."""
+        if self.idmap_allocator is None:
+            self._ensure_instance_idmap(
+                instance, observed_base=observed_base,
+                observed_size=observed_size)
+            return None
+        materialization_id = _canonical_materialization_id(
+            materialization_id)
+        host_id = virt_node.read_local_node_uuid()
+        if not host_id:
+            raise incus_idmap.IDMapConfigurationError(
+                'Nova has no persistent compute-node UUID')
+        with lockutils.lock(
+                _idmap_host_claim_lock_name(instance.uuid), external=True,
+                lock_path=_idmap_host_claim_lock_path()):
+            assignment = self._ensure_instance_idmap(
+                instance, observed_base=observed_base,
+                observed_size=observed_size)
+            current = self.idmap_allocator.get(instance.uuid)
+            if current is None or not _same_idmap_generation(
+                    current, assignment):
+                raise incus_idmap.IDMapIntegrityError(
+                    'Allocator generation changed before materialization')
+            self.idmap_allocator.claim(
+                instance.uuid, host_id, materialization_id,
+                assignment=current)
+            claim = self.idmap_allocator.get_host_claim(
+                instance.uuid, host_id)
+            if (claim is None or
+                    claim.materialization_id != materialization_id or
+                    claim.state != 'unmaterialized'):
+                raise incus_idmap.IDMapConflict(
+                    reason='Incus materialization has no pristine exact claim')
+            binding = self._root_storage_materialization_binding(
+                self.client, instance, current, host_id,
+                materialization_id, root_device,
+                shared_migration=shared_migration)
+            self._storage_ownership_client().register_materialization(binding)
+            return _IDMapMaterialization(
+                assignment=current, claim=claim, binding=binding,
+                client=self.client)
+
+    def _resume_idmap_materialization(
+            self, client, instance, materialization_id, compute_id,
+            root_device, observed_base, observed_size):
+        """Rebuild an already-registered destination transaction."""
+        if self.idmap_allocator is None:
+            return None
+        assignment = self._ensure_instance_idmap(
+            instance, observed_base=observed_base,
+            observed_size=observed_size)
+        claim = self.idmap_allocator.get_host_claim(
+            instance.uuid, compute_id)
+        if (claim is None or
+                claim.materialization_id != materialization_id or
+                claim.state != 'unmaterialized'):
+            raise incus_idmap.IDMapConflict(
+                reason='Migration target has no exact unmaterialized claim')
+        binding = self._root_storage_materialization_binding(
+            client, instance, assignment, compute_id,
+            materialization_id, root_device, shared_migration=True)
+        attempt = self._storage_ownership_client(
+            client).get_materialization(binding)
+        if (attempt.state != 'active' or attempt.started or
+                attempt.finished or attempt.storage_phase != 'none'):
+            raise incus_idmap.IDMapConflict(
+                reason='Migration target materialization is not pristine')
+        return _IDMapMaterialization(
+            assignment=assignment, claim=claim, binding=binding,
+            client=client)
+
+    def _record_and_ack_materialization_proof(
+            self, materialization, proof):
+        binding = materialization.binding
+        claim = self.idmap_allocator.record_materialization_proof(
+            binding.owner, binding.compute_id, binding.token, proof,
+            assignment=materialization.assignment)
+        try:
+            self._storage_ownership_client(
+                materialization.client).acknowledge_materialization_proof(
+                    binding, proof)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+        return claim
+
+    def _abort_idmap_materialization(self, materialization):
+        if materialization is None:
+            return None
+        protocol = self._storage_ownership_client(materialization.client)
+        attempt = protocol.get_materialization(materialization.binding)
+        if attempt.state == 'committed':
+            raise incus_idmap.IDMapConflict(
+                reason='Committed root materialization cannot be aborted')
+        if attempt.state == 'active':
+            attempt = protocol.abort_materialization(
+                materialization.binding)
+        if attempt.proof is None:
+            attempt = protocol.settle_materialization(
+                materialization.binding)
+        if attempt.proof is None:
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus returned no terminal materialization proof')
+        return self._record_and_ack_materialization_proof(
+            materialization, attempt.proof)
+
+    @staticmethod
+    def _attempt_matches_idmap_claim(attempt, claim):
+        binding = getattr(attempt, 'binding', None)
+        return (
+            binding is not None and
+            binding.token == claim.materialization_id and
+            binding.allocation_id == claim.allocation_id and
+            binding.compute_id == claim.host_id and
+            binding.owner == claim.instance_uuid and
+            binding.idmap_base == claim.base and
+            binding.idmap_size == claim.size)
+
+    def _promote_idmap_claim_if_server_committed(
+            self, instance, claim, client=None, attempt=None,
+            _claim_lock_held=False):
+        """Promote possible only from one exact committed Incus attempt."""
+        if self.idmap_allocator is None:
+            return None, None
+        if not _claim_lock_held:
+            client = client or self.client
+            if attempt is None:
+                # Discovering an Incus/storage attempt may block. Do that
+                # before taking the cross-process claim lock, then bind the
+                # result to the exact A/H/T/U again inside the lock.
+                identity = self._materialization_identity(
+                    instance.name, claim)
+                attempt = self._storage_ownership_client(
+                    client).discover_materialization(identity)
+            with lockutils.lock(
+                    _idmap_host_claim_lock_name(claim.instance_uuid),
+                    external=True, lock_path=_idmap_host_claim_lock_path()):
+                return self._promote_idmap_claim_if_server_committed(
+                    instance, claim, client=client, attempt=attempt,
+                    _claim_lock_held=True)
+
+        assignment, current = self._exact_idmap_host_claim(instance, claim)
+        if current is None or current.state != 'possible':
+            return assignment, current
+
+        client = client or self.client
+        if attempt is None:
+            # Some start/delete callers deliberately hold the claim lock
+            # across their full Incus transaction. Preserve that contract;
+            # ordinary reconciliation discovers before entering the lock.
+            identity = self._materialization_identity(
+                instance.name, current)
+            attempt = self._storage_ownership_client(
+                client).discover_materialization(identity)
+        if not self._attempt_matches_idmap_claim(attempt, current):
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus materialization attempt does not match its exact '
+                'allocator claim')
+        if attempt.state != 'committed' or not attempt.finished:
+            return assignment, current
+
+        current = self.idmap_allocator.mark_materialization_committed(
+            current.instance_uuid, current.host_id,
+            current.materialization_id, assignment=assignment)
+        return assignment, current
+
+    def _with_rootfs_materialization_barrier(
+            self, materialization, request_config, create_action,
+            recover_action=None):
+        """Cross possible immediately before POST and observe its result."""
+        if materialization is None:
+            return create_action()
+        binding = materialization.binding
+        request_config.update(self._idmap_materialization_config(binding))
+        original_error = None
+        result = None
+        with lockutils.lock(
+                _idmap_host_claim_lock_name(binding.owner), external=True,
+                lock_path=_idmap_host_claim_lock_path()):
+            assignment, claim = self._exact_idmap_host_claim(
+                None, materialization.claim)
+            if claim is None or claim.state != 'unmaterialized':
+                raise incus_idmap.IDMapConflict(
+                    reason='Incus materialization claim is not pristine')
+            self.idmap_allocator.mark_materialization_possible(
+                binding.owner, binding.compute_id, binding.token,
+                assignment=assignment)
+            try:
+                result = create_action()
+            except Exception as exc:
+                original_error = exc
+
+        protocol = self._storage_ownership_client(materialization.client)
+        try:
+            attempt = protocol.observe_materialization_start(binding)
+        except Exception:
+            if original_error is not None:
+                raise original_error
+            raise
+        if attempt.state == 'committed' and attempt.finished:
+            unused_assignment, committed_claim = (
+                self._promote_idmap_claim_if_server_committed(
+                    None, materialization.claim,
+                    client=materialization.client, attempt=attempt))
+            if (committed_claim is None or
+                    committed_claim.state != 'committed'):
+                raise incus_idmap.IDMapIntegrityError(
+                    'Incus committed the rootfs but its exact allocator '
+                    'claim did not commit')
+            if original_error is not None:
+                if recover_action is None:
+                    raise original_error
+                return recover_action()
+            return result
+        if original_error is None:
+            original_error = incus_idmap.IDMapIntegrityError(
+                'Incus create returned before materialization committed')
+        try:
+            self._abort_idmap_materialization(materialization)
+        except Exception as cleanup_error:
+            raise cleanup_error from original_error
+        raise original_error
+
+    def _idmap_rootfs_release_context(self, instance):
+        """Return final-delete intent, allocation and this host's exact T."""
+        if self.idmap_allocator is None:
+            return None, None, None
+        assignment = self.idmap_allocator.get(instance.uuid)
+        stored = _instance_idmap_metadata(instance)
+        if (assignment is None or stored is None or
+                not _idmap_generation_matches_metadata(
+                    assignment, stored)):
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus allocator generation does not match the Nova '
+                'instance metadata')
+        host_id = virt_node.read_local_node_uuid()
+        if not host_id:
+            raise incus_idmap.IDMapConfigurationError(
+                'Nova has no persistent compute-node UUID')
+        claim = self.idmap_allocator.get_host_claim(instance.uuid, host_id)
+        if claim is None or not _same_idmap_generation(claim, assignment):
+            raise incus_idmap.IDMapIntegrityError(
+                'Local Incus root has no exact materialization claim')
+        if claim.state == 'possible':
+            assignment, claim = (
+                self._promote_idmap_claim_if_server_committed(
+                    instance, claim))
+        intent = self.idmap_allocator.get_release_intent(instance.uuid)
+        if intent is not None and (
+                intent.instance_uuid != instance.uuid or
+                intent.instance_name != instance.name or
+                not _same_idmap_generation(intent, assignment)):
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus rootfs release intent does not match the Nova '
+                'instance and allocator generation')
+        return intent, assignment, claim
+
+    def _settle_idmap_host_claim(
+            self, instance, claim, final_delete=False, client=None):
+        """Persist then ACK exact Incus proof; never retire the claim."""
+        if self.idmap_allocator is None:
+            raise incus_idmap.IDMapIntegrityError(
+                'Cannot settle an idmap claim without the shared allocator')
+        assignment, current = self._exact_idmap_host_claim(instance, claim)
+        if current is None:
+            return None
+        proof = current.proof
+        if instance is None and (
+                current.state != 'cleaned' or proof is None):
+            raise incus_idmap.IDMapIntegrityError(
+                'A purged Nova row requires an already-durable exact proof')
+
+        if final_delete and current.state not in ('committed', 'cleaned'):
+            raise incus_idmap.IDMapConflict(
+                reason='Final rootfs release requires an exact committed '
+                       'materialization claim')
+
+        client = client or self.client
+        protocol = self._storage_ownership_client(client)
+        if current.state == 'cleaned':
+            if isinstance(proof, incus_idmap.IDMapMaterializationProof):
+                incus_idmap.validate_materialization_proof(proof)
+                binding = self._materialization_binding_from_proof(proof)
+                acknowledge = protocol.acknowledge_materialization_proof
+                acknowledge_payload = proof
+            elif isinstance(proof, incus_idmap.IDMapRootfsReleaseProof):
+                if incus_idmap.rootfs_release_proof_digest(proof) != (
+                        proof.digest):
+                    raise incus_idmap.IDMapIntegrityError(
+                        'Stored Incus release proof has an invalid digest')
+                binding = self._materialization_binding_from_proof(proof)
+                acknowledge = protocol.acknowledge_release_receipt
+                # The ACK endpoint validates a canonical v2 receipt; the
+                # stored proof carries the identical field set.
+                acknowledge_payload = incus_idmap.IDMapRootfsReleaseReceipt(
+                    **dataclasses.asdict(proof))
+            else:
+                raise incus_idmap.IDMapIntegrityError(
+                    'Cleaned Incus host claim has an invalid proof')
+            if (binding.owner != current.instance_uuid or
+                    binding.compute_id != current.host_id or
+                    binding.token != current.materialization_id or
+                    binding.allocation_id != current.allocation_id or
+                    binding.idmap_base != current.base or
+                    binding.idmap_size != current.size):
+                raise incus_idmap.IDMapIntegrityError(
+                    'Stored Incus proof does not match its exact host claim')
+            try:
+                acknowledge(binding, acknowledge_payload)
+            except incus_exceptions.LXDAPIException as exc:
+                if not _is_incus_not_found(exc):
+                    raise
+            return current
+
+        identity = self._materialization_identity(instance.name, current)
+        if final_delete:
+            binding, receipt = protocol.discover_release_receipt(identity)
+            current = self.idmap_allocator.record_rootfs_release_proof(
+                current.instance_uuid, current.host_id,
+                current.materialization_id, receipt,
+                assignment=assignment)
+            try:
+                protocol.acknowledge_release_receipt(binding, receipt)
+            except incus_exceptions.LXDAPIException as exc:
+                if not _is_incus_not_found(exc):
+                    raise
+            return current
+
+        attempt = protocol.discover_materialization(identity)
+        if attempt.state == 'committed':
+            raise incus_idmap.IDMapConflict(
+                reason='Committed materialization requires a release receipt')
+        if attempt.state == 'active':
+            attempt = protocol.abort_materialization(attempt.binding)
+        if attempt.proof is None:
+            attempt = protocol.settle_materialization(attempt.binding)
+        if attempt.proof is None:
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus materialization has no terminal cleanup proof')
+        current = self.idmap_allocator.record_materialization_proof(
+            current.instance_uuid, current.host_id,
+            current.materialization_id, attempt.proof,
+            assignment=assignment)
+        try:
+            protocol.acknowledge_materialization_proof(
+                attempt.binding, attempt.proof)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+        return current
+
+    def _delete_instance_with_rootfs_release_receipt(
+            self, container, instance, claim, client=None):
+        """Delete one exact T-bound root and persist its v2 receipt."""
+        client = client or self.client
+        unused_assignment, claim = (
+            self._promote_idmap_claim_if_server_committed(
+                instance, claim, client=client))
+        if claim is None or claim.state != 'committed':
+            raise incus_idmap.IDMapIntegrityError(
+                'Refusing final Incus rootfs deletion without an exact '
+                'committed materialization claim')
+        config = container.config if isinstance(container.config, dict) else {}
+        expected = {
+            'user.openstack.uuid': claim.instance_uuid,
+            IDMAP_ALLOCATION_CONFIG_KEY: claim.allocation_id,
+            IDMAP_COMPUTE_CONFIG_KEY: claim.host_id,
+            IDMAP_MATERIALIZATION_CONFIG_KEY: claim.materialization_id,
+        }
+        if any(config.get(key) != value for key, value in expected.items()):
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus instance local A/H/T/U does not match its host claim')
+
+        params = {
+            'project': CONF.incus.project,
+            'rootfs-idmap-release-token': claim.materialization_id,
+            'rootfs-idmap-release-owner': claim.instance_uuid,
+            'rootfs-idmap-allocation-id': claim.allocation_id,
+            'rootfs-idmap-compute-id': claim.host_id,
+        }
+        delete_error = None
+        try:
+            response = client.api.instances[instance.name].delete(
+                params=params)
+            operation_id = _migration_operation_id(
+                response.json().get('operation'))
+            if operation_id is None:
+                raise incus_idmap.IDMapIntegrityError(
+                    'Incus rootfs release delete returned no operation UUID')
+            client.operations.wait_for_operation(operation_id)
+        except Exception as exc:
+            delete_error = exc
+
+        try:
+            return self._settle_idmap_host_claim(
+                instance, claim, final_delete=True, client=client)
+        except Exception as receipt_error:
+            if delete_error is not None:
+                raise receipt_error from delete_error
+            raise
+
+    def _ensure_instance_idmap(
+            self, instance, observed_base=None, observed_size=None):
+        """Allocate or verify one deployment-wide fixed idmap."""
+        stored = _instance_idmap_metadata(instance)
+        if self.idmap_allocator is None:
+            if stored:
+                # A globally allocated mapping must never be consumed by a
+                # compute that cannot verify its generation or establish a
+                # durable host claim. This also makes mixed rolling upgrades
+                # fail closed instead of silently weakening isolation.
+                raise incus_idmap.IDMapIntegrityError(
+                    'Nova idmap metadata is present but this compute has no '
+                    'global allocator configured')
+            return None
+
+        if (observed_base is None) != (observed_size is None):
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus instance returned an incomplete idmap')
+
+        if stored:
+            assignment = self.idmap_allocator.get(instance.uuid)
+            if assignment is None:
+                # Never mint a replacement generation implicitly. A stale
+                # etcd restore or partial operator repair could otherwise
+                # make a live instance's slot available for reuse.
+                raise incus_idmap.IDMapIntegrityError(
+                    'Nova idmap metadata has no allocator record; freeze '
+                    'allocations and run the explicit registry recovery '
+                    'procedure')
+            if (
+                stored['base'] != assignment.base or
+                stored['size'] != assignment.size or
+                stored['allocation_id'] != assignment.allocation_id or
+                stored['fingerprint'] != assignment.fingerprint
+            ):
+                raise incus_idmap.IDMapIntegrityError(
+                    'Nova idmap metadata does not match the allocator record')
+
+        if observed_base is not None:
+            observed_base = int(observed_base)
+            observed_size = int(observed_size)
+            if stored and (
+                    stored['base'], stored['size']) != (
+                        observed_base, observed_size):
+                raise incus_idmap.IDMapIntegrityError(
+                    'Nova idmap metadata does not match the running Incus '
+                    'instance')
+            if not stored:
+                assignment = self.idmap_allocator.adopt(
+                    instance.uuid, observed_base, observed_size)
+            elif (
+                assignment.base != observed_base or
+                assignment.size != observed_size
+            ):
+                raise incus_idmap.IDMapIntegrityError(
+                    'Allocator record does not match the running Incus '
+                    'instance')
+        elif stored:
+            # The verified assignment above is authoritative. Re-allocation
+            # here would turn an absent registry record into an unsafe new
+            # generation.
+            pass
+        else:
+            assignment = self.idmap_allocator.allocate(instance.uuid)
+
+        expected = {
+            IDMAP_BASE_METADATA_KEY: str(assignment.base),
+            IDMAP_SIZE_METADATA_KEY: str(assignment.size),
+            IDMAP_ALLOCATION_METADATA_KEY: assignment.allocation_id,
+            IDMAP_FINGERPRINT_METADATA_KEY: assignment.fingerprint,
+        }
+        if isinstance(instance, objects.Instance):
+            # Instance.save() replaces the complete system_metadata mapping.
+            # Refresh under Nova's per-instance operation lock immediately
+            # before merging so we do not delete unrelated keys from a stale
+            # object received earlier in a long spawn or migration workflow.
+            instance.refresh()
+        metadata = dict(_loaded_instance_system_metadata(instance))
+        if any(metadata.get(key) != value for key, value in expected.items()):
+            metadata.update(expected)
+            instance.system_metadata = metadata
+            # If this save fails the durable allocator record is retained.
+            # A Nova retry obtains the same assignment and repairs metadata.
+            instance.save()
+        return assignment
+
+    def _idmap_claim_from_local_config(self, instance, config):
+        """Validate and return the exact claim named by local Incus config."""
+        if self.idmap_allocator is None:
+            return None, None
+        config = config if isinstance(config, dict) else {}
+        try:
+            owner = _canonical_materialization_id(
+                config["user.openstack.uuid"], "instance owner")
+            allocation_id = _canonical_materialization_id(
+                config[IDMAP_ALLOCATION_CONFIG_KEY], "allocation ID")
+            compute_id = _canonical_materialization_id(
+                config[IDMAP_COMPUTE_CONFIG_KEY], "compute ID")
+            materialization_id = _canonical_materialization_id(
+                config[IDMAP_MATERIALIZATION_CONFIG_KEY])
+            idmap_base = int(config["security.idmap.base"])
+            idmap_size = int(config["security.idmap.size"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus instance local config lacks an exact A/H/T/U and '
+                'fixed idmap binding') from exc
+        if owner != instance.uuid or idmap_base < 0 or idmap_size <= 0:
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus instance local ownership or fixed idmap is invalid')
+
+        assignment = self._ensure_instance_idmap(
+            instance, observed_base=idmap_base, observed_size=idmap_size)
+        if allocation_id != assignment.allocation_id:
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus instance local allocation does not match the '
+                'allocator generation')
+        claim = self.idmap_allocator.get_host_claim(
+            instance.uuid, compute_id)
+        if (claim is None or
+                claim.materialization_id != materialization_id or
+                not _same_idmap_generation(claim, assignment)):
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus instance local A/H/T/U has no exact allocator claim')
+        return assignment, claim
+
+    def _instance_local_idmap_claim(self, instance, container):
+        """Return the claim named by an instance's non-expanded config."""
+        config = (
+            container.config if isinstance(container.config, dict) else {})
+        return self._idmap_claim_from_local_config(instance, config)
+
+    def _migration_target_idmap_claim(self, client, instance):
+        """Recover a destination claim from its local instance or profile."""
+        try:
+            container = client.instances.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+            profile = client.profiles.get(instance.name)
+            config = (
+                profile.config if isinstance(profile.config, dict) else {})
+        else:
+            config = (
+                container.config if isinstance(container.config, dict)
+                else {})
+        return self._idmap_claim_from_local_config(instance, config)
+
+    def _delete_migration_target_with_idmap(self, client, instance):
+        """Delete a protected target through its exact release receipt."""
+        unused_assignment, claim = self._migration_target_idmap_claim(
+            client, instance)
+        if claim is not None and claim.state == 'possible':
+            unused_assignment, claim = (
+                self._promote_idmap_claim_if_server_committed(
+                    instance, claim, client=client))
+        try:
+            container = client.instances.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+            if claim is not None:
+                self._settle_idmap_host_claim(
+                    instance, claim,
+                    final_delete=claim.state == 'committed',
+                    client=client)
+            return
+        _set_storage_handover_state(
+            client, instance.name, 'protected', container=container)
+        if container.status != 'Stopped':
+            try:
+                container.stop(timeout=-1, force=True, wait=True)
+            except incus_exceptions.LXDAPIException as exc:
+                if 'instance is already stopped' not in str(exc).lower():
+                    raise
+        if claim is None:
+            container.delete(wait=True)
+        else:
+            self._delete_instance_with_rootfs_release_receipt(
+                container, instance, claim, client=client)
+
+    def _retire_instance_idmap_claim_if_clean(self, instance):
+        """Retire this compute's claim after local ownership is gone."""
+        if self.idmap_allocator is None:
+            return False
+
+        for collection in (
+                self.client.instances, self.client.profiles):
+            try:
+                collection.get(instance.name)
+            except incus_exceptions.LXDAPIException as exc:
+                if not _is_incus_not_found(exc):
+                    LOG.critical(
+                        'Cannot prove local Incus resources are absent; '
+                        'retaining the idmap host claim',
+                        instance=instance, exc_info=True)
+                    return False
+            except Exception:
+                LOG.critical(
+                    'Cannot prove local Incus resources are absent; '
+                    'retaining the idmap host claim',
+                    instance=instance, exc_info=True)
+                return False
+            else:
+                return False
+
+        local_paths = (
+            common.InstanceAttributes(instance).instance_dir,
+            _volume_journal_directory(instance),
+            _share_journal_directory(instance),
+            _spawn_attempt_journal_path(instance),
+        )
+        if any(os.path.lexists(path) for path in local_paths):
+            return False
+
+        stored = _instance_idmap_metadata(instance)
+        if stored is None:
+            LOG.critical(
+                'Cannot retire the local Incus idmap claim because Nova '
+                'system metadata is unavailable', instance=instance)
+            return False
+        host_id = virt_node.read_local_node_uuid()
+        if not host_id:
+            LOG.critical(
+                'Cannot retire the local Incus idmap claim because Nova has '
+                'no persistent compute-node UUID', instance=instance)
+            return False
+
+        try:
+            with lockutils.lock(
+                    _idmap_host_claim_lock_name(instance.uuid), external=True,
+                    lock_path=_idmap_host_claim_lock_path()):
+                assignment = self.idmap_allocator.get(instance.uuid)
+                if assignment is None:
+                    # Another reconciler may already have retired the final
+                    # claim and released this exact generation.
+                    return True
+                if not _idmap_generation_matches_metadata(assignment, stored):
+                    raise incus_idmap.IDMapIntegrityError(
+                        'Nova Incus idmap metadata does not match the '
+                        'allocator generation during local claim retirement')
+                if not _all_project_idmap_resources_absent(
+                        self.inventory_client, instance.uuid,
+                        assignment.base, assignment.size):
+                    return False
+                if host_id not in assignment.host_ids:
+                    return True
+                claim = self.idmap_allocator.get_host_claim(
+                    instance.uuid, host_id)
+                if claim is None:
+                    raise incus_idmap.IDMapIntegrityError(
+                        'Allocator assignment lists a host without its exact '
+                        'materialization claim')
+                if claim.state == 'possible':
+                    assignment, claim = (
+                        self._promote_idmap_claim_if_server_committed(
+                            instance, claim, _claim_lock_held=True))
+                claim = self._settle_idmap_host_claim(
+                    instance, claim,
+                    final_delete=claim.state == 'committed')
+                if claim is None or claim.state != 'cleaned':
+                    return False
+                assignment = self.idmap_allocator.retire_claim(
+                    instance.uuid, host_id, claim.materialization_id,
+                    assignment=assignment)
+                return (
+                    assignment is None or host_id not in assignment.host_ids)
+        except Exception:
+            # Local cleanup is already complete. A retained claim is a safe
+            # leak and can be reconciled later; reversing cleanup would be
+            # destructive and cannot make the etcd result less ambiguous.
+            LOG.critical(
+                'Failed to retire the local Incus idmap host claim after '
+                'cleanup; retaining it for reconciliation',
+                instance=instance, exc_info=True)
+            return False
+
+    def _retire_cleanup_ack_idmap_claim(self, instance, profile):
+        """Retire this rollback target's claim and return durable proof."""
+        if self.idmap_allocator is None:
+            return None
+
+        stored = _instance_idmap_metadata(instance)
+        if stored is None:
+            raise incus_idmap.IDMapIntegrityError(
+                'Cannot acknowledge Incus cleanup without Nova idmap '
+                'metadata')
+        host_id = virt_node.read_local_node_uuid()
+        if not host_id:
+            raise incus_idmap.IDMapIntegrityError(
+                'Cannot acknowledge Incus cleanup without a persistent '
+                'compute-node UUID')
+
+        configured = profile.config.get(MIGRATION_IDMAP_RETIREMENT_KEY)
+        assignment = self.idmap_allocator.get(instance.uuid)
+        if assignment is None:
+            raise incus_idmap.IDMapIntegrityError(
+                'Cannot acknowledge Incus cleanup after its idmap '
+                'generation disappeared')
+        if not _idmap_generation_matches_metadata(assignment, stored):
+            raise incus_idmap.IDMapIntegrityError(
+                'Nova idmap metadata does not match the cleanup target '
+                'generation')
+        if not _all_project_idmap_resources_absent(
+                self.inventory_client, instance.uuid,
+                assignment.base, assignment.size,
+                allowed_profile_name=instance.name):
+            raise incus_idmap.IDMapIntegrityError(
+                'Cannot acknowledge Incus cleanup while another project '
+                'retains the instance UUID or idmap generation')
+
+        if configured:
+            proof = _parse_idmap_retirement_proof(configured)
+            if (not _same_idmap_generation(proof, assignment) or
+                    proof.host_id != host_id or
+                    proof.materialization_id !=
+                    profile.config.get(MIGRATION_CLEANUP_TOKEN_KEY)):
+                raise incus_idmap.IDMapIntegrityError(
+                    'Incus cleanup profile contains another idmap '
+                    'retirement proof')
+            if host_id in assignment.host_ids:
+                raise incus_idmap.IDMapIntegrityError(
+                    'Incus cleanup profile claims idmap retirement while '
+                    'the local host claim still exists')
+            return configured
+
+        generation = assignment
+        if host_id in assignment.host_ids:
+            claim = self.idmap_allocator.get_host_claim(
+                instance.uuid, host_id)
+            if claim is None:
+                raise incus_idmap.IDMapIntegrityError(
+                    'Cleanup target has no exact materialization claim')
+            if claim.state == 'possible':
+                assignment, claim = (
+                    self._promote_idmap_claim_if_server_committed(
+                        instance, claim))
+            claim = self._settle_idmap_host_claim(
+                instance, claim,
+                final_delete=claim.state == 'committed')
+            if claim is None or claim.state != 'cleaned':
+                raise incus_idmap.IDMapIntegrityError(
+                    'Cleanup target has no durable materialization proof')
+            assignment = self.idmap_allocator.retire_claim(
+                instance.uuid, host_id, claim.materialization_id,
+                assignment=assignment)
+        if (assignment is None or
+                not _same_idmap_generation(generation, assignment) or
+                host_id in assignment.host_ids):
+            raise incus_idmap.IDMapIntegrityError(
+                'Cannot prove the cleanup target retired its exact idmap '
+                'host claim')
+        return _idmap_retirement_proof(
+            generation, host_id,
+            profile.config.get(MIGRATION_CLEANUP_TOKEN_KEY))
+
+    def _validate_cleanup_ack_idmap_retirement(
+            self, profile, instance, idmap_base, idmap_size):
+        """Validate target-local retirement before deleting a remote ACK."""
+        if self.idmap_allocator is None:
+            return
+
+        raw = profile.config.get(MIGRATION_IDMAP_RETIREMENT_KEY)
+        if not raw:
+            raise exception.MigrationError(
+                reason='Incus cleanup acknowledgement has no target-local '
+                       'idmap retirement proof')
+        proof = _parse_idmap_retirement_proof(raw)
+        stored = _instance_idmap_metadata(instance)
+        assignment = self.idmap_allocator.get(instance.uuid)
+        local_host_id = virt_node.read_local_node_uuid()
+        if (stored is None or assignment is None or not local_host_id or
+                proof.instance_uuid != instance.uuid or
+                (proof.base, proof.size) != (idmap_base, idmap_size) or
+                not _idmap_generation_matches_metadata(proof, stored) or
+                not _same_idmap_generation(proof, assignment) or
+                proof.materialization_id !=
+                profile.config.get(MIGRATION_CLEANUP_TOKEN_KEY) or
+                proof.host_id == local_host_id or
+                tuple(assignment.host_ids) != (local_host_id,)):
+            raise exception.MigrationError(
+                reason='Incus cleanup acknowledgement idmap retirement '
+                       'proof does not match allocator ownership')
+
+    def _validate_remote_cleanup_acknowledgement(
+            self, profile, instance, cleanup_token,
+            idmap_base, idmap_size):
+        """Validate a token-bound remote cleanup and local-claim proof."""
+        config = (
+            profile.config if isinstance(profile.config, dict) else {})
+        if (config.get('environment.product_name') != 'OpenStack Nova' or
+                config.get('user.openstack.uuid') != instance.uuid or
+                config.get(MIGRATION_CLEANUP_TOKEN_KEY) != cleanup_token or
+                config.get(MIGRATION_CLEANUP_COMPLETE_KEY) != cleanup_token or
+                profile.used_by or
+                _profile_has_volume_connections(profile) or
+                _profile_has_share_devices(profile)):
+            raise exception.MigrationError(
+                reason='Incus migration destination cleanup '
+                       'acknowledgement is incomplete or mismatched')
+        self._validate_cleanup_ack_idmap_retirement(
+            profile, instance, idmap_base, idmap_size)
 
     def cleanup_host(self, host):
         """Clean up the host.
@@ -1831,30 +6291,146 @@ class IncusDriver(driver.ComputeDriver):
         See `nova.virt.driver.ComputeDriver.cleanup_host` for more
         information.
         """
-        for broker in self._serial_consoles.values():
-            broker.close()
-        self._serial_consoles.clear()
+        with self._serial_consoles_lock:
+            brokers = list(self._serial_consoles.values())
+            self._serial_consoles.clear()
+            self._serial_console_destroying.clear()
+        for broker in brokers:
+            try:
+                broker.close()
+            except Exception:
+                LOG.exception(
+                    'Failed to close an Incus serial console broker during '
+                    'compute host cleanup')
 
     def get_info(self, instance, use_cache=True):
         """Return an InstanceInfo object for the instance."""
-        try:
-            container = self.client.instances.get(instance.name)
-        except incus_exceptions.NotFound:
-            raise exception.InstanceNotFound(instance_id=instance.uuid)
+        if use_cache:
+            container = self._get_instance_inventory_snapshot().get(
+                instance.name)
+            if container is None:
+                raise exception.InstanceNotFound(instance_id=instance.uuid)
+        else:
+            try:
+                container = self.client.instances.get(instance.name)
+            except incus_exceptions.LXDAPIException as exc:
+                if _is_incus_not_found(exc):
+                    raise exception.InstanceNotFound(
+                        instance_id=instance.uuid) from exc
+                raise
 
+        status_code = getattr(container, 'status_code', None)
+        if status_code is not None:
+            return hardware.InstanceInfo(
+                state=_get_power_state(status_code))
+
+        # Older SDK/server combinations may omit status_code from the
+        # recursive instance representation.
         if container.status == 'Stopped':
             return hardware.InstanceInfo(state=power_state.SHUTDOWN)
 
-        state = container.state()
+        try:
+            state = container.state()
+        except incus_exceptions.LXDAPIException as exc:
+            if _is_incus_not_found(exc):
+                raise exception.InstanceNotFound(
+                    instance_id=instance.uuid) from exc
+            raise
         return hardware.InstanceInfo(
             state=_get_power_state(state.status_code))
+
+    def _get_generation_cached_snapshot(
+            self, cache_attribute, fetch_generation_attribute, ttl,
+            fetch):
+        """Single-flight one cache without holding a lock across ``fetch``."""
+        while True:
+            with self._inventory_cache_condition:
+                generation = self._inventory_cache_generation
+                cached = getattr(self, cache_attribute)
+                if (cached is not None and
+                        time.monotonic() - cached[0] <= ttl):
+                    return cached[1]
+
+                if (getattr(self, fetch_generation_attribute) ==
+                        generation):
+                    self._inventory_cache_condition.wait()
+                    continue
+
+                setattr(
+                    self, fetch_generation_attribute, generation)
+
+            try:
+                value = fetch()
+            except Exception:
+                with self._inventory_cache_condition:
+                    if (getattr(self, fetch_generation_attribute) ==
+                            generation):
+                        setattr(
+                            self, fetch_generation_attribute, None)
+                    current = self._inventory_cache_generation
+                    self._inventory_cache_condition.notify_all()
+                if current != generation:
+                    # The failed read belongs to an invalidated generation.
+                    # Retry against the current one instead of surfacing an
+                    # obsolete result to its caller.
+                    continue
+                raise
+
+            with self._inventory_cache_condition:
+                if (getattr(self, fetch_generation_attribute) ==
+                        generation):
+                    setattr(self, fetch_generation_attribute, None)
+                current = self._inventory_cache_generation
+                if current == generation:
+                    setattr(
+                        self, cache_attribute,
+                        (time.monotonic(), value))
+                self._inventory_cache_condition.notify_all()
+                if current == generation:
+                    return value
+            # Invalidation raced the I/O.  Never publish or return that stale
+            # result; join or start the single flight for the new generation.
+
+    def _get_instance_inventory_snapshot(self):
+        """Return a short-lived expanded inventory for periodic work."""
+        def fetch():
+            instances = self.client.instances.all(recursion=1)
+            return {
+                item.name: item
+                for item in instances
+                if getattr(item, 'type', 'container') == 'container'
+            }
+
+        return self._get_generation_cached_snapshot(
+            '_instance_inventory_cache',
+            '_instance_inventory_fetch_generation',
+            _INSTANCE_INVENTORY_CACHE_TTL, fetch)
+
+    def _invalidate_instance_inventory_cache(self):
+        """Invalidate every cache derived from mutable instance inventory."""
+        with self._inventory_cache_condition:
+            self._inventory_cache_generation += 1
+            self._instance_inventory_cache = None
+            self._metric_devices_cache = None
+            self._metric_instance_devices_cache.clear()
+            self._disk_metrics_cache = None
+            # Old-generation I/O is allowed to finish, but it no longer owns
+            # a publication slot.  Invalidation never waits for it.
+            self._instance_inventory_fetch_generation = None
+            self._disk_metrics_fetch_generation = None
+            self._metric_devices_fetch_generation = None
+            self._metric_instance_devices_fetch_generations.clear()
+            self._inventory_cache_condition.notify_all()
 
     def _get_diagnostics_data(self, instance):
         """Return accurately attributable counters from the Incus state API."""
         try:
             container = self.client.instances.get(instance.name)
-        except incus_exceptions.NotFound:
-            raise exception.InstanceNotFound(instance_id=instance.uuid)
+        except incus_exceptions.LXDAPIException as exc:
+            if _is_incus_not_found(exc):
+                raise exception.InstanceNotFound(
+                    instance_id=instance.uuid) from exc
+            raise
 
         state = container.state()
         cpu = state.cpu or {}
@@ -1969,18 +6545,23 @@ class IncusDriver(driver.ComputeDriver):
     def block_stats(self, instance, disk_id):
         """Return cumulative cgroup v2 counters for a Cinder block device."""
         try:
-            profile = self.client.profiles.get(instance.name)
+            profile = self._get_metric_instance_devices_snapshot(
+                instance.name)
+            if profile is None:
+                return None
             metric_device = _disk_metric_device(
                 profile, instance, disk_id)
             if metric_device is None:
                 return None
-            counters = _incus_disk_metrics(
-                self.client, instance.name).get(metric_device)
-        except incus_exceptions.NotFound:
-            LOG.info(
-                'Cannot get block stats for missing instance %s',
-                instance.name, instance=instance)
-            return None
+            counters = self._get_disk_metrics_snapshot().get(
+                instance.name, {}).get(metric_device)
+        except incus_exceptions.LXDAPIException as exc:
+            if _is_incus_not_found(exc):
+                LOG.info(
+                    'Cannot get block stats for missing instance %s',
+                    instance.name, instance=instance)
+                return None
+            raise
 
         stats = _nova_block_stats(counters)
         if stats is None:
@@ -1993,21 +6574,58 @@ class IncusDriver(driver.ComputeDriver):
 
     def get_all_volume_usage(self, context, compute_host_bdms):
         """Return Cinder volume counters in Nova's polling format."""
+        compute_host_bdms = [
+            item for item in compute_host_bdms
+            if item.get('instance_bdms')]
+        if not compute_host_bdms:
+            return []
+
         usage = []
+        metrics_by_instance = self._get_disk_metrics_snapshot()
+        profiles = self._get_metric_devices_snapshot()
+        rbd_devices = _mapped_cinder_rbd_devices()
         for instance_bdms in compute_host_bdms:
             instance = instance_bdms['instance']
-            try:
-                profile = self.client.profiles.get(instance.name)
-                disk_metrics = _incus_disk_metrics(
-                    self.client, instance.name)
-            except incus_exceptions.NotFound:
-                LOG.info(
-                    'Skipping volume usage for missing instance %s',
-                    instance.name, instance=instance)
-                continue
+            profile = profiles.get(instance.name)
+            disk_metrics = metrics_by_instance.get(instance.name, {})
             for bdm in instance_bdms['instance_bdms']:
-                metric_device = _disk_metric_device(
-                    profile, instance, bdm['device_name'])
+                try:
+                    volume_id = bdm['volume_id']
+                except (KeyError, TypeError):
+                    volume_id = (
+                        getattr(bdm, 'volume_id', None) or '<unknown>')
+                try:
+                    if not isinstance(profile, dict):
+                        raise exception.InvalidVolume(
+                            reason='Incus metric profile is missing or is not '
+                                   'a dictionary')
+                    devices = profile.get('devices')
+                    if not isinstance(devices, dict):
+                        raise exception.InvalidVolume(
+                            reason='Incus metric profile has no valid devices '
+                                   'dictionary')
+                    metric_device = _disk_metric_device(
+                        profile, instance, bdm['device_name'],
+                        rbd_devices=rbd_devices)
+                except (
+                        exception.InvalidVolume,
+                        incus_exceptions.NotFound,
+                        AttributeError,
+                        KeyError,
+                        TypeError,
+                        ValueError) as exc:
+                    # A malformed or concurrently removed attachment must not
+                    # suppress usage for every other volume on this host.
+                    LOG.error(
+                        'Failed to collect volume usage for instance '
+                        '%(instance)s volume %(volume)s: %(error)s',
+                        {
+                            'instance': instance.name,
+                            'volume': volume_id,
+                            'error': exc,
+                        },
+                        instance=instance)
+                    continue
                 if metric_device is None:
                     continue
                 stats = _nova_block_stats(
@@ -2023,7 +6641,7 @@ class IncusDriver(driver.ComputeDriver):
                         instance=instance)
                     continue
                 usage.append({
-                    'volume': bdm['volume_id'],
+                    'volume': volume_id,
                     'instance': instance,
                     'rd_req': stats[0],
                     'rd_bytes': stats[1],
@@ -2032,23 +6650,187 @@ class IncusDriver(driver.ComputeDriver):
                 })
         return usage
 
+    def _get_disk_metrics_snapshot(self):
+        """Reuse one Incus metrics sample across a burst of volume events."""
+        return self._get_generation_cached_snapshot(
+            '_disk_metrics_cache', '_disk_metrics_fetch_generation', 1,
+            lambda: _incus_all_disk_metrics(self.client))
+
+    def _get_metric_devices_snapshot(self):
+        """Bulk-read effective devices for a burst of volume metrics calls."""
+        def fetch():
+            instances = self._get_instance_inventory_snapshot().values()
+            return {
+                item.name: {
+                    'devices': (
+                        getattr(item, 'expanded_devices', None) or
+                        getattr(item, 'devices', {}) or {}),
+                }
+                for item in instances
+            }
+
+        return self._get_generation_cached_snapshot(
+            '_metric_devices_cache', '_metric_devices_fetch_generation', 1,
+            fetch)
+
+    def _get_metric_instance_devices_snapshot(self, instance_name):
+        """Read one effective device map without expanding the whole host.
+
+        ``block_stats`` is used for a single detach as well as for a shutdown
+        burst. Expanding every instance on a thousand-instance compute for a
+        single volume is disproportionate, so cache one exact instance read.
+        The host-wide volume-usage poll continues to use the bulk snapshot.
+        """
+        while True:
+            with self._inventory_cache_condition:
+                generation = self._inventory_cache_generation
+                now = time.monotonic()
+                bulk = self._metric_devices_cache
+                if bulk is not None and now - bulk[0] <= 1:
+                    return bulk[1].get(instance_name)
+
+                cached = self._metric_instance_devices_cache.get(
+                    instance_name)
+                if cached is not None and now - cached[0] <= 1:
+                    return cached[1]
+
+                if (self._metric_instance_devices_fetch_generations.get(
+                        instance_name) == generation):
+                    self._inventory_cache_condition.wait()
+                    continue
+
+                self._metric_instance_devices_fetch_generations[
+                    instance_name] = generation
+
+            try:
+                item = self.client.instances.get(instance_name)
+                devices = {
+                    'devices': (
+                        getattr(item, 'expanded_devices', None) or
+                        getattr(item, 'devices', {}) or {}),
+                }
+            except Exception:
+                with self._inventory_cache_condition:
+                    if (self._metric_instance_devices_fetch_generations.get(
+                            instance_name) == generation):
+                        self._metric_instance_devices_fetch_generations.pop(
+                            instance_name, None)
+                    current = self._inventory_cache_generation
+                    self._inventory_cache_condition.notify_all()
+                if current != generation:
+                    continue
+                raise
+
+            with self._inventory_cache_condition:
+                if (self._metric_instance_devices_fetch_generations.get(
+                        instance_name) == generation):
+                    self._metric_instance_devices_fetch_generations.pop(
+                        instance_name, None)
+                current = self._inventory_cache_generation
+                if current == generation:
+                    self._metric_instance_devices_cache[instance_name] = (
+                        time.monotonic(), devices)
+                self._inventory_cache_condition.notify_all()
+                if current == generation:
+                    return devices
+
     def list_instances(self):
         """Return a list of all instance names."""
-        return [instance.name
-                for instance in self.client.instances.all(recursion=1)
-                if getattr(instance, 'type', 'container') == 'container']
+        # The Nova Incus project is dedicated to this system-container
+        # driver. Avoid transferring every instance config and device map for
+        # Nova's frequent name-only inventory reconciliation.
+        return [
+            instance.name for instance in self.client.instances.all()]
+
+    def get_num_instances(self):
+        """Count the same expanded snapshot used by power-state syncing.
+
+        Nova calls this immediately before ``get_info`` for every database
+        instance. Reusing the expanded inventory avoids a separate name-only
+        Incus request without adding any per-instance reads.
+        """
+        return len(self._get_instance_inventory_snapshot())
 
     def list_instance_uuids(self):
         """Return UUIDs for Incus instances managed by this Nova driver."""
-        uuids = []
-        for instance in self.client.instances.all(recursion=1):
-            if getattr(instance, 'type', 'container') != 'container':
-                continue
+        owners = {}
+        for instance in self._get_instance_inventory_snapshot().values():
             instance_uuid = getattr(instance, 'config', {}).get(
                 'user.openstack.uuid')
             if instance_uuid:
-                uuids.append(instance_uuid)
-        return uuids
+                owners.setdefault(instance_uuid, []).append(instance.name)
+
+        for instance_uuid, names in owners.items():
+            if len(names) > 1:
+                LOG.error(
+                    'Multiple Incus containers claim Nova instance UUID '
+                    '%(uuid)s: %(names)s. Refusing to report duplicate UUIDs; '
+                    'an operator must identify and remove the stale record.',
+                    {'uuid': instance_uuid, 'names': sorted(names)})
+
+        # Nova uses this result as a database UUID filter. Report each UUID
+        # once while retaining the integrity error above for duplicate owners.
+        return list(owners)
+
+    def list_migration_recovery_candidates(self):
+        """Return unambiguous migration owners needing runtime repair."""
+        candidates_by_uuid = {}
+        for container in self._get_instance_inventory_snapshot().values():
+
+            config = getattr(container, 'config', {}) or {}
+            expanded_config = (
+                getattr(container, 'expanded_config', None) or config)
+            instance_uuid = config.get('user.openstack.uuid')
+            marker = expanded_config.get(MIGRATION_RECOVERY_KEY)
+            if not (
+                instance_uuid and
+                marker in ('true', 'running', 'stopped')
+            ):
+                continue
+
+            candidates_by_uuid.setdefault(instance_uuid, []).append({
+                'name': container.name,
+                'uuid': instance_uuid,
+            })
+
+        candidates = []
+        for instance_uuid, owners in candidates_by_uuid.items():
+            if len(owners) > 1:
+                LOG.error(
+                    'Multiple Incus targets marked for recovery '
+                    'claim Nova instance UUID %(uuid)s: %(names)s. Refusing '
+                    'automatic recovery until an operator resolves the '
+                    'conflict.',
+                    {
+                        'uuid': instance_uuid,
+                        'names': sorted(owner['name'] for owner in owners),
+                    })
+                continue
+            candidates.append(owners[0])
+
+        return sorted(candidates, key=lambda candidate: candidate['name'])
+
+    def _plug_vifs_for_spawn(
+            self, context, instance, network_info, block_device_info):
+        timeout = CONF.vif_plugging_timeout
+        events = []
+        if timeout:
+            events = [
+                ('network-vif-plugged', vif['id'])
+                for vif in network_info if not vif.get('active', True)
+            ]
+
+        try:
+            with self.virtapi.wait_for_instance_event(
+                    instance, events, timeout=timeout,
+                    error_callback=_neutron_failed_callback):
+                self.plug_vifs(instance, network_info)
+        except exception.InstanceEventTimeout:
+            if not CONF.vif_plugging_is_fatal:
+                return
+            self.cleanup(
+                context, instance, network_info, block_device_info)
+            raise exception.VirtualInterfaceCreateException()
 
     def rebuild(self, context, instance, image_meta, injected_files,
                 admin_password, allocations, bdms, detach_block_devices,
@@ -2073,6 +6855,54 @@ class IncusDriver(driver.ComputeDriver):
         # transaction. The driver must not duplicate that framework logic.
         raise NotImplementedError()
 
+    @_invalidates_instance_inventory
+    def _spawn_root_device_preflight(self, context, instance, image_meta,
+                                     network_info, block_device_info):
+        """Resolve and validate the spawn root device before any side effect.
+
+        Returns ``(root_volume, root_device, data_volume_bdms)`` where
+        ``root_volume`` is ``None`` for an Incus-managed (non-BFV) root.
+        """
+        if driver.block_device_info_get_ephemerals(block_device_info):
+            raise exception.InvalidConfiguration(
+                'Nova ephemeral disks are disabled until they can be '
+                'backed by quota-controlled Incus storage volumes')
+
+        root_bdm = _boot_from_volume(block_device_info)
+        data_volume_bdms = _spawn_data_volume_bdms(
+            block_device_info,
+            root_device_name=getattr(instance, 'root_device_name', None))
+        self._validate_initial_volume_encryption(
+            context, root_bdm, data_volume_bdms)
+        self._preflight_data_volume_bdms(data_volume_bdms)
+        _require_initial_data_volume_image_capability(
+            instance, image_meta, data_volume_bdms)
+        root_volume = None
+        if root_bdm:
+            root_volume = _cinder_rbd_root(root_bdm)
+            bfv_pool_name = _bfv_storage_pool_name(root_volume[0])
+            extensions = self.client.host_info.get('api_extensions', [])
+            if 'storage_driver_cephext' not in extensions:
+                raise exception.InvalidConfiguration(
+                    'The Incus server does not support '
+                    'storage_driver_cephext')
+            bfv_pool = self.client.storage_pools.get(bfv_pool_name)
+            if bfv_pool.driver != 'cephext':
+                raise exception.InvalidConfiguration(
+                    'Incus boot-from-volume storage pool must use '
+                    'cephext')
+            if bfv_pool.config.get('source') != root_volume[0]:
+                raise exception.InvalidConfiguration(
+                    'The Incus cephext pool source does not match the '
+                    'Cinder RBD pool')
+            root_device = _bfv_root_device(
+                instance, root_bdm, root_volume)
+        else:
+            root_device = flavor._root(
+                instance, self.client, network_info,
+                block_device_info)['root']
+        return root_volume, root_device, data_volume_bdms
+
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, allocations, network_info=None,
               block_device_info=None, power_on=True, accel_info=None):
@@ -2086,35 +6916,38 @@ class IncusDriver(driver.ComputeDriver):
         See `nova.virt.driver.ComputeDriver.spawn` for more
         information.
         """
-        if driver.block_device_info_get_ephemerals(block_device_info):
-            raise exception.InvalidConfiguration(
-                'Nova ephemeral disks are disabled until they can be backed '
-                'by quota-controlled Incus storage volumes')
-
-        root_bdm = _boot_from_volume(block_device_info)
         root_volume = None
-        if root_bdm:
-            root_volume = _cinder_rbd_root(root_bdm)
-            bfv_pool_name = _bfv_storage_pool_name(root_volume[0])
-            extensions = self.client.host_info.get('api_extensions', [])
-            if 'storage_driver_cephext' not in extensions:
-                raise exception.InvalidConfiguration(
-                    'The Incus server does not support storage_driver_cephext')
-            bfv_pool = self.client.storage_pools.get(bfv_pool_name)
-            if bfv_pool.driver != 'cephext':
-                raise exception.InvalidConfiguration(
-                    'Incus boot-from-volume storage pool must use cephext')
-            if bfv_pool.config.get('source') != root_volume[0]:
-                raise exception.InvalidConfiguration(
-                    'The Incus cephext pool source does not match the Cinder '
-                    'RBD pool')
+        root_device = None
+        materialization = None
+        materialization_id = uuidutils.generate_uuid()
+        spawn_attempt = self._create_spawn_preflight_attempt(
+            instance, materialization_id)
+        try:
+            root_volume, root_device, data_volume_bdms = (
+                self._spawn_root_device_preflight(
+                    context, instance, image_meta, network_info,
+                    block_device_info))
+        except (exception.Invalid,
+                exception.MultiattachNotSupportedByVirtDriver) as exc:
+            self._spawn_build_abort(instance, exc)
 
         try:
             self.client.instances.get(instance.name)
             raise exception.InstanceExists(name=instance.name)
         except incus_exceptions.LXDAPIException as e:
-            if e.response.status_code != 404:
+            if not _is_incus_not_found(e):
                 raise  # Re-raise the exception if it wasn't NotFound
+
+        spawn_attempt = self._open_spawn_attempt(instance, spawn_attempt)
+        try:
+            materialization = self._begin_idmap_materialization(
+                instance, materialization_id, root_device)
+        except incus_idmap.IDMapError as exc:
+            raise exception.InvalidConfiguration(
+                'Cannot register a deployment-wide Incus root '
+                'materialization: {}'.format(
+                    exc)) from exc
+        self._finish_spawn_attempt_open(instance, spawn_attempt)
 
         instance_dir = common.InstanceAttributes(instance).instance_dir
         if not os.path.exists(instance_dir):
@@ -2125,47 +6958,39 @@ class IncusDriver(driver.ComputeDriver):
             try:
                 self.client.images.get_by_alias(instance.image_ref)
             except incus_exceptions.LXDAPIException as e:
-                if e.response.status_code != 404:
+                if not _is_incus_not_found(e):
                     raise
-                _sync_glance_image_to_incus(
-                    self.client, context, instance.image_ref)
+                try:
+                    _sync_glance_image_to_incus(
+                        self.client, context, instance.image_ref)
+                except Exception:
+                    with excutils.save_and_reraise_exception():
+                        self._abort_idmap_materialization(materialization)
+                        self.cleanup(
+                            context, instance, network_info,
+                            block_device_info)
 
         # Plug in the network
         if network_info:
-            timeout = CONF.vif_plugging_timeout
-            if timeout:
-                events = [('network-vif-plugged', vif['id'])
-                          for vif in network_info if not vif.get(
-                    'active', True)]
-            else:
-                events = []
-
             try:
-                with self.virtapi.wait_for_instance_event(
-                        instance, events, timeout=timeout,
-                        error_callback=_neutron_failed_callback):
-                    self.plug_vifs(instance, network_info)
-            except eventlet.timeout.Timeout:
-                LOG.warn("Timeout waiting for vif plugging callback for "
-                         "instance {uuid}"
-                         .format(uuid=instance['name']))
-                if CONF.vif_plugging_is_fatal:
-                    self.destroy(
+                self._plug_vifs_for_spawn(
+                    context, instance, network_info, block_device_info)
+            except Exception:
+                with excutils.save_and_reraise_exception():
+                    self._abort_idmap_materialization(materialization)
+                    self.cleanup(
                         context, instance, network_info, block_device_info)
-                    raise exception.InstanceDeployFailure(
-                        'Timeout waiting for vif plugging',
-                        instance_id=instance['name'])
 
         # Create the profile
         try:
             profile = flavor.to_profile(
                 self.client, instance, network_info, block_device_info)
             if root_volume:
-                profile.devices['root'] = _bfv_root_device(
-                    instance, root_bdm, root_volume)
+                profile.devices['root'] = root_device
                 profile.save()
         except incus_exceptions.LXDAPIException:
             with excutils.save_and_reraise_exception():
+                self._abort_idmap_materialization(materialization)
                 self.cleanup(
                     context, instance, network_info, block_device_info)
 
@@ -2176,6 +7001,10 @@ class IncusDriver(driver.ComputeDriver):
             'profiles': [profile.name],
             'config': {
                 **_incus_cloud_init_config(instance, network_info),
+                # The storage release receipt endpoint binds the external
+                # owner to instance-local configuration, not a profile that
+                # can be shared or removed independently.
+                'user.openstack.uuid': instance.uuid,
                 # Nova must reconcile ownership before a workload resumes
                 # after a fenced compute returns.
                 'boot.autostart': 'false',
@@ -2184,17 +7013,32 @@ class IncusDriver(driver.ComputeDriver):
                 'type': 'image', 'alias': instance.image_ref}),
         }
         try:
-            container = self.client.instances.create(
-                container_config, wait=True)
-        except incus_exceptions.LXDAPIException:
+            container = self._with_rootfs_materialization_barrier(
+                materialization, container_config['config'],
+                lambda: self.client.instances.create(
+                    container_config, wait=True),
+                recover_action=lambda: self.client.instances.get(
+                    instance.name))
+        except Exception:
             with excutils.save_and_reraise_exception():
                 self.cleanup(
                     context, instance, network_info, block_device_info)
 
+        attached_data_volumes = []
         try:
             incus_config = self.client.host_info
             storage.attach_ephemeral(
                 self.client, block_device_info, incus_config, instance)
+            # Nova's initial BDM preparation creates and completes the Cinder
+            # attachments with do_driver_attach=False. The virt driver's
+            # spawn transaction must therefore connect every non-root volume
+            # before the guest is first started.
+            for bdm in data_volume_bdms:
+                self.attach_volume(
+                    context, bdm['connection_info'], instance,
+                    bdm['mount_device'], encryption=bdm.get('encrypted'))
+                attached_data_volumes.append(bdm)
+
             if configdrive.required_by(instance):
                 configdrive_path = self._add_configdrive(
                     context, instance,
@@ -2219,25 +7063,296 @@ class IncusDriver(driver.ComputeDriver):
                 instance, network_info)
 
             if power_on:
-                container.start(wait=True)
+                self._start_instance_with_idmap(instance, container)
 
             self.firewall_driver.apply_instance_filter(
                 instance, network_info)
         except Exception:
             with excutils.save_and_reraise_exception():
-                try:
-                    container.delete(wait=True)
-                except Exception:
-                    LOG.exception(
-                        'Failed to delete container after a spawn failure',
-                        instance=instance)
-                try:
-                    self.cleanup(
-                        context, instance, network_info, block_device_info)
-                except Exception as e:
-                    LOG.warn('The cleanup process failed with: %s. This '
-                             'error may or not may be relevant', e)
+                self._fence_failed_spawn(
+                    context, instance, network_info, block_device_info,
+                    materialization, attached_data_volumes)
 
+    def _fence_failed_spawn(self, context, instance, network_info,
+                            block_device_info, materialization,
+                            attached_data_volumes):
+        """Fence and roll back a spawn that failed after container creation.
+
+        Called from inside ``save_and_reraise_exception``; the original
+        spawn failure is always re-raised after this returns.
+        """
+        def fence_spawn_container():
+            try:
+                current = self.client.instances.get(instance.name)
+            except incus_exceptions.LXDAPIException as exc:
+                if _is_incus_not_found(exc):
+                    return
+                raise
+            if current.status != 'Stopped':
+                current.stop(timeout=-1, force=True, wait=True)
+            if materialization is None:
+                current.delete(wait=True)
+            else:
+                self._delete_instance_with_rootfs_release_receipt(
+                    current, instance, materialization.claim)
+
+        try:
+            _retry_incus_instance_action(
+                fence_spawn_container,
+                'failed spawn container fencing',
+                instance, retry_transient=True)
+        except Exception:
+            # A still-running or ambiguously deleted workload must
+            # retain every storage and network attachment. Nova can
+            # retry destroy after Incus reaches a known state.
+            LOG.critical(
+                'Failed to fence the Incus container after spawn '
+                'failed; retaining all attached resources',
+                instance=instance, exc_info=True)
+            return
+
+        # Undo only attachments completed by this spawn attempt. A
+        # failed attach owns its own rollback and retains profile
+        # device_info if os-brick cannot be disconnected safely.
+        for bdm in reversed(attached_data_volumes):
+            try:
+                self.detach_volume(
+                    context, bdm['connection_info'], instance,
+                    bdm['mount_device'],
+                    encryption=bdm.get('encrypted'))
+            except Exception:
+                LOG.exception(
+                    'Failed to roll back spawn-time Cinder volume '
+                    '%s; retaining the Incus profile recovery '
+                    'metadata',
+                    _volume_id(bdm['connection_info']),
+                    instance=instance)
+        try:
+            self.cleanup(
+                context, instance, network_info, block_device_info)
+        except Exception as e:
+            LOG.warn('The cleanup process failed with: %s. This '
+                     'error may or not may be relevant', e)
+
+    def _failed_build_idmap_release_allowed(self, instance, reasons):
+        """Return whether idmap ownership permits releasing the failed host.
+
+        Only observes and settles already-proven claims; any uncertainty
+        appends a reason and blocks the release.
+        """
+        allowed = True
+        try:
+            idmap_metadata = _instance_idmap_metadata(instance)
+            allocator = getattr(self, 'idmap_allocator', None)
+            if allocator is None:
+                if idmap_metadata is not None:
+                    raise incus_idmap.IDMapIntegrityError(
+                        'Nova idmap metadata has no configured allocator')
+            else:
+                assignment = allocator.get(instance.uuid)
+                if assignment is None:
+                    if idmap_metadata is not None:
+                        raise incus_idmap.IDMapIntegrityError(
+                            'Nova idmap metadata has no allocator record')
+                else:
+                    host_id = virt_node.read_local_node_uuid()
+                    if not host_id:
+                        raise incus_idmap.IDMapIntegrityError(
+                            'Nova compute node UUID is unavailable')
+                    claim = allocator.get_host_claim(instance.uuid, host_id)
+                    indexed = host_id in assignment.host_ids
+                    if indexed != (claim is not None):
+                        raise incus_idmap.IDMapIntegrityError(
+                            'Incus idmap host index and claim disagree')
+                    if claim is not None:
+                        unused_assignment, exact_claim = (
+                            self._exact_idmap_host_claim(instance, claim))
+                        if (exact_claim.state != 'cleaned' or
+                                exact_claim.proof is None):
+                            allowed = False
+                            reasons.add(
+                                'local idmap materialization still exists')
+                        else:
+                            # Replaying the exact ACK proves this is a durable
+                            # cleaned claim. Keep it in the registry while Nova
+                            # decides whether to reschedule or terminally fail;
+                            # it no longer owns local host resources.
+                            self._settle_idmap_host_claim(
+                                instance, exact_claim, final_delete=False)
+            if (idmap_metadata is not None and
+                    not _all_project_idmap_resources_absent(
+                        self.inventory_client, instance.uuid,
+                        idmap_metadata['base'],
+                        idmap_metadata['size'])):
+                allowed = False
+                reasons.add('Incus idmap resource still exists')
+        except Exception as exc:
+            allowed = False
+            reasons.add('idmap ownership is uncertain: {}'.format(exc))
+        return allowed
+
+    def assess_failed_build_cleanup(self, instance, block_device_info):
+        """Decide which Nova resources can be released after failed spawn.
+
+        This method only observes local state. Any uncertainty retains the
+        affected external ownership instead of allowing Nova to free a port,
+        Cinder attachment, host assignment, or Placement allocation while a
+        local Incus resource may still consume it.
+        """
+        if not isinstance(block_device_info, dict):
+            return FailedBuildCleanupAssessment.unsafe(
+                'block-device inventory is unavailable')
+
+        # This assessment is reached only after driver.destroy() failed. A
+        # missing Incus instance/profile does not prove that spawn-time host
+        # VIF wiring was removed: profile creation can fail after plug(), and
+        # cleanup can then fail in vif_driver.unplug(). Nova's generic failed
+        # build cleanup would otherwise release Neutron despite that error.
+        # Retain networking until a later destroy retry completes end to end.
+        reasons = {'host VIF absence is not proven after failed destroy'}
+        release_network = False
+        release_cinder = True
+        release_host = True
+
+        try:
+            container = self.client.instances.get(instance.name)
+        except Exception as exc:
+            if _is_incus_not_found(exc):
+                container = None
+            else:
+                return FailedBuildCleanupAssessment.unsafe(
+                    'Incus instance inventory is uncertain: {}'.format(exc))
+
+        try:
+            profile = self.client.profiles.get(instance.name)
+        except Exception as exc:
+            if _is_incus_not_found(exc):
+                profile = None
+            else:
+                return FailedBuildCleanupAssessment.unsafe(
+                    'Incus profile inventory is uncertain: {}'.format(exc))
+
+        if container is not None:
+            if _instance_nova_uuid(container) != instance.uuid:
+                return FailedBuildCleanupAssessment.unsafe(
+                    'named Incus instance ownership is ambiguous')
+            release_network = False
+            release_host = False
+            reasons.add('Incus instance still exists')
+
+        try:
+            volume_journals = _volume_journal_records(instance)
+        except Exception as exc:
+            release_cinder = False
+            release_host = False
+            reasons.add(
+                'Cinder journal ownership is uncertain: {}'.format(exc))
+            volume_journals = None
+
+        if profile is not None:
+            try:
+                _validate_profile_volume_owner(profile, instance)
+            except Exception as exc:
+                return FailedBuildCleanupAssessment.unsafe(
+                    'named Incus profile ownership is ambiguous: {}'.format(
+                        exc))
+            release_host = False
+            reasons.add('Incus profile still exists')
+            devices = (
+                profile.devices if isinstance(profile.devices, dict) else {})
+            if any(
+                    isinstance(device, dict) and
+                    device.get('type') == 'nic'
+                    for device in devices.values()):
+                release_network = False
+                reasons.add('Incus profile still owns a network device')
+            try:
+                if _profile_has_volume_connections(profile):
+                    release_cinder = False
+                    reasons.add('Incus profile still owns a Cinder device')
+                topology = _data_volume_topology(
+                    profile, volume_journals or {})
+                if topology['opaque_ids']:
+                    release_cinder = False
+                    reasons.add(
+                        'Incus profile has an opaque unix-block device')
+            except Exception as exc:
+                release_cinder = False
+                reasons.add(
+                    'Cinder profile ownership is uncertain: {}'.format(exc))
+
+        if volume_journals:
+            release_cinder = False
+            release_host = False
+            reasons.add('host Cinder cleanup journal still exists')
+
+        try:
+            volume_bdms = list(
+                driver.block_device_info_get_mapping(block_device_info))
+        except Exception as exc:
+            release_cinder = False
+            release_host = False
+            reasons.add(
+                'Cinder block-device inventory is invalid: {}'.format(exc))
+            volume_bdms = []
+
+        root_bdm = None
+        try:
+            root_bdm = _boot_from_volume(block_device_info)
+        except Exception as exc:
+            release_cinder = False
+            release_host = False
+            reasons.add('BFV root identity is uncertain: {}'.format(exc))
+        mapping_cinder, mapping_host, mapping_reasons = (
+            _failed_build_rbd_mapping_ownership(
+                volume_bdms, container, profile, root_bdm))
+        release_cinder = release_cinder and mapping_cinder
+        release_host = release_host and mapping_host
+        reasons.update(mapping_reasons)
+
+        try:
+            share_journals = _share_journal_records(instance)
+        except Exception as exc:
+            release_host = False
+            reasons.add(
+                'Manila journal ownership is uncertain: {}'.format(exc))
+            share_journals = None
+        if share_journals:
+            release_host = False
+            reasons.add('host Manila cleanup journal still exists')
+
+        local_paths = (
+            common.InstanceAttributes(instance).instance_dir,
+            _volume_journal_directory(instance),
+            _share_journal_directory(instance),
+            _spawn_attempt_journal_path(instance),
+        )
+        try:
+            retained_paths = [
+                path for path in local_paths if os.path.lexists(path)]
+        except Exception as exc:
+            release_host = False
+            reasons.add(
+                'host resource paths are uncertain: {}'.format(exc))
+        else:
+            if retained_paths:
+                release_host = False
+                reasons.add('host resource path still exists')
+
+        if not self._failed_build_idmap_release_allowed(instance, reasons):
+            release_host = False
+
+        release_host = release_host and release_network and release_cinder
+        release_placement = release_host
+        return FailedBuildCleanupAssessment(
+            release_network=release_network,
+            release_cinder=release_cinder,
+            release_host=release_host,
+            release_placement=release_placement,
+            reasons=tuple(sorted(reasons)))
+
+    @_invalidates_instance_inventory
+    @_guards_serial_console_destroy
     def destroy(self, context, instance, network_info, block_device_info=None,
                 destroy_disks=True, destroy_secrets=True):
         """Destroy a running instance.
@@ -2248,63 +7363,214 @@ class IncusDriver(driver.ComputeDriver):
         See `nova.virt.driver.ComputeDriver.destroy` for more
         information.
         """
+        if self._consume_spawn_preflight_noop(instance):
+            LOG.debug(
+                'Consumed exact preflight-only spawn attempt for %s; no '
+                'Incus or host resource cleanup is required',
+                instance.name)
+            return
+
+        failed_build_cleanup = (
+            getattr(instance, 'vm_state', None) == vm_states.BUILDING and
+            getattr(instance, 'task_state', None) == task_states.SPAWNING)
         lock_path = os.path.join(CONF.instances_path, 'locks')
-        broker = self._serial_consoles.pop(instance.uuid, None)
-        if broker is not None:
-            broker.close()
+        unused_release_intent, unused_release_assignment, release_claim = (
+            self._idmap_rootfs_release_context(instance))
 
         def destroy_container(name):
             _retry_incus_instance_action(
                 lambda: stop_and_delete(name),
                 'stop and delete {}'.format(name),
-                instance)
+                instance, retry_transient=True)
 
         def stop_and_delete(name):
             try:
                 container = self.client.instances.get(name)
             except incus_exceptions.LXDAPIException as exc:
                 if _is_incus_not_found(exc):
-                    LOG.warning(
-                        "Failed to delete instance. Container does not exist "
-                        "for %(instance)s.",
+                    if name == instance.name and release_claim is not None:
+                        self._settle_idmap_host_claim(
+                            instance, release_claim,
+                            final_delete=(
+                                release_claim.state == 'committed'))
+                    LOG.debug(
+                        "Incus container is already absent for "
+                        "%(instance)s; continuing idempotent cleanup.",
                         {'instance': name})
                     return
                 raise
 
+            if (name == instance.name and release_claim is not None and
+                    release_claim.state != 'committed'):
+                raise incus_idmap.IDMapIntegrityError(
+                    'An Incus instance exists without an exact committed '
+                    'materialization claim')
+
+            if (name == instance.name and
+                    _instance_has_negotiated_handover(container)):
+                root_pool = _instance_root_pool(
+                    self.client, name, container=container)
+                if root_pool.driver == 'ceph':
+                    if cleanup_token:
+                        # A token-bound resize/live-migration loser must
+                        # delete only its local record even when Nova asks to
+                        # destroy local copied disks. The cleanup ACK proves
+                        # target teardown independently of destroy_disks.
+                        _set_storage_handover_state(
+                            self.client, name, 'protected',
+                            container=container)
+                    elif destroy_disks:
+                        # destroy_disks is a Nova cleanup policy, not proof
+                        # that this record owns an Incus-managed shared root.
+                        # Only migration commit/revert may grant ownership.
+                        raise exception.MigrationError(
+                            reason='Incus instance %s is protected by an '
+                                   'incomplete shared-storage handover' %
+                                   name)
+                    else:
+                        # Reassert the existing negotiated protection, then
+                        # delete only the record.
+                        _set_storage_handover_state(
+                            self.client, name, 'protected',
+                            container=container)
             if container.status != 'Stopped':
                 container.stop(wait=True)
 
-            container.delete(wait=True)
+            if name == instance.name and release_claim is not None:
+                self._delete_instance_with_rootfs_release_receipt(
+                    container, instance, release_claim)
+            else:
+                container.delete(wait=True)
+
+        cleanup_token = None
+        try:
+            profile = self.client.profiles.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+        else:
+            if isinstance(profile.config, dict):
+                cleanup_token = profile.config.get(
+                    MIGRATION_CLEANUP_TOKEN_KEY)
 
         with lockutils.lock(
                 lock_path, external=True,
                 lock_file_prefix='incus-container-{}'.format(instance.name)):
+            if (cleanup_token and destroy_disks and
+                    getattr(instance, 'host', None) == self.host):
+                # A successful migration updates Nova's authoritative host
+                # before every target-side staging record is necessarily
+                # retired. Do not mistake that current owner for a rollback
+                # loser merely because its profile still has the cleanup
+                # token. Converge the committed attempt, then require both
+                # Incus ownership and token retirement before final delete.
+                _converge_migration_target_ownership(
+                    self.client, instance)
+                current = self.client.instances.get(instance.name)
+                if not _storage_handover_is_owned(
+                        self.client, instance.name, container=current):
+                    raise exception.MigrationError(
+                        reason='Refusing final delete before the current '
+                               'Incus migration target owns shared storage')
+                current_profile = self.client.profiles.get(instance.name)
+                current_config = (
+                    current_profile.config
+                    if isinstance(current_profile.config, dict) else {})
+                if current_config.get(MIGRATION_CLEANUP_TOKEN_KEY):
+                    raise exception.MigrationError(
+                        reason='Refusing final delete before committed Incus '
+                               'migration staging metadata is retired')
+                cleanup_token = None
+
             # TODO(sahid): Each time we get a container we should
             # protect it by using a mutex.
             destroy_container(instance.name)
             if instance.vm_state == vm_states.RESCUED:
                 destroy_container('{}-rescue'.format(instance.name))
 
-            self.cleanup(
-                context, instance, network_info, block_device_info)
+            if cleanup_token:
+                self._cleanup(
+                    context, instance, network_info,
+                    block_device_info=block_device_info,
+                    destroy_disks=destroy_disks,
+                    destroy_secrets=destroy_secrets,
+                    delete_profile=False)
+                self._acknowledge_cleanup_profile(
+                    instance, cleanup_token)
+            else:
+                self.cleanup(
+                    context, instance, network_info, block_device_info,
+                    destroy_disks=destroy_disks,
+                    destroy_secrets=destroy_secrets)
+            if release_claim is not None:
+                self._remove_spawn_attempt_for_claim(
+                    instance, release_claim)
+            if not failed_build_cleanup:
+                self._retire_instance_idmap_claim_if_clean(instance)
 
     def cleanup(self, context, instance, network_info, block_device_info=None,
                 destroy_disks=True, migrate_data=None, destroy_vifs=True,
                 destroy_secrets=True):
+        return self._cleanup(
+            context, instance, network_info,
+            block_device_info=block_device_info,
+            destroy_disks=destroy_disks,
+            migrate_data=migrate_data,
+            destroy_vifs=destroy_vifs,
+            destroy_secrets=destroy_secrets,
+            delete_profile=True)
+
+    def _cleanup(
+            self, context, instance, network_info, block_device_info=None,
+            destroy_disks=True, migrate_data=None, destroy_vifs=True,
+            destroy_secrets=True, delete_profile=True):
         """Clean up the filesystem around the container.
 
         See `nova.virt.driver.ComputeDriver.cleanup` for more
         information.
         """
-        if destroy_vifs:
-            self.unplug_vifs(instance, network_info)
-            self.firewall_driver.unfilter_instance(instance, network_info)
+        failures = []
+        retain_profile = not delete_profile
 
-        incus_config = self.client.host_info
-        storage.detach_ephemeral(self.client,
-                                 block_device_info,
-                                 incus_config,
-                                 instance)
+        def attempt(description, action):
+            try:
+                action()
+            except Exception as exc:
+                failures.append((description, exc))
+                LOG.exception(
+                    'Failed Incus cleanup step: %s',
+                    description, instance=instance)
+
+        if destroy_vifs:
+            for vif in network_info or []:
+                vif_id = vif.get('id', 'unknown')
+                attempt(
+                    'unplug destination VIF %s' % vif_id,
+                    lambda vif=vif: self.vif_driver.unplug(instance, vif))
+                attempt(
+                    'remove firewall filter for VIF %s' % vif_id,
+                    lambda vif=vif: self.firewall_driver.unfilter_instance(
+                        instance, [vif]))
+
+        attempt(
+            'detach ephemeral storage',
+            lambda: storage.detach_ephemeral(
+                self.client, block_device_info, self.client.host_info,
+                instance))
+
+        profile = None
+        try:
+            profile = self.client.profiles.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                failures.append(('read Manila cleanup profile', exc))
+        else:
+            attempt(
+                'unmount Manila staging paths',
+                lambda: _cleanup_profile_share_mounts(profile, instance))
+        attempt(
+            'unmount journaled Manila staging paths',
+            lambda: _cleanup_share_journal_mounts(instance))
 
         # ComputeManager releases Cinder attachments after destroy() returns;
         # the virt driver must disconnect host mappings before that happens.
@@ -2318,82 +7584,254 @@ class IncusDriver(driver.ComputeDriver):
             mountpoint = bdm.get('mount_device')
             if not connection_info or not mountpoint:
                 continue
+            # The detach transaction performs its own authoritative profile
+            # reads and persistence checks. Reuse the initial snapshot only
+            # to decide which Nova BDMs need that transaction; otherwise an
+            # instance with N data volumes incurs N redundant Incus reads.
+            if profile is None:
+                break
             try:
-                profile = self.client.profiles.get(instance.name)
-            except incus_exceptions.LXDAPIException as exc:
-                if exc.response.status_code == 404:
-                    break
-                raise
-            if _volume_id(connection_info) in profile.devices:
-                self.detach_volume(
-                    context, connection_info, instance, mountpoint)
+                volume_id = _volume_id(connection_info)
+            except Exception as exc:
+                failures.append(('validate Cinder cleanup record', exc))
+                LOG.exception(
+                    'Failed to validate Cinder cleanup record',
+                    instance=instance)
+                continue
+            if _profile_has_volume_connection(profile, volume_id):
+                attempt(
+                    'disconnect Cinder volume %s' % volume_id,
+                    lambda connection_info=connection_info,
+                    mountpoint=mountpoint: self.detach_volume(
+                        context, connection_info, instance, mountpoint))
 
-        _remove_instance_directory(instance)
+        # Nova can deliberately omit destination BDMs after a source-side
+        # detach attempt. The versioned profile record is therefore the
+        # authoritative retry journal for any mapping still present.
+        failures.extend(
+            ('disconnect profile-recorded Cinder volume %s' % volume_id, exc)
+            for volume_id, exc in
+            self._disconnect_profile_volume_connections(context, instance))
+
+        attempt(
+            'remove instance directory',
+            lambda: _remove_instance_directory(instance))
 
         try:
             profile = self.client.profiles.get(instance.name)
         except incus_exceptions.LXDAPIException as e:
-            if e.response.status_code == 404:
-                LOG.warning("Failed to delete instance. "
-                            "Profile does not exist for {instance}."
-                            .format(instance=instance.name))
+            if _is_incus_not_found(e):
+                LOG.debug(
+                    "Incus profile is already absent for %(instance)s; "
+                    "cleanup is complete.",
+                    {'instance': instance.name})
             else:
-                raise
+                failures.append(('read final Incus profile', e))
+                LOG.exception(
+                    'Failed to read final Incus cleanup profile',
+                    instance=instance)
         else:
             if _profile_has_volume_connections(profile):
+                retain_profile = True
                 LOG.error(
                     'Retaining Incus profile because it contains host volume '
                     'connection metadata that requires cleanup',
                     instance=instance)
+                if not any(
+                        description.startswith('disconnect ')
+                        for description, _exc in failures):
+                    failures.append((
+                        'disconnect retained Cinder volume metadata',
+                        exception.InvalidVolume(
+                            reason='Incus profile still contains Cinder '
+                                   'connection metadata')))
+            elif delete_profile and not failures:
+                attempt('delete Incus profile', profile.delete)
             else:
-                profile.delete()
+                LOG.error(
+                    'Retaining Incus profile as a migration cleanup barrier',
+                    instance=instance)
 
+        retain_profile = retain_profile or bool(failures)
+        if retain_profile:
+            try:
+                profile = self.client.profiles.get(instance.name)
+                profile_config = (
+                    profile.config if isinstance(profile.config, dict)
+                    else {})
+                profile_uuid = profile_config.get('user.openstack.uuid')
+                if (profile_config.get('environment.product_name') !=
+                        'OpenStack Nova' or
+                        profile_uuid not in (None, instance.uuid) or
+                        profile.used_by):
+                    raise exception.InvalidConfiguration(
+                        'Refusing to mark a foreign or in-use Incus profile '
+                        'for automatic cleanup')
+                profile.config['user.openstack.uuid'] = instance.uuid
+                profile.config[CLEANUP_RECOVERY_KEY] = 'true'
+                profile.save(wait=True)
+            except incus_exceptions.LXDAPIException as exc:
+                if not _is_incus_not_found(exc):
+                    raise
+                if not failures:
+                    failures.append((
+                        'persist Incus cleanup retry journal',
+                        exception.InvalidConfiguration(
+                            'Incus cleanup profile disappeared')))
+            except Exception as exc:
+                failures.append((
+                    'persist Incus cleanup retry journal', exc))
+                LOG.critical(
+                    'Failed to persist the Incus cleanup retry journal',
+                    instance=instance, exc_info=True)
+
+        if failures:
+            raise exception.MigrationError(
+                reason='%d Incus cleanup operation(s) failed; the profile '
+                       'was retained as a retry and migration safety barrier'
+                       % len(failures))
+
+    def _acknowledge_cleanup_profile(self, instance, cleanup_token):
+        """Persist token-bound proof that one destination is fully clean."""
+        if not uuidutils.is_uuid_like(cleanup_token):
+            raise exception.MigrationError(
+                reason='Missing or invalid Incus cleanup token')
+
+        def assert_instance_absent():
+            try:
+                self.client.instances.get(instance.name)
+            except incus_exceptions.LXDAPIException as exc:
+                if not _is_incus_not_found(exc):
+                    raise
+            else:
+                raise exception.MigrationError(
+                    reason='Incus cleanup cannot be acknowledged while the '
+                           'destination instance record exists')
+
+        assert_instance_absent()
+
+        def validate_profile(profile):
+            config = (
+                profile.config if isinstance(profile.config, dict) else {})
+            if (config.get('environment.product_name') != 'OpenStack Nova' or
+                    config.get('user.openstack.uuid') != instance.uuid or
+                    config.get(MIGRATION_CLEANUP_TOKEN_KEY) != cleanup_token or
+                    profile.used_by or
+                    _profile_has_volume_connections(profile) or
+                    _volume_journal_records(instance) or
+                    _profile_has_share_devices(profile) or
+                    _share_journal_records(instance) or
+                    any(os.path.ismount(path) for path in
+                        _profile_share_mounts(profile, instance)) or
+                    any(os.path.lexists(path) for path in (
+                        common.InstanceAttributes(instance).instance_dir,
+                        _volume_journal_directory(instance),
+                        _share_journal_directory(instance)))):
+                raise exception.MigrationError(
+                    reason='Incus destination cleanup profile is not safe to '
+                           'acknowledge')
+
+        with lockutils.lock(_profile_lock_name(instance)):
+            with lockutils.lock(
+                    _idmap_host_claim_lock_name(instance.uuid), external=True,
+                    lock_path=_idmap_host_claim_lock_path()):
+                profile = self.client.profiles.get(instance.name)
+                validate_profile(profile)
+                retirement = self._retire_cleanup_ack_idmap_claim(
+                    instance, profile)
+
+                # Retirement is irreversible. Re-read all local barriers and
+                # the all-project inventory before publishing the token-bound
+                # ACK. Holding the claim lock prevents a new local claim from
+                # crossing this proof window.
+                profile = self.client.profiles.get(instance.name)
+                assert_instance_absent()
+                validate_profile(profile)
+                if retirement is not None:
+                    proof = _parse_idmap_retirement_proof(retirement)
+                    if not _all_project_idmap_resources_absent(
+                            self.inventory_client, instance.uuid,
+                            proof.base, proof.size,
+                            allowed_profile_name=instance.name):
+                        raise incus_idmap.IDMapIntegrityError(
+                            'Incus resources appeared after cleanup idmap '
+                            'retirement; refusing to publish the cleanup ACK')
+                original_config = dict(profile.config)
+                if retirement is None:
+                    profile.config.pop(MIGRATION_IDMAP_RETIREMENT_KEY, None)
+                else:
+                    profile.config[MIGRATION_IDMAP_RETIREMENT_KEY] = retirement
+                profile.config[MIGRATION_CLEANUP_COMPLETE_KEY] = cleanup_token
+                profile.config.pop(CLEANUP_RECOVERY_KEY, None)
+                profile.config.pop(
+                    MIGRATION_DESTINATION_PREPARED_KEY, None)
+                profile.config.pop(MIGRATION_TARGET_OPERATION_KEY, None)
+                try:
+                    profile.save(wait=True)
+                except Exception:
+                    # A failed save leaves the server-side prepared marker in
+                    # place. Restore it locally so retries using this resource
+                    # object do not mistake an unsaved ACK for durable state.
+                    profile.config = original_config
+                    raise
+        return True
+
+    @_invalidates_instance_inventory
     def cleanup_lingering_instance_resources(self, instance):
         """Remove a stopped record left on a failed migration source."""
         try:
             container = self.client.instances.get(instance.name)
         except incus_exceptions.LXDAPIException as exc:
-            if exc.response.status_code == 404:
-                return True
-            LOG.exception(
-                'Failed to query lingering Incus migration record',
-                instance=instance)
-            return False
+            if _is_incus_not_found(exc):
+                container = None
+            else:
+                LOG.exception(
+                    'Failed to query lingering Incus migration record',
+                    instance=instance)
+                return False
         except Exception:
             LOG.exception(
                 'Failed to query lingering Incus migration record',
                 instance=instance)
             return False
 
-        if container.status != 'Stopped':
+        if container is not None and container.status != 'Stopped':
             LOG.error(
                 'Refusing to clean a running lingering Incus record',
                 instance=instance)
             return False
-        if container.config.get('user.openstack.uuid') != instance.uuid:
+        if (container is not None and
+                _instance_nova_uuid(container) != instance.uuid):
             LOG.error(
                 'Refusing to clean an Incus record owned by another UUID',
                 instance=instance)
             return False
 
-        root = container.devices.get('root', {})
+        root = container.devices.get('root', {}) if container else {}
         external_root = root.get('initial.ceph.rbd.image_name')
-        handover = container.config.get(
-            'volatile.migration.storage_handover')
-        if external_root and handover not in ('pending', 'committed'):
+        if (external_root and
+                not _instance_has_negotiated_handover(container)):
             LOG.error(
-                'Refusing to clean an external BFV root without a protected '
-                'handover state',
+                'Refusing to clean an external BFV root without negotiated '
+                'migration delete protection',
                 instance=instance)
             return False
 
         try:
-            container.delete(wait=True)
-            try:
-                self.client.profiles.get(instance.name).delete()
-            except incus_exceptions.LXDAPIException as exc:
-                if exc.response.status_code != 404:
-                    raise
+            if container is not None:
+                _retry_incus_instance_action(
+                    lambda: self._delete_migration_target_with_idmap(
+                        self.client, instance),
+                    'lingering migration record deletion',
+                    instance, retry_transient=True)
+
+            # The profile and host journals contain the only exact os-brick
+            # device_info and Manila mount ownership proof. Replay them before
+            # deleting the profile; _cleanup retains and marks it on failure.
+            self._cleanup(
+                None, instance, [], block_device_info=None,
+                destroy_vifs=False, delete_profile=True)
+            self._retire_instance_idmap_claim_if_clean(instance)
             return True
         except Exception:
             LOG.exception(
@@ -2401,6 +7839,280 @@ class IncusDriver(driver.ComputeDriver):
                 instance=instance)
             return False
 
+    def list_cleanup_recovery_candidates(self):
+        """Return cleanup-marked profiles using one recursive API request."""
+        response = self.client.api.profiles.get(params={'recursion': 1})
+        body = response.json()
+        profiles = body.get('metadata') if isinstance(body, dict) else None
+        if not isinstance(profiles, list):
+            raise exception.InvalidConfiguration(
+                'Incus recursive profile inventory is malformed')
+
+        candidates = []
+        for profile in profiles:
+            if not isinstance(profile, dict):
+                continue
+            config = profile.get('config')
+            name = profile.get('name')
+            if (not isinstance(config, dict) or
+                    config.get(CLEANUP_RECOVERY_KEY) != 'true' or
+                    config.get('environment.product_name') !=
+                    'OpenStack Nova' or
+                    not isinstance(name, str) or not name):
+                continue
+            instance_uuid = config.get('user.openstack.uuid')
+            if not uuidutils.is_uuid_like(instance_uuid):
+                LOG.error(
+                    'Ignoring cleanup-marked Incus profile %s with an '
+                    'invalid Nova UUID', name)
+                continue
+            candidates.append({
+                'name': name,
+                'uuid': instance_uuid,
+            })
+        return sorted(candidates, key=lambda item: item['name'])
+
+    def list_destination_prepared_recovery_candidates(self):
+        """Return target profiles that survive without their mount journal."""
+        response = self.client.api.profiles.get(params={'recursion': 1})
+        body = response.json()
+        profiles = body.get('metadata') if isinstance(body, dict) else None
+        if not isinstance(profiles, list):
+            raise exception.InvalidConfiguration(
+                'Incus recursive profile inventory is malformed')
+
+        candidates = []
+        for profile in profiles:
+            if not isinstance(profile, dict):
+                continue
+            config = profile.get('config')
+            name = profile.get('name')
+            if (not isinstance(config, dict) or
+                    MIGRATION_DESTINATION_PREPARED_KEY not in config or
+                    not isinstance(name, str) or not name):
+                continue
+            # Once cleanup() has published its own retry marker, the existing
+            # cleanup recovery loop owns this profile and avoids duplicate
+            # host unmount/disconnect attempts.
+            if config.get(CLEANUP_RECOVERY_KEY) == 'true':
+                continue
+            try:
+                binding = _destination_prepared_profile_binding(config)
+            except exception.MigrationError:
+                LOG.error(
+                    'Ignoring destination-prepared Incus profile %s with an '
+                    'invalid transaction binding', name, exc_info=True)
+                continue
+            candidates.append({'name': name, **binding})
+        return sorted(candidates, key=lambda item: item['name'])
+
+    def _abort_and_cleanup_destination_profile(
+            self, context, instance, cleanup_token, idmap_base, idmap_size,
+            network_info):
+        """Fence a non-committed target, then publish a durable cleanup ACK."""
+        attempt = _abort_migration_attempt(
+            self.client, instance, cleanup_token, idmap_base, idmap_size,
+            target_cleanup=lambda: _retry_migration_finish_action(
+                lambda: self._delete_migration_target_with_idmap(
+                    self.client, instance),
+                'aborted prepared migration target deletion', instance))
+        if attempt['state'] == 'committed':
+            return attempt
+        if (attempt['state'] not in ('aborted', 'failed') or
+                not attempt.get('finished')):
+            raise exception.MigrationError(
+                reason='Prepared Incus migration destination did not reach '
+                       'a terminal non-committed state')
+
+        try:
+            self.client.instances.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+        else:
+            raise exception.MigrationError(
+                reason='Refusing prepared destination cleanup while its '
+                       'Incus instance record still exists')
+
+        self._cleanup(
+            context, instance, network_info, block_device_info=None,
+            destroy_vifs=True, delete_profile=False)
+        self._acknowledge_cleanup_profile(instance, cleanup_token)
+        return attempt
+
+    def recover_destination_prepared_profile(
+            self, context, instance, candidate, migration, network_info):
+        """Reconcile a profile that outlived its destination callback."""
+        expected = {
+            'name': instance.name,
+            'uuid': instance.uuid,
+        }
+        if any(candidate.get(key) != value for key, value in expected.items()):
+            raise exception.MigrationError(
+                reason='Prepared destination profile owner does not match '
+                       'the Nova instance')
+        cleanup_token = candidate.get('operation_token')
+        if (getattr(migration, 'uuid', None) != cleanup_token or
+                not uuidutils.is_uuid_like(cleanup_token)):
+            raise exception.MigrationError(
+                reason='Prepared destination profile does not match the '
+                       'exact Nova migration')
+
+        with lockutils.lock(_profile_lock_name(instance)):
+            profile = self.client.profiles.get(instance.name)
+            config = (
+                profile.config if isinstance(profile.config, dict) else {})
+            binding = _destination_prepared_profile_binding(config)
+            if any(binding.get(key) != candidate.get(key) for key in (
+                    'uuid', 'operation_token', 'idmap_base', 'idmap_size')):
+                raise exception.MigrationError(
+                    reason='Prepared destination profile changed during '
+                           'recovery')
+
+        try:
+            container = self.client.instances.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+            container = None
+        if (container is not None and
+                _instance_nova_uuid(container) != instance.uuid):
+            raise exception.MigrationError(
+                reason='Prepared migration target UUID does not match Nova')
+
+        attempt = _get_migration_attempt(
+            self.client, instance, cleanup_token,
+            candidate['idmap_base'], candidate['idmap_size'])
+        if (attempt['state'] != 'committed' and
+                instance.host == getattr(migration, 'dest_compute', None)):
+            raise exception.MigrationError(
+                reason='Nova names this compute as instance owner but the '
+                       'Incus migration attempt was not committed')
+        if attempt['state'] != 'committed':
+            attempt = self._abort_and_cleanup_destination_profile(
+                context, instance, cleanup_token,
+                candidate['idmap_base'], candidate['idmap_size'],
+                network_info)
+            if attempt['state'] != 'committed':
+                return True
+
+        # Abort is a no-op after the server proves commit. Never unmount or
+        # delete committed storage unless Nova also proves this destination is
+        # the authoritative host and its target record still exists.
+        if container is None:
+            raise exception.MigrationError(
+                reason='Committed Incus migration attempt has no target '
+                       'instance record; refusing automatic cleanup')
+        if instance.host != getattr(migration, 'dest_compute', None):
+            raise exception.MigrationError(
+                reason='Committed Incus migration target is not the Nova '
+                       'instance owner; refusing automatic cleanup')
+        _converge_migration_target_ownership(self.client, instance)
+        return True
+
+    def list_share_journal_recovery_candidates(self):
+        """Return migration journal owners for manager-side validation."""
+        return _share_journal_recovery_candidates()
+
+    def recover_share_journal_candidate(self, instance, candidate):
+        """Clean one terminal migration journal after rechecking runtime."""
+        expected = {
+            'uuid': instance.uuid,
+            'name': instance.name,
+        }
+        if any(candidate.get(key) != value for key, value in expected.items()):
+            raise exception.MigrationError(
+                reason='Manila journal recovery owner does not match Nova')
+        operation_token = candidate.get('operation_token')
+        if not uuidutils.is_uuid_like(operation_token):
+            raise exception.MigrationError(
+                reason='Manila journal recovery token is not a migration UUID')
+        records = _share_journal_records(
+            instance, operation_token=operation_token)
+        if tuple(record['share_id'] for record in records) != tuple(
+                candidate.get('share_ids', ())):
+            raise exception.MigrationError(
+                reason='Manila journal set changed during recovery')
+
+        for collection, resource_type in (
+                (self.client.instances, 'instance'),
+                (self.client.profiles, 'profile')):
+            try:
+                collection.get(instance.name)
+            except incus_exceptions.LXDAPIException as exc:
+                if not _is_incus_not_found(exc):
+                    raise
+            else:
+                raise exception.MigrationError(
+                    reason='Refusing Manila journal cleanup while a local '
+                           'Incus {} exists'.format(resource_type))
+
+        _cleanup_share_journal_mounts(
+            instance, operation_token=operation_token)
+        return True
+
+    def recover_cleanup_profile(
+            self, context, instance, network_info):
+        """Replay one durable source/destination cleanup transaction."""
+        with lockutils.lock(_profile_lock_name(instance)):
+            profile = self.client.profiles.get(instance.name)
+            config = (
+                profile.config if isinstance(profile.config, dict) else {})
+            if (config.get(CLEANUP_RECOVERY_KEY) != 'true' or
+                    config.get('environment.product_name') !=
+                    'OpenStack Nova' or
+                    config.get('user.openstack.uuid') != instance.uuid):
+                raise exception.InvalidConfiguration(
+                    'Incus cleanup recovery profile is not owned by the '
+                    'requested Nova instance')
+            cleanup_token = config.get(MIGRATION_CLEANUP_TOKEN_KEY)
+            destination_cleanup = (
+                not config.get(MIGRATION_DESTINATION_KEY) and
+                uuidutils.is_uuid_like(cleanup_token))
+            if destination_cleanup:
+                try:
+                    idmap_base = int(config.get('security.idmap.base'))
+                    idmap_size = int(config.get('security.idmap.size'))
+                except (TypeError, ValueError) as exc:
+                    raise exception.MigrationError(
+                        reason='Cleanup-marked migration destination has no '
+                               'fixed idmap proof') from exc
+                attempt = _get_migration_attempt(
+                    self.client, instance, cleanup_token,
+                    idmap_base, idmap_size)
+                if (
+                    attempt['state'] not in ('aborted', 'failed') or
+                    not attempt.get('finished')
+                ):
+                    raise exception.MigrationError(
+                        reason='Refusing destination cleanup before its '
+                               'migration attempt is terminal and '
+                               'non-committed')
+
+        try:
+            self.client.instances.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+        else:
+            # A cleanup profile is not authority to delete an instance. Nova's
+            # deleted-instance reconciliation handles stopped records using
+            # the migration handover checks in
+            # cleanup_lingering_instance_resources(). This periodic path only
+            # replays host resources after positive target absence.
+            raise exception.MigrationError(
+                reason='Refusing cleanup recovery while an Incus instance '
+                       'record still exists')
+
+        self._cleanup(
+            context, instance, network_info, block_device_info=None,
+            destroy_vifs=True, delete_profile=not destination_cleanup)
+        if destination_cleanup:
+            self._acknowledge_cleanup_profile(
+                instance, cleanup_token)
+        return True
+
+    @_invalidates_instance_inventory
     def reboot(self, context, instance, network_info, reboot_type,
                block_device_info=None, bad_volumes_callback=None,
                accel_info=None, share_info=None):
@@ -2418,85 +8130,138 @@ class IncusDriver(driver.ComputeDriver):
         if container.status == 'Stopped':
             self._validate_reboot_vifs(instance, network_info)
             self.plug_vifs(instance, network_info)
+
+            def start_stopped():
+                current = self.client.instances.get(instance.name)
+                if current.status != 'Running':
+                    self._start_instance_with_idmap(instance, current)
+
             _retry_incus_instance_action(
-                lambda: container.start(wait=True),
+                start_stopped,
                 'start stopped instance during reboot',
-                instance)
+                instance, retry_transient=True)
         else:
+            def restart(force):
+                # Re-read on every busy retry. A concurrent stop or a lost
+                # start response can otherwise leave Nova operating on a stale
+                # SDK model and fail even though the requested running state
+                # has already converged.
+                current = self.client.instances.get(instance.name)
+                with lockutils.lock(
+                        _idmap_host_claim_lock_name(instance.uuid),
+                        external=True,
+                        lock_path=_idmap_host_claim_lock_path()):
+                    self._ensure_instance_idmap_before_start(
+                        instance, current, _claim_lock_held=True)
+                    if current.status == 'Stopped':
+                        current.start(wait=True)
+                    else:
+                        current.restart(force=force, wait=True)
+
             if reboot_type == 'SOFT':
                 try:
                     _retry_incus_instance_action(
-                        lambda: container.restart(
-                            force=False, wait=True),
+                        lambda: restart(force=False),
                         'soft reboot',
                         instance)
-                except incus_exceptions.LXDAPIException:
+                except incus_exceptions.LXDAPIException as exc:
+                    if (
+                        _is_incus_busy_operation(exc) or
+                        _incus_api_status_code(exc) != 400
+                    ):
+                        raise
                     LOG.warning(
                         'Incus soft reboot failed; falling back to hard '
                         'reboot',
                         instance=instance,
                         exc_info=True)
                     _retry_incus_instance_action(
-                        lambda: container.restart(
-                            force=True, wait=True),
+                        lambda: restart(force=True),
                         'hard reboot fallback',
                         instance)
             else:
                 _retry_incus_instance_action(
-                    lambda: container.restart(force=True, wait=True),
+                    lambda: restart(force=True),
                     'hard reboot',
                     instance)
         self._reassert_vifs(instance, network_info)
         self._clear_migration_recovery_marker(instance)
 
     def needs_migration_recovery(self, instance):
-        """Return whether this host owns a marked, stopped BFV target."""
+        """Return whether this host owns a marked, stopped migration target."""
         try:
             container = self.client.instances.get(instance.name)
             profile = self.client.profiles.get(instance.name)
         except incus_exceptions.LXDAPIException as exc:
-            if exc.response.status_code == 404:
+            if _is_incus_not_found(exc):
                 return False
             raise
 
-        root = container.devices.get('root', {})
-        # storage_handover protects deletion of the source record and is not
-        # present on the destination. The driver-owned profile marker is only
-        # written after this target has definitely claimed the external root.
         checks = {
-            'stopped': container.status == 'Stopped',
+            'known_state': container.status in ('Running', 'Stopped'),
             'uuid_match': (
-                container.config.get('user.openstack.uuid') == instance.uuid),
-            'external_root': bool(
-                root.get('initial.ceph.rbd.image_name')),
+                _instance_nova_uuid(container) == instance.uuid),
             'marked': profile.config.get(MIGRATION_RECOVERY_KEY) in (
                 'true', 'running', 'stopped'),
         }
         LOG.debug(
-            'Evaluated Incus BFV migration recovery candidate: %(checks)s',
+            'Evaluated Incus migration recovery candidate: %(checks)s',
             {'checks': checks}, instance=instance)
         return all(checks.values())
 
     def _mark_migration_recovery_required(
-            self, instance, profile, power_on=True):
+            self, instance, power_on=True):
+        # Attach/detach paths fetch and save their own profile objects. Always
+        # re-read here so a stale flavor.to_profile object cannot overwrite
+        # the only durable os-brick cleanup record.
+        profile = self.client.profiles.get(instance.name)
         profile.config[MIGRATION_RECOVERY_KEY] = (
             'running' if power_on else 'stopped')
         profile.save(wait=True)
         LOG.warning(
-            'Marked claimed BFV target for automatic recovery',
+            'Marked claimed migration target for automatic recovery',
             instance=instance)
 
+    def _mark_cleanup_recovery_required(self, instance):
+        """Journal source host cleanup before deleting its instance record."""
+        with lockutils.lock(_profile_lock_name(instance)):
+            profile = self.client.profiles.get(instance.name)
+            config = (
+                profile.config if isinstance(profile.config, dict) else {})
+            if (config.get('environment.product_name') != 'OpenStack Nova' or
+                    config.get('user.openstack.uuid') != instance.uuid):
+                raise exception.InvalidConfiguration(
+                    'Refusing to journal cleanup on an Incus profile not '
+                    'owned by the Nova instance')
+            profile.config[CLEANUP_RECOVERY_KEY] = 'true'
+            profile.save(wait=True)
+
+    @_invalidates_instance_inventory
     def recover_migration_target(
             self, context, instance, network_info, block_device_info=None):
-        """Repair a marked BFV owner without changing its intended state."""
+        """Repair a marked migration owner without changing intended state."""
         profile = self.client.profiles.get(instance.name)
         desired_state = profile.config.get(MIGRATION_RECOVERY_KEY)
         if desired_state not in ('true', 'running', 'stopped'):
             raise exception.InvalidConfiguration(
                 'Incus BFV recovery marker is missing or invalid')
 
+        _retry_migration_finish_action(
+            lambda: _set_storage_handover_state(
+                self.client, instance.name, 'owned'),
+            'migration recovery shared-storage ownership', instance)
         self._reconcile_reboot_data_volumes(
             context, instance, block_device_info)
+        cleanup_token = profile.config.get(MIGRATION_CLEANUP_TOKEN_KEY)
+        if uuidutils.is_uuid_like(cleanup_token):
+            journals = _share_journal_records(
+                instance, operation_token=cleanup_token)
+            if journals:
+                with lockutils.lock(_profile_lock_name(instance)):
+                    profile = self.client.profiles.get(instance.name)
+                    self._attach_journaled_share_devices(
+                        profile, instance, cleanup_token,
+                        [record['share_id'] for record in journals])
         container = self.client.instances.get(instance.name)
         self._validate_reboot_vifs(instance, network_info)
         should_run = desired_state in ('true', 'running')
@@ -2505,11 +8270,74 @@ class IncusDriver(driver.ComputeDriver):
             container.stop(wait=True)
         self._refresh_vifs(instance, network_info)
         if should_run and (network_info or not was_running):
-            container.start(wait=True)
+            self._start_instance_with_idmap(instance, container)
         elif not should_run and was_running and not network_info:
             container.stop(wait=True)
+        profile = self.client.profiles.get(instance.name)
+        cleanup_token = (
+            profile.config.get(MIGRATION_CLEANUP_TOKEN_KEY)
+            if isinstance(profile.config, dict) else None)
+        if uuidutils.is_uuid_like(cleanup_token):
+            idmap_base, idmap_size = _instance_migration_idmap(
+                container, profile)
+            try:
+                attempt = _get_migration_attempt(
+                    self.client, instance, cleanup_token,
+                    idmap_base, idmap_size)
+            except incus_exceptions.LXDAPIException as exc:
+                if not _is_incus_not_found(exc):
+                    raise
+            else:
+                if attempt['state'] != 'committed':
+                    raise exception.MigrationError(
+                        reason='Marked migration owner has a non-committed '
+                               'local attempt')
+                _finalize_committed_migration_attempt(
+                    self.client, instance, cleanup_token,
+                    idmap_base, idmap_size)
         self._clear_migration_recovery_marker(instance)
         return should_run
+
+    def _ensure_instance_idmap_before_start(
+            self, instance, container, _claim_lock_held=False):
+        """Fail closed unless this instance still owns its observed idmap."""
+        if not _claim_lock_held:
+            with lockutils.lock(
+                    _idmap_host_claim_lock_name(instance.uuid), external=True,
+                    lock_path=_idmap_host_claim_lock_path()):
+                return self._ensure_instance_idmap_before_start(
+                    instance, container, _claim_lock_held=True)
+
+        assignment, claim = self._instance_local_idmap_claim(
+            instance, container)
+        if self.idmap_allocator is None:
+            return assignment
+
+        host_id = virt_node.read_local_node_uuid()
+        if not host_id:
+            raise incus_idmap.IDMapConfigurationError(
+                'Nova has no persistent compute-node UUID; refusing to '
+                'start an Incus instance')
+        if claim.host_id != host_id:
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus instance local host binding does not match this '
+                'compute')
+        if claim.state == 'possible':
+            assignment, claim = (
+                self._promote_idmap_claim_if_server_committed(
+                    instance, claim, _claim_lock_held=True))
+        return self.idmap_allocator.assert_startable(
+            instance.uuid, host_id, claim.materialization_id,
+            assignment=assignment)
+
+    def _start_instance_with_idmap(self, instance, container):
+        """Start only after validating the observed fixed idmap generation."""
+        with lockutils.lock(
+                _idmap_host_claim_lock_name(instance.uuid), external=True,
+                lock_path=_idmap_host_claim_lock_path()):
+            self._ensure_instance_idmap_before_start(
+                instance, container, _claim_lock_held=True)
+            container.start(wait=True)
 
     def _refresh_vifs(self, instance, network_info):
         """Recreate retained host VIFs so OVN reasserts their binding state."""
@@ -2524,7 +8352,7 @@ class IncusDriver(driver.ComputeDriver):
         try:
             profile = self.client.profiles.get(instance.name)
         except incus_exceptions.LXDAPIException as exc:
-            if exc.response.status_code == 404:
+            if _is_incus_not_found(exc):
                 return
             raise
         if (isinstance(profile.config, dict) and
@@ -2534,45 +8362,103 @@ class IncusDriver(driver.ComputeDriver):
 
     def _reconcile_reboot_data_volumes(
             self, context, instance, block_device_info):
-        """Restore data-volume devices before recovering a retained target."""
-        profile = self.client.profiles.get(instance.name)
+        """Make the durable Cinder topology exact before an instance starts."""
+        data_volume_bdms = _reboot_data_volume_bdms(
+            block_device_info,
+            root_device_name=getattr(instance, 'root_device_name', None))
+        self._preflight_data_volume_bdms(
+            data_volume_bdms, validate_connectors=False)
+        desired = {
+            _bdm_volume_id(bdm): bdm for bdm in data_volume_bdms
+        }
+
         container = self.client.instances.get(instance.name)
+        profile = self.client.profiles.get(instance.name)
+        journals = _volume_journal_records(instance)
+        topology = _data_volume_topology(profile, journals)
+
+        if block_device_info is None and topology['proven_ids']:
+            raise exception.InvalidVolume(
+                reason='Nova did not provide block-device mappings for an '
+                       'instance that retains Cinder volume state')
+        if desired or topology['proven_ids'] or topology['opaque_ids']:
+            _validate_profile_volume_owner(profile, instance)
+        if topology['opaque_ids']:
+            raise exception.InvalidVolume(
+                reason='Incus profile contains opaque unix-block devices: %s'
+                       % ', '.join(sorted(topology['opaque_ids'])))
+
+        extra = topology['proven_ids'] - set(desired)
+        if container.status != 'Stopped':
+            if (extra or topology['journal_ids'] or
+                    topology['profile_ids'] != set(desired)):
+                raise exception.InvalidVolume(
+                    reason='Running Incus instance Cinder topology differs '
+                           'from Nova block-device mappings')
+        else:
+            for volume_id in sorted(extra):
+                self._disconnect_profile_volume_connection(
+                    context, instance, volume_id)
+
+            for volume_id, bdm in sorted(desired.items()):
+                connection_info = bdm['connection_info']
+                mountpoint = bdm['mount_device']
+                profile = self.client.profiles.get(instance.name)
+                journals = _volume_journal_records(instance)
+                qos_limits = _data_volume_qos(
+                    connection_info,
+                    self.client.host_info.get('api_extensions', []))
+
+                if volume_id in journals:
+                    self.attach_volume(
+                        context, connection_info, instance, mountpoint)
+                    continue
+                if not _profile_has_volume_connection(profile, volume_id):
+                    self.attach_volume(
+                        context, connection_info, instance, mountpoint)
+                    continue
+                try:
+                    _profile_volume_attachment_matches(
+                        profile, volume_id, mountpoint, qos_limits,
+                        connection_info, rbd_mapping_cache={})
+                except exception.InvalidVolume:
+                    LOG.warning(
+                        'Repairing an incomplete or stale Cinder attachment '
+                        'before starting the retained Incus instance',
+                        instance=instance, exc_info=True)
+                    self._disconnect_profile_volume_connection(
+                        context, instance, volume_id,
+                        connection_info=connection_info,
+                        mountpoint=mountpoint)
+                    self.attach_volume(
+                        context, connection_info, instance, mountpoint)
+
+        profile = self.client.profiles.get(instance.name)
+        journals = _volume_journal_records(instance)
+        topology = _data_volume_topology(profile, journals)
+        if (topology['opaque_ids'] or topology['journal_ids'] or
+                topology['profile_ids'] != set(desired) or
+                topology['unix_block_ids'] != set(desired)):
+            raise exception.InvalidVolume(
+                reason='Incus Cinder topology did not converge to the exact '
+                       'Nova block-device mapping')
+
+        rbd_mapping_cache = {}
+        for volume_id, bdm in sorted(desired.items()):
+            connection_info = bdm['connection_info']
+            qos_limits = _data_volume_qos(
+                connection_info,
+                self.client.host_info.get('api_extensions', []))
+            _profile_volume_attachment_matches(
+                profile, volume_id, bdm['mount_device'], qos_limits,
+                connection_info, rbd_mapping_cache=rbd_mapping_cache)
+
         root_bdm = _boot_from_volume(block_device_info)
         if root_bdm is not None and root_bdm.get('volume_size'):
             root_volume = _cinder_rbd_root(root_bdm)
             self._resize_bfv_root(
                 container, root_volume[1],
                 int(root_bdm['volume_size']) * units.Gi)
-
-        seen = set()
-        for bdm in driver.block_device_info_get_mapping(block_device_info):
-            if _is_boot_volume(bdm):
-                continue
-            connection_info = bdm.get('connection_info')
-            mountpoint = bdm.get('mount_device')
-            if not connection_info or not mountpoint:
-                continue
-
-            volume_id = _volume_id(connection_info)
-            if volume_id in seen:
-                raise exception.InvalidVolume(
-                    reason='Duplicate Cinder volume in reboot block mapping: '
-                    '%s' % volume_id)
-            seen.add(volume_id)
-
-            device = profile.devices.get(volume_id)
-            if device is None:
-                self.attach_volume(
-                    context, connection_info, instance, mountpoint)
-                continue
-
-            metadata_key = _volume_device_info_key(volume_id)
-            if (device.get('type') != 'unix-block' or
-                    device.get('path') != mountpoint or
-                    metadata_key not in profile.config):
-                raise exception.InvalidVolume(
-                    reason='Incus profile data volume %s does not match the '
-                    'Nova block-device mapping' % volume_id)
         return container
 
     @staticmethod
@@ -2629,14 +8515,17 @@ class IncusDriver(driver.ComputeDriver):
         """Return a token-protected Nova serialproxy backend."""
         if not CONF.serial_console.enabled:
             raise exception.ConsoleTypeUnavailable(console_type='serial')
-        container = self.client.instances.get(instance.name)
-        if container.status != 'Running':
-            raise exception.InstanceNotRunning(instance_id=instance.uuid)
-        broker = self._serial_consoles.get(instance.uuid)
-        if broker is None:
-            broker = incus_console.SerialConsoleBroker(
-                CONF.serial_console.proxyclient_address, container)
-            self._serial_consoles[instance.uuid] = broker
+        with self._serial_consoles_lock:
+            if instance.uuid in self._serial_console_destroying:
+                raise exception.InstanceNotRunning(instance_id=instance.uuid)
+            container = self.client.instances.get(instance.name)
+            if container.status != 'Running':
+                raise exception.InstanceNotRunning(instance_id=instance.uuid)
+            broker = self._serial_consoles.get(instance.uuid)
+            if broker is None:
+                broker = incus_console.SerialConsoleBroker(
+                    CONF.serial_console.proxyclient_address, container)
+                self._serial_consoles[instance.uuid] = broker
         return console_type.ConsoleSerial(
             host=CONF.serial_console.proxyclient_address,
             port=broker.port)
@@ -2644,8 +8533,77 @@ class IncusDriver(driver.ComputeDriver):
     def get_host_ip_addr(self):
         return CONF.my_ip
 
+    def _retain_volume_cleanup_metadata(
+            self, instance, volume_id, connection_info, device_info,
+            mountpoint):
+        """Durably retain os-brick data after an uncertain disconnect."""
+        _write_volume_journal(
+            instance, volume_id, connection_info, device_info or {},
+            mountpoint, phase='disconnecting')
+        try:
+            with lockutils.lock(_profile_lock_name(instance)):
+                profile = self.client.profiles.get(instance.name)
+                _validate_profile_volume_owner(profile, instance)
+                profile.devices.pop(volume_id, None)
+                profile.config[_volume_device_info_key(volume_id)] = (
+                    _serialize_volume_attachment(
+                        connection_info, device_info or {}, mountpoint,
+                        phase='disconnecting'))
+                profile.save(wait=True)
+        except Exception:
+            LOG.critical(
+                'Failed to retain cleanup metadata for Cinder volume %s '
+                'in Incus after host disconnect failed; the host-local '
+                'journal remains authoritative',
+                volume_id, instance=instance, exc_info=True)
+
+    @_invalidates_instance_inventory
     def attach_volume(self, context, connection_info, instance, mountpoint,
                       disk_bus=None, device_type=None, encryption=None):
+        with lockutils.lock(
+                _volume_topology_lock_name(instance), external=True,
+                lock_path=_volume_topology_lock_path()):
+            return self._attach_volume_locked(
+                context, connection_info, instance, mountpoint,
+                disk_bus=disk_bus, device_type=device_type,
+                encryption=encryption)
+
+    def _stage_volume_for_live_migration(
+            self, context, connection_info, instance, mountpoint,
+            cleanup_token):
+        """Connect a target volume before the migrated instance exists."""
+        with lockutils.lock(
+                _volume_topology_lock_name(instance), external=True,
+                lock_path=_volume_topology_lock_path()):
+            try:
+                self.client.instances.get(instance.name)
+            except incus_exceptions.LXDAPIException as exc:
+                if not _is_incus_not_found(exc):
+                    raise
+            else:
+                raise exception.DestinationDiskExists(path=instance.name)
+
+            profile = self.client.profiles.get(instance.name)
+            config = (
+                profile.config if isinstance(profile.config, dict) else {})
+            if (config.get('environment.product_name') != 'OpenStack Nova' or
+                    config.get('user.openstack.uuid') != instance.uuid or
+                    config.get(MIGRATION_CLEANUP_TOKEN_KEY) != cleanup_token or
+                    profile.used_by):
+                raise exception.MigrationError(
+                    reason='Refusing to stage a Cinder volume on an '
+                           'unverified Incus migration profile')
+
+            return self._attach_volume_locked(
+                context, connection_info, instance, mountpoint,
+                allow_missing_instance=True,
+                expected_migration_token=cleanup_token)
+
+    def _attach_volume_locked(
+            self, context, connection_info, instance, mountpoint,
+            disk_bus=None, device_type=None, encryption=None,
+            allow_missing_instance=False,
+            expected_migration_token=None):
         """Attach block device to a nova instance.
 
         Attaching a block device to a container requires a couple of steps.
@@ -2666,17 +8624,23 @@ class IncusDriver(driver.ComputeDriver):
             connection_info,
             self.client.host_info.get('api_extensions', []))
 
-        if encryption:
+        if (_has_encryption_marker(encryption) or
+                _has_encryption_marker(
+                    (connection_info.get('data') or {}).get('encrypted'))):
             raise exception.VolumeEncryptionNotSupported(
                 volume_type=connection_info['driver_volume_type'],
                 volume_id=_volume_id(connection_info))
 
         volume_id = _volume_id(connection_info)
-        profile = self.client.profiles.get(instance.name)
-        _validate_profile_volume_slot(profile, volume_id, mountpoint)
+        _validate_recoverable_data_volume(connection_info, volume_id)
 
-        container = self.client.instances.get(instance.name)
-        if container.status == 'Running':
+        try:
+            container = self.client.instances.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if not allow_missing_instance or not _is_incus_not_found(exc):
+                raise
+            container = None
+        if container is not None and container.status == 'Running':
             for binary in flavor.data_volume_fuse_binaries():
                 result = container.execute(['which', binary])
                 if result.exit_code != 0:
@@ -2685,15 +8649,124 @@ class IncusDriver(driver.ComputeDriver):
                                'Cinder data volumes'.format(binary))
 
         protocol = connection_info['driver_volume_type']
+        metadata_key = _volume_device_info_key(volume_id)
+
+        # Recover any prior attach/detach transaction before writing new
+        # intent. In particular, never overwrite a connected journal carrying
+        # the device_info required for safe os-brick cleanup.
+        journal = _read_volume_journal(instance, volume_id)
+        with lockutils.lock(_profile_lock_name(instance)):
+            profile = self.client.profiles.get(instance.name)
+            _validate_profile_volume_owner(profile, instance)
+            if expected_migration_token is not None:
+                config = (
+                    profile.config
+                    if isinstance(profile.config, dict) else {})
+                if (config.get('environment.product_name') !=
+                        'OpenStack Nova' or
+                        config.get('user.openstack.uuid') != instance.uuid or
+                        config.get(MIGRATION_CLEANUP_TOKEN_KEY) !=
+                        expected_migration_token or profile.used_by):
+                    raise exception.MigrationError(
+                        reason='Incus live-migration volume staging profile '
+                               'changed during attachment')
+            if _profile_has_volume_connection(profile, volume_id):
+                profile_record = _profile_volume_record(
+                    profile, volume_id,
+                    device=profile.devices.get(volume_id))
+                profile_phase = _validate_volume_recovery_record(
+                    profile_record, volume_id, mountpoint, connection_info)
+                journal_phase = (
+                    _validate_volume_recovery_record(
+                        journal, volume_id, mountpoint, connection_info)
+                    if journal is not None else None)
+                if (profile_phase == 'connected' and
+                        journal_phase != 'disconnecting' and
+                        profile.devices.get(volume_id) is not None and
+                        _profile_volume_attachment_matches(
+                            profile, volume_id, mountpoint, qos_limits,
+                            connection_info)):
+                    _remove_volume_journal(instance, volume_id)
+                    LOG.debug(
+                        'Cinder volume %(volume)s is already connected at '
+                        '%(mountpoint)s; treating attach as idempotent',
+                        {'volume': volume_id, 'mountpoint': mountpoint},
+                        instance=instance)
+                    return
+                if (profile_phase == 'disconnecting' and
+                        journal_phase not in (None, 'disconnecting')):
+                    raise exception.InvalidVolume(
+                        reason='Cinder volume %s has conflicting profile and '
+                               'host recovery phases' % volume_id)
+                recovery_record = journal or profile_record
+                phase = journal_phase or profile_phase
+            elif journal is not None:
+                recovery_record = journal
+                phase = _validate_volume_recovery_record(
+                    recovery_record, volume_id, mountpoint, connection_info)
+            else:
+                recovery_record = None
+                phase = None
+            _validate_profile_volume_slot(
+                profile, volume_id, mountpoint,
+                replacing_volume_id=volume_id)
+
+        if phase == 'disconnecting':
+            # A prior detach removed guest access but did not reach its commit
+            # point. Complete it before starting a fresh attachment.
+            self._detach_volume_locked(
+                context, connection_info, instance, mountpoint)
+            journal = None
+            recovery_record = None
+
+        if journal is None:
+            # Persist intent before os-brick mutates host state. A process
+            # crash after connect is repaired by an idempotent connect retry.
+            _write_volume_journal(
+                instance, volume_id, connection_info, {}, mountpoint,
+                phase='connecting')
+
+        with lockutils.lock(_profile_lock_name(instance)):
+            profile = self.client.profiles.get(instance.name)
+            existing_device = profile.devices.get(volume_id)
+            if existing_device is not None:
+                if (existing_device.get('type') != 'unix-block' or
+                        existing_device.get('path') != mountpoint):
+                    raise exception.InvalidVolume(
+                        reason='Existing Incus device for Cinder volume %s '
+                               'does not match the recovery request' %
+                               volume_id)
+            else:
+                _validate_profile_volume_slot(
+                    profile, volume_id, mountpoint)
+            profile.config[metadata_key] = _serialize_volume_attachment(
+                connection_info, {}, mountpoint, phase='connecting')
+            profile.config.pop(
+                _legacy_volume_device_info_key(volume_id), None)
+            profile.save(wait=True)
         storage_driver = brick_get_connector(protocol)
-        device_info = storage_driver.connect_volume(
-            connection_info['data'])
+        try:
+            device_info = storage_driver.connect_volume(
+                connection_info['data'])
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                try:
+                    self._detach_volume_locked(
+                        context, connection_info, instance, mountpoint)
+                except Exception:
+                    LOG.critical(
+                        'Retaining connecting journal for Cinder volume %s '
+                        'after os-brick connect failed ambiguously',
+                        volume_id, instance=instance, exc_info=True)
         try:
             device_path = os.path.realpath(device_info['path'])
         except (KeyError, TypeError):
+            self._retain_volume_cleanup_metadata(
+                instance, volume_id, connection_info, device_info,
+                mountpoint)
             try:
-                storage_driver.disconnect_volume(
-                    connection_info['data'], device_info)
+                self._detach_volume_locked(
+                    context, connection_info, instance, mountpoint)
             except Exception:
                 LOG.exception(
                     'Failed to roll back a volume connection without a path',
@@ -2704,44 +8777,88 @@ class IncusDriver(driver.ComputeDriver):
             _validate_block_device_path(
                 device_path, 'os-brick connector path')
         except exception.InvalidVolume:
+            self._retain_volume_cleanup_metadata(
+                instance, volume_id, connection_info, device_info,
+                mountpoint)
             try:
-                storage_driver.disconnect_volume(
-                    connection_info['data'], device_info)
+                self._detach_volume_locked(
+                    context, connection_info, instance, mountpoint)
             except Exception:
                 LOG.exception(
                     'Failed to roll back an invalid volume connection',
                     instance=instance)
             raise
-        metadata_key = _volume_device_info_key(volume_id)
+        _write_volume_journal(
+            instance, volume_id, connection_info, device_info, mountpoint,
+            phase='connected')
         try:
-            profile.devices[volume_id] = {
-                'path': mountpoint,
-                'required': 'true',
-                'source': device_path,
-                'type': 'unix-block',
-            }
-            profile.devices[volume_id].update(qos_limits)
-            profile.config[metadata_key] = _serialize_device_info(device_info)
-            profile.save(wait=True)
+            with lockutils.lock(_profile_lock_name(instance)):
+                profile = self.client.profiles.get(instance.name)
+                _validate_profile_volume_owner(profile, instance)
+                if expected_migration_token is not None:
+                    config = (
+                        profile.config
+                        if isinstance(profile.config, dict) else {})
+                    if (config.get('environment.product_name') !=
+                            'OpenStack Nova' or
+                            config.get('user.openstack.uuid') !=
+                            instance.uuid or
+                            config.get(MIGRATION_CLEANUP_TOKEN_KEY) !=
+                            expected_migration_token or profile.used_by):
+                        raise exception.MigrationError(
+                            reason='Incus live-migration volume staging '
+                                   'profile changed after host connect')
+                existing_device = profile.devices.get(volume_id)
+                if (existing_device is not None and
+                        (existing_device.get('type') != 'unix-block' or
+                         existing_device.get('path') != mountpoint)):
+                    raise exception.InvalidVolume(
+                        reason='Existing Incus device for Cinder volume %s '
+                               'does not match the final attach request' %
+                               volume_id)
+                _validate_profile_volume_slot(
+                    profile, volume_id, mountpoint,
+                    replacing_volume_id=volume_id)
+                profile.devices[volume_id] = {
+                    'path': mountpoint,
+                    'required': 'true',
+                    'source': device_path,
+                    'type': 'unix-block',
+                }
+                profile.devices[volume_id].update(qos_limits)
+                profile.config[metadata_key] = _serialize_volume_attachment(
+                    connection_info, device_info, mountpoint,
+                    phase='connected')
+                profile.save(wait=True)
+            _remove_volume_journal(instance, volume_id)
         except Exception:
             with excutils.save_and_reraise_exception():
-                if self._remove_profile_volume_reference(
-                        instance, volume_id, (metadata_key,)):
-                    storage_driver.disconnect_volume(
-                        connection_info['data'], device_info)
-                else:
-                    LOG.error(
-                        'Retaining host mapping for volume %(volume)s '
-                        'because Incus profile %(profile)s still references '
-                        'it after attach failed',
-                        {
-                            'volume': volume_id,
-                            'profile': instance.name,
-                        },
-                        instance=instance)
+                self._retain_volume_cleanup_metadata(
+                    instance, volume_id, connection_info, device_info,
+                    mountpoint)
+                try:
+                    # attach_volume() already owns the instance topology lock.
+                    self._detach_volume_locked(
+                        context, connection_info, instance, mountpoint)
+                except Exception:
+                    LOG.critical(
+                        'Retaining disconnecting journal for Cinder volume '
+                        '%s after the final Incus attach update failed',
+                        volume_id, instance=instance, exc_info=True)
 
+    @_invalidates_instance_inventory
     def detach_volume(self, context, connection_info, instance, mountpoint,
                       encryption=None):
+        with lockutils.lock(
+                _volume_topology_lock_name(instance), external=True,
+                lock_path=_volume_topology_lock_path()):
+            return self._detach_volume_locked(
+                context, connection_info, instance, mountpoint,
+                encryption=encryption)
+
+    def _detach_volume_locked(
+            self, context, connection_info, instance, mountpoint,
+            encryption=None):
         """Detach block device from a nova instance.
 
         First the volume id is deleted from the profile, and the
@@ -2751,37 +8868,185 @@ class IncusDriver(driver.ComputeDriver):
         See `nova.virt.driver.Computedriver.detach_volume` for
         more information.
         """
-        data = connection_info.get('data') or {}
-        if data.pop(_PRE_LIVE_DISCONNECTED_KEY, False):
-            # Destination pre-live cleanup already disconnected this mapping.
-            # ComputeManager intentionally calls driver_detach once more while
-            # rolling back its temporary Cinder attachment.
-            return
+        pre_live_disconnected = (connection_info.get('data') or {}).get(
+            _PRE_LIVE_DISCONNECTED_KEY, False)
+        bfv_root = (
+            mountpoint == getattr(instance, 'root_device_name', None))
+        if bfv_root:
+            # A cephext root is not an os-brick mapping. Cinder may release its
+            # attachment only after both Incus objects that can claim the RBD
+            # are gone. The profile check below covers a partially deleted
+            # instance; this check covers the inverse partial state.
+            _cinder_rbd_root({'connection_info': connection_info})
+            try:
+                self.client.instances.get(instance.name)
+            except incus_exceptions.LXDAPIException as exc:
+                if not _is_incus_not_found(exc):
+                    raise
+            else:
+                raise exception.InvalidVolume(
+                    reason='Refusing to detach an Incus BFV root while the '
+                           'instance still exists')
 
         try:
-            profile = self.client.profiles.get(instance.name)
-        except incus_exceptions.NotFound:
-            if mountpoint != getattr(instance, 'root_device_name', None):
+            with lockutils.lock(_profile_lock_name(instance)):
+                profile = self.client.profiles.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+            try:
+                volume_id = _volume_id(connection_info)
+            except exception.InvalidVolume:
+                volume_id = None
+            journal = (
+                _read_volume_journal(instance, volume_id)
+                if volume_id is not None else None)
+            if journal is not None:
+                protocol = journal.get('driver_volume_type')
+                device_info = journal.get('device_info')
+                if (not isinstance(protocol, str) or
+                        not isinstance(device_info, dict)):
+                    raise exception.InvalidVolume(
+                        reason='Host Cinder cleanup journal is incomplete')
+                effective_connection_info = copy.deepcopy(connection_info)
+                effective_connection_info['driver_volume_type'] = protocol
+                connection_data = dict(
+                    journal.get('connection_data') or {})
+                connection_data.update(
+                    effective_connection_info.get('data') or {})
+                effective_connection_info['data'] = connection_data
+                phase = _validate_volume_recovery_record(
+                    journal, volume_id, mountpoint,
+                    effective_connection_info)
+                storage_driver = brick_get_connector(protocol)
+                if phase == 'connecting':
+                    # The profile can be removed by an interrupted destroy
+                    # after os-brick connected but before device_info was
+                    # persisted. Recover the exact same connector handle from
+                    # the host journal before disconnecting it.
+                    device_info = storage_driver.connect_volume(
+                        connection_data)
+                    if (not isinstance(device_info, dict) or
+                            not device_info.get('path')):
+                        raise exception.InvalidVolume(
+                            reason='os-brick could not recover device '
+                                   'information for unfinished Cinder volume '
+                                   '%s' % volume_id)
+                    _validate_block_device_path(
+                        os.path.realpath(device_info['path']),
+                        'Recovered os-brick connector path')
+                storage_driver.disconnect_volume(
+                    connection_data, device_info)
+                _remove_volume_journal(instance, volume_id)
+                return
+            if pre_live_disconnected:
+                # ComputeManager intentionally issues a second detach after
+                # destination pre-live cleanup. Absence of both profile and
+                # journal is the durable idempotency proof.
+                return
+            if not bfv_root:
                 raise
             # Nova destroys the Incus guest and profile before detaching a
             # BFV root for Cinder reimage. The cephext root was already
             # unmounted and never used the os-brick data-volume path.
-            _cinder_rbd_root({'connection_info': connection_info})
             return
+        if bfv_root:
+            raise exception.InvalidVolume(
+                reason='Refusing to detach an Incus BFV root while its '
+                       'profile still exists')
         volume_id = _detach_volume_id(profile, connection_info, mountpoint)
         device = profile.devices.get(volume_id)
         metadata_keys = _volume_device_info_keys(volume_id)
-        encoded_device_info = {
-            key: profile.config[key]
-            for key in metadata_keys if key in profile.config
-        }
-        device_info = _profile_device_info(profile, volume_id, device)
+        has_metadata = any(
+            key in profile.config for key in metadata_keys)
+        journal = _read_volume_journal(instance, volume_id)
+        if device is None and not has_metadata and journal is None:
+            LOG.debug(
+                'Cinder volume %s is already disconnected from the Incus '
+                'profile; treating detach as idempotent',
+                volume_id, instance=instance)
+            return
+        record = (
+            journal if journal is not None else
+            _profile_volume_record(profile, volume_id, device=device))
+        device_info = record['device_info']
+        effective_connection_info = copy.deepcopy(connection_info)
+        if (not effective_connection_info.get('driver_volume_type') and
+                record.get('driver_volume_type')):
+            effective_connection_info['driver_volume_type'] = record[
+                'driver_volume_type']
+        connection_data = dict(record.get('connection_data') or {})
+        connection_data.update(
+            effective_connection_info.get('data') or {})
+        effective_connection_info['data'] = connection_data
         protocol = _detach_volume_protocol(
-            connection_info, device, device_info)
+            effective_connection_info, device, device_info)
+        effective_connection_info['driver_volume_type'] = protocol
         storage_driver = brick_get_connector(protocol)
+        phase = _validate_volume_recovery_record(
+            record, volume_id, mountpoint, effective_connection_info)
 
-        if device:
-            del profile.devices[volume_id]
+        if phase == 'connecting':
+            # The intent journal is durable before connect_volume(), but its
+            # returned device_info cannot be persisted atomically with the
+            # host mapping. Re-run the same connector request after a process
+            # crash to recover that cleanup handle. The record validation above
+            # prevents a different volume, RBD image or connector from being
+            # used to claim the unfinished mapping.
+            device_info = storage_driver.connect_volume(connection_data)
+            if (not isinstance(device_info, dict) or
+                    not device_info.get('path')):
+                raise exception.InvalidVolume(
+                    reason='os-brick could not recover device information for '
+                           'unfinished Cinder volume %s' % volume_id)
+            _validate_block_device_path(
+                os.path.realpath(device_info['path']),
+                'Recovered os-brick connector path')
+
+        # Remove guest access but keep a durable disconnecting journal until
+        # os-brick confirms that host state is gone.
+        _write_volume_journal(
+            instance, volume_id, effective_connection_info,
+            device_info or {}, mountpoint, phase='disconnecting')
+        with lockutils.lock(_profile_lock_name(instance)):
+            profile = self.client.profiles.get(instance.name)
+            profile.devices.pop(volume_id, None)
+            profile.config[_volume_device_info_key(volume_id)] = (
+                _serialize_volume_attachment(
+                    effective_connection_info, device_info or {}, mountpoint,
+                    phase='disconnecting'))
+            profile.config.pop(
+                _legacy_volume_device_info_key(volume_id), None)
+            try:
+                profile.save(wait=True)
+            except Exception:
+                try:
+                    persisted = self.client.profiles.get(instance.name)
+                except Exception:
+                    raise
+                persisted_device = (
+                    persisted.devices.get(volume_id)
+                    if isinstance(persisted.devices, dict) else None)
+                persisted_record = _profile_volume_record(
+                    persisted, volume_id, device=persisted_device)
+                if (persisted_device is not None or
+                        persisted_record.get('phase') != 'disconnecting'):
+                    raise
+                LOG.warning(
+                    'Incus reported a failed detach profile update for volume '
+                    '%(volume)s, but the disconnecting journal was persisted; '
+                    'continuing host cleanup',
+                    {'volume': volume_id},
+                    instance=instance)
+
+        storage_driver.disconnect_volume(
+            connection_data, device_info or {})
+
+        # Clearing the journal is the commit point. If this save is uncertain,
+        # retain/retry rather than telling Nova that cleanup completed.
+        with lockutils.lock(_profile_lock_name(instance)):
+            profile = self.client.profiles.get(instance.name)
+            profile.devices.pop(volume_id, None)
             for metadata_key in metadata_keys:
                 profile.config.pop(metadata_key, None)
             try:
@@ -2791,44 +9056,30 @@ class IncusDriver(driver.ComputeDriver):
                     persisted = self.client.profiles.get(instance.name)
                 except Exception:
                     raise
-                if volume_id in persisted.devices:
+                if _profile_has_volume_connection(persisted, volume_id):
                     raise
                 LOG.warning(
-                    'Incus reported a failed detach profile update for '
-                    'volume %(volume)s, but the persisted device is absent; '
-                    'continuing host disconnect',
-                    {'volume': volume_id},
-                    instance=instance)
-
-        try:
-            storage_driver.disconnect_volume(
-                connection_info.get('data') or {}, device_info)
-        except Exception:
-            if device:
-                try:
-                    profile.devices[volume_id] = device
-                    profile.config.update(encoded_device_info)
-                    profile.save(wait=True)
-                except Exception:
-                    LOG.exception(
-                        'Failed to restore the Incus volume device after a '
-                        'host disconnect failure', instance=instance)
-            raise
+                    'Incus reported a failed final detach update for volume '
+                    '%(volume)s, but its cleanup journal is absent',
+                    {'volume': volume_id}, instance=instance)
+        _remove_volume_journal(instance, volume_id)
 
     def _remove_profile_volume_reference(
             self, instance, volume_id, metadata_keys):
         """Remove a failed attach after persisted profile confirmation."""
         try:
             profile = self.client.profiles.get(instance.name)
-        except incus_exceptions.NotFound:
-            return True
+        except incus_exceptions.LXDAPIException as exc:
+            if _is_incus_not_found(exc):
+                return True
+            raise
         except Exception:
             LOG.exception(
                 'Cannot read Incus profile while rolling back volume %s',
                 volume_id, instance=instance)
             return False
 
-        if volume_id not in profile.devices:
+        if not _profile_has_volume_connection(profile, volume_id):
             return True
 
         profile.devices.pop(volume_id, None)
@@ -2839,14 +9090,100 @@ class IncusDriver(driver.ComputeDriver):
         except Exception:
             try:
                 profile = self.client.profiles.get(instance.name)
-            except incus_exceptions.NotFound:
-                return True
+            except incus_exceptions.LXDAPIException as exc:
+                if _is_incus_not_found(exc):
+                    return True
+                LOG.exception(
+                    'Cannot verify Incus profile rollback for volume %s',
+                    volume_id, instance=instance)
+                return False
             except Exception:
                 LOG.exception(
                     'Cannot verify Incus profile rollback for volume %s',
                     volume_id, instance=instance)
                 return False
-        return volume_id not in profile.devices
+        return not _profile_has_volume_connection(profile, volume_id)
+
+    def _disconnect_profile_volume_connection(
+            self, context, instance, volume_id, connection_info=None,
+            mountpoint=None):
+        """Replay one connector cleanup from its durable profile record."""
+        journal = _read_volume_journal(instance, volume_id)
+        try:
+            current = self.client.profiles.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if _is_incus_not_found(exc):
+                current = None
+            else:
+                raise
+        device = (
+            current.devices.get(volume_id)
+            if current is not None and isinstance(current.devices, dict)
+            else None)
+        if journal is not None:
+            record = journal
+        elif current is not None:
+            record = _profile_volume_record(
+                current, volume_id, device=device)
+        else:
+            raise exception.InvalidVolume(
+                reason='No durable cleanup record exists for Cinder volume %s'
+                       % volume_id)
+        mountpoint = (
+            mountpoint or record.get('mountpoint') or
+            (device or {}).get('path'))
+        effective = copy.deepcopy(connection_info or {})
+        protocol = (
+            effective.get('driver_volume_type') or
+            record.get('driver_volume_type'))
+        if not mountpoint or not protocol:
+            raise exception.InvalidVolume(
+                reason='Incus profile cleanup record for Cinder volume %s '
+                       'is incomplete' % volume_id)
+        stored_data = dict(record.get('connection_data') or {})
+        stored_data.update(effective.get('data') or {})
+        effective.update({
+            'serial': volume_id,
+            'driver_volume_type': protocol,
+            'data': stored_data,
+        })
+        if current is None:
+            device_info = record.get('device_info')
+            if not isinstance(device_info, dict):
+                raise exception.InvalidVolume(
+                    reason='Host Cinder cleanup journal for volume %s has no '
+                           'device_info' % volume_id)
+            brick_get_connector(protocol).disconnect_volume(
+                stored_data, device_info)
+            _remove_volume_journal(instance, volume_id)
+            return
+        self.detach_volume(
+            context, effective, instance, mountpoint)
+
+    def _disconnect_profile_volume_connections(self, context, instance):
+        """Retry every connector cleanup recorded in an Incus profile."""
+        journal_records = _volume_journal_records(instance)
+        try:
+            profile = self.client.profiles.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+            profile = None
+
+        failures = []
+        volume_ids = set(journal_records)
+        if profile is not None:
+            volume_ids.update(_profile_volume_ids(profile))
+        for volume_id in sorted(volume_ids):
+            try:
+                self._disconnect_profile_volume_connection(
+                    context, instance, volume_id)
+            except Exception as exc:
+                failures.append((volume_id, exc))
+                LOG.exception(
+                    'Failed to disconnect profile-recorded Cinder volume %s',
+                    volume_id, instance=instance)
+        return failures
 
     def swap_volume(self, context, old_connection_info, new_connection_info,
                     instance, mountpoint, resize_to):
@@ -2876,10 +9213,8 @@ class IncusDriver(driver.ComputeDriver):
                 reason='os-brick reported %s bytes; expected at least %s' %
                 (new_size, requested_size))
 
+    @_invalidates_instance_inventory
     def attach_interface(self, context, instance, image_meta, vif):
-        self.vif_driver.plug(instance, vif)
-        self.firewall_driver.setup_basic_filtering(instance, vif)
-
         net_device = incus_vif.get_vif_devname(vif)
         device = {
                 'nictype': 'physical',
@@ -2889,24 +9224,39 @@ class IncusDriver(driver.ComputeDriver):
                 'type': 'nic',
         }
 
-        def add_device():
-            container = self.client.instances.get(instance.name)
-            devices = dict(container.devices)
-            devices[net_device] = device
-            container.devices = devices
-            container.save(wait=True)
-
         try:
-            _retry_incus_instance_action(
-                add_device,
-                'attach interface {}'.format(vif['id']),
-                instance)
+            self.vif_driver.plug(instance, vif)
+            self.firewall_driver.setup_basic_filtering(instance, vif)
+
+            def add_device():
+                container = self.client.instances.get(instance.name)
+                devices = dict(container.devices)
+                devices[net_device] = device
+                container.devices = devices
+                container.save(wait=True)
+
+            with lockutils.lock(_profile_lock_name(instance)):
+                _retry_incus_instance_action(
+                    add_device,
+                    'attach interface {}'.format(vif['id']),
+                    instance, retry_transient=True)
         except Exception:
             with excutils.save_and_reraise_exception():
                 if self._remove_instance_device_reference(
                         instance, net_device):
-                    self.firewall_driver.unfilter_instance(instance, [vif])
-                    self.vif_driver.unplug(instance, vif)
+                    try:
+                        self.firewall_driver.unfilter_instance(
+                            instance, [vif])
+                    except Exception:
+                        LOG.exception(
+                            'Failed to roll back filtering for VIF %s',
+                            vif['id'], instance=instance)
+                    try:
+                        self.vif_driver.unplug(instance, vif)
+                    except Exception:
+                        LOG.exception(
+                            'Failed to roll back host wiring for VIF %s',
+                            vif['id'], instance=instance)
                 else:
                     LOG.error(
                         'Retaining VIF wiring for %(vif)s because Incus '
@@ -2919,35 +9269,47 @@ class IncusDriver(driver.ComputeDriver):
                         instance=instance)
 
     def _remove_instance_device_reference(self, instance, device_name):
-        try:
-            container = self.client.instances.get(instance.name)
-        except incus_exceptions.NotFound:
-            return True
-        except Exception:
-            LOG.exception(
-                'Cannot read Incus instance while rolling back device %s',
-                device_name, instance=instance)
-            return False
-
-        if device_name not in container.devices:
-            return True
-        devices = dict(container.devices)
-        devices.pop(device_name, None)
-        container.devices = devices
-        try:
-            container.save(wait=True)
-        except Exception:
+        with lockutils.lock(_profile_lock_name(instance)):
             try:
                 container = self.client.instances.get(instance.name)
-            except incus_exceptions.NotFound:
-                return True
-            except Exception:
+            except incus_exceptions.LXDAPIException as exc:
+                if _is_incus_not_found(exc):
+                    return True
                 LOG.exception(
-                    'Cannot verify Incus device rollback for %s',
+                    'Cannot read Incus instance while rolling back device %s',
                     device_name, instance=instance)
                 return False
-        return device_name not in container.devices
+            except Exception:
+                LOG.exception(
+                    'Cannot read Incus instance while rolling back device %s',
+                    device_name, instance=instance)
+                return False
 
+            if device_name not in container.devices:
+                return True
+            devices = dict(container.devices)
+            devices.pop(device_name, None)
+            container.devices = devices
+            try:
+                container.save(wait=True)
+            except Exception:
+                try:
+                    container = self.client.instances.get(instance.name)
+                except incus_exceptions.LXDAPIException as exc:
+                    if _is_incus_not_found(exc):
+                        return True
+                    LOG.exception(
+                        'Cannot verify Incus device rollback for %s',
+                        device_name, instance=instance)
+                    return False
+                except Exception:
+                    LOG.exception(
+                        'Cannot verify Incus device rollback for %s',
+                        device_name, instance=instance)
+                    return False
+            return device_name not in container.devices
+
+    @_invalidates_instance_inventory
     def detach_interface(self, context, instance, vif):
         # A Neutron vif-deleted event races with normal server deletion. The
         # destroy path owns profile and instance cleanup, so changing the
@@ -2983,63 +9345,79 @@ class IncusDriver(driver.ComputeDriver):
             _retry_incus_instance_action(
                 update,
                 'update interface {} during detach'.format(vif['id']),
-                instance)
+                instance, retry_transient=True)
 
         try:
-            container = self.client.instances.get(instance.name)
-            profile = self.client.profiles.get(instance.name)
-            profile_devname = find_device(profile.devices)
-            local_devname = find_device(container.devices)
-            if (local_devname is None and profile_devname is not None and
-                    profile_devname in container.devices):
-                local_devname = profile_devname
+            with lockutils.lock(_profile_lock_name(instance)):
+                container = self.client.instances.get(instance.name)
+                profile = self.client.profiles.get(instance.name)
+                profile_devname = find_device(profile.devices)
+                local_devname = find_device(container.devices)
+                if (local_devname is None and profile_devname is not None and
+                        profile_devname in container.devices):
+                    local_devname = profile_devname
 
-            local_device = (
-                container.devices.get(local_devname)
-                if local_devname is not None else None)
-            mask_applied = (
-                local_device is not None and
-                local_device.get('type') == 'none')
+                local_device = (
+                    copy.deepcopy(container.devices.get(local_devname))
+                    if local_devname is not None else None)
+                mask_applied = (
+                    local_device is not None and
+                    local_device.get('type') == 'none')
 
-            if profile_devname is None:
-                if local_devname is not None:
+                if profile_devname is None:
+                    if local_devname is not None:
+                        update_local_device(local_devname, None)
+                    self.vif_driver.unplug(instance, vif)
+                    return
+
+                # Mask the inherited profile NIC using an instance-local
+                # "none" device. This atomically replaces the usual same-name
+                # local override and hides the inherited profile NIC.
+                if not mask_applied:
+                    update_local_device(profile_devname, {'type': 'none'})
+
+                if (local_devname is not None and
+                        local_devname != profile_devname):
                     update_local_device(local_devname, None)
-                self.vif_driver.unplug(instance, vif)
-                return
 
-            # Mask the inherited profile NIC using an instance-local "none"
-            # device. Instance updates are rolled back by Incus if applying
-            # the device change fails, so this step is safe to retry. Apply
-            # the mask before removing a differently named local NIC. For the
-            # usual same-name override this atomically replaces the local NIC
-            # and masks the profile device in one update.
-            if not mask_applied:
-                update_local_device(profile_devname, {'type': 'none'})
+                devices = dict(profile.devices)
+                devices.pop(profile_devname)
+                profile.devices = devices
+                try:
+                    profile.save(wait=True)
+                except Exception:
+                    # Incus can return either an explicit partial-success
+                    # error or lose the response after persisting the update.
+                    # Read the authoritative profile before deciding whether
+                    # to commit the detach or restore the local overrides.
+                    saved_profile = self.client.profiles.get(instance.name)
+                    if profile_devname in saved_profile.devices:
+                        try:
+                            if (local_devname is not None and
+                                    local_devname != profile_devname and
+                                    local_device is not None):
+                                update_local_device(
+                                    local_devname, local_device)
+                            if (local_devname == profile_devname and
+                                    local_device is not None):
+                                update_local_device(
+                                    profile_devname, local_device)
+                            else:
+                                update_local_device(profile_devname, None)
+                        except Exception:
+                            LOG.critical(
+                                'Failed to restore the Incus device state '
+                                'for VIF %s after profile detach failed',
+                                vif['id'], instance=instance,
+                                exc_info=True)
+                        raise
 
-            if (local_devname is not None and
-                    local_devname != profile_devname):
-                update_local_device(local_devname, None)
-
-            devices = dict(profile.devices)
-            devices.pop(profile_devname)
-            profile.devices = devices
-            try:
-                profile.save(wait=True)
-            except incus_exceptions.LXDAPIException as exc:
-                # Incus commits profile changes before applying them to each
-                # instance. Accept this specific partial-success response only
-                # after confirming the desired profile state was persisted.
-                if not _is_incus_profile_change_saved(exc):
-                    raise
-
-                saved_profile = self.client.profiles.get(instance.name)
-                if profile_devname in saved_profile.devices:
-                    raise
-
-            # The profile no longer supplies the NIC, so remove the temporary
-            # mask. The effective instance configuration remains detached.
-            update_local_device(profile_devname, None)
-        except incus_exceptions.NotFound:
+                # The profile no longer supplies the NIC, so remove the
+                # temporary mask. The effective configuration stays detached.
+                update_local_device(profile_devname, None)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
             # This method is called when an instance get destroyed. It
             # could happen that Nova to receive an event
             # "vif-delete-event" after the instance is destroyed which
@@ -3050,9 +9428,14 @@ class IncusDriver(driver.ComputeDriver):
 
         self.vif_driver.unplug(instance, vif)
 
+    @_invalidates_instance_inventory
     def migrate_disk_and_power_off(
             self, context, instance, dest, flavor, network_info,
             block_device_info=None, timeout=0, retry_interval=0):
+        if dest == self.host:
+            raise exception.InstanceFaultRollback(
+                inner_exception=exception.UnableToMigrateToSelf(
+                    instance_id=instance.uuid, host=self.host))
         if not CONF.incus.allow_cold_migration:
             raise exception.MigrationError(
                 reason='Incus cold migration is disabled by configuration')
@@ -3083,17 +9466,78 @@ class IncusDriver(driver.ComputeDriver):
                 # still-running source instance to ERROR.
                 raise exception.InstanceFaultRollback(exc) from exc
 
+        cleanup_token = _cold_migration_cleanup_token(context, instance)
         container = self.client.instances.get(instance.name)
+        root_pool = _instance_root_pool(self.client, instance.name)
+        if root_pool.driver == 'ceph':
+            source_identity = _storage_pool_identity(root_pool)
+            required = {
+                INCUS_STORAGE_HANDOVER_EXTENSION,
+                INCUS_STORAGE_HANDOVER_PROOF_EXTENSION,
+                INCUS_STORAGE_READY_FENCE_EXTENSION,
+            }
+            missing = sorted(
+                required - set(
+                    self.client.host_info.get('api_extensions', [])))
+            if missing:
+                raise exception.MigrationError(
+                    reason='Incus source does not advertise required shared '
+                    'Ceph handover extensions: %s' % ', '.join(missing))
+            _preflight_shared_ceph_handover_destination(
+                dest, root_pool.name, source_identity)
+        with lockutils.lock(_profile_lock_name(instance)):
+            migration_profile = self.client.profiles.get(instance.name)
+            idmap_base, idmap_size = _instance_migration_idmap(
+                container, migration_profile)
+            try:
+                self._ensure_instance_idmap(
+                    instance, observed_base=idmap_base,
+                    observed_size=idmap_size)
+            except incus_idmap.IDMapError as exc:
+                # The source is still running and no migration marker has
+                # been written. Preserve Nova's pre-migration state.
+                raise exception.InstanceFaultRollback(
+                    exception.MigrationError(
+                        reason='Incus source idmap is not globally reserved: '
+                               '{}'.format(exc))) from exc
+            if migration_profile.config.get(CLEANUP_RECOVERY_KEY):
+                raise exception.MigrationError(
+                    reason='Incus source profile has unresolved cleanup work')
+            migration_profile.config[MIGRATION_DESTINATION_KEY] = (
+                _migration_address_for_host(dest))
+            migration_profile.config[MIGRATION_CLEANUP_TOKEN_KEY] = (
+                cleanup_token)
+            migration_profile.config.pop(
+                MIGRATION_CLEANUP_COMPLETE_KEY, None)
+            migration_profile.config.pop(
+                MIGRATION_ROLLBACK_COMPLETE_KEY, None)
+            migration_profile.save(wait=True)
         configdrive_payload = None
         if instance.config_drive:
             configdrive_payload = _pack_configdrive_for_migration(
                 instance, container)
-        was_running = container.status != 'Stopped'
-        if was_running:
-            container.stop(wait=True)
-
-        detached = []
+        destination_address = _migration_address_for_host(dest)
+        migration_target = _migration_client(destination_address)
         try:
+            _register_migration_attempt(
+                migration_target, instance, cleanup_token,
+                idmap_base, idmap_size)
+        except Exception:
+            with lockutils.lock(_profile_lock_name(instance)):
+                migration_profile = self.client.profiles.get(instance.name)
+                migration_profile.config.pop(
+                    MIGRATION_DESTINATION_KEY, None)
+                migration_profile.config.pop(
+                    MIGRATION_CLEANUP_TOKEN_KEY, None)
+                migration_profile.save(wait=True)
+            raise
+        was_running = container.status != 'Stopped'
+
+        detach_attempted = []
+        source_operation_id = None
+        try:
+            if was_running:
+                container.stop(wait=True)
             migration_data = container.generate_migration_data(live=False)
             # pylxd historically emitted the source profile list under the
             # non-API key ``default``. The destination profile is recreated
@@ -3102,8 +9546,18 @@ class IncusDriver(driver.ComputeDriver):
             migration_data.pop('default', None)
             migration_data['profiles'] = [instance.name]
             source = migration_data['source']
+            source_operation_id = _migration_operation_id(
+                source['operation'])
+            if source_operation_id is None:
+                raise exception.MigrationError(
+                    reason='Incus source migration returned no operation UUID')
             source['operation'] = _migration_operation_url(
                 source['operation'], migration_address)
+            with lockutils.lock(_profile_lock_name(instance)):
+                migration_profile = self.client.profiles.get(instance.name)
+                migration_profile.config[MIGRATION_OPERATION_KEY] = (
+                    source_operation_id)
+                migration_profile.save(wait=True)
 
             for bdm in driver.block_device_info_get_mapping(
                     block_device_info):
@@ -3115,26 +9569,94 @@ class IncusDriver(driver.ComputeDriver):
                 connection_info = bdm.get('connection_info')
                 mountpoint = bdm.get('mount_device')
                 if connection_info and mountpoint:
+                    # Record rollback ownership before detach. A failed detach
+                    # can already have removed guest access and persisted a
+                    # disconnecting journal, so restoring only calls that
+                    # returned successfully would leave the source with
+                    # partial I/O.
+                    detach_attempted.append(bdm)
                     self.detach_volume(
                         context, connection_info, instance, mountpoint)
-                    detached.append((connection_info, mountpoint))
-        except Exception:
-            for connection_info, mountpoint in reversed(detached):
+        except Exception as original_error:
+            rollback_failures = []
+            try:
+                attempt = _abort_migration_attempt(
+                    migration_target, instance, cleanup_token,
+                    idmap_base, idmap_size,
+                    target_cleanup=lambda: _retry_migration_finish_action(
+                        lambda: _delete_migration_target_record(
+                            migration_target, instance),
+                        'aborted cold migration target deletion', instance))
+            except Exception as attempt_error:
+                raise exception.MigrationError(
+                    reason='Cold migration preparation failed and its target '
+                           'attempt could not be fenced; the source remains '
+                           'stopped') from attempt_error
+            if attempt['state'] == 'committed':
+                raise exception.MigrationError(
+                    reason='Cold migration preparation failed after the '
+                           'target attempt committed; the source remains '
+                           'stopped for reconciliation') from original_error
+            try:
+                _settle_instance_migration_operations(
+                    self.client, instance,
+                    operation_ids=(source_operation_id,))
+            except Exception as operation_error:
+                raise exception.MigrationError(
+                    reason='Cold migration preparation failed and its Incus '
+                           'source operation could not be fenced; the source '
+                           'remains stopped') from operation_error
+            for bdm in reversed(detach_attempted):
+                connection_info = bdm['connection_info']
+                mountpoint = bdm['mount_device']
                 try:
-                    self.attach_volume(
-                        context, connection_info, instance, mountpoint)
-                except Exception:
+                    _retry_migration_finish_action(
+                        lambda connection_info=connection_info,
+                        mountpoint=mountpoint:
+                        self.attach_volume(
+                            context, connection_info, instance, mountpoint),
+                        'source data-volume rollback', instance)
+                except Exception as rollback_error:
+                    rollback_failures.append(
+                        (_volume_id(connection_info), rollback_error))
                     LOG.exception(
                         'Failed to restore a source volume after migration '
                         'preparation failed', instance=instance)
-            if was_running:
-                container.start(wait=True)
+            if rollback_failures:
+                raise exception.MigrationError(
+                    reason=(
+                        'Cold migration preparation failed and {} source '
+                        'Cinder volume connection(s) could not be restored; '
+                        'the source remains stopped to prevent partial I/O'
+                    ).format(len(rollback_failures))) from original_error
+            container.sync()
+            if was_running and container.status != 'Running':
+                _retry_migration_finish_action(
+                    lambda: self._start_instance_with_idmap(
+                        instance, container),
+                    'source restart after migration preparation failure',
+                    instance)
+            with lockutils.lock(_profile_lock_name(instance)):
+                migration_profile = self.client.profiles.get(instance.name)
+                migration_profile.config.pop(
+                    MIGRATION_DESTINATION_KEY, None)
+                migration_profile.config.pop(MIGRATION_OPERATION_KEY, None)
+                migration_profile.config.pop(
+                    MIGRATION_CLEANUP_TOKEN_KEY, None)
+                migration_profile.save(wait=True)
+            _retire_migration_attempt(
+                migration_target, instance, cleanup_token,
+                idmap_base, idmap_size)
             raise
 
         return jsonutils.dumps({
             'format': 'incus-pull-v1',
             'boot_from_volume': bool(root_bdm),
             'migration_data': migration_data,
+            'source_operation_id': source_operation_id,
+            'cleanup_token': cleanup_token,
+            'idmap_base': idmap_base,
+            'idmap_size': idmap_size,
             'was_running': was_running,
             'configdrive': configdrive_payload,
         })
@@ -3181,6 +9703,7 @@ class IncusDriver(driver.ComputeDriver):
                 if instance_snapshot is not None:
                     instance_snapshot.delete(wait=True)
 
+    @_invalidates_instance_inventory
     def pause(self, instance):
         """Pause container.
 
@@ -3190,6 +9713,7 @@ class IncusDriver(driver.ComputeDriver):
         container = self.client.instances.get(instance.name)
         container.freeze(wait=True)
 
+    @_invalidates_instance_inventory
     def unpause(self, instance):
         """Unpause container.
 
@@ -3204,12 +9728,14 @@ class IncusDriver(driver.ComputeDriver):
             'Incus freeze does not satisfy Nova suspend semantics because '
             'it does not release instance memory')
 
+    @_invalidates_instance_inventory
     def resume(self, context, instance, network_info, block_device_info=None,
                share_info=None):
         raise NotImplementedError(
             'Incus suspend and resume require a reliable container '
             'checkpoint implementation')
 
+    @_invalidates_instance_inventory
     def resume_state_on_host_boot(self, context, instance, network_info,
                                   share_info, block_device_info=None):
         """resume guest state when a host is booted."""
@@ -3223,7 +9749,9 @@ class IncusDriver(driver.ComputeDriver):
             if state in ignored_states:
                 return
 
-            self.power_on(context, instance, network_info, block_device_info)
+            self.power_on(
+                context, instance, network_info, block_device_info,
+                share_info=share_info)
         except (exception.InternalError, exception.InstanceNotFound):
             pass
 
@@ -3237,19 +9765,51 @@ class IncusDriver(driver.ComputeDriver):
         raise NotImplementedError(
             'Incus container rescue is not implemented')
 
+    @_invalidates_instance_inventory
     def power_off(self, instance, timeout=0, retry_interval=0):
         """Power off an instance
 
         See 'nova.virt.drvier.ComputeDriver.power_off` for more
         information.
         """
-        def stop():
+        def force_stop():
             container = self.client.instances.get(instance.name)
             if container.status != 'Stopped':
-                container.stop(wait=True)
+                container.stop(timeout=0, force=True, wait=True)
 
-        _retry_incus_instance_action(stop, 'power off', instance)
+        if timeout:
+            def clean_stop():
+                container = self.client.instances.get(instance.name)
+                if container.status != 'Stopped':
+                    # Incus owns the timeout and sends the guest's clean
+                    # shutdown signal once. Nova's retry_interval therefore
+                    # has no separate polling role on this backend.
+                    container.stop(
+                        timeout=timeout, force=False, wait=True)
 
+            try:
+                _retry_incus_instance_action(
+                    clean_stop, 'graceful power off', instance,
+                    retry_transient=True)
+                return
+            except incus_exceptions.LXDAPIException as exc:
+                if (
+                    _is_retryable_migration_exception(exc) or
+                    _incus_api_status_code(exc) != 400
+                ):
+                    # An exhausted busy/transport-class server error leaves
+                    # the result uncertain. Do not issue a destructive second
+                    # operation until Nova retries the action. Authorization
+                    # and server failures must also preserve their real error.
+                    raise
+                LOG.info(
+                    'Incus graceful shutdown failed; forcing power off',
+                    instance=instance, exc_info=True)
+
+        _retry_incus_instance_action(
+            force_stop, 'forced power off', instance, retry_transient=True)
+
+    @_invalidates_instance_inventory
     def power_on(self, context, instance, network_info,
                  block_device_info=None, accel_info=None, share_info=None):
         """Power on an instance
@@ -3257,15 +9817,24 @@ class IncusDriver(driver.ComputeDriver):
         See 'nova.virt.drvier.ComputeDriver.power_on` for more
         information.
         """
+        # A host restart destroys os-brick's process-local assumptions. Rebuild
+        # and prove the complete Nova Cinder topology before any guest start.
+        reconciled_container = self._reconcile_reboot_data_volumes(
+            context, instance, block_device_info)
         profile = self.client.profiles.get(instance.name)
         self._attach_share_devices(profile, instance, share_info)
 
         def start():
-            container = self.client.instances.get(instance.name)
+            nonlocal reconciled_container
+            container = reconciled_container
+            reconciled_container = None
+            if container is None:
+                container = self.client.instances.get(instance.name)
             if container.status != 'Running':
-                container.start(wait=True)
+                self._start_instance_with_idmap(instance, container)
 
-        _retry_incus_instance_action(start, 'power on', instance)
+        _retry_incus_instance_action(
+            start, 'power on', instance, retry_transient=True)
         self._reassert_vifs(instance, network_info)
 
     def _reassert_vifs(self, instance, network_info):
@@ -3273,8 +9842,11 @@ class IncusDriver(driver.ComputeDriver):
         for vif in network_info or []:
             self.vif_driver.reassert(instance, vif)
 
-    def _attach_share_devices(self, profile, instance, share_info):
+    def _attach_share_devices(
+            self, profile, instance, share_info, operation_token=None):
         changed = False
+        attached = []
+        added_device_names = []
         for share_mapping in share_info or []:
             mount_path = _share_mount_path(instance, share_mapping)
             if not os.path.ismount(mount_path):
@@ -3299,79 +9871,160 @@ class IncusDriver(driver.ComputeDriver):
             if current is None:
                 profile.devices[device_name] = expected
                 changed = True
+                added_device_names.append(device_name)
+            attached.append(share_mapping)
         if changed:
-            profile.save(wait=True)
+            try:
+                profile.save(wait=True)
+            except Exception:
+                try:
+                    persisted = self.client.profiles.get(instance.name)
+                except Exception:
+                    for device_name in added_device_names:
+                        profile.devices.pop(device_name, None)
+                    raise
+                for share_mapping in attached:
+                    device_name = _share_device_name(share_mapping)
+                    expected = profile.devices[device_name]
+                    if persisted.devices.get(device_name) != expected:
+                        for added_name in added_device_names:
+                            profile.devices.pop(added_name, None)
+                        raise
+                LOG.warning(
+                    'Incus reported a failed Manila profile update, but all '
+                    'share devices were persisted; continuing attachment',
+                    instance=instance)
+        # A pre-profile journal is no longer needed only after the matching
+        # profile device is known to be durable.
+        for share_mapping in attached:
+            owner_token = (
+                operation_token or
+                _share_mapping_owner_token(instance, share_mapping))
+            _remove_share_journal(
+                instance, share_mapping.share_id, owner_token)
+        return tuple(added_device_names)
 
+    def _attach_journaled_share_devices(
+            self, profile, instance, operation_token, expected_share_ids):
+        mappings = _journaled_share_mappings(
+            instance, operation_token,
+            expected_share_ids=expected_share_ids)
+        self._attach_share_devices(
+            profile, instance, mappings,
+            operation_token=operation_token)
+        return mappings
+
+    def _attach_cold_migration_share_devices(
+            self, profile, instance, share_mappings, operation_token):
+        if not share_mappings:
+            return
+        with lockutils.lock(_profile_lock_name(instance)):
+            profile = self.client.profiles.get(instance.name)
+            self._attach_share_devices(
+                profile, instance, share_mappings,
+                operation_token=operation_token)
+
+    def get_share_mount_table(self):
+        """Build one mount table snapshot for a manager share transaction."""
+        return _share_mount_table_index()
+
+    @_invalidates_instance_inventory
     def mount_share(self, context, instance, share_mapping):
         """Mount an approved Manila export and stage its Incus disk device."""
-        lock_name = 'incus-share-{}-{}'.format(
-            instance.uuid, share_mapping.share_id)
-        with lockutils.lock(lock_name):
+        with lockutils.lock(
+                _share_operation_lock_name(
+                    instance, share_mapping.share_id)):
             return self._mount_share_locked(
                 context, instance, share_mapping)
 
-    def _mount_share_locked(self, context, instance, share_mapping):
+    @_invalidates_instance_inventory
+    def mount_share_transaction(
+            self, context, instance, share_mapping, mount_table):
+        """Mount one member using a transaction-wide mount snapshot."""
+        with lockutils.lock(
+                _share_operation_lock_name(
+                    instance, share_mapping.share_id)):
+            return self._mount_share_locked(
+                context, instance, share_mapping,
+                mount_table=mount_table)
+
+    def _stage_share_mount_locked(
+            self, instance, share_mapping, operation_token=None,
+            mount_table=None):
+        """Mount a Manila export without requiring an Incus profile."""
         if not CONF.incus.enable_manila_shares:
             raise exception.ShareProtocolNotSupported(
                 share_proto=share_mapping.share_proto)
+        operation_token = (
+            operation_token or
+            _share_mapping_owner_token(instance, share_mapping))
+        existing = _read_share_journal(
+            instance, share_mapping, operation_token=operation_token)
+        if existing is None:
+            _write_share_journal(
+                instance, share_mapping, operation_token, 'staging')
         mount_path = _ensure_share_mount_path(instance, share_mapping)
-        mounted = os.path.ismount(mount_path)
+        real_mount_path = os.path.realpath(mount_path)
+        if mount_table is None:
+            mounted = os.path.ismount(mount_path)
+            mount_table = (
+                _share_mount_table_index() if mounted else {})
+        else:
+            mounted = real_mount_path in mount_table
+        if mounted:
+            _validate_existing_share_mount(
+                mount_path, share_mapping, mount_table=mount_table)
+            _write_share_journal(
+                instance, share_mapping, operation_token, 'mounted')
+            return mount_path, False
+
         secret_path = None
         try:
-            if not mounted:
-                options = ['-o', 'nosuid,nodev']
-                if (share_mapping.share_proto ==
-                        obj_fields.ShareMappingProto.NFS):
-                    fstype = 'nfs'
-                elif (share_mapping.share_proto ==
-                      obj_fields.ShareMappingProto.CEPHFS):
-                    if (not share_mapping.access_to or
-                            not share_mapping.access_key):
-                        raise exception.ShareMountError(
-                            share_id=share_mapping.share_id,
-                            server_id=instance.uuid,
-                            reason='CephFS credentials are missing')
-                    fstype = 'ceph'
-                    fd, secret_path = tempfile.mkstemp(
-                        prefix='.ceph-secret-',
-                        dir=os.path.dirname(mount_path))
-                    try:
-                        os.fchmod(fd, 0o600)
-                        os.write(fd, share_mapping.access_key.encode('utf-8'))
-                    finally:
-                        os.close(fd)
-                    options = [
-                        '-o',
-                        'nosuid,nodev,name=%s,secretfile=%s' %
-                        (share_mapping.access_to, secret_path),
-                    ]
-                else:
-                    raise exception.ShareProtocolNotSupported(
-                        share_proto=share_mapping.share_proto)
-                privsep_fs.mount(
-                    fstype, share_mapping.export_location,
-                    mount_path, options)
-
-            try:
-                profile = self.client.profiles.get(instance.name)
-            except incus_exceptions.LXDAPIException as exc:
-                if exc.response.status_code == 404:
-                    if not mounted and os.path.ismount(mount_path):
-                        privsep_fs.umount(mount_path)
-                    return
-                raise
-            self._attach_share_devices(profile, instance, [share_mapping])
+            options = ['rw', 'nosuid', 'nodev']
+            if (share_mapping.share_proto ==
+                    obj_fields.ShareMappingProto.NFS):
+                fstype = 'nfs'
+            elif (share_mapping.share_proto ==
+                  obj_fields.ShareMappingProto.CEPHFS):
+                if (not share_mapping.access_to or
+                        not share_mapping.access_key):
+                    raise exception.ShareMountError(
+                        share_id=share_mapping.share_id,
+                        server_id=instance.uuid,
+                        reason='CephFS credentials are missing')
+                fstype = 'ceph'
+                fd, secret_path = tempfile.mkstemp(
+                    prefix='.ceph-secret-',
+                    dir=os.path.dirname(mount_path))
+                try:
+                    os.fchmod(fd, 0o600)
+                    os.write(fd, share_mapping.access_key.encode('utf-8'))
+                finally:
+                    os.close(fd)
+                options = [
+                    'rw', 'nosuid', 'nodev',
+                    'name=%s' % share_mapping.access_to,
+                    'secretfile=%s' % secret_path,
+                ]
+            else:
+                raise exception.ShareProtocolNotSupported(
+                    share_proto=share_mapping.share_proto)
+            incus_privsep.mount(
+                fstype, share_mapping.export_location, mount_path, options,
+                CONF.incus.share_mount_timeout)
+            mount_table[real_mount_path] = {
+                'device': _normalize_share_export(
+                    share_mapping.export_location),
+                'fstype': fstype,
+                'opts': frozenset(options),
+            }
+            _write_share_journal(
+                instance, share_mapping, operation_token, 'mounted')
+            return mount_path, True
         except (exception.ShareMountError,
                 exception.ShareProtocolNotSupported):
             raise
         except Exception as exc:
-            if not mounted and os.path.ismount(mount_path):
-                try:
-                    privsep_fs.umount(mount_path)
-                except Exception:
-                    LOG.exception(
-                        'Failed to roll back Manila share mount',
-                        instance=instance)
             raise exception.ShareMountError(
                 share_id=share_mapping.share_id,
                 server_id=instance.uuid,
@@ -3383,36 +10036,234 @@ class IncusDriver(driver.ComputeDriver):
                 except FileNotFoundError:
                     pass
 
-    def umount_share(self, context, instance, share_mapping):
-        """Remove the Incus share device before unmounting the host export."""
-        lock_name = 'incus-share-{}-{}'.format(
-            instance.uuid, share_mapping.share_id)
-        with lockutils.lock(lock_name):
-            return self._umount_share_locked(
-                context, instance, share_mapping)
+    def stage_share_for_live_migration(
+            self, context, instance, share_mapping, operation_token,
+            mount_table=None):
+        """Stage a destination export before its Incus profile exists."""
+        with lockutils.lock(
+                _share_operation_lock_name(
+                    instance, share_mapping.share_id)):
+            _mount_path, mounted_now = self._stage_share_mount_locked(
+                instance, share_mapping,
+                operation_token=operation_token,
+                mount_table=mount_table)
+            return mounted_now
 
-    def _umount_share_locked(self, context, instance, share_mapping):
-        if not CONF.incus.enable_manila_shares:
-            raise exception.ShareProtocolNotSupported(
-                share_proto=share_mapping.share_proto)
+    def stage_share_for_cold_migration(
+            self, context, instance, share_mapping, operation_token,
+            mount_table=None):
+        """Stage a cold-migration destination with an exact attempt owner."""
+        with lockutils.lock(
+                _share_operation_lock_name(
+                    instance, share_mapping.share_id)):
+            _mount_path, mounted_now = self._stage_share_mount_locked(
+                instance, share_mapping,
+                operation_token=operation_token,
+                mount_table=mount_table)
+            return mounted_now
+
+    def rollback_cold_migration_preparation(
+            self, context, instance, disk_info):
+        """Fail closed around a failed manager-side cold preparation."""
+        (
+            transfer, _migration_data, cleanup_token,
+            idmap_base, idmap_size, _expected_share_ids,
+        ) = _parse_cold_migration_transfer(disk_info)
+
+        # Entering ComputeManager's base helper does not prove whether
+        # finish_migration created a target. The prepared marker is written in
+        # the initial profile create, so even a profile-only crash can now be
+        # fenced and cleaned without depending on a Manila mount journal.
+        try:
+            container = self.client.instances.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+            container = None
         try:
             profile = self.client.profiles.get(instance.name)
         except incus_exceptions.LXDAPIException as exc:
-            if exc.response.status_code == 404:
-                profile = None
-            else:
+            if not _is_incus_not_found(exc):
                 raise
+            profile = None
 
-        if profile is not None:
-            device_name = _share_device_name(share_mapping)
-            if device_name in profile.devices:
-                profile.devices.pop(device_name)
-                profile.save(wait=True)
+        if container is not None or profile is not None:
+            if container is not None:
+                if _instance_nova_uuid(container) != instance.uuid:
+                    raise exception.MigrationError(
+                        reason='Refusing to reconcile a cold migration '
+                               'target with a mismatched Nova UUID')
+            if profile is None:
+                # An instance without its durable profile has no complete
+                # transaction binding. Keep it for operator reconciliation.
+                return True
+            profile_config = (
+                profile.config
+                if isinstance(profile.config, dict) else {})
+            binding = _destination_prepared_profile_binding(profile_config)
+            if (
+                    binding['uuid'] != instance.uuid or
+                    binding['operation_token'] != cleanup_token or
+                    binding['idmap_base'] != idmap_base or
+                    binding['idmap_size'] != idmap_size
+            ):
+                raise exception.MigrationError(
+                    reason='Refusing to reconcile a cold migration profile '
+                           'outside this cleanup transaction')
+            if (
+                    container is not None and
+                    _instance_migration_receive_complete(container)
+            ):
+                try:
+                    self._mark_migration_recovery_required(
+                        instance,
+                        power_on=bool(transfer.get('was_running', True)))
+                except Exception:
+                    # A missing recovery marker is not evidence that the
+                    # target is disposable. Retaining its mount journals and
+                    # idmap is the only data-preserving outcome.
+                    LOG.critical(
+                        'Failed to mark a cold migration target for '
+                        'recovery; retaining every target resource',
+                        instance=instance, exc_info=True)
+                return True
 
+            network_info = self.network_api.get_instance_nw_info(
+                context, instance)
+            attempt = self._abort_and_cleanup_destination_profile(
+                context, instance, cleanup_token, idmap_base, idmap_size,
+                network_info)
+            # A committed attempt is never cleanup authority. The target is
+            # retained even if its local instance record is missing.
+            return True
+
+        attempt = None
+        try:
+            attempt = _abort_migration_attempt(
+                self.client, instance, cleanup_token,
+                idmap_base, idmap_size)
+        except incus_exceptions.LXDAPIException as exc:
+            # A manager retry can arrive after a previous rollback already
+            # retired the exact attempt. Journal cleanup remains idempotent.
+            if not _is_incus_not_found(exc):
+                raise
+        if attempt is not None and attempt['state'] == 'committed':
+            return True
+        if (
+                attempt is not None and
+                (
+                    attempt['state'] not in ('aborted', 'failed') or
+                    not attempt.get('finished')
+                )
+        ):
+            return True
+
+        # Do not retire the idmap reservation until every host mount owned by
+        # this token is gone. A cleanup failure deliberately leaves the
+        # aborted attempt as a retryable safety reservation.
+        _cleanup_share_journal_mounts(
+            instance, operation_token=cleanup_token)
+        if attempt is not None:
+            _retire_migration_attempt(
+                self.client, instance, cleanup_token,
+                idmap_base, idmap_size)
+        return False
+
+    def _mount_share_locked(
+            self, context, instance, share_mapping, mount_table=None):
+        owner_token = _share_mapping_owner_token(instance, share_mapping)
+        _mount_path, mounted_now = self._stage_share_mount_locked(
+            instance, share_mapping, operation_token=owner_token,
+            mount_table=mount_table)
+        try:
+            with lockutils.lock(_profile_lock_name(instance)):
+                try:
+                    profile = self.client.profiles.get(instance.name)
+                except incus_exceptions.LXDAPIException as exc:
+                    if _is_incus_not_found(exc):
+                        try:
+                            self._unstage_share_mount_locked(
+                                instance, share_mapping,
+                                operation_token=owner_token,
+                                mount_table=mount_table)
+                        except Exception:
+                            LOG.critical(
+                                'Failed to roll back a Manila mount after '
+                                'the Incus profile was not found',
+                                instance=instance, exc_info=True)
+                        raise exception.ShareMountError(
+                            share_id=share_mapping.share_id,
+                            server_id=instance.uuid,
+                            reason='Incus instance profile does not exist')
+                    raise
+                added_devices = self._attach_share_devices(
+                    profile, instance, [share_mapping],
+                    operation_token=owner_token)
+        except Exception as exc:
+            # A failed profile save is not proof that Incus rejected the
+            # update. Keep the mount and its owner journal so a retry can
+            # inspect durable profile state without exposing an absent source
+            # through a possibly committed disk device.
+            LOG.error(
+                'Retaining the Manila mount journal after profile attach '
+                'failed', instance=instance)
+            if isinstance(
+                    exc, (exception.ShareMountError,
+                          exception.ShareProtocolNotSupported)):
+                raise
+            raise exception.ShareMountError(
+                share_id=share_mapping.share_id,
+                server_id=instance.uuid,
+                reason=exc)
+        return bool(mounted_now or added_devices)
+
+    @_invalidates_instance_inventory
+    def umount_share(self, context, instance, share_mapping):
+        """Remove the Incus share device before unmounting the host export."""
+        with lockutils.lock(
+                _share_operation_lock_name(
+                    instance, share_mapping.share_id)):
+            return self._umount_share_locked(
+                context, instance, share_mapping)
+
+    @_invalidates_instance_inventory
+    def umount_share_transaction(
+            self, context, instance, share_mapping, mount_table):
+        """Unmount one member and update the shared mount snapshot."""
+        with lockutils.lock(
+                _share_operation_lock_name(
+                    instance, share_mapping.share_id)):
+            return self._umount_share_locked(
+                context, instance, share_mapping,
+                mount_table=mount_table)
+
+    def _unstage_share_mount_locked(
+            self, instance, share_mapping, operation_token=None,
+            mount_table=None):
         mount_path = _share_mount_path(instance, share_mapping)
         try:
-            if os.path.ismount(mount_path):
-                privsep_fs.umount(mount_path)
+            journal = _read_share_journal(
+                instance, share_mapping, operation_token=operation_token)
+            real_mount_path = os.path.realpath(mount_path)
+            mounted = (
+                real_mount_path in mount_table
+                if mount_table is not None else os.path.ismount(mount_path))
+            if (operation_token is not None and journal is None and mounted):
+                raise exception.ShareUmountError(
+                    share_id=share_mapping.share_id,
+                    server_id=instance.uuid,
+                    reason='host Manila mount has no matching owner journal')
+            if journal is not None:
+                _write_share_journal(
+                    instance, share_mapping,
+                    journal['operation_token'], 'unmounting')
+            if mounted:
+                _validate_existing_share_mount(
+                    mount_path, share_mapping, mount_table=mount_table)
+                incus_privsep.umount(
+                    mount_path, CONF.incus.share_unmount_timeout)
+                if mount_table is not None:
+                    mount_table.pop(real_mount_path, None)
             if os.path.isdir(mount_path):
                 os.rmdir(mount_path)
             instance_share_dir = os.path.dirname(mount_path)
@@ -3420,25 +10271,96 @@ class IncusDriver(driver.ComputeDriver):
                 try:
                     os.rmdir(instance_share_dir)
                 except OSError as exc:
-                    # Other share mappings for this instance legitimately
-                    # keep sibling directories beneath the common parent.
+                    # Sibling share mappings keep their common parent.
                     if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST):
                         raise
-            return False
+            if journal is not None:
+                _remove_share_journal(
+                    instance, share_mapping.share_id,
+                    journal['operation_token'])
+        except exception.ShareUmountError:
+            raise
         except Exception as exc:
             raise exception.ShareUmountError(
                 share_id=share_mapping.share_id,
                 server_id=instance.uuid,
                 reason=exc)
 
-    def get_available_resource(self, nodename):
-        """Aggregate all available system resources.
+    def unstage_share_for_live_migration(
+            self, context, instance, share_mapping, operation_token,
+            mount_table=None):
+        """Undo a destination-only mount without changing Nova share state."""
+        with lockutils.lock(
+                _share_operation_lock_name(
+                    instance, share_mapping.share_id)):
+            self._unstage_share_mount_locked(
+                instance, share_mapping,
+                operation_token=operation_token,
+                mount_table=mount_table)
 
-        See 'nova.virt.drvier.ComputeDriver.get_available_resource`
-        for more information.
-        """
+    def unstage_share_for_cold_migration(
+            self, context, instance, share_mapping, operation_token,
+            mount_table=None):
+        """Undo only the cold-migration mount owned by this attempt."""
+        with lockutils.lock(
+                _share_operation_lock_name(
+                    instance, share_mapping.share_id)):
+            self._unstage_share_mount_locked(
+                instance, share_mapping,
+                operation_token=operation_token,
+                mount_table=mount_table)
+
+    def _umount_share_locked(
+            self, context, instance, share_mapping, mount_table=None):
+        if not CONF.incus.enable_manila_shares:
+            raise exception.ShareProtocolNotSupported(
+                share_proto=share_mapping.share_proto)
+        owner_token = _share_mapping_owner_token(instance, share_mapping)
+        _write_share_journal(
+            instance, share_mapping, owner_token, 'unmounting')
+        with lockutils.lock(_profile_lock_name(instance)):
+            try:
+                profile = self.client.profiles.get(instance.name)
+            except incus_exceptions.LXDAPIException as exc:
+                if _is_incus_not_found(exc):
+                    profile = None
+                else:
+                    raise
+
+            if profile is not None:
+                device_name = _share_device_name(share_mapping)
+                if device_name in profile.devices:
+                    profile.devices.pop(device_name)
+                    try:
+                        profile.save(wait=True)
+                    except Exception:
+                        try:
+                            persisted = self.client.profiles.get(instance.name)
+                        except Exception:
+                            raise
+                        if device_name in persisted.devices:
+                            raise
+                        LOG.warning(
+                            'Incus reported a failed Manila detach profile '
+                            'update, but the share device is absent; '
+                            'continuing host unmount',
+                            instance=instance)
+
+        self._unstage_share_mount_locked(
+            instance, share_mapping, operation_token=owner_token,
+            mount_table=mount_table)
+        return False
+
+    def _get_host_resource_snapshot(self, nodename, use_cache=False):
+        """Collect host totals, reusing the current ResourceTracker cycle."""
+        now = time.monotonic()
+        if use_cache:
+            with self._host_resource_cache_lock:
+                cached = self._host_resource_cache.pop(nodename, None)
+            if cached and now - cached[0] <= _HOST_RESOURCE_CACHE_TTL:
+                return copy.deepcopy(cached[1])
+
         cpuinfo = _get_cpu_info()
-
         cpu_info = {
             'arch': platform.machine(),
             'features': cpuinfo.get('flags', 'unknown'),
@@ -3457,18 +10379,39 @@ class IncusDriver(driver.ComputeDriver):
                  int(cpu_topology['threads']))
 
         local_memory_info = _get_ram_usage()
-
         incus_config = self.client.host_info
-
-        # NOTE(jamespage): ZFS storage report is very Incus 2.0.x
-        #                  centric and will need to be updated
-        #                  to support Incus storage pools
         storage_driver = incus_config['environment']['storage']
+        default_storage_pool_available = True
         if CONF.incus.storage_pool:
-            local_disk_info = _placement_storage_pool_info(
-                self.client,
-                CONF.incus.storage_pool,
-                CONF.incus.shared_storage_pool_capacity_gb)
+            try:
+                default_pool = self.client.storage_pools.get(
+                    CONF.incus.storage_pool)
+                status = str(
+                    getattr(default_pool, 'status', '')).casefold()
+                if status != 'created':
+                    default_storage_pool_available = False
+                    local_disk_info = {'total': 0, 'used': 0}
+                    LOG.error(
+                        'Default Incus root storage pool %(pool)s is in '
+                        'state %(status)s; suppressing new instance '
+                        'scheduling',
+                        {'pool': CONF.incus.storage_pool,
+                         'status': getattr(default_pool, 'status', None)})
+                else:
+                    local_disk_info = _placement_storage_pool_info(
+                        self.client,
+                        CONF.incus.storage_pool,
+                        CONF.incus.shared_storage_pool_capacity_gb,
+                        pool=default_pool)
+            except (incus_exceptions.LXDAPIException,
+                    incus_exceptions.ClientConnectionFailed) as exc:
+                default_storage_pool_available = False
+                local_disk_info = {'total': 0, 'used': 0}
+                LOG.error(
+                    'Default Incus root storage pool %(pool)s cannot report '
+                    'capacity; suppressing new instance scheduling: '
+                    '%(error)s',
+                    {'pool': CONF.incus.storage_pool, 'error': exc})
         elif storage_driver == 'zfs':
             # NOTE(ajkavanagh) - BUG/1782329 - this is temporary until storage
             # pools is implemented.  Incus 3 removed the storage.zfs_pool_name
@@ -3482,6 +10425,29 @@ class IncusDriver(driver.ComputeDriver):
         else:
             local_disk_info = _get_fs_info(CONF.incus.root_dir)
 
+        snapshot = {
+            'cpu_info': cpu_info,
+            'hypervisor_version': _incus_hypervisor_version(incus_config),
+            'local_gb': local_disk_info['total'] // units.Gi,
+            'local_gb_used': local_disk_info['used'] // units.Gi,
+            'memory_mb': local_memory_info['total'] // units.Mi,
+            'memory_mb_used': local_memory_info['used'] // units.Mi,
+            'vcpus': vcpus,
+            'default_storage_pool_available':
+                default_storage_pool_available,
+        }
+        with self._host_resource_cache_lock:
+            self._host_resource_cache[nodename] = (
+                time.monotonic(), copy.deepcopy(snapshot))
+        return snapshot
+
+    def get_available_resource(self, nodename):
+        """Aggregate all available system resources.
+
+        See `nova.virt.driver.ComputeDriver.get_available_resource`
+        for more information.
+        """
+        resources = self._get_host_resource_snapshot(nodename)
         supported_instances = [
             (obj_fields.Architecture.I686, obj_fields.HVType.LXD,
              obj_fields.VMMode.EXE),
@@ -3490,15 +10456,15 @@ class IncusDriver(driver.ComputeDriver):
         ]
 
         data = {
-            'vcpus': vcpus,
-            'memory_mb': local_memory_info['total'] // units.Mi,
-            'memory_mb_used': local_memory_info['used'] // units.Mi,
-            'local_gb': local_disk_info['total'] // units.Gi,
-            'local_gb_used': local_disk_info['used'] // units.Gi,
+            'vcpus': resources['vcpus'],
+            'memory_mb': resources['memory_mb'],
+            'memory_mb_used': resources['memory_mb_used'],
+            'local_gb': resources['local_gb'],
+            'local_gb_used': resources['local_gb_used'],
             'vcpus_used': self._get_vcpus_used(),
             'hypervisor_type': obj_fields.HVType.LXD,
-            'hypervisor_version': '011',
-            'cpu_info': jsonutils.dumps(cpu_info),
+            'hypervisor_version': resources['hypervisor_version'],
+            'cpu_info': jsonutils.dumps(resources['cpu_info']),
             'hypervisor_hostname': CONF.host,
             'supported_instances': supported_instances,
             'numa_topology': None,
@@ -3510,7 +10476,7 @@ class IncusDriver(driver.ComputeDriver):
         """Return vCPUs assigned to Nova-owned Incus instance records."""
         used = 0
         try:
-            containers = self.client.instances.all()
+            containers = self._get_instance_inventory_snapshot().values()
         except Exception:
             LOG.exception('Failed to audit Incus vCPU usage')
             return 0
@@ -3568,7 +10534,8 @@ class IncusDriver(driver.ComputeDriver):
 
     def update_provider_tree(self, provider_tree, nodename, allocations=None):
         """Report Incus compute and managed rootfs capacity to Placement."""
-        resources = self.get_available_resource(nodename)
+        resources = self._get_host_resource_snapshot(
+            nodename, use_cache=True)
         current = provider_tree.data(nodename)
         ratios = self._get_allocation_ratios(current.inventory)
         inventory = {
@@ -3588,15 +10555,48 @@ class IncusDriver(driver.ComputeDriver):
                 'allocation_ratio': ratios[orc.MEMORY_MB],
                 'reserved': CONF.reserved_host_memory_mb,
             },
-            orc.DISK_GB: {
+        }
+        default_storage_pool_available = resources.get(
+            'default_storage_pool_available', True)
+        if default_storage_pool_available:
+            inventory[orc.DISK_GB] = {
                 'total': resources['local_gb'],
                 'min_unit': 1,
                 'max_unit': resources['local_gb'],
                 'step_size': 1,
                 'allocation_ratio': ratios[orc.DISK_GB],
                 'reserved': self._get_reserved_host_disk_gb_from_config(),
-            },
-        }
+            }
+        else:
+            quiesced = _quiesced_inventory(current.inventory, orc.DISK_GB)
+            if quiesced is not None:
+                inventory[orc.DISK_GB] = quiesced
+        root_pool_traits = _root_storage_pool_traits()
+        available_root_pool_traits = set(root_pool_traits)
+        root_pools = {}
+        for selector, pool_name in CONF.incus.root_storage_pools.items():
+            trait = common.root_storage_pool_trait(selector)
+            try:
+                pool = self.client.storage_pools.get(pool_name)
+            except (incus_exceptions.LXDAPIException,
+                    incus_exceptions.ClientConnectionFailed) as exc:
+                available_root_pool_traits.discard(trait)
+                LOG.error(
+                    'Configured Incus root storage selector %(selector)s '
+                    'cannot access pool %(pool)s; suppressing its Placement '
+                    'trait: %(error)s',
+                    {'selector': selector, 'pool': pool_name, 'error': exc})
+                continue
+            root_pools[selector] = pool
+            if str(getattr(pool, 'status', '')).casefold() != 'created':
+                available_root_pool_traits.discard(trait)
+                LOG.error(
+                    'Configured Incus root storage selector %(selector)s '
+                    'uses pool %(pool)s in state %(status)s; suppressing its '
+                    'Placement trait',
+                    {'selector': selector, 'pool': pool_name,
+                     'status': getattr(pool, 'status', None)})
+
         for selector, resource_class in (
                 CONF.incus.root_storage_pool_resource_classes.items()):
             pool_name = CONF.incus.root_storage_pools.get(selector)
@@ -3608,11 +10608,36 @@ class IncusDriver(driver.ComputeDriver):
                 raise exception.InvalidConfiguration(
                     'Incus root storage resource class {} must start with '
                     'CUSTOM_'.format(resource_class))
-            pool_info = _placement_storage_pool_info(
-                self.client,
-                pool_name,
-                CONF.incus.shared_root_storage_pool_capacities_gb.get(
-                    selector))
+            pool = root_pools.get(selector)
+            if pool is None or common.root_storage_pool_trait(
+                    selector) not in available_root_pool_traits:
+                quiesced = _quiesced_inventory(
+                    current.inventory, resource_class)
+                if quiesced is not None:
+                    inventory[resource_class] = quiesced
+                continue
+            try:
+                pool_info = _placement_storage_pool_info(
+                    self.client,
+                    pool_name,
+                    CONF.incus.shared_root_storage_pool_capacities_gb.get(
+                        selector),
+                    pool=pool)
+            except (incus_exceptions.LXDAPIException,
+                    incus_exceptions.ClientConnectionFailed) as exc:
+                available_root_pool_traits.discard(
+                    common.root_storage_pool_trait(selector))
+                quiesced = _quiesced_inventory(
+                    current.inventory, resource_class)
+                if quiesced is not None:
+                    inventory[resource_class] = quiesced
+                LOG.error(
+                    'Configured Incus root storage selector %(selector)s '
+                    'cannot report capacity for pool %(pool)s; preserving '
+                    'its existing inventory and suppressing its Placement '
+                    'trait: %(error)s',
+                    {'selector': selector, 'pool': pool_name, 'error': exc})
+                continue
             total_gb = pool_info['total'] // units.Gi
             if total_gb < 1:
                 raise exception.InvalidConfiguration(
@@ -3627,13 +10652,17 @@ class IncusDriver(driver.ComputeDriver):
                 'reserved': 0,
             }
         provider_tree.update_inventory(nodename, inventory)
-        traits = set(current.traits) | {INCUS_SYSTEM_CONTAINER_TRAIT}
+        traits = set(current.traits)
+        if default_storage_pool_available:
+            traits.add(INCUS_SYSTEM_CONTAINER_TRAIT)
+        else:
+            traits.discard(INCUS_SYSTEM_CONTAINER_TRAIT)
         managed_pool_traits = {
             trait for trait in traits
             if trait.startswith(common.INCUS_STORAGE_POOL_TRAIT_PREFIX)
         }
         traits.difference_update(managed_pool_traits)
-        traits.update(_root_storage_pool_traits())
+        traits.update(available_root_pool_traits)
         if CONF.incus.allow_instance_swap and _host_has_swap():
             traits.add(INCUS_SWAP_TRAIT)
         else:
@@ -3644,9 +10673,14 @@ class IncusDriver(driver.ComputeDriver):
                 traits.add(INCUS_MANILA_LIVE_MIGRATION_TRAIT)
             else:
                 traits.discard(INCUS_MANILA_LIVE_MIGRATION_TRAIT)
+            if CONF.incus.allow_cold_migration:
+                traits.add(INCUS_MANILA_COLD_MIGRATION_TRAIT)
+            else:
+                traits.discard(INCUS_MANILA_COLD_MIGRATION_TRAIT)
         else:
             traits.discard(INCUS_MANILA_SHARE_TRAIT)
             traits.discard(INCUS_MANILA_LIVE_MIGRATION_TRAIT)
+            traits.discard(INCUS_MANILA_COLD_MIGRATION_TRAIT)
         provider_tree.update_traits(nodename, traits)
 
     def refresh_instance_security_rules(self, instance):
@@ -3679,13 +10713,33 @@ class IncusDriver(driver.ComputeDriver):
                 plugged.append(vif)
         except Exception:
             with excutils.save_and_reraise_exception():
-                for vif in reversed(plugged):
-                    try:
-                        self.vif_driver.unplug(instance, vif)
-                    except Exception:
-                        LOG.exception(
-                            'Failed to roll back partially plugged VIF',
-                            instance=instance)
+                self._cleanup_vifs_best_effort(
+                    instance, reversed(plugged))
+
+    def _cleanup_vifs_best_effort(
+            self, instance, network_info, remove_firewall=False):
+        """Attempt every target VIF cleanup and report all failures."""
+        failures = []
+        for vif in list(network_info or []):
+            vif_id = vif.get('id', 'unknown')
+            try:
+                self.vif_driver.unplug(instance, vif)
+            except Exception as exc:
+                failures.append(
+                    ('unplug destination VIF %s' % vif_id, exc))
+                LOG.exception(
+                    'Failed to unplug destination VIF %s',
+                    vif_id, instance=instance)
+            if remove_firewall:
+                try:
+                    self.firewall_driver.unfilter_instance(instance, [vif])
+                except Exception as exc:
+                    failures.append(
+                        ('remove firewall filter for VIF %s' % vif_id, exc))
+                    LOG.exception(
+                        'Failed to remove firewall filter for VIF %s',
+                        vif_id, instance=instance)
+        return failures
 
     def unplug_vifs(self, instance, network_info):
         for vif in network_info:
@@ -3706,6 +10760,38 @@ class IncusDriver(driver.ComputeDriver):
     def get_available_nodes(self, refresh=False):
         return [CONF.host]
 
+    def check_instance_shared_storage_local(self, context, instance):
+        """Return the destination root identity for Nova resize rollback."""
+        try:
+            identity = _instance_storage_identity(
+                self.client, instance.name)
+            identity['instance_name'] = instance.name
+            return identity
+        except incus_exceptions.LXDAPIException as exc:
+            if _is_incus_not_found(exc):
+                return {'shared': False}
+            raise
+
+    def check_instance_shared_storage_remote(self, context, data):
+        """Require the retained source to reference the same shared pool."""
+        if not isinstance(data, dict) or not data.get('shared'):
+            return False
+        try:
+            local = _instance_storage_identity(
+                self.client, data.get('instance_name') or '')
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+            return False
+        except exception.InvalidConfiguration:
+            # Older callers do not include instance_name. The Nova contract
+            # supplies only opaque data, so include the name explicitly below.
+            return False
+        return local == {
+            key: data.get(key)
+            for key in ('shared', 'driver', 'cluster', 'source')
+        }
+
     # XXX: rockstar (5 July 2016) - The methods and code below this line
     # have not been through the cleanup process. We know the cleanup process
     # is complete when there is no more code below this comment, and the
@@ -3714,23 +10800,160 @@ class IncusDriver(driver.ComputeDriver):
     #
     # ComputeDriver implementation methods
     #
+    def _rollback_failed_finish_migration(
+            self, context, instance, network_info, configdrive_staging,
+            attempt, cleanup_token, idmap_base, idmap_size, container,
+            create_completed, profile, attached, plugged, power_on,
+            materialization):
+        """Fence or retain a failed cold-migration destination."""
+        if configdrive_staging:
+            shutil.rmtree(configdrive_staging, ignore_errors=True)
+
+        target_ownership_uncertain = False
+
+        def delete_aborted_target():
+            nonlocal container
+            self._delete_migration_target_with_idmap(
+                self.client, instance)
+            container = None
+
+        try:
+            attempt = _abort_migration_attempt(
+                self.client, instance, cleanup_token,
+                idmap_base, idmap_size,
+                target_cleanup=delete_aborted_target)
+        except Exception:
+            target_ownership_uncertain = True
+            LOG.critical(
+                'Cannot fence the destination migration attempt; '
+                'retaining every target resource',
+                instance=instance, exc_info=True)
+        else:
+            target_ownership_uncertain = attempt['state'] == 'committed'
+
+        if container is None:
+            try:
+                container = self.client.instances.get(instance.name)
+            except incus_exceptions.LXDAPIException as exc:
+                if not _is_incus_not_found(exc):
+                    target_ownership_uncertain = True
+                    LOG.exception(
+                        'Cannot determine whether the migration target '
+                        'exists after destination failure',
+                        instance=instance)
+            except Exception:
+                target_ownership_uncertain = True
+                LOG.exception(
+                    'Cannot determine whether the migration target exists '
+                    'after destination failure',
+                    instance=instance)
+
+        target_exists = container is not None
+        target_receive_complete = (
+            target_exists and (
+                create_completed or
+                _instance_migration_receive_complete(container)))
+        retain_target = (
+            target_exists or target_ownership_uncertain)
+        recovery_marked = False
+        if retain_target:
+            if target_receive_complete and profile is not None:
+                try:
+                    _retry_migration_finish_action(
+                        lambda: self._mark_migration_recovery_required(
+                            instance, power_on=power_on),
+                        'durable recovery marker', instance)
+                    recovery_marked = True
+                except Exception:
+                    LOG.exception(
+                        'Failed to mark migration target for automatic '
+                        'recovery',
+                        instance=instance)
+            LOG.error(
+                'Retaining the migration target after finish_migration '
+                'failed; receive_complete=%s. Repair the reported error '
+                'before retrying or removing the protected target',
+                target_receive_complete, instance=instance)
+
+        if not retain_target:
+            try:
+                if materialization is not None:
+                    assignment, claim = self._exact_idmap_host_claim(
+                        instance, materialization.claim)
+                    if claim is not None and claim.state != 'cleaned':
+                        if claim.state == 'unmaterialized':
+                            self._abort_idmap_materialization(
+                                materialization)
+                        else:
+                            if claim.state == 'possible':
+                                promote = (
+                                    self.
+                                    _promote_idmap_claim_if_server_committed)
+                                assignment, claim = promote(instance, claim)
+                            self._settle_idmap_host_claim(
+                                instance, claim,
+                                final_delete=(
+                                    claim.state == 'committed'))
+                # This is the only rollback transaction which may remove the
+                # profile. It replays every profile/host Cinder and Manila
+                # journal, unwires VIFs, and marks the profile for periodic
+                # recovery if any step fails.
+                self._cleanup(
+                    context, instance, network_info,
+                    block_device_info=None,
+                    destroy_vifs=plugged, delete_profile=True)
+                self._retire_instance_idmap_claim_if_clean(instance)
+            except Exception:
+                retain_target = True
+                LOG.exception(
+                    'Failed to roll back cold-migration destination '
+                    'resources; retained the cleanup profile for recovery',
+                    instance=instance)
+        if (not retain_target and attempt is not None and
+                attempt.get('finished')):
+            try:
+                _retire_migration_attempt(
+                    self.client, instance, cleanup_token,
+                    idmap_base, idmap_size)
+            except Exception:
+                LOG.exception(
+                    'Failed to retire rolled-back migration attempt',
+                    instance=instance)
+
+        # A durably marked, definitely received target can continue through
+        # Nova finish_resize; the periodic manager repairs runtime state
+        # without auto-confirming the resize.
+        return (
+            recovery_marked and
+            CONF.incus.migration_auto_recovery
+        )
+
+    @_invalidates_instance_inventory
     def finish_migration(self, context, migration, instance, disk_info,
                          network_info, image_meta, resize_instance,
                          allocations, block_device_info=None, power_on=True):
+        if (getattr(migration, 'source_compute', None) and
+                migration.source_compute ==
+                getattr(migration, 'dest_compute', None)):
+            raise exception.UnableToMigrateToSelf(
+                instance_id=instance.uuid, host=migration.dest_compute)
         if not CONF.incus.allow_cold_migration:
             raise exception.MigrationError(
                 reason='Incus cold migration is disabled by configuration')
 
+        (
+            transfer, migration_data, cleanup_token,
+            idmap_base, idmap_size, expected_share_ids,
+        ) = _parse_cold_migration_transfer(disk_info)
+        _bind_migration_instance_local_owner(migration_data, instance)
         try:
-            transfer = jsonutils.loads(disk_info)
-            if transfer.get('format') != 'incus-pull-v1':
-                raise ValueError('unsupported migration data format')
-            migration_data = transfer['migration_data']
-            migration_data.setdefault('config', {})[
-                'boot.autostart'] = 'false'
-        except (TypeError, ValueError, KeyError) as exc:
+            self._ensure_instance_idmap(
+                instance, observed_base=idmap_base,
+                observed_size=idmap_size)
+        except incus_idmap.IDMapError as exc:
             raise exception.MigrationError(
-                reason='Invalid Incus migration data: %s' % exc)
+                reason='Incus destination cannot verify the global idmap: '
+                       '{}'.format(exc)) from exc
 
         root_bdm = _boot_from_volume(block_device_info)
         if bool(root_bdm) != bool(transfer.get('boot_from_volume')):
@@ -3741,38 +10964,126 @@ class IncusDriver(driver.ComputeDriver):
         if root_bdm:
             root_volume = _require_bfv_migration_support(
                 self.client, root_bdm)
-        configdrive_staging = _prepare_configdrive_migration(
-            instance, transfer)
+            root_device = _bfv_root_device(
+                instance, root_bdm, root_volume)
+        else:
+            root_device = flavor._root(
+                instance, self.client, network_info,
+                block_device_info)['root']
+        try:
+            materialization = self._begin_idmap_materialization(
+                instance, cleanup_token, root_device,
+                observed_base=idmap_base, observed_size=idmap_size,
+                shared_migration=True)
+        except incus_idmap.IDMapError as exc:
+            raise exception.MigrationError(
+                reason='Cannot register the cold migration root '
+                       'materialization: {}'.format(exc)) from exc
+        try:
+            attempt = _register_migration_attempt(
+                self.client, instance, cleanup_token,
+                idmap_base, idmap_size)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                self._abort_idmap_materialization(materialization)
+                self._retire_instance_idmap_claim_if_clean(instance)
+        try:
+            configdrive_staging = _prepare_configdrive_migration(
+                instance, transfer)
+            journaled_shares = _journaled_share_mappings(
+                instance, cleanup_token,
+                expected_share_ids=expected_share_ids)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                attempt = _abort_migration_attempt(
+                    self.client, instance, cleanup_token,
+                    idmap_base, idmap_size)
+                if attempt['state'] != 'committed':
+                    _retire_migration_attempt(
+                        self.client, instance, cleanup_token,
+                        idmap_base, idmap_size)
+                    self._abort_idmap_materialization(materialization)
+                    self._retire_instance_idmap_claim_if_clean(instance)
 
         profile = None
         container = None
+        create_completed = False
+        target_operation_id = None
         attached = []
         plugged = False
         try:
+            # The profile is the durable cleanup owner for target-side VIFs.
+            # Create and identify it before a multi-VIF plug can partially
+            # succeed, otherwise a failed rollback has no periodic candidate.
+            profile_config = {
+                MIGRATION_CLEANUP_TOKEN_KEY: cleanup_token,
+                MIGRATION_DESTINATION_PREPARED_KEY: cleanup_token,
+                'security.idmap.base': str(idmap_base),
+                'security.idmap.size': str(idmap_size),
+            }
+            if materialization is not None:
+                profile_config.update(self._idmap_materialization_config(
+                    materialization.binding))
+            device_overrides = (
+                {'root': root_device} if root_volume else None)
+            with lockutils.lock(_profile_lock_name(instance)):
+                profile = flavor.to_profile(
+                    self.client, instance, network_info, block_device_info,
+                    config_overrides=profile_config,
+                    device_overrides=device_overrides)
+            # Test doubles and older SDK resource wrappers may not echo the
+            # create payload. Keep the local object coherent without a second
+            # API write; the durable profile was already created atomically.
+            if isinstance(profile.config, dict):
+                profile.config.update(profile_config)
+                profile.config.pop(MIGRATION_CLEANUP_COMPLETE_KEY, None)
+            if root_volume and isinstance(profile.devices, dict):
+                profile.devices['root'] = root_device
+
+            # Set this before the first plug attempt. plug_vifs() rolls back
+            # every successfully plugged VIF once, and _cleanup() performs a
+            # second per-VIF pass while retaining the profile on any failure.
+            plugged = bool(network_info)
             _retry_migration_finish_action(
                 lambda: self.plug_vifs(instance, network_info),
                 'VIF wiring', instance)
-            plugged = True
-            profile = flavor.to_profile(
-                self.client, instance, network_info, block_device_info)
-            if root_volume:
-                profile.devices['root'] = _bfv_root_device(
-                    instance, root_bdm, root_volume)
-                profile.save(wait=True)
-            container = self.client.instances.create(
-                migration_data, wait=True)
+
+            def record_target_operation(operation_id):
+                nonlocal target_operation_id
+                target_operation_id = operation_id
+                with lockutils.lock(_profile_lock_name(instance)):
+                    current = self.client.profiles.get(instance.name)
+                    current.config[MIGRATION_TARGET_OPERATION_KEY] = (
+                        operation_id)
+                    current.save(wait=True)
+
+            container, target_operation_id = (
+                self._with_rootfs_materialization_barrier(
+                    materialization,
+                    migration_data.setdefault('config', {}),
+                    lambda: _create_migration_target(
+                        self.client, migration_data, instance, cleanup_token,
+                        idmap_base, idmap_size,
+                        operation_started=record_target_operation),
+                    recover_action=lambda: _create_migration_target(
+                        self.client, migration_data, instance, cleanup_token,
+                        idmap_base, idmap_size,
+                        operation_started=record_target_operation)))
+            create_completed = True
             if configdrive_staging:
                 target_container = self.client.instances.get(instance.name)
                 configdrive_path = _commit_staged_configdrive(
                     instance, target_container, configdrive_staging)
                 configdrive_staging = None
-                profile.devices['configdrive'] = {
-                    'path': '/config-drive',
-                    'source': configdrive_path,
-                    'type': 'disk',
-                    'readonly': 'true',
-                }
-                profile.save(wait=True)
+                with lockutils.lock(_profile_lock_name(instance)):
+                    profile = self.client.profiles.get(instance.name)
+                    profile.devices['configdrive'] = {
+                        'path': '/config-drive',
+                        'source': configdrive_path,
+                        'type': 'disk',
+                        'readonly': 'true',
+                    }
+                    profile.save(wait=True)
 
             for bdm in driver.block_device_info_get_mapping(
                     block_device_info):
@@ -3788,106 +11099,213 @@ class IncusDriver(driver.ComputeDriver):
                         'data-volume attachment', instance)
                     attached.append((connection_info, mountpoint))
 
+            self._attach_cold_migration_share_devices(
+                profile, instance, journaled_shares, cleanup_token)
+
             if power_on:
                 _retry_migration_finish_action(
-                    lambda: container.start(wait=True),
+                    lambda: self._start_instance_with_idmap(
+                        instance, container),
                     'container start', instance)
         except Exception:
             with excutils.save_and_reraise_exception() as error_context:
-                if configdrive_staging:
-                    shutil.rmtree(configdrive_staging, ignore_errors=True)
-                bfv_ownership_uncertain = False
-                if root_bdm is not None and container is None:
-                    try:
-                        container = self.client.instances.get(instance.name)
-                    except incus_exceptions.LXDAPIException as exc:
-                        if exc.response.status_code != 404:
-                            bfv_ownership_uncertain = True
-                            LOG.exception(
-                                'Cannot determine whether the BFV migration '
-                                'target claimed its root volume',
-                                instance=instance)
-                    except Exception:
-                        bfv_ownership_uncertain = True
-                        LOG.exception(
-                            'Cannot determine whether the BFV migration '
-                            'target claimed its root volume',
-                            instance=instance)
+                recovered = self._rollback_failed_finish_migration(
+                    context, instance, network_info, configdrive_staging,
+                    attempt, cleanup_token, idmap_base, idmap_size,
+                    container, create_completed, profile, attached, plugged,
+                    power_on, materialization)
+                if recovered:
+                    error_context.reraise = False
 
-                for connection_info, mountpoint in reversed(attached):
-                    try:
-                        self.detach_volume(
-                            context, connection_info, instance, mountpoint)
-                    except Exception:
-                        LOG.exception(
-                            'Failed to roll back migrated volume attachment',
-                            instance=instance)
-                bfv_claimed = root_bdm is not None and container is not None
-                retain_bfv_target = bfv_claimed or bfv_ownership_uncertain
-                if retain_bfv_target:
-                    # The destination now owns the external root RBD. Retain
-                    # its Incus record, profile and VIF so Nova's destination
-                    # host remains aligned with storage ownership. Deleting
-                    # this record would strand the instance between hosts and
-                    # make a hard-reboot recovery impossible.
-                    recovery_marked = False
-                    if bfv_claimed and profile is not None:
-                        try:
-                            _retry_migration_finish_action(
-                                lambda: self._mark_migration_recovery_required(
-                                    instance, profile, power_on=power_on),
-                                'durable recovery marker', instance)
-                            recovery_marked = True
-                        except Exception:
-                            LOG.exception(
-                                'Failed to mark claimed BFV target for '
-                                'automatic recovery',
-                                instance=instance)
-                    LOG.error(
-                        'Retaining the claimed BFV migration target after '
-                        'finish_migration failed; repair the reported error '
-                        'and hard reboot the instance on this host',
-                        instance=instance)
-                    # A definite claim plus a durable marker is a valid staged
-                    # migration target. Let Nova complete finish_resize and
-                    # enter VERIFY_RESIZE so host, Cinder, Neutron and
-                    # Placement ownership remain on the target. The optional
-                    # manager repairs runtime state without auto-confirming.
-                    if recovery_marked:
-                        error_context.reraise = False
-                elif container is not None:
-                    try:
-                        container.delete(wait=True)
-                    except Exception:
-                        LOG.exception(
-                            'Failed to remove incomplete migration target',
-                            instance=instance)
-                if profile is not None and not retain_bfv_target:
-                    try:
-                        profile.delete()
-                    except Exception:
-                        LOG.exception(
-                            'Failed to remove incomplete migration profile',
-                            instance=instance)
-                if plugged and not retain_bfv_target:
-                    self.unplug_vifs(instance, network_info)
-                if not retain_bfv_target:
-                    try:
-                        _remove_instance_directory(instance)
-                    except Exception:
-                        LOG.exception(
-                            'Failed to remove migration target directory',
-                            instance=instance)
-
+    @_invalidates_instance_inventory
     def confirm_migration(self, context, migration, instance, network_info):
-        container = self.client.instances.get(instance.name)
-        if container.status != 'Stopped':
-            container.stop(wait=True)
-        container.delete(wait=True)
-        self.client.profiles.get(instance.name).delete()
-        self.unplug_vifs(instance, network_info)
-        _remove_instance_directory(instance)
+        unused_intent, unused_assignment, source_claim = (
+            self._idmap_rootfs_release_context(instance))
+        try:
+            profile = self.client.profiles.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if _is_incus_not_found(exc):
+                profile = None
+            else:
+                raise
+        try:
+            source_container = self.client.instances.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if _is_incus_not_found(exc):
+                source_container = None
+            else:
+                raise
+        if source_container is None:
+            # Source deletion is the irreversible half of shared-storage
+            # handover. A process can die before committing target ownership;
+            # converge the target (or durably queue recovery) instead of
+            # treating source absence alone as completion proof.
+            destination_address = None
+            cleanup_complete = profile is None
+            if profile is not None:
+                profile_config = (
+                    profile.config if isinstance(profile.config, dict) else {})
+                if (
+                    profile_config.get('environment.product_name') !=
+                    'OpenStack Nova' or
+                    profile_config.get('user.openstack.uuid') != instance.uuid
+                ):
+                    raise exception.MigrationError(
+                        reason='Cold migration source cleanup profile is not '
+                               'owned by the Nova instance')
+                destination_address = profile_config.get(
+                    MIGRATION_DESTINATION_KEY)
+            remote = _migration_client(
+                destination_address or
+                _migration_address_for_host(migration.dest_compute))
+            _converge_migration_target_ownership(remote, instance)
+            if profile is not None:
+                # Ownership is already decided. Finish any source os-brick,
+                # Manila, VIF and profile cleanup left by the interrupted
+                # confirm transaction.
+                try:
+                    self._cleanup(
+                        context, instance, network_info,
+                        destroy_vifs=True, delete_profile=True)
+                except Exception:
+                    LOG.critical(
+                        'Retried cold migration confirm retained source '
+                        'cleanup work for periodic repair',
+                        instance=instance, exc_info=True)
+                else:
+                    cleanup_complete = True
+            if cleanup_complete:
+                self._retire_instance_idmap_claim_if_clean(instance)
+            return
+        if profile is None:
+            raise exception.MigrationError(
+                reason='Cold migration source record and profile disagree')
 
+        cleanup_token = profile.config.get(MIGRATION_CLEANUP_TOKEN_KEY)
+        if not uuidutils.is_uuid_like(cleanup_token):
+            raise exception.MigrationError(
+                reason='Cold migration confirm has no valid attempt token')
+        idmap_base, idmap_size = _instance_migration_idmap(
+            source_container, profile)
+        destination_address = None
+        configured_address = profile.config.get(MIGRATION_DESTINATION_KEY)
+        if isinstance(configured_address, str) and configured_address:
+            destination_address = configured_address
+        if not destination_address:
+            destination_address = _migration_address_for_host(
+                migration.dest_compute)
+        operation_id = profile.config.get(MIGRATION_OPERATION_KEY)
+
+        _settle_instance_migration_operations(
+            self.client, instance, operation_ids=(operation_id,))
+        remote = _migration_client(destination_address)
+        attempt = _get_migration_attempt(
+            remote, instance, cleanup_token, idmap_base, idmap_size)
+        if attempt['state'] != 'committed' or not attempt.get('finished'):
+            raise exception.MigrationError(
+                reason='Refusing to confirm cold migration before the '
+                       'destination attempt is committed')
+
+        # The source record deletion below is irreversible. Persist the
+        # os-brick/Manila/VIF cleanup transaction first so a compute-process
+        # restart cannot strand host mappings without a periodic candidate.
+        self._mark_cleanup_recovery_required(instance)
+
+        def delete_source_record():
+            try:
+                container = self.client.instances.get(instance.name)
+            except incus_exceptions.LXDAPIException as exc:
+                if _is_incus_not_found(exc):
+                    if source_claim is not None:
+                        self._settle_idmap_host_claim(
+                            instance, source_claim, final_delete=True)
+                    return
+                raise
+            _set_storage_handover_state(
+                self.client, instance.name, 'protected',
+                container=container)
+            if container.status != 'Stopped':
+                container.stop(wait=True)
+            if source_claim is None:
+                container.delete(wait=True)
+            else:
+                self._delete_instance_with_rootfs_release_receipt(
+                    container, instance, source_claim)
+
+        _retry_migration_finish_action(
+            delete_source_record, 'confirmed source record deletion',
+            instance)
+
+        # The receiving ordinary-Ceph record stays deletion-protected until
+        # the old source record is gone. Only then may it become authoritative
+        # for a future user-requested delete.
+        destination = remote.instances.get(instance.name)
+        if _instance_nova_uuid(destination) != instance.uuid:
+            raise exception.MigrationError(
+                reason='Incus migration destination UUID does not match '
+                       'the Nova instance')
+        ownership_committed = False
+        try:
+            _retry_migration_finish_action(
+                lambda: _set_storage_handover_state(
+                    remote, instance.name, 'owned',
+                    container=destination,
+                    migration_attempt=cleanup_token,
+                    operation_uuid=attempt.get('operation_uuid')),
+                'destination shared-storage ownership commit', instance)
+            ownership_committed = True
+        except Exception as ownership_error:
+            try:
+                _mark_remote_migration_recovery(
+                    remote, instance.name,
+                    'running' if destination.status == 'Running'
+                    else 'stopped')
+            except Exception:
+                LOG.critical(
+                    'The cold migration source is gone but target ownership '
+                    'could not be committed or queued for recovery',
+                    instance=instance, exc_info=True)
+                raise exception.MigrationError(
+                    reason='Cold migration target ownership is protected but '
+                           'has no durable automatic-recovery marker') from (
+                               ownership_error)
+            LOG.critical(
+                'Cold migration target remains deletion-protected; queued '
+                'automatic ownership recovery', instance=instance,
+                exc_info=True)
+
+        if ownership_committed:
+            try:
+                _retry_migration_finish_action(
+                    lambda: _finalize_committed_migration_attempt(
+                        remote, instance, cleanup_token,
+                        idmap_base, idmap_size),
+                    'committed migration attempt retirement', instance)
+            except Exception:
+                LOG.critical(
+                    'Cold migration committed but target staging metadata '
+                    'could not be retired; queuing target recovery',
+                    instance=instance, exc_info=True)
+                _mark_remote_migration_recovery(
+                    remote, instance.name,
+                    'running' if destination.status == 'Running'
+                    else 'stopped')
+
+        # The target is now authoritative (or durably queued to become so).
+        # Source-side Cinder, VIF, filesystem and profile cleanup cannot roll
+        # that decision back, so retain a journal and let Nova finish.
+        try:
+            self._cleanup(
+                context, instance, network_info,
+                destroy_vifs=True, delete_profile=True)
+        except Exception:
+            LOG.critical(
+                'Confirmed cold migration retained source cleanup work for '
+                'periodic repair', instance=instance, exc_info=True)
+        else:
+            self._retire_instance_idmap_claim_if_clean(instance)
+
+    @_invalidates_instance_inventory
     def finish_revert_migration(self, context, instance, network_info,
                                 migration, block_device_info=None,
                                 power_on=True):
@@ -3895,6 +11313,100 @@ class IncusDriver(driver.ComputeDriver):
         root_bdm = _boot_from_volume(block_device_info)
         if root_bdm:
             _require_bfv_migration_support(self.client, root_bdm)
+        with lockutils.lock(_profile_lock_name(instance)):
+            source_profile = self.client.profiles.get(instance.name)
+            source_config = (
+                source_profile.config
+                if isinstance(source_profile.config, dict) else {})
+            cleanup_token = source_config.get(MIGRATION_CLEANUP_TOKEN_KEY)
+            destination_address = (
+                source_config.get(MIGRATION_DESTINATION_KEY) or
+                _migration_address_for_host(migration.dest_compute))
+            source_operation_id = source_config.get(MIGRATION_OPERATION_KEY)
+            rollback_complete = (
+                source_config.get(MIGRATION_ROLLBACK_COMPLETE_KEY) ==
+                cleanup_token)
+        if not uuidutils.is_uuid_like(cleanup_token):
+            raise exception.MigrationError(
+                reason='Cold migration revert has no valid cleanup token')
+        idmap_base, idmap_size = _instance_migration_idmap(
+            container, source_profile)
+
+        _settle_instance_migration_operations(
+            self.client, instance,
+            operation_ids=(source_operation_id,))
+        remote = _migration_client(destination_address)
+
+        if rollback_complete:
+            container.sync()
+            if power_on and container.status != 'Running':
+                raise exception.MigrationError(
+                    reason='Cold migration rollback completion marker exists '
+                           'but the source instance is not running')
+            try:
+                acknowledgement = remote.profiles.get(instance.name)
+            except incus_exceptions.LXDAPIException as exc:
+                if not _is_incus_not_found(exc):
+                    raise
+            else:
+                self._validate_remote_cleanup_acknowledgement(
+                    acknowledgement, instance, cleanup_token,
+                    idmap_base, idmap_size)
+                acknowledgement.delete()
+            _retire_migration_attempt(
+                remote, instance, cleanup_token,
+                idmap_base, idmap_size)
+            return
+
+        attempt = _get_migration_attempt(
+            remote, instance, cleanup_token, idmap_base, idmap_size)
+        if attempt['state'] == 'active':
+            attempt = _abort_migration_attempt(
+                remote, instance, cleanup_token, idmap_base, idmap_size,
+                target_cleanup=lambda: _retry_migration_finish_action(
+                    lambda: self._delete_migration_target_with_idmap(
+                        remote, instance),
+                    'aborted cold migration target deletion', instance))
+        elif attempt['state'] in ('aborted', 'failed'):
+            attempt = _wait_migration_attempt_finished(
+                remote, instance, cleanup_token, idmap_base, idmap_size,
+                ('aborted', 'failed'))
+        elif attempt['state'] != 'committed':
+            raise exception.MigrationError(
+                reason='Cold migration revert found unsupported target '
+                       'attempt state %s' % attempt['state'])
+
+        try:
+            remote.instances.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+        else:
+            raise exception.MigrationError(
+                reason='Cold migration destination instance still exists; '
+                       'refusing to restore the source')
+        try:
+            acknowledgement = remote.profiles.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+            acknowledgement = None
+        if acknowledgement is None:
+            if attempt['state'] == 'committed':
+                raise exception.MigrationError(
+                    reason='Committed cold migration destination has no '
+                           'positive cleanup acknowledgement')
+        else:
+            self._validate_remote_cleanup_acknowledgement(
+                acknowledgement, instance, cleanup_token,
+                idmap_base, idmap_size)
+
+        source_ownership_restored = False
+        _retry_migration_finish_action(
+            lambda: _restore_source_storage_ownership(
+                self.client, instance),
+            'reverted source shared-storage ownership', instance)
+        source_ownership_restored = True
         try:
             for bdm in driver.block_device_info_get_mapping(
                     block_device_info):
@@ -3917,27 +11429,47 @@ class IncusDriver(driver.ComputeDriver):
                 self._refresh_vifs(instance, network_info)
             if power_on and container.status != 'Running':
                 _retry_migration_finish_action(
-                    lambda: container.start(wait=True),
+                    lambda: self._start_instance_with_idmap(
+                        instance, container),
                     'revert container start', instance)
+            with lockutils.lock(_profile_lock_name(instance)):
+                profile = self.client.profiles.get(instance.name)
+                profile.config[MIGRATION_ROLLBACK_COMPLETE_KEY] = cleanup_token
+                profile.config.pop(MIGRATION_DESTINATION_KEY, None)
+                profile.config.pop(MIGRATION_OPERATION_KEY, None)
+                profile.save(wait=True)
+
+            # Delete the destination acknowledgement only after the source
+            # runtime, volumes and network are restored and durably marked.
+            if acknowledgement is not None:
+                acknowledgement = remote.profiles.get(instance.name)
+                self._validate_remote_cleanup_acknowledgement(
+                    acknowledgement, instance, cleanup_token,
+                    idmap_base, idmap_size)
+                acknowledgement.delete()
+            _retire_migration_attempt(
+                remote, instance, cleanup_token,
+                idmap_base, idmap_size)
         except Exception:
-            if root_bdm is None:
+            if not source_ownership_restored:
                 raise
-            profile = self.client.profiles.get(instance.name)
+            if not CONF.incus.migration_auto_recovery:
+                raise
             try:
                 _retry_migration_finish_action(
                     lambda: self._mark_migration_recovery_required(
-                        instance, profile, power_on=power_on),
+                        instance, power_on=power_on),
                     'revert durable recovery marker', instance)
             except Exception:
                 LOG.exception(
-                    'Failed to mark BFV revert owner for automatic recovery',
+                    'Failed to mark reverted owner for automatic recovery',
                     instance=instance)
                 raise
             # Nova has already restored Cinder, Neutron, Placement and the
             # instance host to this retained source. Preserve that completed
             # ownership decision and let the manager repair runtime state.
             LOG.error(
-                'Retaining the BFV revert owner for automatic runtime '
+                'Retaining the reverted owner for automatic runtime '
                 'recovery after finish_revert_migration failed',
                 instance=instance)
 
@@ -3948,39 +11480,98 @@ class IncusDriver(driver.ComputeDriver):
             raise exception.MigrationError(
                 reason='Missing Incus live migration destination data')
 
+        cleanup_token = _live_migration_cleanup_token(migrate_data)
+        idmap_base, idmap_size = _live_migration_idmap(migrate_data)
         config, devices = _live_migration_profile_data(migrate_data)
-        _remove_stale_live_migration_profile(self.client, instance)
-        share_sources = _live_migration_share_sources(devices)
-        for attempt in range(CONF.incus.migration_finish_retries):
-            try:
-                self.client.profiles.create(instance.name, config, devices)
-                break
-            except incus_exceptions.LXDAPIException as exc:
-                if exc.response.status_code == 409:
-                    raise exception.DestinationDiskExists(path=instance.name)
-                mount_visibility_race = (
-                    share_sources and
-                    all(os.path.ismount(path) for path in share_sources) and
-                    'recursive option is only supported for additional '
-                    'bind-mounted paths' in str(exc))
-                if (not mount_visibility_race or
-                        attempt + 1 >=
-                        CONF.incus.migration_finish_retries):
-                    raise
-                LOG.warning(
-                    'Waiting for destination Manila mounts to propagate into '
-                    'the Incus daemon namespace before creating profile '
-                    '%s (attempt %d/%d)',
-                    instance.name, attempt + 1,
-                    CONF.incus.migration_finish_retries,
-                    instance=instance)
-                eventlet.sleep(
-                    CONF.incus.migration_finish_retry_interval)
+        if (config.get('user.openstack.uuid') != instance.uuid or
+                config.get(MIGRATION_CLEANUP_TOKEN_KEY) != cleanup_token):
+            raise exception.MigrationError(
+                reason='Incus source profile UUID or cleanup token does not '
+                       'match the live migration request')
+        try:
+            profile_idmap = (
+                int(config.get('security.idmap.base')),
+                int(config.get('security.idmap.size')))
+        except (TypeError, ValueError) as exc:
+            raise exception.MigrationError(
+                reason='Incus live migration profile has no fixed idmap'
+            ) from exc
+        if profile_idmap != (idmap_base, idmap_size):
+            raise exception.MigrationError(
+                reason='Incus live migration profile idmap does not match '
+                       'the target reservation')
+        root_bdm = _boot_from_volume(block_device_info)
+        if root_bdm:
+            root_volume = _require_bfv_live_migration_support(
+                self.client, root_bdm)
+            root_device = _bfv_root_device(
+                instance, root_bdm, root_volume)
+            devices['root'] = root_device
+        else:
+            root_device = devices.get('root')
+        try:
+            materialization = self._begin_idmap_materialization(
+                instance, cleanup_token, root_device,
+                observed_base=idmap_base, observed_size=idmap_size,
+                shared_migration=True)
+        except incus_idmap.IDMapError as exc:
+            raise exception.MigrationError(
+                reason='Cannot register the live migration root '
+                       'materialization: {}'.format(exc)) from exc
+        if materialization is not None:
+            config.update(self._idmap_materialization_config(
+                materialization.binding))
+        try:
+            _register_migration_attempt(
+                self.client, instance, cleanup_token,
+                idmap_base, idmap_size)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                self._abort_idmap_materialization(materialization)
+                self._retire_instance_idmap_claim_if_clean(instance)
+        config[MIGRATION_CLEANUP_COMPLETE_KEY] = ''
+        try:
+            _remove_stale_live_migration_profile(self.client, instance)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                attempt = _abort_migration_attempt(
+                    self.client, instance, cleanup_token,
+                    idmap_base, idmap_size)
+                if attempt['state'] != 'committed':
+                    _retire_migration_attempt(
+                        self.client, instance, cleanup_token,
+                        idmap_base, idmap_size)
+                    self._abort_idmap_materialization(materialization)
+                    self._retire_instance_idmap_claim_if_clean(instance)
+
+        try:
+            _prepare_live_migration_destination_profile(
+                self.client, instance, config, devices, cleanup_token)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                attempt = _abort_migration_attempt(
+                    self.client, instance, cleanup_token,
+                    idmap_base, idmap_size)
+                if attempt['state'] != 'committed':
+                    _retire_migration_attempt(
+                        self.client, instance, cleanup_token,
+                        idmap_base, idmap_size)
+                    self._abort_idmap_materialization(materialization)
+                    self._retire_instance_idmap_claim_if_clean(instance)
 
         prepared_volumes = []
+        volume_bdms = list(driver.block_device_info_get_mapping(
+            block_device_info))
+        # Nova always invokes driver_detach for every destination BDM after a
+        # pre-live failure. Start with "nothing connected" and clear the
+        # marker only while this driver owns a live host mapping.
+        for bdm in volume_bdms:
+            connection_info = bdm.get('connection_info')
+            if connection_info:
+                connection_info.setdefault(
+                    'data', {})[_PRE_LIVE_DISCONNECTED_KEY] = True
         try:
-            for vif in network_info:
-                self.vif_driver.plug(instance, vif)
+            self.plug_vifs(instance, network_info)
             self.firewall_driver.setup_basic_filtering(
                 instance, network_info)
             self.firewall_driver.prepare_instance_filter(
@@ -3988,24 +11579,28 @@ class IncusDriver(driver.ComputeDriver):
             self.firewall_driver.apply_instance_filter(
                 instance, network_info)
 
-            for bdm in driver.block_device_info_get_mapping(
-                    block_device_info):
+            for bdm in volume_bdms:
                 if _is_boot_volume(bdm):
                     # Incus cephext claims the root during the ordered
                     # CRIU/shared-storage handover. Connecting it through
                     # os-brick here would violate single-writer ownership.
-                    _require_bfv_live_migration_support(self.client, bdm)
+                    # The root BDM was already validated before its Incus
+                    # device was added to the destination profile.
                     continue
                 connection_info = bdm.get('connection_info')
                 mountpoint = bdm.get('mount_device')
                 if connection_info and mountpoint:
-                    self.attach_volume(
-                        context, connection_info, instance, mountpoint)
-                    prepared_volumes.append((connection_info, mountpoint))
+                    self._stage_volume_for_live_migration(
+                        context, connection_info, instance, mountpoint,
+                        cleanup_token)
+                    connection_info.setdefault('data', {}).pop(
+                        _PRE_LIVE_DISCONNECTED_KEY, None)
+                    prepared_volumes.append(bdm)
         except Exception:
             with excutils.save_and_reraise_exception():
-                for connection_info, mountpoint in reversed(
-                        prepared_volumes):
+                for bdm in reversed(prepared_volumes):
+                    connection_info = bdm['connection_info']
+                    mountpoint = bdm['mount_device']
                     try:
                         self.detach_volume(
                             context, connection_info, instance, mountpoint)
@@ -4014,33 +11609,189 @@ class IncusDriver(driver.ComputeDriver):
                             'Failed to roll back a destination Cinder '
                             'connection during pre-live migration',
                             instance=instance)
-                    finally:
+                    else:
                         connection_info.setdefault(
                             'data', {})[_PRE_LIVE_DISCONNECTED_KEY] = True
-                # attach_volume rolls back its own partially connected device.
-                # Mark every remaining destination BDM so Nova's mandatory
-                # second driver_detach is idempotent too.
-                for bdm in driver.block_device_info_get_mapping(
-                        block_device_info):
-                    connection_info = bdm.get('connection_info')
-                    if connection_info:
-                        connection_info.setdefault(
-                            'data', {})[_PRE_LIVE_DISCONNECTED_KEY] = True
+
+                cleanup_complete = False
                 try:
-                    self.client.profiles.get(instance.name).delete()
-                except incus_exceptions.NotFound:
-                    pass
-                try:
-                    self.unplug_vifs(instance, network_info)
-                    self.firewall_driver.unfilter_instance(
-                        instance, network_info)
+                    # The profile was created before any target-side VIF,
+                    # volume or Manila resource. Reuse the durable cleanup
+                    # transaction so every VIF is retried independently and
+                    # any residual host resource retains a periodic-recovery
+                    # owner instead of being orphaned.
+                    self._cleanup(
+                        context, instance, network_info,
+                        block_device_info=None, destroy_vifs=True,
+                        delete_profile=True)
+                    cleanup_complete = True
                 except Exception:
                     LOG.exception(
-                        'Failed to roll back destination networking during '
-                        'pre-live migration', instance=instance)
+                        'Failed to roll back pre-live migration destination '
+                        'resources; retained the cleanup profile for recovery',
+                        instance=instance)
+
+                # attach_volume normally rolls back its own partial work. If
+                # it retained device_info after an uncertain disconnect,
+                # leave the marker clear so Nova's mandatory second detach
+                # retries it instead of silently leaking a host mapping.
+                profile = None
+                if not cleanup_complete:
+                    try:
+                        profile = self.client.profiles.get(instance.name)
+                    except incus_exceptions.LXDAPIException as exc:
+                        if not _is_incus_not_found(exc):
+                            raise
+                if profile is not None:
+                    for bdm in volume_bdms:
+                        if _is_boot_volume(bdm):
+                            continue
+                        connection_info = bdm.get('connection_info')
+                        if not connection_info:
+                            continue
+                        volume_id = _volume_id(connection_info)
+                        if _profile_has_volume_connection(profile, volume_id):
+                            connection_info.setdefault('data', {}).pop(
+                                _PRE_LIVE_DISCONNECTED_KEY, None)
+                attempt = _abort_migration_attempt(
+                    self.client, instance, cleanup_token,
+                    idmap_base, idmap_size)
+                if (
+                    cleanup_complete and
+                    attempt['state'] != 'committed'
+                ):
+                    _retire_migration_attempt(
+                        self.client, instance, cleanup_token,
+                        idmap_base, idmap_size)
+                    self._abort_idmap_materialization(materialization)
+                    self._retire_instance_idmap_claim_if_clean(instance)
 
         return migrate_data
 
+    def _abort_pre_live_migration_preparation(
+            self, instance, migrate_data):
+        """Clean a pre-receive target without requiring an ACK profile."""
+        cleanup_token = _live_migration_cleanup_token(migrate_data)
+        idmap_base, idmap_size = _live_migration_idmap(migrate_data)
+        attempt = None
+        try:
+            attempt = _abort_migration_attempt(
+                self.client, instance, cleanup_token,
+                idmap_base, idmap_size,
+                target_cleanup=lambda: _retry_migration_finish_action(
+                    lambda: _delete_migration_target_record(
+                        self.client, instance),
+                    'aborted live migration pre-stage target deletion',
+                    instance))
+        except incus_exceptions.LXDAPIException as exc:
+            # Manila staging precedes driver.pre_live_migration(), so the
+            # attempt legitimately does not exist when the first mount fails.
+            if not _is_incus_not_found(exc):
+                raise
+        if attempt is not None and attempt['state'] == 'committed':
+            raise exception.MigrationError(
+                reason='Refusing pre-live cleanup after the target attempt '
+                       'committed')
+
+        _cleanup_share_journal_mounts(
+            instance, operation_token=cleanup_token)
+        if attempt is not None:
+            _retire_migration_attempt(
+                self.client, instance, cleanup_token,
+                idmap_base, idmap_size)
+        self._retire_instance_idmap_claim_if_clean(instance)
+        return True
+
+    def cleanup_pre_live_migration_destination(
+            self, context, instance, migrate_data=None):
+        """Remove an unused profile after Nova's second detach pass."""
+        try:
+            self.client.instances.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+        else:
+            return False
+
+        profile = None
+        with lockutils.lock(_profile_lock_name(instance)):
+            try:
+                profile = self.client.profiles.get(instance.name)
+            except incus_exceptions.LXDAPIException as exc:
+                if not _is_incus_not_found(exc):
+                    raise
+            if profile is not None:
+                profile_config = (
+                    profile.config
+                    if isinstance(profile.config, dict) else {})
+                if (profile_config.get('environment.product_name') !=
+                        'OpenStack Nova' or
+                        profile_config.get('user.openstack.uuid') !=
+                        instance.uuid or profile.used_by):
+                    raise exception.DestinationDiskExists(path=instance.name)
+                cleanup_token = profile_config.get(
+                    MIGRATION_CLEANUP_TOKEN_KEY)
+                try:
+                    idmap_base = int(
+                        profile_config.get('security.idmap.base'))
+                    idmap_size = int(
+                        profile_config.get('security.idmap.size'))
+                except (TypeError, ValueError) as exc:
+                    raise exception.MigrationError(
+                        reason='Failed pre-live profile has no fixed idmap'
+                    ) from exc
+                if migrate_data is not None:
+                    expected_token = _live_migration_cleanup_token(
+                        migrate_data)
+                    expected_idmap = _live_migration_idmap(migrate_data)
+                    if (
+                            cleanup_token != expected_token or
+                            (idmap_base, idmap_size) != expected_idmap):
+                        raise exception.MigrationError(
+                            reason='Failed pre-live profile does not match '
+                                   'the migration cleanup transaction')
+        if profile is None:
+            if migrate_data is not None:
+                return self._abort_pre_live_migration_preparation(
+                    instance, migrate_data)
+            return False
+        attempt = _abort_migration_attempt(
+            self.client, instance, cleanup_token,
+            idmap_base, idmap_size)
+        if attempt['state'] == 'committed':
+            raise exception.MigrationError(
+                reason='Refusing pre-live cleanup after the target attempt '
+                       'committed')
+        try:
+            network_info = self.network_api.get_instance_nw_info(
+                context, instance)
+        except Exception:
+            LOG.exception(
+                'Failed to read destination VIFs for pre-live migration '
+                'cleanup; retained the cleanup profile for recovery',
+                instance=instance)
+            self._mark_cleanup_recovery_required(instance)
+            return False
+
+        try:
+            self._cleanup(
+                context, instance, network_info,
+                block_device_info=None, destroy_vifs=True,
+                delete_profile=True)
+        except Exception:
+            LOG.exception(
+                'Failed to retry pre-live migration destination cleanup; '
+                'retained the cleanup profile for recovery',
+                instance=instance)
+            return False
+
+        _retire_migration_attempt(
+            self.client, instance, cleanup_token,
+            idmap_base, idmap_size)
+        self._retire_instance_idmap_claim_if_clean(instance)
+        return True
+
+    @_invalidates_instance_inventory
     def live_migration(self, context, instance, dest,
                        post_method, recover_method, block_migration=False,
                        migrate_data=None):
@@ -4052,24 +11803,75 @@ class IncusDriver(driver.ComputeDriver):
             raise exception.MigrationError(
                 reason='Incus CRIU block migration is not supported')
 
+        cleanup_token = _live_migration_cleanup_token(migrate_data)
+        idmap_base, idmap_size = _live_migration_idmap(migrate_data)
         remote = None
         container = self.client.instances.get(instance.name)
+        source_operation_id = None
+        destination_operation_id = None
+        destination_materialization = None
         try:
             remote = _migration_client(migrate_data.destination_address)
             try:
-                remote.profiles.get(instance.name)
-            except incus_exceptions.NotFound:
-                profile = self.client.profiles.get(instance.name)
-                remote.profiles.create(
-                    instance.name,
-                    _stateful_migration_profile_config(container, profile),
-                    copy.deepcopy(profile.devices))
+                destination_profile = remote.profiles.get(instance.name)
+            except incus_exceptions.LXDAPIException as exc:
+                if _is_incus_not_found(exc):
+                    raise exception.MigrationError(
+                        reason='Incus live migration destination profile is '
+                               'missing; pre_live_migration did not complete'
+                    ) from exc
+                raise
+            profile_config = (
+                destination_profile.config
+                if isinstance(destination_profile.config, dict) else {})
+            if (profile_config.get('environment.product_name') !=
+                    'OpenStack Nova' or destination_profile.used_by):
+                raise exception.MigrationError(
+                    reason='Incus live migration destination profile is not '
+                           'an unused OpenStack Nova staging profile')
+            unused_assignment, destination_claim = (
+                self._idmap_claim_from_local_config(
+                    instance, profile_config))
+            if (destination_claim is not None and
+                    destination_claim.materialization_id != cleanup_token):
+                raise exception.MigrationError(
+                    reason='Incus live migration destination profile has a '
+                           'different materialization token')
+            destination_root = (
+                destination_profile.devices.get('root')
+                if isinstance(destination_profile.devices, dict) else None)
+            destination_materialization = self._resume_idmap_materialization(
+                remote, instance, cleanup_token,
+                destination_claim.host_id, destination_root,
+                idmap_base, idmap_size)
+            unused_source_assignment, source_claim = (
+                self._instance_local_idmap_claim(instance, container))
+            if (source_claim is not None and destination_claim is not None and
+                    source_claim.materialization_id ==
+                    destination_claim.materialization_id):
+                raise exception.MigrationError(
+                    reason='Incus live migration source and destination must '
+                           'use distinct materialization tokens')
 
             migration_data = container.generate_migration_data(live=True)
             migration_data.pop('default', None)
             migration_data['profiles'] = [instance.name]
+            _bind_migration_instance_local_owner(
+                migration_data, instance)
 
             source = migration_data['source']
+            source_operation_id = _migration_operation_id(
+                source['operation'])
+            if source_operation_id is None:
+                raise exception.MigrationError(
+                    reason='Incus live migration returned no source '
+                           'operation UUID')
+            migrate_data.source_operation_id = source_operation_id
+            with lockutils.lock(_profile_lock_name(instance)):
+                source_profile = self.client.profiles.get(instance.name)
+                source_profile.config[MIGRATION_OPERATION_KEY] = (
+                    source_operation_id)
+                source_profile.save(wait=True)
             # pylxd starts the source operation in live mode but does not
             # propagate that mode into the target InstanceSource payload.
             # Without this flag the target opens only the cold-migration
@@ -4077,8 +11879,94 @@ class IncusDriver(driver.ComputeDriver):
             source['live'] = True
             source['operation'] = _migration_operation_url(
                 source['operation'], CONF.incus.migration_address)
-            remote.instances.create(migration_data, wait=True)
-        except Exception:
+
+            def record_target_operation(operation_id):
+                nonlocal destination_operation_id
+                destination_operation_id = operation_id
+                migrate_data.destination_operation_id = operation_id
+                with lockutils.lock(_profile_lock_name(instance)):
+                    target_profile = remote.profiles.get(instance.name)
+                    config = (
+                        target_profile.config
+                        if isinstance(target_profile.config, dict) else {})
+                    if (config.get(MIGRATION_CLEANUP_TOKEN_KEY) !=
+                            _live_migration_cleanup_token(migrate_data)):
+                        raise exception.MigrationError(
+                            reason='Incus migration target operation profile '
+                                   'token does not match')
+                    target_profile.config[MIGRATION_TARGET_OPERATION_KEY] = (
+                        operation_id)
+                    target_profile.save(wait=True)
+
+            self._with_rootfs_materialization_barrier(
+                destination_materialization,
+                migration_data.setdefault('config', {}),
+                lambda: _create_migration_target(
+                    remote, migration_data, instance, cleanup_token,
+                    idmap_base, idmap_size,
+                    operation_started=record_target_operation),
+                recover_action=lambda: _create_migration_target(
+                    remote, migration_data, instance, cleanup_token,
+                    idmap_base, idmap_size,
+                    operation_started=record_target_operation))
+        except Exception as migration_error:
+            settlement_failures = []
+            target_attempt = None
+            if remote is not None:
+                def delete_failed_target():
+                    self._delete_migration_target_with_idmap(
+                        remote, instance)
+
+                try:
+                    target_attempt = _abort_migration_attempt(
+                        remote, instance, cleanup_token,
+                        idmap_base, idmap_size,
+                        target_cleanup=lambda: (
+                            _retry_migration_finish_action(
+                                delete_failed_target,
+                                'aborted live migration target deletion',
+                                instance)))
+                except Exception as exc:
+                    settlement_failures.append(exc)
+                    LOG.critical(
+                        'Failed to fence the Incus live migration target '
+                        'attempt', instance=instance, exc_info=True)
+            if (target_attempt is not None and
+                    target_attempt['state'] == 'committed'):
+                _migration_attempt_instance(remote, instance)
+                LOG.warning(
+                    'Recovered a committed live migration after its client '
+                    'response path failed', instance=instance,
+                    exc_info=migration_error)
+                post_method(
+                    context, instance, dest, block_migration, migrate_data)
+                return
+            try:
+                _settle_instance_migration_operations(
+                    self.client, instance,
+                    operation_ids=(source_operation_id,))
+            except Exception as exc:
+                settlement_failures.append(exc)
+                LOG.critical(
+                    'Failed to fence the Incus live migration source '
+                    'operation', instance=instance, exc_info=True)
+            if settlement_failures:
+                # Calling Nova's recovery callback before both asynchronous
+                # operations are terminal can materialize a late target after
+                # the source resumes. Fail closed and require periodic/operator
+                # recovery instead.
+                try:
+                    container.sync()
+                    if container.status != 'Stopped':
+                        container.stop(timeout=-1, force=True, wait=True)
+                except Exception:
+                    LOG.critical(
+                        'Failed to stop the ambiguous live migration source',
+                        instance=instance, exc_info=True)
+                raise exception.MigrationError(
+                    reason='Incus live migration failed and its asynchronous '
+                           'operations could not be fenced'
+                ) from migration_error
             # Nova owns rollback ordering. The target profile contains the
             # os-brick device_info required to disconnect destination volume
             # mappings before destination VIF and Manila cleanup.
@@ -4088,9 +11976,39 @@ class IncusDriver(driver.ComputeDriver):
         post_method(
             context, instance, dest, block_migration, migrate_data)
 
+    @_invalidates_instance_inventory
     def post_live_migration(self, context, instance, block_device_info,
                             migrate_data=None):
         container = self.client.instances.get(instance.name)
+        unused_assignment, source_claim = self._instance_local_idmap_claim(
+            instance, container)
+        destination_address = _live_migration_destination_address(
+            migrate_data)
+        if not destination_address:
+            raise exception.MigrationError(
+                reason='Missing live migration destination address')
+        cleanup_token = _live_migration_cleanup_token(migrate_data)
+        idmap_base, idmap_size = _live_migration_idmap(migrate_data)
+        remote = _migration_client(destination_address)
+        attempt = _get_migration_attempt(
+            remote, instance, cleanup_token, idmap_base, idmap_size)
+        if attempt['state'] != 'committed' or not attempt.get('finished'):
+            raise exception.MigrationError(
+                reason='Refusing live migration source deletion before the '
+                       'destination attempt is committed')
+        # The source record deletion below is irreversible. Persist the
+        # source host cleanup transaction before changing shared-root
+        # ownership so os-brick and Manila journals remain discoverable after
+        # a compute-process restart.
+        self._mark_cleanup_recovery_required(instance)
+        # Protect the source record before deleting it. The destination stays
+        # protected by Incus until this source record is gone, so there is
+        # never a point at which both records can delete the shared RBD.
+        _retry_migration_finish_action(
+            lambda: _set_storage_handover_state(
+                self.client, instance.name, 'protected',
+                container=container),
+            'source shared-storage delete protection', instance)
         if container.status != 'Stopped':
             # Incus may keep the source record in Running state briefly after
             # CRIU has restored the target. Match `incus delete --force`:
@@ -4106,7 +12024,53 @@ class IncusDriver(driver.ComputeDriver):
                 LOG.debug(
                     'Source instance stopped before live-migration cleanup',
                     instance=instance)
-        container.delete(wait=True)
+        if source_claim is None:
+            container.delete(wait=True)
+        else:
+            self._delete_instance_with_rootfs_release_receipt(
+                container, instance, source_claim)
+
+        ownership_committed = False
+        try:
+            _retry_migration_finish_action(
+                lambda: _set_storage_handover_state(
+                    remote, instance.name, 'owned',
+                    migration_attempt=cleanup_token,
+                    operation_uuid=attempt.get('operation_uuid')),
+                'destination shared-storage ownership commit', instance)
+            ownership_committed = True
+        except Exception:
+            # The target remains runnable but deletion-protected. Leave a
+            # durable marker so its compute service can retry ownership
+            # without turning an otherwise completed migration into a
+            # source/target split-brain rollback.
+            LOG.critical(
+                'Live migration target remains shared-storage '
+                'deletion-protected; queuing automatic recovery',
+                instance=instance, exc_info=True)
+            try:
+                _mark_remote_migration_recovery(
+                    remote, instance.name, 'running')
+            except Exception:
+                LOG.critical(
+                    'Failed to queue ownership recovery for a protected '
+                    'live migration target; operator repair is required',
+                    instance=instance, exc_info=True)
+
+        if ownership_committed:
+            try:
+                _retry_migration_finish_action(
+                    lambda: _finalize_committed_migration_attempt(
+                        remote, instance, cleanup_token,
+                        idmap_base, idmap_size),
+                    'committed live migration attempt retirement', instance)
+            except Exception:
+                LOG.critical(
+                    'Live migration committed but target staging metadata '
+                    'could not be retired; queuing target recovery',
+                    instance=instance, exc_info=True)
+                _mark_remote_migration_recovery(
+                    remote, instance.name, 'running')
 
         # Cinder removes the source attachment record after this hook, but
         # os-brick host mappings are owned by the virt driver. Disconnect
@@ -4133,14 +12097,47 @@ class IncusDriver(driver.ComputeDriver):
                     'disconnect failed for volume %s',
                     _volume_id(connection_info), instance=instance)
 
+    @_invalidates_instance_inventory
     def post_live_migration_at_source(self, context, instance, network_info):
-        profile = self.client.profiles.get(instance.name)
-        _cleanup_profile_share_mounts(profile, instance)
+        failures = []
+        try:
+            profile = self.client.profiles.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if _is_incus_not_found(exc):
+                profile = None
+            else:
+                raise
+        try:
+            if profile is not None:
+                with lockutils.lock(_profile_lock_name(instance)):
+                    _cleanup_profile_share_mounts(profile, instance)
+        except Exception as exc:
+            failures.append(exc)
+            LOG.exception(
+                'Failed to clean source Manila mounts after live migration',
+                instance=instance)
         # cleanup() deletes the profile only after all os-brick connection
         # metadata has been removed. A failed source disconnect must retain
         # that metadata for deterministic operator or periodic repair.
-        self.cleanup(context, instance, network_info)
+        try:
+            self._cleanup(
+                context, instance, network_info,
+                delete_profile=not failures)
+        except Exception as exc:
+            failures.append(exc)
+        if not failures:
+            self._retire_instance_idmap_claim_if_clean(instance)
+        if failures:
+            # The workload is already authoritative on the destination.
+            # Raising here can prevent Nova from completing Cinder and
+            # Neutron bookkeeping but cannot roll the migration back. The
+            # retained profile is the durable retry journal.
+            LOG.critical(
+                '%d live migration source cleanup operation(s) failed; '
+                'retained the profile for periodic or operator retry',
+                len(failures), instance=instance)
 
+    @_invalidates_instance_inventory
     def post_live_migration_at_destination(
             self, context, instance, network_info, block_migration=False,
             block_device_info=None):
@@ -4149,45 +12146,194 @@ class IncusDriver(driver.ComputeDriver):
             raise exception.MigrationError(
                 reason='CRIU-restored Incus instance is not running on the '
                 'destination')
+        # Source post_live_migration() commits ownership and retires its proof
+        # before Nova invokes this destination callback. Repeatedly issuing an
+        # owned transition would require proof which has intentionally been
+        # retired. Verify the already-owned state, or finish a protected target
+        # left by a lost source callback and persist recovery on uncertainty.
+        _converge_migration_target_ownership(
+            self.client, instance, desired_state='running')
 
     def rollback_live_migration_at_source(
             self, context, instance, migrate_data):
         try:
             container = self.client.instances.get(instance.name)
-        except incus_exceptions.NotFound:
-            return
-        # A failed shared-storage receive tells the source to restore its CRIU
-        # checkpoint before the migration request returns. Incus can briefly
-        # report Stopped while that restored monitor completes its start
-        # hooks. Starting again in that window leaks a second root-volume
-        # mount reference and makes the next handover fail with ErrInUse.
-        for attempt in range(CONF.incus.migration_finish_retries):
-            container.sync()
-            if container.status == 'Running':
-                return
-            if attempt + 1 < CONF.incus.migration_finish_retries:
-                eventlet.sleep(
-                    CONF.incus.migration_finish_retry_interval)
-
-        if container.status != 'Running':
+        except incus_exceptions.LXDAPIException as exc:
+            if _is_incus_not_found(exc):
+                raise exception.MigrationError(
+                    reason='Incus live migration source record is missing; '
+                           'refusing to report rollback success') from exc
+            raise
+        destination_address = _live_migration_destination_address(
+            migrate_data)
+        cleanup_token = _live_migration_cleanup_token(migrate_data)
+        idmap_base, idmap_size = _live_migration_idmap(migrate_data)
+        if not destination_address:
+            raise exception.MigrationError(
+                reason='Live migration rollback has no destination address')
+        remote = _migration_client(destination_address)
+        try:
+            target_attempt = _abort_migration_attempt(
+                remote, instance, cleanup_token,
+                idmap_base, idmap_size,
+                target_cleanup=lambda: _retry_migration_finish_action(
+                    lambda: self._delete_migration_target_with_idmap(
+                        remote, instance),
+                    'aborted live migration target deletion', instance))
+        except Exception:
             try:
-                container.start(wait=True)
+                container.sync()
+                if container.status != 'Stopped':
+                    container.stop(timeout=-1, force=True, wait=True)
             except Exception:
-                # ComputeManager still has to restore the original Cinder
-                # attachment IDs, tear down the destination connections and
-                # remove Neutron's inactive binding. Raising here aborts that
-                # authoritative control-plane rollback and leaves the volume
-                # with stale destination attachments. Runtime reconciliation
-                # can repair or rebuild a stopped source after ownership has
-                # been restored.
-                LOG.exception(
-                    'Failed to restart the source Incus instance during live '
-                    'migration rollback; continuing control-plane rollback',
-                    instance=instance)
+                LOG.critical(
+                    'Failed to fence the live migration source after the '
+                    'target attempt could not be fenced',
+                    instance=instance, exc_info=True)
+            raise
+        try:
+            _settle_instance_migration_operations(
+                self.client, instance,
+                operation_ids=(
+                    getattr(migrate_data, 'source_operation_id', None),))
+        except Exception:
+            try:
+                container.sync()
+                if container.status != 'Stopped':
+                    container.stop(timeout=-1, force=True, wait=True)
+            except Exception:
+                LOG.critical(
+                    'Failed to fence the source after its migration operation '
+                    'could not be settled', instance=instance, exc_info=True)
+            raise
+        if target_attempt['state'] == 'committed':
+            LOG.warning(
+                'Live migration rollback lost the attempt race to a '
+                'committed target; leaving target teardown to the '
+                'destination rollback RPC', instance=instance)
+
+        # Do not restore source ownership or runtime here. Nova has not yet
+        # reverted Cinder attachment IDs, Neutron bindings, destination
+        # os-brick mappings, or Manila mounts. The custom manager calls
+        # finalize_live_migration_rollback only after those control-plane
+        # steps and the target instance/profile absence barrier complete.
+        try:
+            container.sync()
+            if container.status != 'Stopped':
+                container.stop(timeout=-1, force=True, wait=True)
+        except Exception:
+            LOG.critical(
+                'Failed to fence the source during live migration rollback; '
+                'operator fencing is required',
+                instance=instance, exc_info=True)
 
     def finalize_live_migration_rollback(
             self, context, instance, migrate_data):
         """Reassert source VIFs after target Neutron bindings are removed."""
+        destination_address = _live_migration_destination_address(
+            migrate_data)
+        if not destination_address:
+            raise exception.MigrationError(
+                reason='Missing live migration destination address')
+        cleanup_token = _live_migration_cleanup_token(migrate_data)
+        idmap_base, idmap_size = _live_migration_idmap(migrate_data)
+        remote = _migration_client(destination_address)
+
+        attempt = _get_migration_attempt(
+            remote, instance, cleanup_token, idmap_base, idmap_size)
+        if attempt['state'] == 'active':
+            attempt = _abort_migration_attempt(
+                remote, instance, cleanup_token,
+                idmap_base, idmap_size,
+                target_cleanup=lambda: _retry_migration_finish_action(
+                    lambda: self._delete_migration_target_with_idmap(
+                        remote, instance),
+                    'aborted live migration target deletion', instance))
+        elif attempt['state'] in ('aborted', 'failed'):
+            attempt = _wait_migration_attempt_finished(
+                remote, instance, cleanup_token,
+                idmap_base, idmap_size, ('aborted', 'failed'))
+        elif attempt['state'] != 'committed':
+            raise exception.MigrationError(
+                reason='Unsupported live rollback attempt state %s' %
+                attempt['state'])
+        _settle_instance_migration_operations(
+            self.client, instance,
+            operation_ids=(
+                getattr(migrate_data, 'source_operation_id', None),))
+
+        with lockutils.lock(_profile_lock_name(instance)):
+            source_profile = self.client.profiles.get(instance.name)
+            source_config = (
+                source_profile.config
+                if isinstance(source_profile.config, dict) else {})
+            rollback_already_complete = (
+                source_config.get(MIGRATION_ROLLBACK_COMPLETE_KEY) ==
+                cleanup_token)
+        if rollback_already_complete:
+            container = self.client.instances.get(instance.name)
+            if container.status != 'Running':
+                raise exception.MigrationError(
+                    reason='Incus rollback completion marker exists but the '
+                           'source instance is not running')
+            try:
+                profile = remote.profiles.get(instance.name)
+            except incus_exceptions.LXDAPIException as exc:
+                if not _is_incus_not_found(exc):
+                    raise
+            else:
+                self._validate_remote_cleanup_acknowledgement(
+                    profile, instance, cleanup_token,
+                    idmap_base, idmap_size)
+                profile.delete()
+            _retire_migration_attempt(
+                remote, instance, cleanup_token,
+                idmap_base, idmap_size)
+            return
+
+        def _target_cleanup_complete():
+            try:
+                remote.instances.get(instance.name)
+            except incus_exceptions.LXDAPIException as exc:
+                if not _is_incus_not_found(exc):
+                    raise
+            else:
+                raise _MigrationStateNotReady(
+                    'Incus live migration destination instance cleanup is '
+                    'still in progress')
+            try:
+                profile = remote.profiles.get(instance.name)
+            except incus_exceptions.LXDAPIException as exc:
+                if not _is_incus_not_found(exc):
+                    raise
+                if attempt['state'] == 'committed':
+                    raise exception.MigrationError(
+                        reason='Committed Incus live migration destination '
+                               'cleanup has no positive acknowledgement')
+                return None
+            self._validate_remote_cleanup_acknowledgement(
+                profile, instance, cleanup_token,
+                idmap_base, idmap_size)
+            return profile
+
+        # Destination rollback is an asynchronous Nova RPC. Require its
+        # token-bound positive acknowledgement before changing ownership.
+        _wait_migration_finish_condition(
+            _target_cleanup_complete,
+            'live migration destination cleanup', instance)
+        _retry_migration_finish_action(
+            lambda: _restore_source_storage_ownership(
+                self.client, instance),
+            'rolled-back source shared-storage ownership', instance)
+
+        container = self.client.instances.get(instance.name)
+        container.sync()
+        if container.status != 'Running':
+            _retry_migration_finish_action(
+                lambda: self._start_instance_with_idmap(
+                    instance, container),
+                'rolled-back source container start', instance)
+
         network_info = network_model.NetworkInfo()
         if ('vifs' in migrate_data and migrate_data.vifs):
             network_info = network_model.NetworkInfo([
@@ -4195,25 +12341,6 @@ class IncusDriver(driver.ComputeDriver):
                 if ('source_vif' in vif and vif.source_vif)
             ])
         if network_info:
-            remote = _migration_client(migrate_data.destination_address)
-
-            def _target_cleanup_complete():
-                try:
-                    remote.profiles.get(instance.name)
-                except incus_exceptions.NotFound:
-                    return
-                raise exception.MigrationError(
-                    reason='Incus live migration destination cleanup is '
-                    'still in progress')
-
-            # Destination rollback is an asynchronous Nova RPC. Its profile is
-            # deliberately deleted only after destination VIFs, volume maps,
-            # and Manila mounts have been cleaned up, making absence a strong
-            # ordering barrier rather than a timing assumption.
-            _retry_migration_finish_action(
-                _target_cleanup_complete,
-                'live migration destination cleanup', instance)
-
             vif_ids = {vif['id'] for vif in network_info}
 
             def _vifs_have_active_state(expected):
@@ -4225,9 +12352,9 @@ class IncusDriver(driver.ComputeDriver):
                 }
                 if (set(states) != vif_ids or
                         any(state != expected for state in states.values())):
-                    raise exception.MigrationError(
-                        reason='Neutron VIFs have not reached rollback state '
-                        '%s' % ('ACTIVE' if expected else 'DOWN'))
+                    raise _MigrationStateNotReady(
+                        'Neutron VIFs have not reached rollback state %s' %
+                        ('ACTIVE' if expected else 'DOWN'))
 
             def _reassert_vifs():
                 for vif in network_info:
@@ -4236,7 +12363,7 @@ class IncusDriver(driver.ComputeDriver):
             # os-vif unplug completion precedes OVN's asynchronous DOWN event.
             # Observe that event before reasserting source wiring so a late
             # destination update cannot overwrite the restored source state.
-            _retry_migration_finish_action(
+            _wait_migration_finish_condition(
                 lambda: _vifs_have_active_state(False),
                 'live migration destination VIF deactivation', instance)
 
@@ -4248,33 +12375,146 @@ class IncusDriver(driver.ComputeDriver):
             _retry_migration_finish_action(
                 _reassert_vifs,
                 'live migration rollback VIF wiring', instance)
-            _retry_migration_finish_action(
+            _wait_migration_finish_condition(
                 lambda: _vifs_have_active_state(True),
                 'live migration source VIF activation', instance)
 
+        # Persist the source-side commit before deleting the destination ACK.
+        # A retry after that deletion can then prove that ownership, runtime
+        # and VIF restoration had already completed.
+        with lockutils.lock(_profile_lock_name(instance)):
+            source_profile = self.client.profiles.get(instance.name)
+            source_profile.config[MIGRATION_ROLLBACK_COMPLETE_KEY] = (
+                cleanup_token)
+            source_profile.config.pop(MIGRATION_OPERATION_KEY, None)
+            source_profile.save(wait=True)
+
+        # Keep the acknowledgement until source ownership, runtime and VIF
+        # state are all restored. Deleting it last makes finalize idempotent.
+        def _delete_acknowledgement():
+            try:
+                profile = remote.profiles.get(instance.name)
+            except incus_exceptions.LXDAPIException as exc:
+                if _is_incus_not_found(exc):
+                    return
+                raise
+            self._validate_remote_cleanup_acknowledgement(
+                profile, instance, cleanup_token,
+                idmap_base, idmap_size)
+            profile.delete()
+
+        _retry_migration_finish_action(
+            _delete_acknowledgement,
+            'live migration cleanup acknowledgement deletion', instance)
+        _retire_migration_attempt(
+            remote, instance, cleanup_token,
+            idmap_base, idmap_size)
+
+    @_invalidates_instance_inventory
     def rollback_live_migration_at_destination(
             self, context, instance, network_info, block_device_info,
             destroy_disks=True, migrate_data=None):
+        cleanup_token = _live_migration_cleanup_token(migrate_data)
+        idmap_base, idmap_size = _live_migration_idmap(migrate_data)
         try:
             profile = self.client.profiles.get(instance.name)
-        except incus_exceptions.NotFound:
-            profile = None
+        except incus_exceptions.LXDAPIException as exc:
+            if _is_incus_not_found(exc):
+                profile = None
+            else:
+                raise
+        pre_receive = (
+            profile is None and
+            getattr(migrate_data, 'source_operation_id', None) is None and
+            getattr(
+                migrate_data, 'destination_operation_id', None) is None)
+        if pre_receive:
+            # The manager stages Manila before driver.pre_live_migration().
+            # Its first mount can therefore fail before an Incus profile,
+            # receive operation or even an attempt exists. This rollback is
+            # complete once the exact token journal and any matching attempt
+            # are gone; an ACK profile would invent a resource solely to
+            # acknowledge that no receive ever started.
+            self._abort_pre_live_migration_preparation(
+                instance, migrate_data)
+            return
+        failures = []
+        _abort_migration_attempt(
+            self.client, instance, cleanup_token,
+            idmap_base, idmap_size,
+            target_cleanup=lambda: _retry_migration_finish_action(
+                lambda: self._delete_migration_target_with_idmap(
+                    self.client, instance),
+                'aborted live migration target deletion', instance))
         try:
-            self.client.instances.get(instance.name).delete(wait=True)
-        except incus_exceptions.NotFound:
-            pass
+            _retry_migration_finish_action(
+                lambda: self._delete_migration_target_with_idmap(
+                    self.client, instance),
+                'live migration destination record deletion', instance)
+        except Exception as exc:
+            try:
+                self.client.instances.get(instance.name)
+            except incus_exceptions.LXDAPIException as verify_exc:
+                if not _is_incus_not_found(verify_exc):
+                    raise
+                LOG.warning(
+                    'Incus target deletion reported failure but the target '
+                    'record is absent; continuing destination cleanup',
+                    instance=instance)
+            else:
+                # Do not tear storage or networking away from a target that
+                # may still be running. Its profile deliberately keeps the
+                # source-side completion barrier closed.
+                raise exception.MigrationError(
+                    reason='Failed to fence the live migration target: %s' %
+                    exc) from exc
         if profile is not None:
-            _cleanup_profile_share_mounts(profile, instance)
+            try:
+                with lockutils.lock(_profile_lock_name(instance)):
+                    _cleanup_profile_share_mounts(profile, instance)
+            except Exception as exc:
+                failures.append(exc)
+                LOG.exception(
+                    'Failed to clean destination Manila mounts during live '
+                    'migration rollback',
+                    instance=instance)
         # cleanup() unplugs destination VIFs and disconnects block devices
         # before deleting the profile. The source uses profile absence as the
         # completion barrier before it reasserts its retained VIFs.
-        self.cleanup(
-            context, instance, network_info, destroy_disks=destroy_disks,
-            destroy_vifs=True)
+        try:
+            self._cleanup(
+                context, instance, network_info,
+                destroy_disks=destroy_disks,
+                destroy_vifs=True,
+                delete_profile=False)
+        except Exception as exc:
+            failures.append(exc)
+            LOG.exception(
+                'Failed to clean destination Incus resources during live '
+                'migration rollback',
+                instance=instance)
+        if failures:
+            raise exception.MigrationError(
+                reason='%d live migration destination cleanup operation(s) '
+                       'failed; the profile was retained as a safety barrier'
+                       % len(failures))
+
+        try:
+            self._acknowledge_cleanup_profile(instance, cleanup_token)
+        except incus_exceptions.LXDAPIException as exc:
+            if _is_incus_not_found(exc):
+                raise exception.MigrationError(
+                    reason='Incus destination cleanup profile disappeared '
+                           'before the positive acknowledgement') from exc
+            raise
 
     def check_can_live_migrate_destination(
             self, context, instance, src_compute_info, dst_compute_info,
             block_migration=False, disk_over_commit=False):
+        if getattr(instance, 'host', None) == self.host:
+            raise exception.MigrationPreCheckError(
+                reason='Incus live migration to the source compute is not '
+                       'supported')
         if not CONF.incus.allow_live_migration:
             raise exception.MigrationPreCheckError(
                 reason='Incus live migration is disabled by configuration')
@@ -4285,12 +12525,19 @@ class IncusDriver(driver.ComputeDriver):
         _validated_migration_address(address)
         _require_stateful_migration_extension(self.client)
         _require_live_ceph_migration_extension(self.client)
+        try:
+            _require_migration_attempt_fencing(self.client)
+        except exception.MigrationError as exc:
+            raise exception.MigrationPreCheckError(reason=str(exc))
         facts = _migration_host_facts(self.client)
         return incus_migrate_data.IncusLiveMigrateData(
             destination_address=address,
             destination_architecture=facts['architecture'],
             destination_kernel_version=facts['kernel_version'],
-            destination_server_version=facts['server_version'])
+            destination_server_version=facts['server_version'],
+            cleanup_token=uuidutils.generate_uuid(),
+            source_operation_id=None,
+            destination_operation_id=None)
 
     def cleanup_live_migration_destination_check(
             self, context, dest_check_data):
@@ -4305,6 +12552,10 @@ class IncusDriver(driver.ComputeDriver):
                 dest_check_data, incus_migrate_data.IncusLiveMigrateData):
             raise exception.MigrationPreCheckError(
                 reason='Destination did not return Incus migration data')
+        try:
+            cleanup_token = _live_migration_cleanup_token(dest_check_data)
+        except exception.MigrationError as exc:
+            raise exception.MigrationPreCheckError(reason=str(exc))
         if instance.config_drive:
             raise exception.MigrationPreCheckError(
                 reason='Incus live migration does not support config drives')
@@ -4319,17 +12570,61 @@ class IncusDriver(driver.ComputeDriver):
                     destination, root_volume[0], live=True)
             except exception.MigrationError as exc:
                 raise exception.MigrationPreCheckError(reason=str(exc))
+        else:
+            root_pool = _instance_root_pool(self.client, instance.name)
+            if root_pool.driver == 'ceph':
+                extensions = set(
+                    self.client.host_info.get('api_extensions', []))
+                required = {
+                    INCUS_STORAGE_HANDOVER_EXTENSION,
+                    INCUS_STORAGE_HANDOVER_PROOF_EXTENSION,
+                    INCUS_STORAGE_READY_FENCE_EXTENSION,
+                }
+                missing = sorted(required - extensions)
+                if missing:
+                    raise exception.MigrationPreCheckError(
+                        reason='Incus source does not advertise required '
+                        'shared Ceph handover extensions: %s' %
+                        ', '.join(missing))
+                destination = _validated_migration_address(
+                    dest_check_data.destination_address).hostname
+                try:
+                    _preflight_shared_ceph_handover_destination(
+                        destination, root_pool.name,
+                        _storage_pool_identity(root_pool))
+                except exception.MigrationError as exc:
+                    raise exception.MigrationPreCheckError(reason=str(exc))
 
         _require_stateful_migration_extension(self.client)
         _require_live_ceph_migration_extension(self.client)
         _live_migration_profile_check(self.client, context, instance)
         container = self.client.instances.get(instance.name)
         profile = self.client.profiles.get(instance.name)
+        idmap_base, idmap_size = _instance_migration_idmap(
+            container, profile)
+        try:
+            self._ensure_instance_idmap(
+                instance, observed_base=idmap_base,
+                observed_size=idmap_size)
+        except incus_idmap.IDMapError as exc:
+            raise exception.MigrationPreCheckError(
+                reason='Incus source idmap is not globally reserved: '
+                       '{}'.format(exc)) from exc
         _validate_live_migration_data_volumes(profile, block_device_info)
+        profile_uuid = (
+            profile.config.get('user.openstack.uuid')
+            if isinstance(profile.config, dict) else None)
+        if profile_uuid not in (None, instance.uuid):
+            raise exception.MigrationPreCheckError(
+                reason='Incus source profile belongs to another Nova UUID')
         if container.status != 'Running':
             raise exception.MigrationPreCheckError(
                 reason='Incus CRIU live migration requires a running '
                 'instance')
+        if (isinstance(profile.config, dict) and
+                profile.config.get(CLEANUP_RECOVERY_KEY)):
+            raise exception.MigrationPreCheckError(
+                reason='Incus source profile has unresolved cleanup work')
 
         source_facts = _migration_host_facts(self.client)
         comparisons = (
@@ -4348,8 +12643,38 @@ class IncusDriver(driver.ComputeDriver):
             raise exception.MigrationPreCheckError(
                 reason='Incus CRIU migration host mismatch: %s' %
                 '; '.join(incompatible))
-        dest_check_data.source_profile = _live_migration_source_profile(
-            container, profile)
+        remote = _migration_client(dest_check_data.destination_address)
+        try:
+            _register_migration_attempt(
+                remote, instance, cleanup_token,
+                idmap_base, idmap_size)
+        except Exception as exc:
+            raise exception.MigrationPreCheckError(
+                reason='Cannot reserve the live migration target: %s' %
+                exc) from exc
+        try:
+            with lockutils.lock(_profile_lock_name(instance)):
+                profile = self.client.profiles.get(instance.name)
+                profile.config['user.openstack.uuid'] = instance.uuid
+                profile.config[MIGRATION_DESTINATION_KEY] = (
+                    dest_check_data.destination_address)
+                profile.config[MIGRATION_CLEANUP_TOKEN_KEY] = cleanup_token
+                profile.config.pop(MIGRATION_CLEANUP_COMPLETE_KEY, None)
+                profile.config.pop(MIGRATION_ROLLBACK_COMPLETE_KEY, None)
+                profile.save(wait=True)
+                dest_check_data.source_profile = (
+                    _live_migration_source_profile(container, profile))
+                dest_check_data.idmap_base = idmap_base
+                dest_check_data.idmap_size = idmap_size
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                attempt = _abort_migration_attempt(
+                    remote, instance, cleanup_token,
+                    idmap_base, idmap_size)
+                if attempt['state'] != 'committed':
+                    _retire_migration_attempt(
+                        remote, instance, cleanup_token,
+                        idmap_base, idmap_size)
         return dest_check_data
 
     #
@@ -4434,24 +12759,3 @@ class IncusDriver(driver.ComputeDriver):
                         root_helper=root_helper)
 
         return configdrive_dir
-
-    def _after_reboot(self):
-        """Perform sync operation after host reboot."""
-        context = nova.context.get_admin_context()
-        instances = objects.InstanceList.get_by_host(
-            context, self.host, expected_attrs=['info_cache', 'metadata'])
-
-        for instance in instances:
-            if (instance.vm_state != vm_states.STOPPED):
-                continue
-            try:
-                network_info = self.network_api.get_instance_nw_info(
-                    context, instance)
-            except exception.InstanceNotFound:
-                network_info = network_model.NetworkInfo()
-
-            self.plug_vifs(instance, network_info)
-            self.firewall_driver.setup_basic_filtering(instance, network_info)
-            self.firewall_driver.prepare_instance_filter(
-                instance, network_info)
-            self.firewall_driver.apply_instance_filter(instance, network_info)

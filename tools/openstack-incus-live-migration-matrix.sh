@@ -6,6 +6,7 @@ set -Eeuo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 E2E=${E2E:-$SCRIPT_DIR/openstack-incus-live-migration-e2e.sh}
 SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute test key}
+SSH_KNOWN_HOSTS_FILE=${SSH_KNOWN_HOSTS_FILE:-$HOME/.ssh/known_hosts}
 NODE01_HOST=${NODE01_HOST:-incus-node-01}
 NODE01_SSH=${NODE01_SSH:-root@10.224.0.21}
 NODE02_HOST=${NODE02_HOST:-incus-node-02}
@@ -18,6 +19,10 @@ MANILA_SHARE=${MANILA_SHARE:-incus-e2e-share}
 TIMEOUT=${TIMEOUT:-420}
 MATRIX_CASES=${MATRIX_CASES:-all}
 
+[[ -f "$SSH_KNOWN_HOSTS_FILE" && -r "$SSH_KNOWN_HOSTS_FILE" ]] || {
+    echo "SSH known_hosts is not a readable regular file: $SSH_KNOWN_HOSTS_FILE" >&2
+    exit 2
+}
 MIGRATION_TARGETS="${NODE02_HOST}=${NODE02_SSH},${NODE03_HOST}=${NODE03_SSH},${NODE01_HOST}=${NODE01_SSH}"
 
 placement_allocations() {
@@ -63,6 +68,7 @@ run_case() {
     echo "=== live migration matrix: $case_name ==="
     env \
         SSH_IDENTITY="$SSH_IDENTITY" \
+        SSH_KNOWN_HOSTS_FILE="$SSH_KNOWN_HOSTS_FILE" \
         SOURCE_HOST="$NODE01_HOST" \
         SOURCE_SSH="$NODE01_SSH" \
         MIGRATION_TARGETS="$MIGRATION_TARGETS" \

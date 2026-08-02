@@ -8,9 +8,17 @@ TARGET_PYTHON_VERSION=${TARGET_PYTHON_VERSION:-3.12}
 EXPECTED_INCUS_IMAGE=${EXPECTED_INCUS_IMAGE:-ghcr.io/fivetime/incus:alpine-novm}
 EXPECTED_INCUS_IMAGE_DIGEST=${EXPECTED_INCUS_IMAGE_DIGEST:-}
 EXPECTED_INCUS_REVISION=${EXPECTED_INCUS_REVISION:-}
+EXPECTED_INCUS_LXCFS_IMAGE=${EXPECTED_INCUS_LXCFS_IMAGE:-$EXPECTED_INCUS_IMAGE}
+EXPECTED_INCUS_LXCFS_IMAGE_DIGEST=${EXPECTED_INCUS_LXCFS_IMAGE_DIGEST:-$EXPECTED_INCUS_IMAGE_DIGEST}
+EXPECTED_INCUS_LXCFS_REVISION=${EXPECTED_INCUS_LXCFS_REVISION:-$EXPECTED_INCUS_REVISION}
 EXPECTED_INCUS_GROUP_MEMBERS=${EXPECTED_INCUS_GROUP_MEMBERS:-stack}
 INCUS_CONTAINER=${INCUS_CONTAINER:-incus}
+INCUS_LXCFS_CONTAINER=${INCUS_LXCFS_CONTAINER:-incus-lxcfs}
 INCUS_SERVICE=${INCUS_SERVICE:-incus-podman.service}
+INCUS_LXCFS_SERVICE=${INCUS_LXCFS_SERVICE:-incus-lxcfs.service}
+INCUS_PROJECT=${INCUS_PROJECT:-nova}
+INCUS_RUNTIME_ROOT=${INCUS_RUNTIME_ROOT:-/run/incus-podman}
+INCUS_LXCFS_ROOT=${INCUS_LXCFS_ROOT:-/var/lib/lxcfs}
 NOVA_SERVICE=${NOVA_SERVICE:-devstack@n-cpu.service}
 NOVA_CONFIG=${NOVA_CONFIG:-/etc/nova/nova-cpu.conf}
 INCUS_SHARE_MOUNT_ROOT=${INCUS_SHARE_MOUNT_ROOT:-/opt/stack/data/nova/instances/incus-shares}
@@ -47,6 +55,46 @@ check_command() {
     fi
 }
 
+service_identity_can_read() {
+    local path=$1 pid uid gid groups
+
+    pid=$(systemctl show "$NOVA_SERVICE" -p MainPID --value 2>/dev/null)
+    [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/status" ]] || return 1
+    uid=$(awk '/^Uid:/ {print $2}' "/proc/$pid/status")
+    gid=$(awk '/^Gid:/ {print $2}' "/proc/$pid/status")
+    groups=$(awk '/^Groups:/ {$1=""; sub(/^ +/, ""); gsub(/ +/, ","); print}' \
+        "/proc/$pid/status")
+    if [[ -n "$groups" ]]; then
+        setpriv --reuid="$uid" --regid="$gid" --groups="$groups" \
+            test -r "$path"
+    else
+        setpriv --reuid="$uid" --regid="$gid" --clear-groups \
+            test -r "$path"
+    fi
+}
+
+is_ipv4() {
+    local address=$1
+    local -a octets
+    local octet
+
+    IFS=. read -r -a octets <<<"$address"
+    if ((${#octets[@]} != 4)); then
+        return 1
+    fi
+
+    for octet in "${octets[@]}"; do
+        if [[ ! "$octet" =~ ^[0-9]+$ ]] ||
+                ((10#$octet > 255)); then
+            return 1
+        fi
+    done
+}
+
+is_tcp_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
+}
+
 check_dedicated_fs() {
     local path=$1 root_source path_source usage free
     root_source=$(findmnt -nro SOURCE -T / 2>/dev/null)
@@ -63,13 +111,80 @@ check_dedicated_fs() {
     fi
 }
 
+check_systemd_service() {
+    local service=$1
+
+    if systemctl is-active --quiet "$service"; then
+        pass "$service" active
+    else
+        fail "$service" "not active"
+    fi
+    if systemctl is-enabled --quiet "$service"; then
+        pass "$service enabled"
+    else
+        fail "$service enabled" "not enabled"
+    fi
+}
+
+check_runtime_image() {
+    local label=$1
+    local container=$2
+    local service=$3
+    local expected_image=$4
+    local expected_digest=$5
+    local expected_revision=$6
+    local expected_repository expected_pinned_image image_name image_revision
+    local quadlet_image repo_digests
+
+    image_name=$(podman inspect "$container" --format '{{.ImageName}}' \
+        2>/dev/null)
+    repo_digests=$(podman image inspect "$image_name" \
+        --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null)
+    expected_repository=${expected_image%@*}
+    if [[ "${expected_repository##*/}" == *:* ]]; then
+        expected_repository=${expected_repository%:*}
+    fi
+    if [[ -z "$expected_digest" ]]; then
+        check_equal "$label image name" "$expected_image" "$image_name"
+        fail "$label image digest pin" "set the expected image digest"
+    else
+        expected_pinned_image="${expected_repository}@${expected_digest}"
+        check_equal "$label image name" "$expected_pinned_image" "$image_name"
+    fi
+    if [[ -n "$expected_digest" ]] && grep -Fqx \
+            "$expected_pinned_image" <<<"$repo_digests"; then
+        pass "$label image digest" "$expected_digest"
+    elif [[ -n "$expected_digest" ]]; then
+        fail "$label image digest" \
+            "expected digest is absent from image RepoDigests"
+    fi
+    image_revision=$(podman image inspect "$image_name" \
+        --format '{{index .Labels "org.opencontainers.image.revision"}}' \
+        2>/dev/null)
+    if [[ -z "$expected_revision" ]]; then
+        fail "$label source revision" \
+            "set the expected source revision (actual=$image_revision)"
+    else
+        check_equal "$label source revision" \
+            "$expected_revision" "$image_revision"
+    fi
+    quadlet_image=$(systemctl cat "$service" 2>/dev/null |
+        sed -n 's/^Image=//p' | tail -n1)
+    if [[ "$quadlet_image" == *@sha256:* ]]; then
+        pass "$label Quadlet immutable image" "$quadlet_image"
+    else
+        fail "$label Quadlet immutable image" \
+            "Image= must use an immutable @sha256 reference"
+    fi
+}
+
 if [[ $EUID -ne 0 ]]; then
     fail "execution user" "run as root"
 else
     pass "execution user" root
 fi
 
-for command_name in podman jq findmnt crudini; do
+for command_name in awk podman jq findmnt crudini setpriv; do
     check_command "$command_name"
 done
 
@@ -125,15 +240,13 @@ socket_mode=$(stat -c '%a' /var/lib/incus/unix.socket 2>/dev/null)
 check_equal "Incus socket owner" root:incus-admin "$socket_owner"
 check_equal "Incus socket mode" 660 "$socket_mode"
 
-if systemctl is-active --quiet "$INCUS_SERVICE"; then
-    pass "$INCUS_SERVICE" active
+check_systemd_service "$INCUS_LXCFS_SERVICE"
+check_systemd_service "$INCUS_SERVICE"
+if systemctl is-active --quiet lxcfs.service; then
+    fail "competing host lxcfs.service" \
+        "disable and mask it; $INCUS_LXCFS_SERVICE must be the only owner"
 else
-    fail "$INCUS_SERVICE" "not active"
-fi
-if systemctl is-enabled --quiet "$INCUS_SERVICE"; then
-    pass "$INCUS_SERVICE enabled"
-else
-    fail "$INCUS_SERVICE enabled" "not enabled"
+    pass "competing host lxcfs.service" inactive
 fi
 if systemctl is-active --quiet "$NOVA_SERVICE"; then
     pass "$NOVA_SERVICE" active
@@ -141,45 +254,109 @@ else
     fail "$NOVA_SERVICE" "not active"
 fi
 
-image_name=$(podman inspect "$INCUS_CONTAINER" --format '{{.ImageName}}' \
+check_runtime_image "Incus LXCFS" "$INCUS_LXCFS_CONTAINER" \
+    "$INCUS_LXCFS_SERVICE" "$EXPECTED_INCUS_LXCFS_IMAGE" \
+    "$EXPECTED_INCUS_LXCFS_IMAGE_DIGEST" "$EXPECTED_INCUS_LXCFS_REVISION"
+check_runtime_image "Incus control" "$INCUS_CONTAINER" "$INCUS_SERVICE" \
+    "$EXPECTED_INCUS_IMAGE" "$EXPECTED_INCUS_IMAGE_DIGEST" \
+    "$EXPECTED_INCUS_REVISION"
+
+for runtime in \
+        "$INCUS_LXCFS_CONTAINER:lxcfs" \
+        "$INCUS_CONTAINER:incusd"; do
+    runtime_container=${runtime%%:*}
+    runtime_role=${runtime#*:}
+    if podman inspect "$runtime_container" \
+            --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null |
+            grep -Fqx "INCUS_RUNTIME_ROLE=$runtime_role"; then
+        pass "runtime role:$runtime_container" "$runtime_role"
+    else
+        fail "runtime role:$runtime_container" \
+            "expected INCUS_RUNTIME_ROLE=$runtime_role"
+    fi
+done
+
+runtime_preserve=$(systemctl show "$INCUS_SERVICE" \
+    -p RuntimeDirectoryPreserve --value 2>/dev/null)
+check_equal "Incus runtime preservation" restart "$runtime_preserve"
+if [[ -d "$INCUS_RUNTIME_ROOT" ]]; then
+    pass "Incus runtime root" "$INCUS_RUNTIME_ROOT"
+else
+    fail "Incus runtime root" "$INCUS_RUNTIME_ROOT is missing"
+fi
+lxcfs_propagation=$(findmnt -nro PROPAGATION -T "$INCUS_LXCFS_ROOT" \
     2>/dev/null)
-repo_digests=$(podman image inspect "$image_name" \
-    --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null)
-expected_repository=${EXPECTED_INCUS_IMAGE%%:*}
-if [[ -z "$EXPECTED_INCUS_IMAGE_DIGEST" ]]; then
-    check_equal "Incus image name" "$EXPECTED_INCUS_IMAGE" "$image_name"
-    fail "Incus image digest pin" \
-        "set EXPECTED_INCUS_IMAGE_DIGEST"
+if [[ "$lxcfs_propagation" == shared ||
+      "$lxcfs_propagation" == rshared ]]; then
+    pass "LXCFS mount propagation" "$lxcfs_propagation"
 else
-    expected_pinned_image="${expected_repository}@${EXPECTED_INCUS_IMAGE_DIGEST}"
-    check_equal "Incus image name" "$expected_pinned_image" "$image_name"
+    fail "LXCFS mount propagation" \
+        "expected shared or rshared, actual=${lxcfs_propagation:-missing}"
 fi
-if [[ -n "$EXPECTED_INCUS_IMAGE_DIGEST" ]] && grep -Fqx \
-        "$expected_pinned_image" \
-        <<<"$repo_digests"; then
-    pass "Incus image digest" "$EXPECTED_INCUS_IMAGE_DIGEST"
-elif [[ -n "$EXPECTED_INCUS_IMAGE_DIGEST" ]]; then
-    fail "Incus image digest" \
-        "expected digest is absent from image RepoDigests"
-fi
-image_revision=$(podman image inspect "$image_name" \
-    --format '{{index .Labels "org.opencontainers.image.revision"}}' \
-    2>/dev/null)
-if [[ -z "$EXPECTED_INCUS_REVISION" ]]; then
-    fail "Incus source revision" \
-        "set EXPECTED_INCUS_REVISION (actual=$image_revision)"
+if timeout 5 head -n 1 "$INCUS_LXCFS_ROOT/proc/meminfo" \
+        >/dev/null 2>&1; then
+    pass "host LXCFS response" "$INCUS_LXCFS_ROOT/proc/meminfo"
 else
-    check_equal "Incus source revision" \
-        "$EXPECTED_INCUS_REVISION" "$image_revision"
+    fail "host LXCFS response" \
+        "$INCUS_LXCFS_ROOT/proc/meminfo is unavailable"
 fi
-quadlet_image=$(systemctl cat "$INCUS_SERVICE" 2>/dev/null |
-    sed -n 's/^Image=//p' | tail -n1)
-if [[ "$quadlet_image" == *@sha256:* ]]; then
-    pass "Quadlet immutable image" "$quadlet_image"
+if podman exec "$INCUS_LXCFS_CONTAINER" \
+        /usr/local/sbin/healthcheck.sh >/dev/null 2>&1; then
+    pass "LXCFS container health"
 else
-    fail "Quadlet immutable image" \
-        "Image= must use an immutable @sha256 reference"
+    fail "LXCFS container health" "role-specific health check failed"
 fi
+if podman exec "$INCUS_CONTAINER" \
+        /usr/local/sbin/healthcheck.sh >/dev/null 2>&1; then
+    pass "Incus container health"
+else
+    fail "Incus container health" "role-specific health check failed"
+fi
+
+network_inventory=$(podman exec "$INCUS_CONTAINER" incus network list \
+    --all-projects --format csv -c emn 2>/dev/null)
+if [[ $? -ne 0 ]]; then
+    fail "managed Incus networks" "failed to query network inventory"
+else
+    managed_networks=$(awk -F, '$2 == "YES" {print $1 "/" $3}' \
+        <<<"$network_inventory")
+    if [[ -n "$managed_networks" ]]; then
+        fail "managed Incus networks" \
+            "unsupported on Neutron nodes: ${managed_networks//$'\n'/ }"
+    else
+        pass "managed Incus networks" none
+    fi
+fi
+
+mapfile -t running_nova_instances < <(
+    podman exec "$INCUS_CONTAINER" incus --project "$INCUS_PROJECT" \
+        list --format json 2>/dev/null |
+        jq -r '.[] |
+          select(.status == "Running") |
+          select(.config["user.openstack.uuid"] != null) |
+          .name'
+)
+if ((${#running_nova_instances[@]} == 0)); then
+    pass "running guest LXCFS audit" "no running Nova instances"
+fi
+for instance_name in "${running_nova_instances[@]}"; do
+    runtime_config="$INCUS_RUNTIME_ROOT/${INCUS_PROJECT}_${instance_name}/lxc.conf"
+    if [[ -s "$runtime_config" ]]; then
+        pass "guest runtime config:$instance_name" "$runtime_config"
+    else
+        fail "guest runtime config:$instance_name" \
+            "$runtime_config is missing or empty"
+    fi
+    if podman exec "$INCUS_CONTAINER" incus --project "$INCUS_PROJECT" \
+            exec "$instance_name" -- /bin/sh -c \
+            'IFS= read -r line < /proc/meminfo && test -n "$line"' \
+            >/dev/null 2>&1; then
+        pass "guest LXCFS response:$instance_name"
+    else
+        fail "guest LXCFS response:$instance_name" \
+            "/proc/meminfo is unreadable (possible stale FUSE mount)"
+    fi
+done
 
 manila_enabled=$(crudini --get "$NOVA_CONFIG" incus enable_manila_shares \
     2>/dev/null || true)
@@ -254,7 +431,14 @@ else
 fi
 
 server_json=$(podman exec "$INCUS_CONTAINER" incus query /1.0 2>/dev/null)
-for extension in storage_driver_cephext migration_shared_ceph_storage \
+for extension in storage_driver_cephext \
+        storage_cephext_rootfs_idmap_provenance \
+        migration_shared_ceph_storage \
+        migration_shared_ceph_storage_ready_fence \
+        instance_storage_handover instance_storage_handover_proof \
+        migration_attempt_fencing \
+        storage_materialization_attempt_v1 \
+        storage_release_receipt_v2 \
         unix_block_limits; do
     if jq -e --arg extension "$extension" \
             '(.metadata.api_extensions // .api_extensions) |
@@ -267,11 +451,15 @@ done
 
 https_address=$(podman exec "$INCUS_CONTAINER" incus config get \
     core.https_address 2>/dev/null)
-if [[ "$https_address" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$ ]]; then
+https_bind_host=${https_address%:*}
+https_bind_port=${https_address##*:}
+if [[ "$https_address" == "$https_bind_host:$https_bind_port" ]] &&
+        is_ipv4 "$https_bind_host" &&
+        is_tcp_port "$https_bind_port"; then
     pass "Incus HTTPS bind" "$https_address"
 else
     fail "Incus HTTPS bind" \
-        "must use an explicit IPv4 migration address, actual=$https_address"
+        "must use 0.0.0.0:PORT or an explicit IPv4:PORT, actual=$https_address"
 fi
 trust_json=$(podman exec "$INCUS_CONTAINER" incus config trust list \
     --format json 2>/dev/null)
@@ -303,6 +491,187 @@ check_equal "preflight protocol" 1 \
 compute_driver=$(crudini --get "$NOVA_CONFIG" DEFAULT compute_driver \
     2>/dev/null)
 check_equal "Nova compute driver" incus.IncusDriver "$compute_driver"
+nova_state_path=$(crudini --get "$NOVA_CONFIG" DEFAULT state_path \
+    2>/dev/null || true)
+compute_id_path=${nova_state_path%/}/compute_id
+nova_user=$(systemctl show "$NOVA_SERVICE" -p User --value)
+nova_user=${nova_user:-root}
+if [[ "$nova_state_path" == /* && -d "$nova_state_path" ]] && \
+        sudo -u "$nova_user" test -w "$nova_state_path"; then
+    pass "Nova persistent state path" \
+        "$nova_state_path is persistent-service writable"
+else
+    fail "Nova persistent state path" \
+        "state_path must be an absolute writable directory, actual=${nova_state_path:-missing}"
+fi
+state_fstype=$(findmnt -n -o FSTYPE -T "$nova_state_path" 2>/dev/null || true)
+if [[ -n "$state_fstype" && "$state_fstype" != tmpfs && \
+      "$state_fstype" != overlay ]]; then
+    pass "Nova persistent state filesystem" "$state_fstype"
+else
+    fail "Nova persistent state filesystem" \
+        "state_path must survive nova-compute restart, fstype=${state_fstype:-unknown}"
+fi
+compute_id=$(tr -d '[:space:]' <"$compute_id_path" 2>/dev/null || true)
+if [[ -f "$compute_id_path" && ! -L "$compute_id_path" ]] && \
+        sudo -u "$nova_user" test -r "$compute_id_path" && \
+        [[ "$compute_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; then
+    pass "Nova persistent compute identity" "$compute_id"
+else
+    fail "Nova persistent compute identity" \
+        "$compute_id_path must be a readable canonical UUID regular file"
+fi
+idmap_endpoint=$(crudini --get "$NOVA_CONFIG" incus \
+    idmap_allocator_endpoint 2>/dev/null || true)
+idmap_namespace=$(crudini --get "$NOVA_CONFIG" incus \
+    idmap_allocator_namespace 2>/dev/null || true)
+idmap_base=$(crudini --get "$NOVA_CONFIG" incus \
+    idmap_allocator_base 2>/dev/null || true)
+idmap_size=$(crudini --get "$NOVA_CONFIG" incus \
+    idmap_allocator_size 2>/dev/null || true)
+idmap_count=$(crudini --get "$NOVA_CONFIG" incus \
+    idmap_allocator_count 2>/dev/null || true)
+idmap_allow_insecure=$(crudini --get "$NOVA_CONFIG" incus \
+    idmap_allocator_allow_insecure 2>/dev/null || printf false)
+idmap_ca_cert=$(crudini --get "$NOVA_CONFIG" incus \
+    idmap_allocator_ca_cert 2>/dev/null || true)
+idmap_client_cert=$(crudini --get "$NOVA_CONFIG" incus \
+    idmap_allocator_client_cert 2>/dev/null || true)
+idmap_client_key=$(crudini --get "$NOVA_CONFIG" incus \
+    idmap_allocator_client_key 2>/dev/null || true)
+idmap_username=$(crudini --get "$NOVA_CONFIG" incus \
+    idmap_allocator_username 2>/dev/null || true)
+idmap_password_file=$(crudini --get "$NOVA_CONFIG" incus \
+    idmap_allocator_password_file 2>/dev/null || true)
+if [[ "$idmap_endpoint" =~ ^https://[^/]+(:[0-9]+)?$ ]]; then
+    pass "idmap allocator endpoint" "$idmap_endpoint"
+else
+    fail "idmap allocator endpoint" \
+        "must be an HTTPS origin, actual=${idmap_endpoint:-missing}"
+fi
+if [[ "${idmap_allow_insecure,,}" == false ]]; then
+    pass "idmap allocator transport policy" "HTTPS and mTLS required"
+else
+    fail "idmap allocator transport policy" \
+        "idmap_allocator_allow_insecure must be false in production"
+fi
+for idmap_tls_path in \
+        "$idmap_ca_cert" "$idmap_client_cert" "$idmap_client_key"; do
+    if [[ -n "$idmap_tls_path" && -s "$idmap_tls_path" ]] && \
+            service_identity_can_read "$idmap_tls_path"; then
+        pass "idmap allocator TLS file" "$idmap_tls_path"
+    else
+        fail "idmap allocator TLS file" \
+            "missing, empty, or unreadable by nova-compute path=${idmap_tls_path:-unset}"
+    fi
+done
+if [[ -n "$idmap_client_key" && -f "$idmap_client_key" ]]; then
+    idmap_key_mode=$(stat -c '%a' "$idmap_client_key")
+    if (( (8#$idmap_key_mode & 037) == 0 )); then
+        pass "idmap allocator client key mode" "$idmap_key_mode"
+    else
+        fail "idmap allocator client key mode" \
+            "must not be accessible by group-write or other, mode=$idmap_key_mode"
+    fi
+fi
+if [[ "$idmap_username" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]]; then
+    pass "idmap allocator RBAC user" "$idmap_username"
+else
+    fail "idmap allocator RBAC user" \
+        "invalid value=${idmap_username:-missing}"
+fi
+if [[ -n "$idmap_password_file" && -f "$idmap_password_file" && \
+      -s "$idmap_password_file" ]] && \
+        service_identity_can_read "$idmap_password_file"; then
+    idmap_password_mode=$(stat -c '%a' "$idmap_password_file")
+    if (( (8#$idmap_password_mode & 037) == 0 )); then
+        pass "idmap allocator password file" \
+            "$idmap_password_file mode=$idmap_password_mode"
+    else
+        fail "idmap allocator password file" \
+            "must not be accessible by group-write or other, mode=$idmap_password_mode"
+    fi
+else
+    fail "idmap allocator password file" \
+        "must resolve to a non-empty readable regular file, path=${idmap_password_file:-unset}"
+fi
+if [[ "$idmap_namespace" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]]; then
+    pass "idmap allocator namespace" "$idmap_namespace"
+else
+    fail "idmap allocator namespace" \
+        "invalid value=${idmap_namespace:-missing}"
+fi
+idmap_end=
+if [[ "$idmap_base" =~ ^[0-9]+$ && "$idmap_size" == 65536 && \
+      "$idmap_count" =~ ^[1-9][0-9]*$ ]]; then
+    idmap_end=$((idmap_base + idmap_size * idmap_count))
+    if ((idmap_end <= 4294967296)); then
+        pass "idmap allocator geometry" \
+            "base=$idmap_base size=$idmap_size count=$idmap_count"
+    else
+        fail "idmap allocator geometry" "range exceeds uint32"
+        idmap_end=
+    fi
+else
+    fail "idmap allocator geometry" \
+        "base=${idmap_base:-missing} size=${idmap_size:-missing} count=${idmap_count:-missing}"
+fi
+if [[ -n "$idmap_end" ]]; then
+    for subordinate_file in /etc/subuid /etc/subgid; do
+        if podman exec "$INCUS_CONTAINER" awk -F: \
+                -v first="$idmap_base" -v end="$idmap_end" \
+                '$1 == "root" && $2 <= first && ($2 + $3) >= end {ok=1}
+                 END {exit !ok}' "$subordinate_file"; then
+            pass "idmap range:$subordinate_file" \
+                "$idmap_base-$((idmap_end - 1))"
+        else
+            fail "idmap range:$subordinate_file" \
+                "root subordinate range does not cover allocator geometry"
+        fi
+    done
+fi
+migration_address=$(crudini --get "$NOVA_CONFIG" incus \
+    migration_address 2>/dev/null || true)
+migration_host=
+migration_port=
+if [[ "$migration_address" =~ ^https://([^/:]+):([0-9]+)$ ]]; then
+    migration_host=${BASH_REMATCH[1]}
+    migration_port=${BASH_REMATCH[2]}
+fi
+if [[ -n "$migration_host" ]] &&
+        is_ipv4 "$migration_host" &&
+        [[ "$migration_host" != 0.0.0.0 ]] &&
+        is_tcp_port "$migration_port"; then
+    pass "Nova migration address" "$migration_address"
+
+    if [[ "$migration_port" == "$https_bind_port" ]]; then
+        pass "migration bind port" "$migration_port"
+    else
+        fail "migration bind port" \
+            "advertised=$migration_port bind=${https_bind_port:-missing}"
+    fi
+
+    if python3 - "$migration_host" "$migration_port" <<'PY'
+import socket
+import sys
+
+try:
+    with socket.create_connection(
+            (sys.argv[1], int(sys.argv[2])), timeout=5):
+        pass
+except OSError:
+    raise SystemExit(1)
+PY
+    then
+        pass "migration TCP reachability" "$migration_host:$migration_port"
+    else
+        fail "migration TCP reachability" \
+            "cannot connect to $migration_host:$migration_port"
+    fi
+else
+    fail "Nova migration address" \
+        "must use https://<non-wildcard IPv4>:PORT, actual=${migration_address:-missing}"
+fi
 nova_bfv_mappings=$(crudini --get "$NOVA_CONFIG" incus \
     boot_from_volume_storage_pools 2>/dev/null || true)
 advertised_bfv_pools=$(jq -r '(.metadata.config // .config)
@@ -369,9 +738,6 @@ if [[ "$REQUIRE_COLD_MIGRATION" == true ]]; then
     check_equal "Nova cold migration" true \
         "$(crudini --get "$NOVA_CONFIG" incus \
             allow_cold_migration 2>/dev/null | tr '[:upper:]' '[:lower:]')"
-    check_equal "Nova migration address" "https://$https_address" \
-        "$(crudini --get "$NOVA_CONFIG" incus \
-            migration_address 2>/dev/null)"
     migration_finish_retries=$(crudini --get "$NOVA_CONFIG" incus \
         migration_finish_retries 2>/dev/null || true)
     if [[ "$migration_finish_retries" =~ ^[0-9]+$ ]] &&

@@ -18,7 +18,6 @@ from nova import exception
 from nova import i18n
 from nova.virt import driver
 from oslo_config import cfg
-from oslo_utils import units
 
 from nova.virt.incus import common
 from nova.virt.incus import vif
@@ -30,7 +29,10 @@ _FUSE_NAME_RE = re.compile(r'^[A-Za-z0-9._+/-]+$')
 
 
 def _base_config(instance, _):
-    return {'environment.product_name': 'OpenStack Nova'}
+    return {
+        'environment.product_name': 'OpenStack Nova',
+        'user.openstack.uuid': instance.uuid,
+    }
 
 
 def _nesting(instance, _):
@@ -73,7 +75,36 @@ def _isolated(instance, client):
     if 'id_map' not in extensions:
         msg = _("Host does not support isolated instance idmaps")
         raise exception.NovaException(msg)
-    return {'security.idmap.isolated': 'True'}
+
+    config = {'security.idmap.isolated': 'True'}
+    attr_is_set = getattr(instance, 'obj_attr_is_set', None)
+    if callable(attr_is_set) and not attr_is_set('system_metadata'):
+        metadata = {}
+    else:
+        metadata = getattr(instance, 'system_metadata', None) or {}
+    base = metadata.get('incus_idmap_base')
+    size = metadata.get('incus_idmap_size')
+    if (base is None) != (size is None):
+        raise exception.InvalidConfiguration(
+            'Incus idmap system metadata must contain both base and size')
+    if base is not None:
+        if 'id_map_base' not in extensions:
+            raise exception.InvalidConfiguration(
+                'Host does not support fixed Incus idmap bases')
+        try:
+            base = int(base)
+            size = int(size)
+        except (TypeError, ValueError) as exc:
+            raise exception.InvalidConfiguration(
+                'Incus idmap system metadata is invalid') from exc
+        if base < 0 or size <= 0:
+            raise exception.InvalidConfiguration(
+                'Incus idmap system metadata is invalid')
+        config.update({
+            'security.idmap.base': str(base),
+            'security.idmap.size': str(size),
+        })
+    return config
 
 
 def _processes(instance, _):
@@ -185,12 +216,28 @@ def disk_qos_limits(specs, prefix='quota:disk_'):
     return limits
 
 
-def _root(instance, client, *_args):
+def _root(instance, client, _network_info, block_info):
     """Configure the root disk."""
     device = {'type': 'disk', 'path': '/'}
+    boot_from_volume = any(
+        bdm.get('connection_info') and
+        str(bdm.get('boot_index')) == '0'
+        for bdm in driver.block_device_info_get_mapping(block_info))
+    if (not boot_from_volume and
+            instance.root_gb < CONF.incus.minimum_root_disk_gb):
+        raise exception.InvalidConfiguration(
+            'Non-BFV Incus Flavor root_gb ({}) is smaller than '
+            '[incus] minimum_root_disk_gb ({}); refusing to allocate '
+            'unreported local root storage'.format(
+                instance.root_gb, CONF.incus.minimum_root_disk_gb))
 
     selector = instance.flavor.extra_specs.get('incus:root_storage_pool')
     if selector:
+        if boot_from_volume:
+            raise exception.InvalidConfiguration(
+                'incus:root_storage_pool applies only to Nova-managed roots; '
+                'boot-from-volume storage is selected by the Cinder volume '
+                'type')
         storage_pool = CONF.incus.root_storage_pools.get(selector)
         if not storage_pool:
             raise exception.InvalidConfiguration(
@@ -208,7 +255,7 @@ def _root(instance, client, *_args):
         if resource_class:
             resource_key = 'resources:{}'.format(resource_class)
             requested = instance.flavor.extra_specs.get(resource_key)
-            root_gb = max(instance.root_gb, CONF.incus.minimum_root_disk_gb)
+            root_gb = instance.root_gb
             try:
                 requested_gb = int(requested)
             except (TypeError, ValueError):
@@ -238,7 +285,9 @@ def _root(instance, client, *_args):
         storage_type = client.host_info['environment']['storage']
 
     if storage_type in ['btrfs', 'ceph', 'lvm', 'zfs']:
-        root_gb = max(instance.root_gb, CONF.incus.minimum_root_disk_gb)
+        root_gb = (
+            max(instance.root_gb, CONF.incus.minimum_root_disk_gb)
+            if boot_from_volume else instance.root_gb)
         device['size'] = '{}GB'.format(root_gb)
 
         specs = instance.flavor.extra_specs
@@ -274,26 +323,36 @@ def _network(instance, _, network_info, __):
         }
 
         specs = instance.flavor.extra_specs
-        # Since Incus does not implement average NIC IO and number of burst
-        # bytes, we take the max(vif_*_average, vif_*_peak) to set the peak
-        # network IO and simply ignore the burst bytes.
-        # Align values to MBit/s (8 * powers of 1000 in this case), having
-        # in mind that the values are recieved in Kilobytes/s.
-        vif_inbound_limit = max(
-            int(specs.get('quota:vif_inbound_average', 0)),
-            int(specs.get('quota:vif_inbound_peak', 0)),
-        )
-        if vif_inbound_limit:
-            devices[key]['limits.ingress'] = '{}Mbit'.format(
-                vif_inbound_limit * units.k * 8 // units.M)
+        unsupported = [
+            'quota:vif_{}_{}'.format(direction, suffix)
+            for direction in ('inbound', 'outbound')
+            for suffix in ('peak', 'burst')
+            if specs.get(
+                'quota:vif_{}_{}'.format(direction, suffix)) is not None
+        ]
+        if unsupported:
+            raise exception.InvalidConfiguration(
+                'Incus cannot exactly represent Nova VIF peak/burst QoS: {}'
+                .format(', '.join(sorted(unsupported))))
 
-        vif_outbound_limit = max(
-            int(specs.get('quota:vif_outbound_average', 0)),
-            int(specs.get('quota:vif_outbound_peak', 0)),
-        )
-        if vif_outbound_limit:
-            devices[key]['limits.egress'] = '{}Mbit'.format(
-                vif_outbound_limit * units.k * 8 // units.M)
+        # Nova expresses VIF average bandwidth in kB/s. Incus accepts kbit/s;
+        # preserve the exact value instead of truncating small limits to zero.
+        for direction, incus_key in (
+                ('inbound', 'limits.ingress'),
+                ('outbound', 'limits.egress')):
+            spec = 'quota:vif_{}_average'.format(direction)
+            raw_value = specs.get(spec)
+            if raw_value is None:
+                continue
+            try:
+                value = int(raw_value)
+            except (TypeError, ValueError):
+                raise exception.InvalidConfiguration(
+                    '{} must be a positive integer'.format(spec))
+            if value <= 0:
+                raise exception.InvalidConfiguration(
+                    '{} must be a positive integer'.format(spec))
+            devices[key][incus_key] = '{}kbit'.format(value * 8)
     return devices
 
 
@@ -304,7 +363,9 @@ _DEVICE_FILTER_MAP = [
 ]
 
 
-def to_profile(client, instance, network_info, block_info, update=False):
+def to_profile(
+        client, instance, network_info, block_info, update=False,
+        config_overrides=None, device_overrides=None):
     """Convert a nova flavor to a incus profile.
 
     Every instance container created via nova-incus has a profile by the
@@ -325,6 +386,15 @@ def to_profile(client, instance, network_info, block_info, update=False):
         new = f(instance, client, network_info, block_info)
         if new:
             devices.update(new)
+
+    # Transactional callers can add migration ownership fields or replace a
+    # generated device before the initial create. Applying overrides here
+    # avoids a create-then-save window while leaving all ordinary callers
+    # unchanged.
+    if config_overrides:
+        config.update(config_overrides)
+    if device_overrides:
+        devices.update(device_overrides)
 
     if update is True:
         profile = client.profiles.get(name)

@@ -15,7 +15,9 @@
 
 import collections
 import base64
+import copy
 from contextlib import closing
+import dataclasses
 import errno
 import hashlib
 import inspect
@@ -24,15 +26,17 @@ import os
 import stat
 import tarfile
 import tempfile
+import threading
+import time
 
-import eventlet
-from oslo_config import cfg
 from oslo_serialization import jsonutils
 from oslo_utils import timeutils
 from oslo_utils import units
 from unittest import mock
+from nova import block_device
 from nova import context
 from nova import exception
+from nova import objects
 from nova import test
 from nova.compute import manager
 from nova.compute import power_state
@@ -40,7 +44,9 @@ from nova.compute import task_states
 from nova.compute import vm_states
 from nova.network import model as network_model
 from nova.objects import migrate_data as nova_migrate_data
+from nova.tests.unit import fake_block_device
 from nova.tests.unit import fake_instance
+from nova.virt import block_device as driver_block_device
 from nova.virt import driver as nova_driver
 from pylxd import exceptions as incuscore_exceptions
 import six
@@ -61,6 +67,10 @@ _VIF = {
     'devname': 'lol0', 'type': 'bridge', 'id': '0123456789abcdef',
     'address': 'ca:fe:de:ad:be:ef'}
 
+_TEST_VOLUME_ID = '8231d2e8-1111-4222-8333-123456789abc'
+_TEST_VOLUME_ID_2 = '9231d2e8-1111-4222-8333-123456789abc'
+_TEST_VOLUME_ID_3 = 'a231d2e8-1111-4222-8333-123456789abc'
+
 
 def incus_api_exception(status_code, message):
     response = mock.Mock(status_code=status_code)
@@ -80,19 +90,33 @@ def incus_operation_exception(status_code, message):
     return incuscore_exceptions.LXDAPIException(response)
 
 
+def migration_disk_info(data):
+    data.setdefault(
+        'cleanup_token', '10000000-0000-0000-0000-000000000001')
+    data.setdefault('idmap_base', 1065536)
+    data.setdefault('idmap_size', 65536)
+    return jsonutils.dumps(data)
+
+
 def fake_connection_info(volume, location, iqn, auth=False, transport=None):
-    dev_name = 'ip-%s-iscsi-%s-lun-1' % (location, iqn)
+    """Return a recoverable RBD connection for attach transaction tests."""
+    dev_name = 'ip-%s-rbd-%s' % (location, iqn)
     if transport is not None:
         dev_name = 'pci-0000:00:00.0-' + dev_name
     dev_path = '/dev/disk/by-path/%s' % (dev_name)
+    volume_id = {
+        '1': _TEST_VOLUME_ID,
+        '2': _TEST_VOLUME_ID_2,
+        '3': _TEST_VOLUME_ID_3,
+    }.get(str(volume['id']), str(volume['id']))
     ret = {
-        'driver_volume_type': 'iscsi',
+        'driver_volume_type': 'rbd',
+        'serial': volume_id,
         'data': {
-            'volume_id': volume['id'],
-            'target_portal': location,
-            'target_iqn': iqn,
-            'target_lun': 1,
+            'volume_id': volume_id,
+            'name': 'volumes/volume-%s' % volume_id,
             'device_path': dev_path,
+            'access_mode': 'rw',
         }
     }
     if auth:
@@ -102,7 +126,56 @@ def fake_connection_info(volume, location, iqn, auth=False, transport=None):
     return ret
 
 
+def real_volume_driver_bdm(
+        ctxt, volume_id, mount_device, boot_index, connection_info):
+    """Build the DriverVolumeBlockDevice shape Nova passes to spawn()."""
+    mapping = block_device.BlockDeviceDict({
+        'instance_uuid': '00000000-0000-4000-8000-000000000001',
+        'device_name': mount_device,
+        'source_type': 'volume',
+        'destination_type': 'volume',
+        'volume_id': volume_id,
+        'volume_size': 1,
+        'connection_info': jsonutils.dumps(connection_info),
+        'delete_on_termination': False,
+        'boot_index': boot_index,
+    })
+    return driver_block_device.DriverVolumeBlockDevice(
+        fake_block_device.fake_bdm_object(ctxt, mapping))
+
+
 class VolumeConnectionInfoTest(test.NoDBTestCase):
+
+    @mock.patch.object(driver, '_validate_block_device_path',
+                       side_effect=lambda path, label: path)
+    @mock.patch.object(driver.processutils, 'execute')
+    def test_mapped_rbd_device_reuses_index_for_same_connector(
+            self, execute, validate_path):
+        execute.return_value = (jsonutils.dumps({
+            '0': {
+                'pool': 'volumes',
+                'name': 'volume-one',
+                'namespace': '',
+                'device': '/dev/rbd0',
+            },
+            '1': {
+                'pool': 'volumes',
+                'name': 'volume-two',
+                'namespace': '',
+                'device': '/dev/rbd1',
+            },
+        }), '')
+        cache = {}
+
+        first = driver._mapped_rbd_device(
+            {'name': 'volumes/volume-one'}, mapping_cache=cache)
+        second = driver._mapped_rbd_device(
+            {'name': 'volumes/volume-two'}, mapping_cache=cache)
+
+        self.assertEqual('/dev/rbd0', first)
+        self.assertEqual('/dev/rbd1', second)
+        execute.assert_called_once_with(
+            'rbd', 'showmapped', '--format=json')
 
     def test_volume_id_prefers_modern_serial(self):
         connection_info = {
@@ -138,15 +211,1480 @@ class GetPowerStateTest(test.NoDBTestCase):
         self.assertEqual(power_state.NOSTATE, state)
 
     def test_crashed(self):
-        state = driver._get_power_state(108)
-        self.assertEqual(power_state.CRASHED, state)
+        self.assertEqual(
+            power_state.CRASHED, driver._get_power_state(108))
+        self.assertEqual(
+            power_state.CRASHED, driver._get_power_state(112))
 
-    def test_suspended(self):
-        state = driver._get_power_state(109)
-        self.assertEqual(power_state.SUSPENDED, state)
+    def test_freeze_transitions_have_no_stable_state(self):
+        self.assertEqual(
+            power_state.NOSTATE, driver._get_power_state(109))
+        self.assertEqual(
+            power_state.NOSTATE, driver._get_power_state(111))
+        self.assertEqual(
+            power_state.NOSTATE, driver._get_power_state(113))
+
+    def test_frozen_is_paused(self):
+        self.assertEqual(
+            power_state.PAUSED, driver._get_power_state(110))
 
     def test_unknown(self):
         self.assertRaises(ValueError, driver._get_power_state, 69)
+
+
+class MigrationAttemptProtocolTest(test.NoDBTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.conf_patcher = mock.patch.object(driver, 'CONF')
+        self.conf = self.conf_patcher.start()
+        self.addCleanup(self.conf_patcher.stop)
+        self.conf.incus.project = 'nova'
+        self.conf.incus.migration_finish_retries = 3
+        self.conf.incus.migration_finish_retry_interval = 0
+        self.instance = mock.Mock(
+            name='instance-test',
+            uuid='00000000-0000-0000-0000-000000000001')
+        self.instance.name = 'instance-test'
+        self.token = '10000000-0000-0000-0000-000000000001'
+        self.client = mock.Mock()
+        self.client.instances.get.return_value.config = {
+            'security.idmap.base': '500000000',
+            'security.idmap.size': '65536',
+        }
+        self.client.instances.get.return_value.expanded_config = {}
+        self.client.host_info = {
+            'api_extensions': ['migration_attempt_fencing']}
+        self.client.api = mock.MagicMock()
+        collection = self.client.api['migration-attempts']
+        self.endpoint = collection[self.token]
+
+    def _attempt(self, state='active', finished=False, **overrides):
+        metadata = {
+            'token': self.token,
+            'project': 'nova',
+            'resource_type': 'instance',
+            'resource_name': self.instance.name,
+            'state': state,
+            'finished': finished,
+            'operation_uuid': '',
+            'idmap_base': 1065536,
+            'idmap_size': 65536,
+        }
+        metadata.update(overrides)
+        response = mock.Mock()
+        response.json.return_value = {'metadata': metadata}
+        return response
+
+    def test_register_attempt_binds_name_project_and_idmap(self):
+        self.endpoint.put.return_value = self._attempt()
+
+        attempt = driver._register_migration_attempt(
+            self.client, self.instance, self.token, 1065536, 65536)
+
+        self.assertEqual('active', attempt['state'])
+        self.endpoint.put.assert_called_once_with(
+            params={'project': 'nova'},
+            json={
+                'state': 'active',
+                'resource_type': 'instance',
+                'resource_name': self.instance.name,
+                'idmap_base': 1065536,
+                'idmap_size': 65536,
+            })
+
+    def test_register_attempt_rejects_idmap_mismatch(self):
+        self.endpoint.put.return_value = self._attempt(idmap_size=131072)
+
+        self.assertRaises(
+            exception.MigrationError,
+            driver._register_migration_attempt,
+            self.client, self.instance, self.token, 1065536, 65536)
+
+    def test_instance_owner_uses_expanded_profile_config(self):
+        container = mock.Mock(
+            expanded_config={
+                'user.openstack.uuid': self.instance.uuid,
+            },
+            config={})
+
+        self.assertEqual(
+            self.instance.uuid, driver._instance_nova_uuid(container))
+
+    def test_instance_owner_rejects_conflicting_config(self):
+        container = mock.Mock(
+            expanded_config={
+                'user.openstack.uuid': self.instance.uuid,
+            },
+            config={
+                'user.openstack.uuid':
+                    '00000000-0000-0000-0000-000000000002',
+            })
+
+        self.assertIsNone(driver._instance_nova_uuid(container))
+
+    def test_abort_fences_before_operation_settlement(self):
+        self.endpoint.put.return_value = self._attempt(
+            state='aborted', finished=True)
+        events = []
+        self.endpoint.put.side_effect = lambda **kwargs: (
+            events.append('abort') or self._attempt(
+                state='aborted', finished=True))
+
+        with mock.patch.object(
+                driver, '_settle_instance_migration_operations',
+                side_effect=lambda *args, **kwargs: events.append('settle')):
+            with mock.patch.object(
+                    driver, '_wait_migration_attempt_finished',
+                    side_effect=lambda *args, **kwargs: (
+                        events.append('wait') or {
+                            'state': 'aborted', 'finished': True})):
+                result = driver._abort_migration_attempt(
+                    self.client, self.instance, self.token, 1065536, 65536)
+
+        self.assertEqual(['abort', 'settle', 'wait'], events)
+        self.assertEqual('aborted', result['state'])
+
+    def test_create_recovers_committed_attempt_after_lost_response(self):
+        active = {
+            'state': 'active', 'finished': False, 'operation_uuid': ''}
+        committed = {
+            'state': 'committed', 'finished': True,
+            'operation_uuid': '20000000-0000-0000-0000-000000000002'}
+        container = mock.sentinel.container
+        self.client.api.instances.post.side_effect = (
+            incuscore_exceptions.ClientConnectionFailed('lost response'))
+        request = {
+            'name': self.instance.name,
+            'source': {'type': 'migration'},
+        }
+
+        with mock.patch.object(
+                driver, '_get_migration_attempt',
+                side_effect=[active, committed]):
+            with mock.patch.object(
+                    driver, '_migration_attempt_instance',
+                    return_value=container):
+                result, operation_id = driver._create_migration_target(
+                    self.client, request, self.instance, self.token,
+                    1065536, 65536)
+
+        self.assertIs(container, result)
+        self.assertEqual(
+            '20000000-0000-0000-0000-000000000002', operation_id)
+        sent = self.client.api.instances.post.call_args.kwargs['json']
+        self.assertEqual(
+            self.token, sent['source']['migration_attempt'])
+        self.assertNotIn('migration_attempt', request['source'])
+
+    def test_side_effect_retry_rejects_generic_runtime_error(self):
+        action = mock.Mock(side_effect=RuntimeError('bad configuration'))
+
+        self.assertRaises(
+            RuntimeError, driver._retry_migration_finish_action,
+            action, 'configuration write', self.instance)
+
+        action.assert_called_once_with()
+
+    def test_side_effect_retry_accepts_connection_failure(self):
+        action = mock.Mock(side_effect=[
+            incuscore_exceptions.ClientConnectionFailed('disconnected'),
+            mock.sentinel.result,
+        ])
+
+        result = driver._retry_migration_finish_action(
+            action, 'API write', self.instance)
+
+        self.assertIs(mock.sentinel.result, result)
+        self.assertEqual(2, action.call_count)
+
+    def test_finalize_marker_save_failure_remains_retryable(self):
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': self.instance.uuid,
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: self.token,
+            driver.MIGRATION_DESTINATION_PREPARED_KEY: self.token,
+        }
+        profile.save.side_effect = RuntimeError('database unavailable')
+        attempt = {'state': 'committed', 'finished': True}
+
+        with mock.patch.object(
+                driver, '_get_migration_attempt', return_value=attempt):
+            with mock.patch.object(
+                    driver, '_retire_migration_attempt') as retire:
+                self.assertRaises(
+                    RuntimeError,
+                    driver._finalize_committed_migration_attempt,
+                    self.client, self.instance, self.token,
+                    1065536, 65536)
+
+        self.assertEqual(
+            self.token,
+            profile.config[driver.MIGRATION_DESTINATION_PREPARED_KEY])
+        retire.assert_not_called()
+
+
+class IncusIDMapDriverTest(test.NoDBTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.instances_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.instances_dir.cleanup)
+        self.flags(instances_path=self.instances_dir.name)
+        self.flags(state_path=self.instances_dir.name)
+        lock_path = os.path.join(self.instances_dir.name, 'locks')
+        os.makedirs(lock_path)
+        self.flags(lock_path=lock_path, group='oslo_concurrency')
+        self.flags(project='nova', group='incus')
+        self.driver = driver.IncusDriver(None)
+        self.driver.idmap_allocator = mock.Mock(
+            spec=driver.incus_idmap.IDMapAllocator)
+        self.host_id = '20000000-0000-0000-0000-000000000002'
+        node_uuid = mock.patch.object(
+            driver.virt_node, 'read_local_node_uuid',
+            return_value=self.host_id)
+        node_uuid.start()
+        self.addCleanup(node_uuid.stop)
+        self.assignment = driver.incus_idmap.IDMapAssignment(
+            instance_uuid='00000000-0000-0000-0000-000000000001',
+            base=500000000, size=65536, slot=0,
+            allocation_id='10000000-0000-0000-0000-000000000001',
+            fingerprint='a' * 64, host_ids=(self.host_id,))
+        self.materialization_id = (
+            '30000000-0000-0000-0000-000000000003')
+        self.claim = self._claim(state='committed')
+        self.driver.idmap_allocator.get.return_value = self.assignment
+        self.driver.idmap_allocator.claim.return_value = self.assignment
+        self.driver.idmap_allocator.get_host_claim.return_value = self.claim
+        self.driver.idmap_allocator.assert_startable.return_value = (
+            self.assignment)
+        self.driver.idmap_allocator.get_release_intent.return_value = None
+        self.driver.client = mock.Mock()
+        self.driver.inventory_client = self.driver.client
+        self.driver.client.api = mock.MagicMock()
+        self.driver.storage_ownership = mock.Mock(
+            spec=driver.incus_storage_protocol.StorageOwnershipClient)
+        self._set_all_project_inventory()
+        self.instance = mock.Mock(
+            uuid=self.assignment.instance_uuid, name='instance-00000001',
+            system_metadata={})
+        self.instance.name = 'instance-00000001'
+
+    def _claim(self, state='committed', proof=None):
+        return driver.incus_idmap.IDMapHostClaim(
+            host_id=self.host_id,
+            materialization_id=self.materialization_id,
+            instance_uuid=self.assignment.instance_uuid,
+            base=self.assignment.base,
+            size=self.assignment.size,
+            slot=self.assignment.slot,
+            allocation_id=self.assignment.allocation_id,
+            fingerprint=self.assignment.fingerprint,
+            state=state,
+            proof=proof)
+
+    def _binding(self, disposition='delete', storage_driver='ceph'):
+        return driver.incus_storage_protocol.StorageMaterializationBinding(
+            token=self.materialization_id,
+            allocation_id=self.assignment.allocation_id,
+            compute_id=self.host_id,
+            owner=self.instance.uuid,
+            project='nova',
+            instance_name=self.instance.name,
+            idmap_base=self.assignment.base,
+            idmap_size=self.assignment.size,
+            storage_driver=storage_driver,
+            storage_pool='root-pool',
+            storage_volume='nova_instance-00000001',
+            cleanup_disposition=disposition)
+
+    def _materialization(self, state='unmaterialized'):
+        claim = self._claim(state=state)
+        return driver._IDMapMaterialization(
+            assignment=self.assignment,
+            claim=claim,
+            binding=self._binding(),
+            client=self.driver.client)
+
+    def _attempt(self, state='committed', finished=True):
+        return driver.incus_storage_protocol.StorageMaterializationAttempt(
+            binding=self._binding(),
+            storage_identity='rbd-image-id',
+            baseline_clean=True,
+            state=state,
+            storage_phase=(
+                'materialized' if state == 'committed' else 'pending'),
+            started=True,
+            finished=finished,
+            operation_uuid=(
+                '40000000-0000-0000-0000-000000000004'),
+            daemon_start=1)
+
+    def _release_intent(self):
+        return driver.incus_idmap.IDMapReleaseIntent(
+            instance_uuid=self.assignment.instance_uuid,
+            instance_name=self.instance.name,
+            base=self.assignment.base,
+            size=self.assignment.size,
+            slot=self.assignment.slot,
+            allocation_id=self.assignment.allocation_id,
+            fingerprint=self.assignment.fingerprint)
+
+    def _release_receipt_metadata(self, **overrides):
+        values = {
+            'digest': 'sha256:' + ('b' * 64),
+            'token': self.assignment.allocation_id,
+            'owner': self.assignment.instance_uuid,
+            'project': 'nova',
+            'instance_name': self.instance.name,
+            'idmap_base': self.assignment.base,
+            'idmap_size': self.assignment.size,
+            'storage_driver': 'cephext',
+            'storage_pool': 'cinder-bfv',
+            'storage_volume': 'container_nova_instance-00000001',
+            'storage_identity': '{"block_name_prefix":"rbd_data.",'
+                                '"id":"1234"}',
+            'rbd_image': 'volume-00000000-0000-0000-0000-000000000009',
+            'outcome': 'normalized',
+            'state': 'complete',
+            'created_at': 1785542400,
+            'completed_at': 1785542401,
+        }
+        values.update(overrides)
+        return values
+
+    def _set_all_project_inventory(self, instances=None, profiles=None):
+        self.driver.client.api.instances.get.return_value.json.return_value = {
+            'metadata': list(instances or [])}
+        self.driver.client.api.profiles.get.return_value.json.return_value = {
+            'metadata': list(profiles or [])}
+
+    def _set_instance_idmap_metadata(self):
+        self.instance.system_metadata = {
+            driver.IDMAP_BASE_METADATA_KEY: str(self.assignment.base),
+            driver.IDMAP_SIZE_METADATA_KEY: str(self.assignment.size),
+            driver.IDMAP_ALLOCATION_METADATA_KEY:
+                self.assignment.allocation_id,
+            driver.IDMAP_FINGERPRINT_METADATA_KEY:
+                self.assignment.fingerprint,
+        }
+
+    def _idmap_container(self):
+        return mock.Mock(config={
+            'user.openstack.uuid': self.instance.uuid,
+            driver.IDMAP_ALLOCATION_CONFIG_KEY:
+                self.assignment.allocation_id,
+            driver.IDMAP_COMPUTE_CONFIG_KEY: self.host_id,
+            driver.IDMAP_MATERIALIZATION_CONFIG_KEY:
+                self.materialization_id,
+            'security.idmap.base': str(self.assignment.base),
+            'security.idmap.size': str(self.assignment.size),
+        }, expanded_config={})
+
+    def test_allocate_persists_nova_system_metadata(self):
+        self.driver.idmap_allocator.allocate.return_value = self.assignment
+
+        result = self.driver._ensure_instance_idmap(self.instance)
+
+        self.assertEqual(self.assignment, result)
+        self.assertEqual(
+            {
+                driver.IDMAP_BASE_METADATA_KEY: '500000000',
+                driver.IDMAP_SIZE_METADATA_KEY: '65536',
+                driver.IDMAP_ALLOCATION_METADATA_KEY:
+                    self.assignment.allocation_id,
+                driver.IDMAP_FINGERPRINT_METADATA_KEY: 'a' * 64,
+            }, self.instance.system_metadata)
+        self.instance.save.assert_called_once_with()
+        self.driver.idmap_allocator.claim.assert_not_called()
+
+    def test_begin_claims_and_registers_before_spawn_can_continue(self):
+        token = self.materialization_id
+        root = {'type': 'disk', 'path': '/', 'pool': 'root-pool'}
+        unmaterialized = self._claim(state='unmaterialized')
+        self.driver._ensure_instance_idmap = mock.Mock(
+            return_value=self.assignment)
+        self.driver.idmap_allocator.get.return_value = self.assignment
+        self.driver.idmap_allocator.get_host_claim.return_value = (
+            unmaterialized)
+        self.driver.client.storage_pools.get.return_value = mock.Mock(
+            driver='ceph')
+        calls = mock.Mock()
+        calls.attach_mock(self.driver.idmap_allocator.claim, 'claim')
+        calls.attach_mock(
+            self.driver.storage_ownership.register_materialization,
+            'register')
+
+        materialization = self.driver._begin_idmap_materialization(
+            self.instance, token, root)
+
+        self.assertEqual(self.assignment, materialization.assignment)
+        self.assertEqual(unmaterialized, materialization.claim)
+        self.assertEqual([
+            mock.call.claim(
+                self.instance.uuid, self.host_id, token,
+                assignment=self.assignment),
+            mock.call.register(materialization.binding),
+        ], calls.mock_calls)
+
+    def test_preflight_spawn_attempt_allows_exact_no_claim_destroy(self):
+        self.driver.idmap_allocator.get.return_value = None
+        self.driver.idmap_allocator.get_release_intent.return_value = None
+        self.instance.system_metadata = {}
+        attempt = self.driver._create_spawn_preflight_attempt(
+            self.instance, self.materialization_id)
+
+        self.assertEqual('preflight', attempt['phase'])
+        self.assertTrue(self.driver._consume_spawn_preflight_noop(
+            self.instance))
+        self.assertIsNone(driver._read_spawn_attempt_journal(self.instance))
+        self.driver.idmap_allocator.retire_claim.assert_not_called()
+
+    def test_opening_spawn_attempt_without_claim_fails_closed(self):
+        self.driver.idmap_allocator.get.return_value = None
+        attempt = self.driver._create_spawn_preflight_attempt(
+            self.instance, self.materialization_id)
+        opened = self.driver._open_spawn_attempt(self.instance, attempt)
+
+        self.assertRaises(
+            driver.incus_idmap.IDMapConflict,
+            self.driver._consume_spawn_preflight_noop, self.instance)
+        self.assertEqual(
+            opened, driver._read_spawn_attempt_journal(self.instance))
+
+    def test_finish_spawn_attempt_open_requires_opening_payload(self):
+        self.driver.idmap_allocator.get.return_value = None
+        self.driver.idmap_allocator.get_release_intent.return_value = None
+        self.instance.system_metadata = {}
+        preflight = self.driver._create_spawn_preflight_attempt(
+            self.instance, self.materialization_id)
+        opened = self.driver._open_spawn_attempt(self.instance, preflight)
+        self.driver.idmap_allocator.get.return_value = self.assignment
+        self.driver.idmap_allocator.get_host_claim.return_value = (
+            self._claim(state='unmaterialized'))
+
+        # spawn() must thread the opening payload forward; finishing with
+        # the stale preflight payload is an integrity error and must retain
+        # the durable journal.
+        self.assertRaises(
+            driver.incus_idmap.IDMapIntegrityError,
+            self.driver._finish_spawn_attempt_open, self.instance, preflight)
+        self.assertEqual(
+            opened, driver._read_spawn_attempt_journal(self.instance))
+
+        self.driver._finish_spawn_attempt_open(self.instance, opened)
+        self.assertIsNone(driver._read_spawn_attempt_journal(self.instance))
+
+    def test_preflight_spawn_attempt_with_incus_token_fails_closed(self):
+        self.driver.idmap_allocator.get.return_value = None
+        self.driver.idmap_allocator.get_release_intent.return_value = None
+        self.instance.system_metadata = {}
+        attempt = self.driver._create_spawn_preflight_attempt(
+            self.instance, self.materialization_id)
+        self._set_all_project_inventory(instances=[{
+            'name': self.instance.name,
+            'project': 'nova',
+            'config': {
+                driver.IDMAP_MATERIALIZATION_CONFIG_KEY:
+                    self.materialization_id,
+            },
+        }])
+
+        self.assertRaises(
+            driver.incus_idmap.IDMapIntegrityError,
+            self.driver._consume_spawn_preflight_noop, self.instance)
+        self.assertEqual(
+            attempt, driver._read_spawn_attempt_journal(self.instance))
+
+    def test_opening_spawn_attempt_removed_only_by_exact_claim(self):
+        unmaterialized = self._claim(state='unmaterialized')
+        self.driver.idmap_allocator.get.return_value = self.assignment
+        self.driver.idmap_allocator.get_host_claim.return_value = (
+            unmaterialized)
+        attempt = driver._write_spawn_attempt_journal(
+            self.instance, self.host_id, self.materialization_id,
+            phase='preflight')
+        opened = self.driver._open_spawn_attempt(self.instance, attempt)
+
+        self.driver._finish_spawn_attempt_open(self.instance, opened)
+
+        self.assertIsNone(driver._read_spawn_attempt_journal(self.instance))
+
+    def test_reschedule_reuses_exact_cleaned_allocation_generation(self):
+        source_host = '10000000-0000-0000-0000-000000000001'
+        source_token = '30000000-0000-0000-0000-000000000001'
+        assignment = dataclasses.replace(
+            self.assignment, host_ids=(source_host,))
+        source_claim = dataclasses.replace(
+            self.claim, host_id=source_host,
+            materialization_id=source_token, state='cleaned',
+            proof=mock.sentinel.source_cleanup_proof)
+        destination_claim = self._claim(state='unmaterialized')
+        claimed_assignment = dataclasses.replace(
+            assignment, host_ids=tuple(sorted((source_host, self.host_id))))
+        state = {
+            'assignment': assignment,
+            'claims': {source_host: source_claim},
+        }
+        self._set_instance_idmap_metadata()
+
+        def get_assignment(instance_uuid):
+            self.assertEqual(self.instance.uuid, instance_uuid)
+            return state['assignment']
+
+        def get_claim(instance_uuid, host_id):
+            self.assertEqual(self.instance.uuid, instance_uuid)
+            return state['claims'].get(host_id)
+
+        def claim(instance_uuid, host_id, token, assignment=None):
+            self.assertEqual(self.instance.uuid, instance_uuid)
+            self.assertEqual(self.host_id, host_id)
+            self.assertEqual(self.materialization_id, token)
+            self.assertEqual(state['assignment'], assignment)
+            state['assignment'] = claimed_assignment
+            state['claims'][self.host_id] = destination_claim
+            return claimed_assignment
+
+        self.driver.idmap_allocator.get.side_effect = get_assignment
+        self.driver.idmap_allocator.get_host_claim.side_effect = get_claim
+        self.driver.idmap_allocator.claim.side_effect = claim
+        self.driver._root_storage_materialization_binding = mock.Mock(
+            return_value=mock.sentinel.binding)
+
+        attempt = self.driver._create_spawn_preflight_attempt(
+            self.instance, self.materialization_id)
+        opened = self.driver._open_spawn_attempt(self.instance, attempt)
+        materialization = self.driver._begin_idmap_materialization(
+            self.instance, self.materialization_id,
+            {'type': 'disk', 'path': '/', 'pool': 'root-pool'})
+        self.driver._finish_spawn_attempt_open(self.instance, opened)
+
+        self.assertTrue(driver._spawn_attempt_generation_matches(
+            attempt, assignment))
+        self.assertEqual(assignment, materialization.assignment)
+        self.assertEqual(source_claim, state['claims'][source_host])
+        self.assertEqual(destination_claim, state['claims'][self.host_id])
+        self.assertEqual(claimed_assignment, state['assignment'])
+        self.driver.idmap_allocator.allocate.assert_not_called()
+        self.driver.storage_ownership.register_materialization.\
+            assert_called_once_with(mock.sentinel.binding)
+        self.assertIsNone(driver._read_spawn_attempt_journal(self.instance))
+
+    def test_reschedule_preflight_failure_preserves_generation_for_retry(self):
+        source_host = '10000000-0000-0000-0000-000000000001'
+        source_token = '30000000-0000-0000-0000-000000000001'
+        failed_token = '30000000-0000-0000-0000-000000000008'
+        assignment = dataclasses.replace(
+            self.assignment, host_ids=(source_host,))
+        source_claim = dataclasses.replace(
+            self.claim, host_id=source_host,
+            materialization_id=source_token, state='cleaned',
+            proof=mock.sentinel.source_cleanup_proof)
+        destination_claim = self._claim(state='unmaterialized')
+        claimed_assignment = dataclasses.replace(
+            assignment, host_ids=tuple(sorted((source_host, self.host_id))))
+        state = {
+            'assignment': assignment,
+            'claims': {source_host: source_claim},
+        }
+        self._set_instance_idmap_metadata()
+
+        self.driver.idmap_allocator.get.side_effect = (
+            lambda unused_uuid: state['assignment'])
+        self.driver.idmap_allocator.get_host_claim.side_effect = (
+            lambda unused_uuid, host_id: state['claims'].get(host_id))
+
+        failed_attempt = self.driver._create_spawn_preflight_attempt(
+            self.instance, failed_token)
+
+        self.assertTrue(self.driver._consume_spawn_preflight_noop(
+            self.instance))
+        self.assertTrue(driver._spawn_attempt_generation_matches(
+            failed_attempt, assignment))
+        self.assertEqual(assignment, state['assignment'])
+        self.assertEqual({source_host: source_claim}, state['claims'])
+        self.driver.idmap_allocator.retire_claim.assert_not_called()
+
+        def claim(instance_uuid, host_id, token, assignment=None):
+            self.assertEqual(self.instance.uuid, instance_uuid)
+            self.assertEqual(self.host_id, host_id)
+            self.assertEqual(self.materialization_id, token)
+            self.assertEqual(state['assignment'], assignment)
+            state['assignment'] = claimed_assignment
+            state['claims'][self.host_id] = destination_claim
+            return claimed_assignment
+
+        self.driver.idmap_allocator.claim.side_effect = claim
+        self.driver._root_storage_materialization_binding = mock.Mock(
+            return_value=mock.sentinel.binding)
+        retry = self.driver._create_spawn_preflight_attempt(
+            self.instance, self.materialization_id)
+        opened = self.driver._open_spawn_attempt(self.instance, retry)
+        self.driver._begin_idmap_materialization(
+            self.instance, self.materialization_id,
+            {'type': 'disk', 'path': '/', 'pool': 'root-pool'})
+        self.driver._finish_spawn_attempt_open(self.instance, opened)
+
+        self.assertEqual(claimed_assignment, state['assignment'])
+        self.assertEqual(source_claim, state['claims'][source_host])
+        self.assertEqual(destination_claim, state['claims'][self.host_id])
+        self.driver.idmap_allocator.allocate.assert_not_called()
+        self.assertIsNone(driver._read_spawn_attempt_journal(self.instance))
+
+    def test_reschedule_rejects_unclean_historical_claim(self):
+        source_host = '10000000-0000-0000-0000-000000000001'
+        assignment = dataclasses.replace(
+            self.assignment, host_ids=(source_host,))
+        source_claim = dataclasses.replace(
+            self.claim, host_id=source_host, state='possible', proof=None)
+        self._set_instance_idmap_metadata()
+        self.driver.idmap_allocator.get.return_value = assignment
+        self.driver.idmap_allocator.get_host_claim.return_value = source_claim
+
+        self.assertRaises(
+            driver.incus_idmap.IDMapConflict,
+            self.driver._create_spawn_preflight_attempt,
+            self.instance, self.materialization_id)
+
+        self.assertIsNone(driver._read_spawn_attempt_journal(self.instance))
+
+    def test_opening_response_loss_destroys_exact_claim_then_retires(self):
+        cleaned = self._claim(
+            state='cleaned', proof=mock.sentinel.cleanup_proof)
+        self._set_instance_idmap_metadata()
+        self.driver.idmap_allocator.get.return_value = self.assignment
+        self.driver.idmap_allocator.get_host_claim.return_value = cleaned
+        attempt = driver._write_spawn_attempt_journal(
+            self.instance, self.host_id, self.materialization_id,
+            phase='preflight')
+        self.driver._open_spawn_attempt(self.instance, attempt)
+        self.driver._settle_idmap_host_claim = mock.Mock(
+            return_value=cleaned)
+        self.driver.cleanup = mock.Mock()
+        self.driver._retire_instance_idmap_claim_if_clean = mock.Mock()
+        absent = incuscore_exceptions.NotFound(MockResponse(404))
+        self.driver.client.instances.get.side_effect = absent
+        self.driver.client.profiles.get.side_effect = absent
+
+        self.driver.destroy(
+            context.get_admin_context(), self.instance, [],
+            block_device_info={'block_device_mapping': []})
+
+        self.driver._settle_idmap_host_claim.assert_called_once_with(
+            self.instance, cleaned, final_delete=False)
+        self.driver.cleanup.assert_called_once()
+        self.driver._retire_instance_idmap_claim_if_clean.\
+            assert_called_once_with(self.instance)
+        self.assertIsNone(driver._read_spawn_attempt_journal(self.instance))
+
+    def test_opening_journal_generation_must_match_claim(self):
+        other = dataclasses.replace(
+            self.assignment,
+            allocation_id='10000000-0000-0000-0000-000000000009')
+        attempt = driver._write_spawn_attempt_journal(
+            self.instance, self.host_id, self.materialization_id,
+            phase='preflight', generation=other)
+        self.driver._open_spawn_attempt(self.instance, attempt)
+
+        self.assertRaises(
+            driver.incus_idmap.IDMapIntegrityError,
+            self.driver._remove_spawn_attempt_for_claim,
+            self.instance, self.claim)
+
+        self.assertIsNotNone(
+            driver._read_spawn_attempt_journal(self.instance))
+
+    def test_failed_build_destroy_reacks_cleaned_claim_without_retiring(self):
+        cleaned = self._claim(
+            state='cleaned', proof=mock.sentinel.cleanup_proof)
+        self.instance.vm_state = vm_states.BUILDING
+        self.instance.task_state = task_states.SPAWNING
+        self.driver._consume_spawn_preflight_noop = mock.Mock(
+            return_value=False)
+        self.driver._idmap_rootfs_release_context = mock.Mock(
+            return_value=(None, self.assignment, cleaned))
+        self.driver._settle_idmap_host_claim = mock.Mock(
+            return_value=cleaned)
+        self.driver.cleanup = mock.Mock()
+        self.driver._remove_spawn_attempt_for_claim = mock.Mock()
+        self.driver._retire_instance_idmap_claim_if_clean = mock.Mock()
+        self.driver.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+        self.driver.client.profiles.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+
+        self.driver.destroy(
+            context.get_admin_context(), self.instance, [],
+            block_device_info={'block_device_mapping': []})
+
+        self.driver._settle_idmap_host_claim.assert_called_once_with(
+            self.instance, cleaned, final_delete=False)
+        self.driver.cleanup.assert_called_once()
+        self.driver._retire_instance_idmap_claim_if_clean.assert_not_called()
+
+    @mock.patch.object(driver.lockutils, 'lock')
+    def test_materialization_lock_covers_mark_and_create(self, lock):
+        materialization = self._materialization()
+        possible = self._claim(state='possible')
+        committed = self._claim(state='committed')
+        self.driver._exact_idmap_host_claim = mock.Mock(side_effect=[
+            (self.assignment, materialization.claim),
+            (self.assignment, possible),
+        ])
+        mark_committed = (
+            self.driver.idmap_allocator.mark_materialization_committed)
+        mark_committed.return_value = committed
+        observe = self.driver.storage_ownership.observe_materialization_start
+        observe.return_value = self._attempt()
+        create = mock.Mock(return_value=mock.sentinel.container)
+        request_config = {}
+
+        result = self.driver._with_rootfs_materialization_barrier(
+            materialization, request_config, create)
+
+        self.assertIs(mock.sentinel.container, result)
+        create.assert_called_once_with()
+        self.driver.idmap_allocator.mark_materialization_possible.\
+            assert_called_once_with(
+                self.instance.uuid, self.host_id, self.materialization_id,
+                assignment=self.assignment)
+        mark_committed.assert_called_once_with(
+            self.instance.uuid, self.host_id, self.materialization_id,
+            assignment=self.assignment)
+        self.assertEqual(
+            self.materialization_id,
+            request_config[driver.IDMAP_MATERIALIZATION_CONFIG_KEY])
+        self.assertEqual(2, lock.call_count)
+
+    @mock.patch.object(driver.lockutils, 'lock')
+    def test_lost_create_response_recovers_only_after_exact_commit(self, lock):
+        materialization = self._materialization()
+        possible = self._claim(state='possible')
+        committed = self._claim(state='committed')
+        self.driver._exact_idmap_host_claim = mock.Mock(side_effect=[
+            (self.assignment, materialization.claim),
+            (self.assignment, possible),
+        ])
+        mark_committed = (
+            self.driver.idmap_allocator.mark_materialization_committed)
+        mark_committed.return_value = committed
+        observe = self.driver.storage_ownership.observe_materialization_start
+        observe.return_value = self._attempt()
+        create = mock.Mock(side_effect=RuntimeError('create response lost'))
+        recover = mock.Mock(return_value=mock.sentinel.container)
+
+        result = self.driver._with_rootfs_materialization_barrier(
+            materialization, {}, create, recover_action=recover)
+
+        self.assertIs(mock.sentinel.container, result)
+        recover.assert_called_once_with()
+        mark_committed.assert_called_once()
+
+    def test_delete_success_then_proof_failure_is_not_reported_complete(self):
+        claim = self._claim(state='committed')
+        container = mock.Mock(config={
+            'user.openstack.uuid': self.instance.uuid,
+            driver.IDMAP_ALLOCATION_CONFIG_KEY: claim.allocation_id,
+            driver.IDMAP_COMPUTE_CONFIG_KEY: claim.host_id,
+            driver.IDMAP_MATERIALIZATION_CONFIG_KEY:
+                claim.materialization_id})
+        endpoint = self.driver.client.api.instances[self.instance.name]
+        response = mock.Mock()
+        response.json.return_value = {
+            'operation': '/1.0/operations/'
+                         '30000000-0000-0000-0000-000000000003'}
+        endpoint.delete.return_value = response
+        proof_error = RuntimeError('process died before proof')
+        self.driver._promote_idmap_claim_if_server_committed = mock.Mock(
+            return_value=(self.assignment, claim))
+        self.driver._settle_idmap_host_claim = mock.Mock(
+            side_effect=proof_error)
+
+        raised = self.assertRaises(
+            RuntimeError,
+            self.driver._delete_instance_with_rootfs_release_receipt,
+            container, self.instance, claim)
+
+        self.assertIs(proof_error, raised)
+        wait = self.driver.client.operations.wait_for_operation
+        wait.assert_called_once_with(
+            '30000000-0000-0000-0000-000000000003')
+
+    def test_tokenized_delete_recovers_lost_operation_response(self):
+        claim = self._claim(state='committed')
+        container = mock.Mock(config={
+            'user.openstack.uuid': self.instance.uuid,
+            driver.IDMAP_ALLOCATION_CONFIG_KEY: claim.allocation_id,
+            driver.IDMAP_COMPUTE_CONFIG_KEY: claim.host_id,
+            driver.IDMAP_MATERIALIZATION_CONFIG_KEY:
+                claim.materialization_id})
+        endpoint = self.driver.client.api.instances[self.instance.name]
+        endpoint.delete.side_effect = RuntimeError('connection lost')
+        self.driver._promote_idmap_claim_if_server_committed = mock.Mock(
+            return_value=(self.assignment, claim))
+        self.driver._settle_idmap_host_claim = mock.Mock(
+            return_value=mock.sentinel.proof)
+
+        result = self.driver._delete_instance_with_rootfs_release_receipt(
+            container, self.instance, claim)
+
+        self.assertIs(mock.sentinel.proof, result)
+        endpoint.delete.assert_called_once_with(params={
+            'project': 'nova',
+            'rootfs-idmap-release-token': claim.materialization_id,
+            'rootfs-idmap-release-owner': claim.instance_uuid,
+            'rootfs-idmap-allocation-id': claim.allocation_id,
+            'rootfs-idmap-compute-id': claim.host_id,
+        })
+        self.driver._settle_idmap_host_claim.assert_called_once_with(
+            self.instance, claim, final_delete=True,
+            client=self.driver.client)
+
+    def test_tokenized_delete_rejects_profile_only_owner(self):
+        claim = self._claim(state='committed')
+        container = mock.Mock(config={})
+        self.driver._promote_idmap_claim_if_server_committed = mock.Mock(
+            return_value=(self.assignment, claim))
+
+        self.assertRaises(
+            driver.incus_idmap.IDMapIntegrityError,
+            self.driver._delete_instance_with_rootfs_release_receipt,
+            container, self.instance, claim)
+
+        self.driver.client.api.instances[
+            self.instance.name].delete.assert_not_called()
+
+    def test_allocate_refreshes_and_preserves_unrelated_system_metadata(self):
+        instance = objects.Instance(
+            uuid=self.assignment.instance_uuid,
+            system_metadata={'stale-key': 'stale-value'})
+        self.driver.idmap_allocator.allocate.return_value = self.assignment
+
+        with mock.patch.object(instance, 'refresh') as refresh:
+            refresh.side_effect = lambda: setattr(
+                instance, 'system_metadata', {'unrelated-key': 'keep-me'})
+            with mock.patch.object(instance, 'save') as save:
+                self.driver._ensure_instance_idmap(instance)
+
+        refresh.assert_called_once_with()
+        save.assert_called_once_with()
+        self.assertEqual('keep-me', instance.system_metadata['unrelated-key'])
+        self.assertNotIn('stale-key', instance.system_metadata)
+
+    def test_existing_metadata_requires_exact_allocator_generation(self):
+        self.instance.system_metadata = {
+            driver.IDMAP_BASE_METADATA_KEY: '500000000',
+            driver.IDMAP_SIZE_METADATA_KEY: '65536',
+            driver.IDMAP_ALLOCATION_METADATA_KEY:
+                self.assignment.allocation_id,
+            driver.IDMAP_FINGERPRINT_METADATA_KEY: 'a' * 64,
+        }
+        self.driver.idmap_allocator.get.return_value = self.assignment
+
+        result = self.driver._ensure_instance_idmap(self.instance)
+
+        self.assertEqual(self.assignment, result)
+        self.driver.idmap_allocator.get.assert_called_once_with(
+            self.instance.uuid)
+        self.driver.idmap_allocator.allocate.assert_not_called()
+        self.instance.save.assert_not_called()
+
+    def test_claim_rechecks_generation_under_reconciliation_lock(self):
+        self.driver._ensure_instance_idmap = mock.Mock(
+            return_value=self.assignment)
+        replacement = dataclasses.replace(
+            self.assignment,
+            allocation_id='50000000-0000-0000-0000-000000000005')
+        self.driver.idmap_allocator.get.return_value = replacement
+
+        self.assertRaises(
+            driver.incus_idmap.IDMapIntegrityError,
+            self.driver._begin_idmap_materialization,
+            self.instance, self.materialization_id,
+            {'type': 'disk', 'path': '/', 'pool': 'root-pool'})
+
+        self.driver.idmap_allocator.claim.assert_not_called()
+
+    def test_global_metadata_without_allocator_fails_closed(self):
+        self.instance.system_metadata = {
+            driver.IDMAP_BASE_METADATA_KEY: '500000000',
+            driver.IDMAP_SIZE_METADATA_KEY: '65536',
+            driver.IDMAP_ALLOCATION_METADATA_KEY:
+                self.assignment.allocation_id,
+            driver.IDMAP_FINGERPRINT_METADATA_KEY: 'a' * 64,
+        }
+        self.driver.idmap_allocator = None
+
+        self.assertRaises(
+            driver.incus_idmap.IDMapIntegrityError,
+            self.driver._ensure_instance_idmap, self.instance)
+
+    def test_allocator_requires_persistent_compute_uuid(self):
+        self.driver._ensure_instance_idmap = mock.Mock(
+            return_value=self.assignment)
+
+        driver.virt_node.read_local_node_uuid.return_value = None
+        self.assertRaises(
+            driver.incus_idmap.IDMapConfigurationError,
+            self.driver._begin_idmap_materialization,
+            self.instance, self.materialization_id,
+            {'type': 'disk', 'path': '/', 'pool': 'root-pool'})
+
+        self.driver.idmap_allocator.claim.assert_not_called()
+
+    def test_existing_metadata_without_registry_record_fails_closed(self):
+        self.instance.system_metadata = {
+            driver.IDMAP_BASE_METADATA_KEY: '500000000',
+            driver.IDMAP_SIZE_METADATA_KEY: '65536',
+            driver.IDMAP_ALLOCATION_METADATA_KEY:
+                self.assignment.allocation_id,
+            driver.IDMAP_FINGERPRINT_METADATA_KEY: 'a' * 64,
+        }
+        self.driver.idmap_allocator.get.return_value = None
+
+        self.assertRaises(
+            driver.incus_idmap.IDMapIntegrityError,
+            self.driver._ensure_instance_idmap, self.instance)
+
+        self.driver.idmap_allocator.allocate.assert_not_called()
+        self.driver.idmap_allocator.adopt.assert_not_called()
+        self.instance.save.assert_not_called()
+
+    def test_observed_mapping_must_match_nova_metadata(self):
+        self.instance.system_metadata = {
+            driver.IDMAP_BASE_METADATA_KEY: '500065536',
+            driver.IDMAP_SIZE_METADATA_KEY: '65536',
+            driver.IDMAP_ALLOCATION_METADATA_KEY:
+                self.assignment.allocation_id,
+            driver.IDMAP_FINGERPRINT_METADATA_KEY: 'a' * 64,
+        }
+
+        self.assertRaises(
+            driver.incus_idmap.IDMapIntegrityError,
+            self.driver._ensure_instance_idmap, self.instance,
+            observed_base=500000000, observed_size=65536)
+        self.driver.idmap_allocator.adopt.assert_not_called()
+
+    def test_start_gate_forwards_observed_instance_mapping(self):
+        self._set_instance_idmap_metadata()
+        container = self._idmap_container()
+
+        result = self.driver._ensure_instance_idmap_before_start(
+            self.instance, container)
+
+        self.assertEqual(self.assignment, result)
+        self.driver.idmap_allocator.assert_startable.assert_called_once_with(
+            self.instance.uuid, self.host_id, self.materialization_id,
+            assignment=self.assignment)
+
+    def test_possible_start_promotes_from_exact_committed_attempt(self):
+        self._set_instance_idmap_metadata()
+        possible = self._claim(state='possible')
+        committed = self._claim(state='committed')
+        self.driver.idmap_allocator.get_host_claim.return_value = possible
+        mark_committed = (
+            self.driver.idmap_allocator.mark_materialization_committed)
+        mark_committed.return_value = committed
+        self.driver.storage_ownership.discover_materialization.return_value = (
+            self._attempt())
+        container = self._idmap_container()
+
+        self.driver._start_instance_with_idmap(self.instance, container)
+
+        mark_committed.assert_called_once_with(
+            self.instance.uuid, self.host_id, self.materialization_id,
+            assignment=self.assignment)
+        self.driver.idmap_allocator.assert_startable.assert_called_once_with(
+            self.instance.uuid, self.host_id, self.materialization_id,
+            assignment=self.assignment)
+        container.start.assert_called_once_with(wait=True)
+
+    def test_possible_start_rejects_noncommitted_server_attempt(self):
+        self._set_instance_idmap_metadata()
+        possible = self._claim(state='possible')
+        self.driver.idmap_allocator.get_host_claim.return_value = possible
+        self.driver.storage_ownership.discover_materialization.return_value = (
+            self._attempt(state='active', finished=False))
+        self.driver.idmap_allocator.assert_startable.side_effect = (
+            driver.incus_idmap.IDMapConflict(
+                reason='materialization has not committed'))
+        container = self._idmap_container()
+
+        self.assertRaises(
+            driver.incus_idmap.IDMapConflict,
+            self.driver._start_instance_with_idmap,
+            self.instance, container)
+
+        self.driver.idmap_allocator.mark_materialization_committed.\
+            assert_not_called()
+        container.start.assert_not_called()
+
+    def test_possible_start_rejects_committed_attempt_for_another_token(self):
+        self._set_instance_idmap_metadata()
+        possible = self._claim(state='possible')
+        self.driver.idmap_allocator.get_host_claim.return_value = possible
+        wrong_binding = dataclasses.replace(
+            self._binding(),
+            token='50000000-0000-0000-0000-000000000005')
+        attempt = dataclasses.replace(
+            self._attempt(), binding=wrong_binding)
+        self.driver.storage_ownership.discover_materialization.return_value = (
+            attempt)
+        container = self._idmap_container()
+
+        self.assertRaises(
+            driver.incus_idmap.IDMapIntegrityError,
+            self.driver._start_instance_with_idmap,
+            self.instance, container)
+
+        self.driver.idmap_allocator.mark_materialization_committed.\
+            assert_not_called()
+        self.driver.idmap_allocator.assert_startable.assert_not_called()
+        container.start.assert_not_called()
+
+    def test_possible_claim_cannot_drive_final_delete(self):
+        possible = self._claim(state='possible')
+        self.driver.idmap_allocator.get_host_claim.return_value = possible
+        self.driver.storage_ownership.discover_materialization.return_value = (
+            self._attempt(state='active', finished=False))
+        container = self._idmap_container()
+
+        self.assertRaises(
+            driver.incus_idmap.IDMapIntegrityError,
+            self.driver._delete_instance_with_rootfs_release_receipt,
+            container, self.instance, possible)
+
+        self.driver.client.api.instances[
+            self.instance.name].delete.assert_not_called()
+
+    def test_final_settlement_requires_committed_claim(self):
+        self._set_instance_idmap_metadata()
+        possible = self._claim(state='possible')
+        self.driver.idmap_allocator.get_host_claim.return_value = possible
+
+        self.assertRaises(
+            driver.incus_idmap.IDMapConflict,
+            self.driver._settle_idmap_host_claim,
+            self.instance, possible, final_delete=True)
+
+        self.driver.storage_ownership.discover_release_receipt.\
+            assert_not_called()
+
+    def test_migration_source_settles_delete_disposition_detach_receipt(self):
+        """The first shared-Ceph migration cannot rewrite its v1 attempt."""
+        self._set_instance_idmap_metadata()
+        claim = self._claim(state='committed')
+        binding = self._binding(disposition='delete', storage_driver='ceph')
+        receipt = driver.incus_idmap.IDMapRootfsReleaseReceipt(
+            token=binding.token,
+            allocation_id=binding.allocation_id,
+            compute_id=binding.compute_id,
+            materialization_id=binding.token,
+            owner=binding.owner,
+            project=binding.project,
+            instance_name=binding.instance_name,
+            idmap_base=binding.idmap_base,
+            idmap_size=binding.idmap_size,
+            storage_driver=binding.storage_driver,
+            storage_pool=binding.storage_pool,
+            storage_volume=binding.storage_volume,
+            rbd_image='container_nova_instance-00000001',
+            storage_identity='rbd_data.1234567890abcdef',
+            baseline_clean=True,
+            cleanup_disposition='delete',
+            outcome='detached',
+            state='complete',
+            digest='',
+            created_at=10,
+            completed_at=11)
+        proof = driver.incus_idmap.IDMapRootfsReleaseProof(
+            **receipt.__dict__)
+        receipt = dataclasses.replace(
+            receipt,
+            digest=driver.incus_idmap.rootfs_release_proof_digest(proof))
+        proof = driver.incus_idmap.validate_rootfs_release_receipt(receipt)
+        cleaned = self._claim(state='cleaned', proof=proof)
+        self.driver.idmap_allocator.get_host_claim.return_value = claim
+        discover = self.driver.storage_ownership.discover_release_receipt
+        discover.return_value = (binding, receipt)
+        record = self.driver.idmap_allocator.record_rootfs_release_proof
+        record.return_value = cleaned
+
+        result = self.driver._settle_idmap_host_claim(
+            self.instance, claim, final_delete=True)
+
+        self.assertEqual(cleaned, result)
+        discover.assert_called_once()
+        record.assert_called_once_with(
+            claim.instance_uuid, claim.host_id, claim.materialization_id,
+            receipt, assignment=self.assignment)
+        self.driver.storage_ownership.acknowledge_release_receipt.\
+            assert_called_once_with(binding, receipt)
+
+    def test_cleaned_claim_release_ack_replay_sends_canonical_receipt(self):
+        # A cleaned claim stores an IDMapRootfsReleaseProof; replaying the
+        # ACK must convert it back to the canonical receipt type the
+        # protocol endpoint validates, or fleet-wide release replay wedges.
+        self._set_instance_idmap_metadata()
+        binding = self._binding(disposition='delete', storage_driver='ceph')
+        receipt = driver.incus_idmap.IDMapRootfsReleaseReceipt(
+            token=binding.token,
+            allocation_id=binding.allocation_id,
+            compute_id=binding.compute_id,
+            materialization_id=binding.token,
+            owner=binding.owner,
+            project=binding.project,
+            instance_name=binding.instance_name,
+            idmap_base=binding.idmap_base,
+            idmap_size=binding.idmap_size,
+            storage_driver=binding.storage_driver,
+            storage_pool=binding.storage_pool,
+            storage_volume=binding.storage_volume,
+            rbd_image='container_nova_instance-00000001',
+            storage_identity='rbd_data.1234567890abcdef',
+            baseline_clean=True,
+            cleanup_disposition='delete',
+            outcome='detached',
+            state='complete',
+            digest='',
+            created_at=10,
+            completed_at=11)
+        proof = driver.incus_idmap.IDMapRootfsReleaseProof(
+            **receipt.__dict__)
+        receipt = dataclasses.replace(
+            receipt,
+            digest=driver.incus_idmap.rootfs_release_proof_digest(proof))
+        proof = driver.incus_idmap.validate_rootfs_release_receipt(receipt)
+        cleaned = self._claim(state='cleaned', proof=proof)
+        self.driver.idmap_allocator.get_host_claim.return_value = cleaned
+
+        result = self.driver._settle_idmap_host_claim(
+            self.instance, cleaned, final_delete=True)
+
+        self.assertEqual(cleaned, result)
+        acknowledge = self.driver.storage_ownership.acknowledge_release_receipt
+        acknowledge.assert_called_once()
+        sent = acknowledge.call_args[0][1]
+        self.assertIsInstance(
+            sent, driver.incus_idmap.IDMapRootfsReleaseReceipt)
+        self.assertEqual(
+            proof, driver.incus_idmap.validate_rootfs_release_receipt(sent))
+        self.driver.storage_ownership.discover_release_receipt.\
+            assert_not_called()
+
+    def test_release_intent_blocks_start_after_exact_mapping_check(self):
+        self.instance.system_metadata = {
+            driver.IDMAP_BASE_METADATA_KEY: str(self.assignment.base),
+            driver.IDMAP_SIZE_METADATA_KEY: str(self.assignment.size),
+            driver.IDMAP_ALLOCATION_METADATA_KEY:
+                self.assignment.allocation_id,
+            driver.IDMAP_FINGERPRINT_METADATA_KEY:
+                self.assignment.fingerprint,
+        }
+        container = mock.Mock(
+            config={
+                'user.openstack.uuid': self.instance.uuid,
+                driver.IDMAP_ALLOCATION_CONFIG_KEY:
+                    self.assignment.allocation_id,
+                driver.IDMAP_COMPUTE_CONFIG_KEY: self.host_id,
+                driver.IDMAP_MATERIALIZATION_CONFIG_KEY:
+                    self.materialization_id,
+                'security.idmap.base': '500000000',
+                'security.idmap.size': '65536',
+            },
+            expanded_config={})
+        failure = driver.incus_idmap.IDMapConflict(
+            reason='release intent blocks instance start')
+        self.driver.idmap_allocator.assert_startable.side_effect = failure
+
+        raised = self.assertRaises(
+            driver.incus_idmap.IDMapConflict,
+            self.driver._start_instance_with_idmap,
+            self.instance, container)
+
+        self.assertIs(failure, raised)
+        container.start.assert_not_called()
+
+    def test_clean_local_state_retires_exact_host_claim(self):
+        self.instance.system_metadata = {
+            driver.IDMAP_BASE_METADATA_KEY: str(self.assignment.base),
+            driver.IDMAP_SIZE_METADATA_KEY: str(self.assignment.size),
+            driver.IDMAP_ALLOCATION_METADATA_KEY:
+                self.assignment.allocation_id,
+            driver.IDMAP_FINGERPRINT_METADATA_KEY:
+                self.assignment.fingerprint,
+        }
+        absent = incuscore_exceptions.NotFound(MockResponse(404))
+        self.driver.client.instances.get.side_effect = absent
+        self.driver.client.profiles.get.side_effect = absent
+        self.driver.idmap_allocator.get.return_value = self.assignment
+        retired = dataclasses.replace(self.assignment, host_ids=())
+        self.driver.idmap_allocator.retire_claim.return_value = retired
+        cleaned = self._claim(
+            state='cleaned', proof=mock.sentinel.cleanup_proof)
+        self.driver._settle_idmap_host_claim = mock.Mock(
+            return_value=cleaned)
+
+        with mock.patch.object(os.path, 'lexists', return_value=False):
+            self.assertTrue(
+                self.driver._retire_instance_idmap_claim_if_clean(
+                    self.instance))
+
+        self.driver.idmap_allocator.retire_claim.assert_called_once_with(
+            self.instance.uuid, self.host_id, self.materialization_id,
+            assignment=self.assignment)
+
+    def test_local_resource_prevents_host_claim_retirement(self):
+        self.driver.client.instances.get.return_value = mock.sentinel.instance
+
+        self.assertFalse(
+            self.driver._retire_instance_idmap_claim_if_clean(self.instance))
+
+        self.driver.idmap_allocator.get.assert_not_called()
+        self.driver.idmap_allocator.retire_claim.assert_not_called()
+
+    @mock.patch.object(driver, '_profile_share_mounts', return_value=[])
+    @mock.patch.object(driver, '_share_journal_records', return_value=[])
+    @mock.patch.object(driver, '_volume_journal_records', return_value=[])
+    @mock.patch.object(os.path, 'lexists', return_value=False)
+    def test_cleanup_ack_retires_target_claim_before_publishing_proof(
+            self, lexists, volume_records, share_records, share_mounts):
+        source_host = '10000000-0000-0000-0000-000000000003'
+        assignment = dataclasses.replace(
+            self.assignment, host_ids=(source_host, self.host_id))
+        retired = dataclasses.replace(assignment, host_ids=(source_host,))
+        self.instance.system_metadata = {
+            driver.IDMAP_BASE_METADATA_KEY: str(assignment.base),
+            driver.IDMAP_SIZE_METADATA_KEY: str(assignment.size),
+            driver.IDMAP_ALLOCATION_METADATA_KEY: assignment.allocation_id,
+            driver.IDMAP_FINGERPRINT_METADATA_KEY: assignment.fingerprint,
+        }
+        token = '30000000-0000-0000-0000-000000000003'
+        profile = mock.Mock(
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                'user.openstack.uuid': self.instance.uuid,
+                driver.MIGRATION_CLEANUP_TOKEN_KEY: token,
+            },
+            devices={}, used_by=[])
+        self.driver.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+        self.driver.client.profiles.get.return_value = profile
+        self.driver.idmap_allocator.get.return_value = assignment
+        self.driver.idmap_allocator.retire_claim.return_value = retired
+        self.driver.idmap_allocator.get_host_claim.return_value = self.claim
+        cleaned = self._claim(
+            state='cleaned', proof=mock.sentinel.cleanup_proof)
+        self.driver._settle_idmap_host_claim = mock.Mock(
+            return_value=cleaned)
+
+        self.assertTrue(self.driver._acknowledge_cleanup_profile(
+            self.instance, token))
+
+        self.driver.idmap_allocator.retire_claim.assert_called_once_with(
+            self.instance.uuid, self.host_id, self.materialization_id,
+            assignment=assignment)
+        proof = driver._parse_idmap_retirement_proof(
+            profile.config[driver.MIGRATION_IDMAP_RETIREMENT_KEY])
+        self.assertEqual(self.host_id, proof.host_id)
+        self.assertTrue(driver._same_idmap_generation(proof, assignment))
+        self.assertEqual(
+            token, profile.config[driver.MIGRATION_CLEANUP_COMPLETE_KEY])
+        profile.save.assert_called_once_with(wait=True)
+
+    def test_duplicate_uuid_in_another_project_blocks_claim_retirement(self):
+        self.instance.system_metadata = {
+            driver.IDMAP_BASE_METADATA_KEY: str(self.assignment.base),
+            driver.IDMAP_SIZE_METADATA_KEY: str(self.assignment.size),
+            driver.IDMAP_ALLOCATION_METADATA_KEY:
+                self.assignment.allocation_id,
+            driver.IDMAP_FINGERPRINT_METADATA_KEY:
+                self.assignment.fingerprint,
+        }
+        absent = incuscore_exceptions.NotFound(MockResponse(404))
+        self.driver.client.instances.get.side_effect = absent
+        self.driver.client.profiles.get.side_effect = absent
+        self._set_all_project_inventory(instances=[{
+            'name': 'foreign-name',
+            'project': 'foreign-project',
+            'config': {'user.openstack.uuid': self.instance.uuid},
+        }])
+
+        with mock.patch.object(os.path, 'lexists', return_value=False):
+            self.assertFalse(
+                self.driver._retire_instance_idmap_claim_if_clean(
+                    self.instance))
+
+        self.driver.idmap_allocator.retire_claim.assert_not_called()
+
+    @mock.patch.object(driver, '_profile_share_mounts', return_value=[])
+    @mock.patch.object(driver, '_share_journal_records', return_value=[])
+    @mock.patch.object(driver, '_volume_journal_records', return_value=[])
+    @mock.patch.object(os.path, 'lexists', return_value=False)
+    def test_same_generation_foreign_profile_blocks_cleanup_ack(
+            self, lexists, volume_records, share_records, share_mounts):
+        source_host = '10000000-0000-0000-0000-000000000003'
+        assignment = dataclasses.replace(
+            self.assignment, host_ids=(source_host, self.host_id))
+        self.instance.system_metadata = {
+            driver.IDMAP_BASE_METADATA_KEY: str(assignment.base),
+            driver.IDMAP_SIZE_METADATA_KEY: str(assignment.size),
+            driver.IDMAP_ALLOCATION_METADATA_KEY: assignment.allocation_id,
+            driver.IDMAP_FINGERPRINT_METADATA_KEY: assignment.fingerprint,
+        }
+        token = '30000000-0000-0000-0000-000000000003'
+        profile = mock.Mock(
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                'user.openstack.uuid': self.instance.uuid,
+                driver.MIGRATION_CLEANUP_TOKEN_KEY: token,
+            },
+            devices={}, used_by=[])
+        self.driver.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+        self.driver.client.profiles.get.return_value = profile
+        self.driver.idmap_allocator.get.return_value = assignment
+        self._set_all_project_inventory(profiles=[
+            {
+                'name': self.instance.name,
+                'project': driver.CONF.incus.project,
+                'config': {
+                    'user.openstack.uuid': self.instance.uuid,
+                    'security.idmap.base': str(assignment.base),
+                    'security.idmap.size': str(assignment.size),
+                },
+            },
+            {
+                'name': 'foreign-profile',
+                'project': 'foreign-project',
+                'config': {
+                    'security.idmap.base': str(assignment.base),
+                    'security.idmap.size': str(assignment.size),
+                },
+            },
+        ])
+
+        self.assertRaises(
+            driver.incus_idmap.IDMapIntegrityError,
+            self.driver._acknowledge_cleanup_profile,
+            self.instance, token)
+
+        self.driver.idmap_allocator.retire_claim.assert_not_called()
+        profile.save.assert_not_called()
+
+    def test_source_ack_rejects_residual_third_host_claim(self):
+        target_host = '10000000-0000-0000-0000-000000000003'
+        third_host = '30000000-0000-0000-0000-000000000003'
+        assignment = dataclasses.replace(
+            self.assignment, host_ids=(self.host_id, third_host))
+        self.instance.system_metadata = {
+            driver.IDMAP_BASE_METADATA_KEY: str(assignment.base),
+            driver.IDMAP_SIZE_METADATA_KEY: str(assignment.size),
+            driver.IDMAP_ALLOCATION_METADATA_KEY: assignment.allocation_id,
+            driver.IDMAP_FINGERPRINT_METADATA_KEY: assignment.fingerprint,
+        }
+        token = '40000000-0000-0000-0000-000000000004'
+        profile = mock.Mock(
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                'user.openstack.uuid': self.instance.uuid,
+                driver.MIGRATION_CLEANUP_TOKEN_KEY: token,
+                driver.MIGRATION_CLEANUP_COMPLETE_KEY: token,
+                driver.MIGRATION_IDMAP_RETIREMENT_KEY:
+                    driver._idmap_retirement_proof(
+                        assignment, target_host, token),
+            },
+            devices={}, used_by=[])
+        self.driver.idmap_allocator.get.return_value = assignment
+
+        self.assertRaises(
+            exception.MigrationError,
+            self.driver._validate_remote_cleanup_acknowledgement,
+            profile, self.instance, token,
+            assignment.base, assignment.size)
+
+    def test_source_ack_accepts_exact_target_retirement_proof(self):
+        target_host = '10000000-0000-0000-0000-000000000003'
+        assignment = dataclasses.replace(
+            self.assignment, host_ids=(self.host_id,))
+        self.instance.system_metadata = {
+            driver.IDMAP_BASE_METADATA_KEY: str(assignment.base),
+            driver.IDMAP_SIZE_METADATA_KEY: str(assignment.size),
+            driver.IDMAP_ALLOCATION_METADATA_KEY: assignment.allocation_id,
+            driver.IDMAP_FINGERPRINT_METADATA_KEY: assignment.fingerprint,
+        }
+        token = '40000000-0000-0000-0000-000000000004'
+        profile = mock.Mock(
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                'user.openstack.uuid': self.instance.uuid,
+                driver.MIGRATION_CLEANUP_TOKEN_KEY: token,
+                driver.MIGRATION_CLEANUP_COMPLETE_KEY: token,
+                driver.MIGRATION_IDMAP_RETIREMENT_KEY:
+                    driver._idmap_retirement_proof(
+                        assignment, target_host, token),
+            },
+            devices={}, used_by=[])
+        self.driver.idmap_allocator.get.return_value = assignment
+
+        self.driver._validate_remote_cleanup_acknowledgement(
+            profile, self.instance, token,
+            assignment.base, assignment.size)
+
+
+class ColdMigrationCleanupTokenTest(test.NoDBTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.context = context.get_admin_context()
+        self.instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            migration_context=mock.Mock(migration_id=42))
+        self.token = '20000000-0000-0000-0000-000000000002'
+
+    @mock.patch.object(driver.objects.Migration, 'get_by_id_and_instance')
+    def test_uses_current_nova_migration_uuid(self, get_migration):
+        get_migration.return_value = mock.Mock(uuid=self.token)
+
+        token = driver._cold_migration_cleanup_token(
+            self.context, self.instance)
+
+        self.assertEqual(self.token, token)
+        get_migration.assert_called_once_with(
+            self.context, 42, self.instance.uuid)
+
+    @mock.patch.object(driver.objects.Migration, 'get_by_id_and_instance')
+    def test_missing_migration_context_fails_closed(self, get_migration):
+        self.instance.migration_context = None
+
+        self.assertRaises(
+            exception.MigrationError,
+            driver._cold_migration_cleanup_token,
+            self.context, self.instance)
+
+        get_migration.assert_not_called()
+
+    @mock.patch.object(driver.objects.Migration, 'get_by_id_and_instance')
+    def test_invalid_migration_id_fails_closed(self, get_migration):
+        self.instance.migration_context.migration_id = 0
+
+        self.assertRaises(
+            exception.MigrationError,
+            driver._cold_migration_cleanup_token,
+            self.context, self.instance)
+
+        get_migration.assert_not_called()
+
+    @mock.patch.object(driver.objects.Migration, 'get_by_id_and_instance')
+    def test_noncanonical_migration_uuid_fails_closed(self, get_migration):
+        get_migration.return_value = mock.Mock(
+            uuid='ABCDEF00-0000-0000-0000-000000000002')
+
+        self.assertRaises(
+            exception.MigrationError,
+            driver._cold_migration_cleanup_token,
+            self.context, self.instance)
 
 
 class IncusDriverTest(test.NoDBTestCase):
@@ -164,8 +1702,15 @@ class IncusDriverTest(test.NoDBTestCase):
         self.client.host_info = {
             'api_extensions': [
                 'id_map',
+                'id_map_base',
+                'storage_materialization_attempt_v1',
+                'storage_release_receipt_v2',
                 'migration_stateful_shifted_root',
                 'migration_live_shared_ceph_storage',
+                'migration_shared_ceph_storage_ready_fence',
+                'migration_attempt_fencing',
+                'instance_storage_handover',
+                'instance_storage_handover_proof',
             ],
             'environment': {
                 'storage': 'zfs',
@@ -176,28 +1721,56 @@ class IncusDriverTest(test.NoDBTestCase):
         }
         self.Client.return_value = self.client
 
-        self.patchers = []
+        cold_token_patcher = mock.patch.object(
+            driver, '_cold_migration_cleanup_token',
+            return_value='20000000-0000-0000-0000-000000000002')
+        self.patchers = [cold_token_patcher]
+        self.cold_migration_cleanup_token = cold_token_patcher.start()
+
+        cinder_api_patcher = mock.patch.object(driver.cinder, 'API')
+        self.patchers.append(cinder_api_patcher)
+        self.CinderAPI = cinder_api_patcher.start()
+        self.volume_api = self.CinderAPI.return_value
+        self.volume_api.get_volume_encryption_metadata.return_value = {}
 
         CONF_patcher = mock.patch('nova.virt.incus.driver.CONF')
         self.patchers.append(CONF_patcher)
         self.CONF = CONF_patcher.start()
-        self.CONF.instances_path = '/path/to/instances'
+        self.instances_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.instances_dir.cleanup)
+        self.CONF.instances_path = self.instances_dir.name
+        self.CONF.state_path = self.instances_dir.name
         self.CONF.my_ip = '0.0.0.0'
         self.CONF.config_drive_format = 'iso9660'
         self.CONF.force_config_drive = False
         self.CONF.incus.storage_pool = None
+        self.CONF.incus.project = 'nova'
         self.CONF.incus.shared_storage_pool_capacity_gb = None
         self.CONF.incus.root_storage_pools = {}
         self.CONF.incus.root_storage_pool_resource_classes = {}
         self.CONF.incus.shared_root_storage_pool_capacities_gb = {}
         self.CONF.incus.allow_cold_migration = False
         self.CONF.incus.allow_live_migration = False
+        self.CONF.incus.allow_bfv_evacuate = False
+        self.CONF.incus.idmap_allocator_endpoint = 'http://etcd:2379'
+        self.CONF.incus.idmap_allocator_namespace = 'unit-test'
+        self.CONF.incus.idmap_allocator_base = 500000000
+        self.CONF.incus.idmap_allocator_size = 65536
+        self.CONF.incus.idmap_allocator_count = 1000
+        self.CONF.incus.idmap_allocator_timeout = 5
+        self.CONF.incus.idmap_allocator_allow_insecure = False
+        self.CONF.incus.idmap_allocator_ca_cert = None
+        self.CONF.incus.idmap_allocator_client_cert = None
+        self.CONF.incus.idmap_allocator_client_key = None
+        self.CONF.incus.idmap_allocator_username = None
+        self.CONF.incus.idmap_allocator_password_file = None
         self.CONF.incus.migration_address = None
         self.CONF.incus.migration_tls_ca = None
         self.CONF.incus.migration_tls_ca_by_server = {}
         self.CONF.incus.migration_preflight_server_names = {}
         self.CONF.incus.migration_finish_retries = 3
         self.CONF.incus.migration_finish_retry_interval = 0
+        self.CONF.incus.migration_auto_recovery = True
         self.CONF.incus.configdrive_migration_max_bytes = 8 * 1024 * 1024
         self.CONF.incus.configdrive_migration_max_files = 512
         self.CONF.incus.volume_use_multipath = False
@@ -208,6 +1781,46 @@ class IncusDriverTest(test.NoDBTestCase):
         self.CONF.serial_console.enabled = False
         self.CONF.serial_console.proxyclient_address = '127.0.0.1'
 
+        allocator_patcher = mock.patch.object(
+            driver.incus_idmap, 'IDMapAllocator')
+        self.patchers.append(allocator_patcher)
+        self.IDMapAllocator = allocator_patcher.start()
+        self.idmap_allocator = self.IDMapAllocator.return_value
+        self.idmap_allocator.get_release_intent.return_value = None
+
+        node_uuid_patcher = mock.patch.object(
+            driver.virt_node, 'read_local_node_uuid',
+            return_value='20000000-0000-0000-0000-000000000002')
+        self.patchers.append(node_uuid_patcher)
+        self.read_local_node_uuid = node_uuid_patcher.start()
+
+        ensure_idmap_patcher = mock.patch.object(
+            driver.IncusDriver, '_ensure_instance_idmap')
+        self.patchers.append(ensure_idmap_patcher)
+        self.ensure_instance_idmap = ensure_idmap_patcher.start()
+
+        # Legacy driver workflow tests exercise Nova/Incus orchestration, not
+        # the deployment-wide ID map transaction.  Keep that transaction
+        # isolated here; IncusIDMapDriverTest covers its exact v3 state and
+        # identity protocol without permissive workflow mocks.
+        begin_materialization_patcher = mock.patch.object(
+            driver.IncusDriver, '_begin_idmap_materialization',
+            return_value=None)
+        self.patchers.append(begin_materialization_patcher)
+        self.begin_idmap_materialization = (
+            begin_materialization_patcher.start())
+
+        spawn_attempt_patcher = mock.patch.object(
+            driver.IncusDriver, '_create_spawn_preflight_attempt',
+            return_value=None)
+        self.patchers.append(spawn_attempt_patcher)
+        self.create_spawn_preflight_attempt = spawn_attempt_patcher.start()
+
+        start_idmap_patcher = mock.patch.object(
+            driver.IncusDriver, '_ensure_instance_idmap_before_start')
+        self.patchers.append(start_idmap_patcher)
+        self.ensure_start_idmap = start_idmap_patcher.start()
+
         # XXX: rockstar (03 Nov 2016) - This should be removed once
         # everything is where it should live.
         CONF2_patcher = mock.patch('nova.virt.incus.driver.nova.conf.CONF')
@@ -216,13 +1829,6 @@ class IncusDriverTest(test.NoDBTestCase):
         self.CONF2.incus.root_dir = '/incus'
         self.CONF2.incus.storage_pool = None
         self.CONF2.instances_path = '/i'
-
-        # IncusDriver._after_reboot reads from the database and syncs container
-        # state. These tests can't read from the database.
-        after_reboot_patcher = mock.patch(
-            'nova.virt.incus.driver.IncusDriver._after_reboot')
-        self.patchers.append(after_reboot_patcher)
-        self.after_reboot = after_reboot_patcher.start()
 
         bdige_patcher = mock.patch(
             'nova.virt.incus.driver.driver.block_device_info_get_ephemerals')
@@ -245,6 +1851,49 @@ class IncusDriverTest(test.NoDBTestCase):
             'mac_address': '00:11:22:33:44:55', 'bridge': 'qbr0123456789a',
         }
 
+        # Driver workflow tests isolate Nova orchestration from the Incus
+        # migration-attempt REST contract. Dedicated tests below exercise the
+        # exact token binding, idmap fencing, abort and lost-response paths.
+        attempt_active = {
+            'state': 'active', 'finished': False,
+            'operation_uuid': '',
+        }
+        attempt_committed = {
+            'state': 'committed', 'finished': True,
+            'operation_uuid': '20000000-0000-0000-0000-000000000002',
+        }
+        attempt_aborted = {
+            'state': 'aborted', 'finished': True,
+            'operation_uuid': '',
+        }
+        attempt_patches = {
+            '_register_migration_attempt': mock.Mock(
+                return_value=attempt_active),
+            '_get_migration_attempt': mock.Mock(
+                return_value=attempt_committed),
+            '_abort_migration_attempt': mock.Mock(
+                return_value=attempt_aborted),
+            '_wait_migration_attempt_finished': mock.Mock(
+                return_value=attempt_aborted),
+            '_retire_migration_attempt': mock.Mock(),
+            '_finalize_committed_migration_attempt': mock.Mock(),
+        }
+        for name, replacement in attempt_patches.items():
+            patcher = mock.patch.object(driver, name, replacement)
+            self.patchers.append(patcher)
+            setattr(self, name, patcher.start())
+
+        def create_migration_target(
+                client, config, instance, attempt_token,
+                idmap_base, idmap_size, operation_started=None):
+            return client.instances.create(config, wait=True), None
+
+        create_target_patcher = mock.patch.object(
+            driver, '_create_migration_target',
+            side_effect=create_migration_target)
+        self.patchers.append(create_target_patcher)
+        self.create_migration_target = create_target_patcher.start()
+
         # NOTE: mock out fileutils to ensure that unit tests don't try
         #       to manipulate the filesystem (breaks in package builds).
         driver.fileutils = mock.Mock()
@@ -255,13 +1904,222 @@ class IncusDriverTest(test.NoDBTestCase):
         for patcher in self.patchers:
             patcher.stop()
 
+    def _start_concurrent_calls(self, action, count=8):
+        barrier = threading.Barrier(count + 1)
+        results = [None] * count
+        errors = [None] * count
+
+        def call(index):
+            try:
+                barrier.wait(timeout=5)
+                results[index] = action()
+            except Exception as exc:
+                errors[index] = exc
+
+        threads = [
+            threading.Thread(target=call, args=(index,))
+            for index in range(count)
+        ]
+        for thread in threads:
+            thread.start()
+        barrier.wait(timeout=5)
+        return threads, results, errors
+
+    def _join_concurrent_calls(self, threads, results, errors):
+        for thread in threads:
+            thread.join(timeout=5)
+        self.assertFalse(
+            [thread for thread in threads if thread.is_alive()],
+            'concurrent cache calls did not complete')
+        self.assertEqual([None] * len(errors), errors)
+        return results
+
+    def _configure_exact_idmap_release(
+            self, incus_driver, instance, *resources,
+            storage_driver='ceph', cleanup_disposition='delete',
+            outcome=None, idmap_base=500000000, idmap_size=65536,
+            host_id='20000000-0000-0000-0000-000000000002',
+            materialization_id='30000000-0000-0000-0000-000000000003'):
+        """Install one protocol-realistic A/H/T/U release fixture."""
+        allocation_id = '10000000-0000-0000-0000-000000000001'
+        assignment = driver.incus_idmap.IDMapAssignment(
+            instance_uuid=instance.uuid,
+            base=idmap_base,
+            size=idmap_size,
+            slot=0,
+            allocation_id=allocation_id,
+            fingerprint='a' * 64,
+            host_ids=(host_id,))
+        claim = driver.incus_idmap.IDMapHostClaim(
+            host_id=host_id,
+            materialization_id=materialization_id,
+            instance_uuid=instance.uuid,
+            base=assignment.base,
+            size=assignment.size,
+            slot=assignment.slot,
+            allocation_id=assignment.allocation_id,
+            fingerprint=assignment.fingerprint,
+            state='committed')
+        metadata = (
+            dict(instance.system_metadata or {})
+            if instance.obj_attr_is_set('system_metadata') else {})
+        metadata.update({
+            driver.IDMAP_BASE_METADATA_KEY: str(assignment.base),
+            driver.IDMAP_SIZE_METADATA_KEY: str(assignment.size),
+            driver.IDMAP_ALLOCATION_METADATA_KEY: assignment.allocation_id,
+            driver.IDMAP_FINGERPRINT_METADATA_KEY: assignment.fingerprint,
+        })
+        instance.system_metadata = metadata
+        local_config = {
+            'user.openstack.uuid': instance.uuid,
+            driver.IDMAP_ALLOCATION_CONFIG_KEY: assignment.allocation_id,
+            driver.IDMAP_COMPUTE_CONFIG_KEY: host_id,
+            driver.IDMAP_MATERIALIZATION_CONFIG_KEY: materialization_id,
+            'security.idmap.base': str(assignment.base),
+            'security.idmap.size': str(assignment.size),
+        }
+        for resource in resources:
+            config = dict(
+                resource.config if isinstance(resource.config, dict) else {})
+            config.update(local_config)
+            resource.config = config
+
+        if outcome is None:
+            if storage_driver == 'cephext':
+                outcome = 'normalized'
+            elif cleanup_disposition == 'detach':
+                outcome = 'detached'
+            else:
+                outcome = 'deleted'
+        binding = driver.incus_storage_protocol.StorageMaterializationBinding(
+            token=materialization_id,
+            allocation_id=assignment.allocation_id,
+            compute_id=host_id,
+            owner=instance.uuid,
+            project='nova',
+            instance_name=instance.name,
+            idmap_base=assignment.base,
+            idmap_size=assignment.size,
+            storage_driver=storage_driver,
+            storage_pool='root-pool',
+            storage_volume='nova_{}'.format(instance.name),
+            cleanup_disposition=cleanup_disposition,
+            rbd_image='container_nova_{}'.format(instance.name))
+        receipt = driver.incus_idmap.IDMapRootfsReleaseReceipt(
+            token=binding.token,
+            allocation_id=binding.allocation_id,
+            compute_id=binding.compute_id,
+            materialization_id=binding.token,
+            owner=binding.owner,
+            project=binding.project,
+            instance_name=binding.instance_name,
+            idmap_base=binding.idmap_base,
+            idmap_size=binding.idmap_size,
+            storage_driver=binding.storage_driver,
+            storage_pool=binding.storage_pool,
+            storage_volume=binding.storage_volume,
+            rbd_image=binding.rbd_image,
+            storage_identity='rbd_data.1234567890abcdef',
+            baseline_clean=True,
+            cleanup_disposition=binding.cleanup_disposition,
+            outcome=outcome,
+            state='complete',
+            digest='',
+            created_at=10,
+            completed_at=11)
+        proof = driver.incus_idmap.IDMapRootfsReleaseProof(
+            **receipt.__dict__)
+        receipt = dataclasses.replace(
+            receipt,
+            digest=driver.incus_idmap.rootfs_release_proof_digest(proof))
+        proof = driver.incus_idmap.validate_rootfs_release_receipt(receipt)
+        cleaned = dataclasses.replace(claim, state='cleaned', proof=proof)
+
+        self.ensure_instance_idmap.return_value = assignment
+        self.idmap_allocator.get.return_value = assignment
+        self.idmap_allocator.get_host_claim.return_value = claim
+        self.idmap_allocator.get_release_intent.return_value = None
+        self.idmap_allocator.record_rootfs_release_proof.return_value = cleaned
+        self.idmap_allocator.retire_claim.return_value = dataclasses.replace(
+            assignment, host_ids=())
+        ownership = mock.Mock(
+            spec=driver.incus_storage_protocol.StorageOwnershipClient)
+        ownership.discover_release_receipt.return_value = (binding, receipt)
+        incus_driver.storage_ownership = ownership
+        incus_driver._storage_ownership_client = mock.Mock(
+            return_value=ownership)
+
+        def delete_with_release_receipt(
+                container, target_instance, target_claim, client=None):
+            observed_assignment, observed_claim = (
+                incus_driver._instance_local_idmap_claim(
+                    target_instance, container))
+            self.assertEqual(assignment, observed_assignment)
+            self.assertEqual(claim, observed_claim)
+            self.assertEqual(claim, target_claim)
+            return container.delete(wait=True)
+
+        tokenized_delete = mock.Mock(side_effect=delete_with_release_receipt)
+        incus_driver._delete_instance_with_rootfs_release_receipt = (
+            tokenized_delete)
+        return (assignment, claim, binding, receipt, ownership,
+                tokenized_delete)
+
     def test_init_host(self):
         """init_host initializes the pylxd Client."""
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
-        self.Client.assert_called_once_with(self.CONF)
+        self.assertEqual(
+            [mock.call(self.CONF), mock.call(self.CONF, project=None)],
+            self.Client.call_args_list)
         self.assertEqual(self.client, incus_driver.client)
+        self.assertEqual(self.client, incus_driver.inventory_client)
+        self.IDMapAllocator.assert_called_once_with(
+            endpoint='http://etcd:2379', namespace='unit-test',
+            base=500000000, size=65536, count=1000, timeout=5,
+            ca_cert=None, cert_cert=None, cert_key=None,
+            username=None, password_file=None,
+            allow_insecure=False)
+        self.idmap_allocator.initialize.assert_called_once_with()
+        self.idmap_allocator.audit.assert_called_once_with()
+
+    def test_init_host_requires_global_idmap_for_migration(self):
+        self.CONF.incus.idmap_allocator_endpoint = None
+        self.CONF.incus.allow_cold_migration = True
+        incus_driver = driver.IncusDriver(None)
+
+        self.assertRaisesRegex(
+            exception.InvalidConfiguration, 'idmap_allocator_endpoint',
+            incus_driver.init_host, None)
+
+    def test_init_host_requires_release_receipts_with_global_idmap(self):
+        self.client.host_info['api_extensions'].remove(
+            'storage_release_receipt_v2')
+        incus_driver = driver.IncusDriver(None)
+
+        self.assertRaisesRegex(
+            exception.InvalidConfiguration, 'storage_release_receipt',
+            incus_driver.init_host, None)
+
+    def test_init_host_keeps_existing_power_operations_when_etcd_is_down(self):
+        self.idmap_allocator.initialize.side_effect = (
+            driver.incus_idmap.IDMapBackendError(reason='unavailable'))
+        incus_driver = driver.IncusDriver(None)
+
+        incus_driver.init_host(None)
+
+        self.assertIs(self.idmap_allocator, incus_driver.idmap_allocator)
+
+    def test_init_host_rejects_corrupt_idmap_registry(self):
+        self.idmap_allocator.audit.side_effect = (
+            driver.incus_idmap.IDMapIntegrityError(
+                reason='orphan allocation'))
+        incus_driver = driver.IncusDriver(None)
+
+        self.assertRaises(
+            driver.incus_idmap.IDMapIntegrityError,
+            incus_driver.init_host, None)
 
     def test_capabilities_extend_modern_nova_defaults(self):
         capabilities = driver.IncusDriver.capabilities
@@ -365,6 +2223,161 @@ class IncusDriverTest(test.NoDBTestCase):
 
         self.Client.assert_not_called()
 
+    @mock.patch.object(
+        driver.incus_privsep, 'validate_gnu_timeout',
+        side_effect=RuntimeError('BusyBox timeout'))
+    def test_init_host_rejects_non_gnu_timeout_for_manila(self, validate):
+        self.CONF.incus.enable_manila_shares = True
+        incus_driver = driver.IncusDriver(None)
+
+        self.assertRaisesRegex(
+            exception.InvalidConfiguration, 'GNU coreutils timeout',
+            incus_driver.init_host, None)
+
+        validate.assert_called_once_with()
+        self.Client.assert_not_called()
+
+    def test_init_host_rejects_duplicate_root_pool_resource_class(self):
+        self.CONF.incus.root_storage_pools = {
+            'fast': 'fast-pool',
+            'durable': 'durable-pool',
+        }
+        self.CONF.incus.root_storage_pool_resource_classes = {
+            'fast': 'CUSTOM_INCUS_ROOT_DISK_GB',
+            'durable': 'CUSTOM_INCUS_ROOT_DISK_GB',
+        }
+        self.client.storage_pools.get.return_value = mock.Mock(
+            driver='zfs', config={'source': 'tank/incus'})
+        incus_driver = driver.IncusDriver(None)
+
+        self.assertRaisesRegex(
+            exception.InvalidConfiguration, 'reuse Placement resource class',
+            incus_driver.init_host, None)
+
+    def test_init_host_rejects_duplicate_physical_root_pool(self):
+        self.CONF.incus.root_storage_pools = {
+            'fast': 'ceph-alias-a',
+            'durable': 'ceph-alias-b',
+        }
+        self.CONF.incus.root_storage_pool_resource_classes = {
+            'fast': 'CUSTOM_INCUS_FAST_DISK_GB',
+            'durable': 'CUSTOM_INCUS_DURABLE_DISK_GB',
+        }
+        self.CONF.incus.shared_root_storage_pool_capacities_gb = {
+            'fast': '100',
+            'durable': '100',
+        }
+        self.client.storage_pools.get.return_value = mock.Mock(
+            driver='ceph',
+            config={
+                'source': 'incus-rootfs',
+                'ceph.cluster_name': 'ceph',
+            })
+        incus_driver = driver.IncusDriver(None)
+
+        self.assertRaisesRegex(
+            exception.InvalidConfiguration, 'same physical pool',
+            incus_driver.init_host, None)
+
+    def test_init_host_rejects_default_pool_double_accounting(self):
+        self.CONF.incus.storage_pool = 'ceph-root'
+        self.CONF.incus.shared_storage_pool_capacity_gb = 100
+        self.CONF.incus.root_storage_pools = {
+            'durable': 'ceph-root-alias',
+        }
+        self.CONF.incus.root_storage_pool_resource_classes = {
+            'durable': 'CUSTOM_INCUS_DURABLE_DISK_GB',
+        }
+        self.CONF.incus.shared_root_storage_pool_capacities_gb = {
+            'durable': '100',
+        }
+        self.client.storage_pools.get.return_value = mock.Mock(
+            driver='ceph',
+            config={
+                'source': 'incus-rootfs',
+                'ceph.cluster_name': 'ceph',
+            })
+        incus_driver = driver.IncusDriver(None)
+
+        self.assertRaisesRegex(
+            exception.InvalidConfiguration, 'reports the default',
+            incus_driver.init_host, None)
+
+    def test_init_host_rejects_non_default_pool_without_inventory(self):
+        self.CONF.incus.storage_pool = 'ceph-root'
+        self.CONF.incus.root_storage_pools = {
+            'local-nvme': 'local-zfs',
+        }
+
+        def get_pool(name):
+            if name == 'ceph-root':
+                return mock.Mock(
+                    driver='ceph',
+                    config={
+                        'source': 'incus-rootfs',
+                        'ceph.cluster_name': 'ceph',
+                    })
+            return mock.Mock(driver='zfs', config={'source': 'tank/incus'})
+
+        self.client.storage_pools.get.side_effect = get_pool
+        incus_driver = driver.IncusDriver(None)
+
+        self.assertRaisesRegex(
+            exception.InvalidConfiguration,
+            'requires a dedicated Placement capacity resource class',
+            incus_driver.init_host, None)
+
+    def test_init_host_accepts_default_pool_alias_without_inventory(self):
+        self.CONF.incus.storage_pool = 'ceph-root'
+        self.CONF.incus.root_storage_pools = {
+            'durable': 'ceph-root-alias',
+        }
+        self.client.storage_pools.get.return_value = mock.Mock(
+            driver='ceph',
+            config={
+                'source': 'incus-rootfs',
+                'ceph.cluster_name': 'ceph',
+            })
+        incus_driver = driver.IncusDriver(None)
+
+        incus_driver.init_host(None)
+
+    def test_init_host_rejects_unused_shared_pool_budget(self):
+        self.CONF.incus.shared_root_storage_pool_capacities_gb = {
+            'durable': '100',
+        }
+        incus_driver = driver.IncusDriver(None)
+
+        self.assertRaisesRegex(
+            exception.InvalidConfiguration, 'without a capacity resource',
+            incus_driver.init_host, None)
+
+    def test_power_off_invalidates_mutable_inventory_caches(self):
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        container = self.client.instances.get.return_value
+        container.status = 'Running'
+        incus_driver._instance_inventory_cache = mock.sentinel.instances
+        incus_driver._metric_devices_cache = mock.sentinel.devices
+        incus_driver._disk_metrics_cache = mock.sentinel.metrics
+
+        def stop(timeout=0, force=True, wait=True):
+            self.assertIsNone(incus_driver._instance_inventory_cache)
+            incus_driver._instance_inventory_cache = (
+                0, {'stale': mock.sentinel.container})
+            incus_driver._metric_devices_cache = mock.sentinel.stale_devices
+            incus_driver._disk_metrics_cache = mock.sentinel.stale_metrics
+
+        container.stop.side_effect = stop
+
+        incus_driver.power_off(instance)
+
+        self.assertIsNone(incus_driver._instance_inventory_cache)
+        self.assertIsNone(incus_driver._metric_devices_cache)
+        self.assertIsNone(incus_driver._disk_metrics_cache)
+
     @mock.patch('nova.virt.incus.driver.utils.get_root_helper',
                 return_value='sudo nova-rootwrap')
     @mock.patch('nova.virt.incus.driver.connector.InitiatorConnector.factory')
@@ -398,32 +2411,182 @@ class IncusDriverTest(test.NoDBTestCase):
             host='compute-01')
 
     def test_get_info(self):
-        container = mock.Mock()
-        container.state.return_value = MockContainerState(
-            'Running', {'usage': 4000, 'usage_peak': 4500}, 100)
-        self.client.instances.get.return_value = container
-
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
+        container = mock.Mock(
+            type='container', status='Running',
+            status_code=100)
+        container.name = instance.name
+        self.client.instances.all.return_value = [container]
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
         info = incus_driver.get_info(instance)
 
         self.assertEqual(power_state.RUNNING, info.state)
+        self.client.instances.all.assert_called_once_with(recursion=1)
+        self.client.instances.get.assert_not_called()
+        container.state.assert_not_called()
 
     def test_get_info_stopped_does_not_query_runtime_state(self):
-        container = mock.Mock(status='Stopped')
-        self.client.instances.get.return_value = container
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
+        container = mock.Mock(
+            type='container', status='Stopped',
+            status_code=102)
+        container.name = instance.name
+        self.client.instances.all.return_value = [container]
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
         info = incus_driver.get_info(instance)
 
         self.assertEqual(power_state.SHUTDOWN, info.state)
+        container.state.assert_not_called()
+
+    def test_get_info_reuses_expanded_inventory(self):
+        ctx = context.get_admin_context()
+        first_instance = fake_instance.fake_instance_obj(
+            ctx, name='first', id=1)
+        second_instance = fake_instance.fake_instance_obj(
+            ctx, name='second', id=2)
+        first = mock.Mock(
+            type='container', status='Running',
+            status_code=100)
+        first.name = first_instance.name
+        second = mock.Mock(
+            type='container', status='Stopped',
+            status_code=102)
+        second.name = second_instance.name
+        self.client.instances.all.return_value = [first, second]
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        first_info = incus_driver.get_info(first_instance)
+        second_info = incus_driver.get_info(second_instance)
+
+        self.assertEqual(power_state.RUNNING, first_info.state)
+        self.assertEqual(power_state.SHUTDOWN, second_info.state)
+        self.client.instances.all.assert_called_once_with(recursion=1)
+
+    def test_instance_inventory_cache_single_flight(self):
+        item = mock.Mock(type='container')
+        item.name = 'instance-1'
+        fetch_started = threading.Event()
+        release_fetch = threading.Event()
+
+        def fetch(recursion):
+            self.assertEqual(1, recursion)
+            fetch_started.set()
+            if not release_fetch.wait(timeout=5):
+                raise RuntimeError('inventory fetch was not released')
+            return [item]
+
+        self.client.instances.all.side_effect = fetch
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        threads, results, errors = self._start_concurrent_calls(
+            incus_driver._get_instance_inventory_snapshot)
+        self.assertTrue(fetch_started.wait(timeout=5))
+        release_fetch.set()
+
+        results = self._join_concurrent_calls(threads, results, errors)
+
+        self.assertEqual(1, self.client.instances.all.call_count)
+        self.assertTrue(all(result is results[0] for result in results))
+        self.assertIs(item, results[0]['instance-1'])
+
+    def test_metric_inventory_abba_invalidation_does_not_deadlock(self):
+        stale = mock.Mock(
+            type='container',
+            expanded_devices={'stale': {'type': 'disk'}})
+        stale.name = 'instance-1'
+        fresh = mock.Mock(
+            type='container',
+            expanded_devices={'fresh': {'type': 'disk'}})
+        fresh.name = 'instance-1'
+        fetch_started = threading.Event()
+        release_fetch = threading.Event()
+        invalidated = threading.Event()
+        fetch_count = 0
+        fetch_count_lock = threading.Lock()
+
+        def fetch(recursion):
+            nonlocal fetch_count
+            self.assertEqual(1, recursion)
+            with fetch_count_lock:
+                fetch_count += 1
+                current = fetch_count
+            if current == 1:
+                fetch_started.set()
+                if not release_fetch.wait(timeout=5):
+                    raise RuntimeError('inventory fetch was not released')
+                return [stale]
+            return [fresh]
+
+        self.client.instances.all.side_effect = fetch
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        results = []
+        errors = []
+
+        def read_metrics():
+            try:
+                results.append(
+                    incus_driver._get_metric_devices_snapshot())
+            except Exception as exc:
+                errors.append(exc)
+
+        reader = threading.Thread(target=read_metrics)
+        reader.start()
+        self.assertTrue(fetch_started.wait(timeout=5))
+
+        def invalidate():
+            incus_driver._invalidate_instance_inventory_cache()
+            invalidated.set()
+
+        invalidator = threading.Thread(target=invalidate)
+        invalidator.start()
+        # These two paths used to acquire metric->inventory and
+        # inventory->metric respectively.  Invalidation must finish while
+        # the Incus inventory request is still blocked.
+        completed_without_fetch = invalidated.wait(timeout=1)
+        release_fetch.set()
+        invalidator.join(timeout=5)
+        reader.join(timeout=5)
+
+        self.assertTrue(
+            completed_without_fetch,
+            'cache invalidation waited for an in-flight inventory fetch')
+        self.assertFalse(invalidator.is_alive())
+        self.assertFalse(reader.is_alive())
+        self.assertEqual([], errors)
+        self.assertEqual(2, fetch_count)
+        self.assertEqual(
+            {'fresh': {'type': 'disk'}},
+            results[0]['instance-1']['devices'])
+        self.assertIs(
+            fresh,
+            incus_driver._instance_inventory_cache[1]['instance-1'])
+        self.assertEqual(
+            {'fresh': {'type': 'disk'}},
+            incus_driver._metric_devices_cache[1][
+                'instance-1']['devices'])
+
+    def test_get_info_without_cache_reads_exact_instance(self):
+        container = mock.Mock(status='Running', status_code=100)
+        self.client.instances.get.return_value = container
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        info = incus_driver.get_info(instance, use_cache=False)
+
+        self.assertEqual(power_state.RUNNING, info.state)
+        self.client.instances.get.assert_called_once_with(instance.name)
+        self.client.instances.all.assert_not_called()
         container.state.assert_not_called()
 
     @mock.patch('nova.virt.incus.driver.timeutils.utcnow')
@@ -558,6 +2721,32 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         }, result)
         self.client.api.metrics.get.assert_called_once_with(is_api=False)
 
+    @mock.patch('nova.virt.incus.driver._incus_all_disk_metrics')
+    def test_disk_metrics_cache_single_flight(self, fetch_metrics):
+        fetch_started = threading.Event()
+        release_fetch = threading.Event()
+        expected = {'instance-1': {'rbd1': {'rd_req': 1}}}
+
+        def fetch(client):
+            self.assertIs(self.client, client)
+            fetch_started.set()
+            if not release_fetch.wait(timeout=5):
+                raise RuntimeError('metrics fetch was not released')
+            return expected
+
+        fetch_metrics.side_effect = fetch
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        threads, results, errors = self._start_concurrent_calls(
+            incus_driver._get_disk_metrics_snapshot)
+        self.assertTrue(fetch_started.wait(timeout=5))
+        release_fetch.set()
+
+        results = self._join_concurrent_calls(threads, results, errors)
+
+        fetch_metrics.assert_called_once_with(self.client)
+        self.assertTrue(all(result is expected for result in results))
+
     @mock.patch('nova.virt.incus.driver.os.path.realpath',
                 return_value='/dev/rbd3')
     def test_disk_metric_device_maps_data_volume(self, realpath):
@@ -596,67 +2785,366 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertEqual('rbd4', result)
         realpath.assert_called_once_with(path)
 
-    @mock.patch('nova.virt.incus.driver._incus_disk_metrics')
+    @mock.patch('nova.virt.incus.driver.glob.glob')
+    def test_mapped_cinder_rbd_devices_indexes_all_pools_once(self, glob):
+        first = (
+            '/dev/rbd/fast/'
+            'volume-8231d2e8-1111-2222-3333-444444444444')
+        second = (
+            '/dev/rbd/durable/'
+            'volume-9331d2e8-1111-2222-3333-444444444444')
+        glob.return_value = [first, second, '/dev/rbd/fast/not-a-volume']
+
+        result = driver._mapped_cinder_rbd_devices()
+
+        self.assertEqual({
+            os.path.basename(first): [first],
+            os.path.basename(second): [second],
+        }, result)
+        glob.assert_called_once_with('/dev/rbd/*/volume-*')
+
+    @mock.patch('nova.virt.incus.driver._incus_all_disk_metrics')
     @mock.patch('nova.virt.incus.driver._disk_metric_device',
                 return_value='rbd1')
     def test_block_stats(self, metric_device, disk_metrics):
-        disk_metrics.return_value = {
-            'rbd1': {
-                'rd_req': 3,
-                'rd_bytes': 4096,
-                'wr_req': 4,
-                'wr_bytes': 8192,
-            },
-        }
-        profile = mock.Mock()
-        self.client.profiles.get.return_value = profile
         instance = fake_instance.fake_instance_obj(
             context.get_admin_context(), name='test')
+        disk_metrics.return_value = {
+            instance.name: {
+                'rbd1': {
+                    'rd_req': 3,
+                    'rd_bytes': 4096,
+                    'wr_req': 4,
+                    'wr_bytes': 8192,
+                },
+            },
+        }
+        profile = {'devices': {}}
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
+        incus_driver._get_metric_instance_devices_snapshot = mock.Mock(
+            return_value=profile)
 
         result = incus_driver.block_stats(instance, 'vda')
 
         self.assertEqual([3, 4096, 4, 8192, 0], result)
         metric_device.assert_called_once_with(profile, instance, 'vda')
+        disk_metrics.assert_called_once_with(self.client)
 
-    @mock.patch('nova.virt.incus.driver._incus_disk_metrics')
-    @mock.patch('nova.virt.incus.driver._disk_metric_device',
-                return_value='rbd1')
-    def test_get_all_volume_usage(self, metric_device, disk_metrics):
-        disk_metrics.return_value = {
-            'rbd1': {
-                'rd_req': 3,
-                'rd_bytes': 4096,
-                'wr_req': 4,
-                'wr_bytes': 8192,
-            },
-        }
-        profile = mock.Mock()
-        self.client.profiles.get.return_value = profile
-        instance = fake_instance.fake_instance_obj(
-            context.get_admin_context(), name='test')
+    def test_metric_instance_devices_uses_exact_cached_read(self):
+        container = self.client.instances.get.return_value
+        container.expanded_devices = {
+            'root': {'type': 'disk', 'path': '/'}}
+        container.devices = {}
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
-        result = incus_driver.get_all_volume_usage(None, [{
-            'instance': instance,
-            'instance_bdms': [{
-                'device_name': '/dev/vda',
-                'volume_id': 'volume-id',
-            }],
-        }])
+        first = incus_driver._get_metric_instance_devices_snapshot('test')
+        second = incus_driver._get_metric_instance_devices_snapshot('test')
 
-        self.assertEqual([{
-            'volume': 'volume-id',
-            'instance': instance,
+        self.assertEqual(first, second)
+        self.assertEqual(container.expanded_devices, first['devices'])
+        self.client.instances.get.assert_called_once_with('test')
+        self.client.instances.all.assert_not_called()
+
+    def test_metric_devices_cache_single_flight(self):
+        item = mock.Mock(
+            expanded_devices={'root': {'type': 'disk', 'path': '/'}})
+        item.name = 'instance-1'
+        fetch_started = threading.Event()
+        release_fetch = threading.Event()
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        def fetch():
+            fetch_started.set()
+            if not release_fetch.wait(timeout=5):
+                raise RuntimeError('device inventory fetch was not released')
+            return {item.name: item}
+
+        incus_driver._get_instance_inventory_snapshot = mock.Mock(
+            side_effect=fetch)
+        threads, results, errors = self._start_concurrent_calls(
+            incus_driver._get_metric_devices_snapshot)
+        self.assertTrue(fetch_started.wait(timeout=5))
+        release_fetch.set()
+
+        results = self._join_concurrent_calls(threads, results, errors)
+
+        incus_driver._get_instance_inventory_snapshot.assert_called_once_with()
+        self.assertTrue(all(result is results[0] for result in results))
+        self.assertEqual(
+            item.expanded_devices,
+            results[0][item.name]['devices'])
+
+    def test_metric_instance_devices_cache_single_flight(self):
+        item = mock.Mock(
+            expanded_devices={'root': {'type': 'disk', 'path': '/'}})
+        fetch_started = threading.Event()
+        release_fetch = threading.Event()
+
+        def fetch(instance_name):
+            self.assertEqual('instance-1', instance_name)
+            fetch_started.set()
+            if not release_fetch.wait(timeout=5):
+                raise RuntimeError('exact device fetch was not released')
+            return item
+
+        self.client.instances.get.side_effect = fetch
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        threads, results, errors = self._start_concurrent_calls(
+            lambda: incus_driver._get_metric_instance_devices_snapshot(
+                'instance-1'))
+        self.assertTrue(fetch_started.wait(timeout=5))
+        release_fetch.set()
+
+        results = self._join_concurrent_calls(threads, results, errors)
+
+        self.client.instances.get.assert_called_once_with('instance-1')
+        self.assertTrue(all(result is results[0] for result in results))
+        self.assertEqual(item.expanded_devices, results[0]['devices'])
+
+    def test_metric_instance_devices_reuses_fresh_bulk_snapshot(self):
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        expected = {'devices': {'root': {'type': 'disk', 'path': '/'}}}
+        incus_driver._metric_devices_cache = (
+            time.monotonic(), {'test': expected})
+
+        result = incus_driver._get_metric_instance_devices_snapshot('test')
+
+        self.assertIs(expected, result)
+        self.client.instances.get.assert_not_called()
+
+    @mock.patch('nova.virt.incus.driver._mapped_cinder_rbd_devices',
+                return_value={})
+    @mock.patch('nova.virt.incus.driver._incus_all_disk_metrics')
+    @mock.patch('nova.virt.incus.driver._disk_metric_device',
+                return_value='rbd1')
+    def test_get_all_volume_usage_fetches_metrics_once(
+            self, metric_device, all_disk_metrics, mapped_rbd_devices):
+        counters = {
             'rd_req': 3,
             'rd_bytes': 4096,
             'wr_req': 4,
             'wr_bytes': 8192,
+        }
+        profile = {'devices': {}}
+        ctxt = context.get_admin_context()
+        instance_1 = fake_instance.fake_instance_obj(ctxt, id=1)
+        instance_2 = fake_instance.fake_instance_obj(ctxt, id=2)
+        all_disk_metrics.return_value = {
+            instance_1.name: {
+                'rbd1': counters,
+            },
+            instance_2.name: {
+                'rbd1': counters,
+            },
+        }
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver._get_metric_devices_snapshot = mock.Mock(
+            return_value={
+                instance_1.name: profile,
+                instance_2.name: profile,
+            })
+
+        result = incus_driver.get_all_volume_usage(None, [
+            {
+                'instance': instance_1,
+                'instance_bdms': [{
+                    'device_name': '/dev/vda',
+                    'volume_id': 'volume-1',
+                }],
+            },
+            {
+                'instance': instance_2,
+                'instance_bdms': [{
+                    'device_name': '/dev/vdb',
+                    'volume_id': 'volume-2',
+                }],
+            },
+        ])
+
+        self.assertEqual([
+            {
+                'volume': 'volume-1',
+                'instance': instance_1,
+                **counters,
+            },
+            {
+                'volume': 'volume-2',
+                'instance': instance_2,
+                **counters,
+            },
+        ], result)
+        self.assertEqual([
+            mock.call(
+                profile, instance_1, '/dev/vda', rbd_devices={}),
+            mock.call(
+                profile, instance_2, '/dev/vdb', rbd_devices={}),
+        ], metric_device.call_args_list)
+        all_disk_metrics.assert_called_once_with(self.client)
+        mapped_rbd_devices.assert_called_once_with()
+
+    @mock.patch.object(driver.LOG, 'error')
+    @mock.patch('nova.virt.incus.driver._disk_metric_device')
+    def test_get_all_volume_usage_isolates_invalid_volume(
+            self, metric_device, log_error):
+        ctxt = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctxt, id=1)
+        bad_bdm = {
+            'device_name': '/dev/vdb',
+            'volume_id': 'volume-bad',
+        }
+        good_bdm = {
+            'device_name': '/dev/vdc',
+            'volume_id': 'volume-good',
+        }
+        counters = {
+            'rd_req': 3,
+            'rd_bytes': 4096,
+            'wr_req': 4,
+            'wr_bytes': 8192,
+        }
+        metric_device.side_effect = [
+            exception.InvalidVolume(reason='unsafe source'),
+            'rbd2',
+        ]
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver._get_disk_metrics_snapshot = mock.Mock(return_value={
+            instance.name: {'rbd2': counters},
+        })
+        incus_driver._get_metric_devices_snapshot = mock.Mock(return_value={
+            instance.name: {'devices': {}},
+        })
+
+        result = incus_driver.get_all_volume_usage(None, [{
+            'instance': instance,
+            'instance_bdms': [bad_bdm, good_bdm],
+        }])
+
+        self.assertEqual([{
+            'volume': 'volume-good',
+            'instance': instance,
+            **counters,
         }], result)
-        metric_device.assert_called_once_with(profile, instance, '/dev/vda')
-        disk_metrics.assert_called_once_with(self.client, instance.name)
+        self.assertEqual('volume-bad', log_error.call_args.args[1]['volume'])
+        self.assertEqual(instance.name,
+                         log_error.call_args.args[1]['instance'])
+
+    @mock.patch.object(driver.LOG, 'error')
+    def test_get_all_volume_usage_isolates_bad_profile_per_bdm(
+            self, log_error):
+        ctxt = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctxt, id=1)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver._get_disk_metrics_snapshot = mock.Mock(return_value={})
+        incus_driver._get_metric_devices_snapshot = mock.Mock(return_value={
+            instance.name: {'devices': []},
+        })
+
+        result = incus_driver.get_all_volume_usage(None, [{
+            'instance': instance,
+            'instance_bdms': [
+                {
+                    'device_name': '/dev/vdb',
+                    'volume_id': 'volume-1',
+                },
+                {
+                    'device_name': '/dev/vdc',
+                    'volume_id': 'volume-2',
+                },
+            ],
+        }])
+
+        self.assertEqual([], result)
+        self.assertEqual(2, log_error.call_count)
+        self.assertEqual(
+            ['volume-1', 'volume-2'],
+            [call.args[1]['volume'] for call in log_error.call_args_list])
+
+    @mock.patch.object(driver.LOG, 'error')
+    @mock.patch('nova.virt.incus.driver._disk_metric_device')
+    def test_get_all_volume_usage_isolates_incus_not_found(
+            self, metric_device, log_error):
+        ctxt = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctxt, id=1)
+        response = mock.Mock(status_code=404)
+        response.json.return_value = {'error': 'profile disappeared'}
+        metric_device.side_effect = incuscore_exceptions.NotFound(response)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver._get_disk_metrics_snapshot = mock.Mock(return_value={})
+        incus_driver._get_metric_devices_snapshot = mock.Mock(return_value={
+            instance.name: {'devices': {}},
+        })
+
+        result = incus_driver.get_all_volume_usage(None, [{
+            'instance': instance,
+            'instance_bdms': [{
+                'device_name': '/dev/vdb',
+                'volume_id': 'volume-1',
+            }],
+        }])
+
+        self.assertEqual([], result)
+        self.assertEqual('volume-1', log_error.call_args.args[1]['volume'])
+        self.assertEqual(instance.name,
+                         log_error.call_args.args[1]['instance'])
+
+    def test_get_all_volume_usage_propagates_metrics_transport_failure(self):
+        ctxt = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctxt, id=1)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        transport_error = RuntimeError('Incus metrics endpoint unavailable')
+        incus_driver._get_disk_metrics_snapshot = mock.Mock(
+            side_effect=transport_error)
+        incus_driver._get_metric_devices_snapshot = mock.Mock()
+
+        raised = self.assertRaises(
+            RuntimeError,
+            incus_driver.get_all_volume_usage,
+            None,
+            [{
+                'instance': instance,
+                'instance_bdms': [{
+                    'device_name': '/dev/vdb',
+                    'volume_id': 'volume-1',
+                }],
+            }])
+
+        self.assertIs(transport_error, raised)
+        incus_driver._get_metric_devices_snapshot.assert_not_called()
+
+    def test_get_all_volume_usage_propagates_profile_transport_failure(self):
+        ctxt = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctxt, id=1)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        transport_error = RuntimeError(
+            'Incus instance inventory endpoint unavailable')
+        incus_driver._get_disk_metrics_snapshot = mock.Mock(return_value={})
+        incus_driver._get_metric_devices_snapshot = mock.Mock(
+            side_effect=transport_error)
+
+        raised = self.assertRaises(
+            RuntimeError,
+            incus_driver.get_all_volume_usage,
+            None,
+            [{
+                'instance': instance,
+                'instance_bdms': [{
+                    'device_name': '/dev/vdb',
+                    'volume_id': 'volume-1',
+                }],
+            }])
+
+        self.assertIs(transport_error, raised)
 
     def test_list_instances(self):
         self.client.instances.all.return_value = [
@@ -669,13 +3157,30 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         instances = incus_driver.list_instances()
 
         self.assertEqual(['mock-instance-1', 'mock-instance-2'], instances)
+        self.client.instances.all.assert_called_once_with()
+
+    def test_get_num_instances_primes_power_state_inventory(self):
+        first = mock.Mock(type='container')
+        first.name = 'instance-1'
+        second = mock.Mock(type='container')
+        second.name = 'instance-2'
+        self.client.instances.all.return_value = [first, second]
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertEqual(2, incus_driver.get_num_instances())
+        self.assertIs(first, incus_driver._get_instance_inventory_snapshot()[
+            first.name])
+        self.client.instances.all.assert_called_once_with(recursion=1)
 
     def test_list_instance_uuids_ignores_unmanaged_instances_and_vms(self):
         managed = mock.Mock(
+            name='managed',
             type='container',
             config={'user.openstack.uuid': 'managed-uuid'})
-        unmanaged = mock.Mock(type='container', config={})
+        unmanaged = mock.Mock(name='unmanaged', type='container', config={})
         virtual_machine = mock.Mock(
+            name='virtual-machine',
             type='virtual-machine',
             config={'user.openstack.uuid': 'vm-uuid'})
         self.client.instances.all.return_value = [
@@ -684,6 +3189,31 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         incus_driver.init_host(None)
 
         self.assertEqual(['managed-uuid'], incus_driver.list_instance_uuids())
+
+    @mock.patch.object(driver.LOG, 'error')
+    def test_list_instance_uuids_reports_duplicate_owners_once(self, error):
+        first = mock.Mock(
+            type='container',
+            config={'user.openstack.uuid': 'duplicate-uuid'})
+        first.name = 'instance-00000001'
+        stale = mock.Mock(
+            type='container',
+            config={'user.openstack.uuid': 'duplicate-uuid'})
+        stale.name = 'criu-test-copy'
+        self.client.instances.all.return_value = [first, stale]
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertEqual(
+            ['duplicate-uuid'], incus_driver.list_instance_uuids())
+        error.assert_called_once_with(
+            'Multiple Incus containers claim Nova instance UUID '
+            '%(uuid)s: %(names)s. Refusing to report duplicate UUIDs; '
+            'an operator must identify and remove the stale record.',
+            {
+                'uuid': 'duplicate-uuid',
+                'names': ['criu-test-copy', 'instance-00000001'],
+            })
 
     def test_incus_cloud_init_config(self):
         instance = mock.Mock(
@@ -837,13 +3367,13 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
-            ctx, name='test', memory_mb=0)
+            ctx, name='test', memory_mb=0, root_gb=1)
         image_meta = mock.Mock()
         injected_files = mock.Mock()
         admin_password = mock.Mock()
         allocations = mock.Mock()
         network_info = [_VIF]
-        block_device_info = mock.Mock()
+        block_device_info = {'block_device_mapping': []}
         virtapi = manager.ComputeVirtAPI(mock.MagicMock())
 
         incus_driver = driver.IncusDriver(virtapi)
@@ -865,12 +3395,14 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         fd.apply_instance_filter.assert_called_once_with(
             instance, network_info)
         container.start.assert_called_once_with(wait=True)
+        self.begin_idmap_materialization.assert_called_once()
         self.client.instances.create.assert_called_once_with({
             'name': instance.name,
             'type': 'container',
             'profiles': [self.client.profiles.create.return_value.name],
             'config': {
                 **driver._incus_cloud_init_config(instance),
+                'user.openstack.uuid': instance.uuid,
                 'boot.autostart': 'false',
             },
             'source': {
@@ -884,14 +3416,14 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         get_ephemerals.return_value = [{'virtual_name': 'ephemeral0'}]
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
-            ctx, name='test', memory_mb=512)
+            ctx, name='test', memory_mb=512, root_gb=1)
         virtapi = manager.ComputeVirtAPI(mock.MagicMock())
         incus_driver = driver.IncusDriver(virtapi)
         incus_driver.init_host(None)
         block_device_info = {'block_device_mapping': []}
 
         self.assertRaises(
-            exception.InvalidConfiguration,
+            exception.BuildAbortException,
             incus_driver.spawn,
             ctx, instance, mock.Mock(), [], None, mock.Mock(), [],
             block_device_info)
@@ -901,8 +3433,10 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.vif_driver.plug.assert_not_called()
         get_ephemerals.assert_called_once_with(block_device_info)
 
+    @mock.patch.object(driver.IncusDriver, 'attach_volume')
     @mock.patch('nova.virt.configdrive.required_by', return_value=False)
-    def test_spawn_boot_from_cinder_rbd(self, configdrive):
+    def test_spawn_boot_from_cinder_rbd(
+            self, configdrive, attach_volume):
         def container_get(*args, **kwargs):
             raise incuscore_exceptions.LXDAPIException(MockResponse(404))
 
@@ -931,6 +3465,19 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                 },
             },
         }
+        data_bdm = {
+            'boot_index': None,
+            'mount_device': '/dev/vdb',
+            'connection_info': {
+                'driver_volume_type': 'rbd',
+                'serial': '9231d2e8-1111-4222-8333-123456789abc',
+                'data': {
+                    'name': ('cinder-volumes/volume-'
+                             '9231d2e8-1111-4222-8333-123456789abc'),
+                    'access_mode': 'rw',
+                },
+            },
+        }
         profile = self.client.profiles.create.return_value
         profile.devices = {'root': {'type': 'disk', 'path': '/',
                                     'size': '20GB'}}
@@ -938,7 +3485,10 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
-            ctx, name='test-bfv', memory_mb=512)
+            ctx, name='test-bfv', memory_mb=512,
+            expected_attrs=['system_metadata'],
+            system_metadata={
+                'image_hw_incus_data_volume_fuse': 'true'})
         image_meta = mock.Mock(disk_format='raw', container_format='bare')
         incus_driver = driver.IncusDriver(
             manager.ComputeVirtAPI(mock.MagicMock()))
@@ -947,7 +3497,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         incus_driver.spawn(
             ctx, instance, image_meta, [], None, mock.Mock(), [],
-            {'block_device_mapping': [root_bdm]})
+            {'block_device_mapping': [root_bdm, data_bdm]})
 
         self.client.images.get_by_alias.assert_not_called()
         self.client.storage_pools.get.assert_called_with('cinder')
@@ -970,7 +3520,874 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             },
             'source': {'type': 'none'},
         }, wait=True)
+        attach_volume.assert_called_once_with(
+            ctx, data_bdm['connection_info'], instance, '/dev/vdb',
+            encryption=None)
         container.start.assert_called_once_with(wait=True)
+
+    @mock.patch.object(driver.IncusDriver, 'attach_volume')
+    @mock.patch('nova.virt.configdrive.required_by', return_value=False)
+    def test_spawn_attaches_initial_data_volumes_before_start(
+            self, configdrive, attach_volume):
+        container = self.client.instances.create.return_value
+        self.client.instances.get.side_effect = (
+            incuscore_exceptions.LXDAPIException(MockResponse(404)))
+        events = []
+        attach_volume.side_effect = (
+            lambda *args, **kwargs: events.append(
+                'attach-' + args[1]['serial']))
+        container.start.side_effect = lambda **kwargs: events.append('start')
+        data_bdms = [{
+            'boot_index': None,
+            'mount_device': '/dev/vdb',
+            'connection_info': {
+                'driver_volume_type': 'rbd',
+                'serial': _TEST_VOLUME_ID,
+                'data': {
+                    'name': 'volumes/volume-%s' % _TEST_VOLUME_ID,
+                },
+            },
+        }, {
+            'boot_index': None,
+            'mount_device': '/dev/vdc',
+            'connection_info': {
+                'driver_volume_type': 'rbd',
+                'serial': _TEST_VOLUME_ID_2,
+                'data': {
+                    'name': 'volumes/volume-%s' % _TEST_VOLUME_ID_2,
+                },
+            },
+        }]
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-data-volumes', memory_mb=512, root_gb=1,
+            expected_attrs=['system_metadata'],
+            system_metadata={
+                'image_hw_incus_data_volume_fuse': 'true'})
+        incus_driver = driver.IncusDriver(
+            manager.ComputeVirtAPI(mock.MagicMock()))
+        incus_driver.init_host(None)
+        incus_driver.firewall_driver = mock.Mock()
+
+        incus_driver.spawn(
+            ctx, instance, mock.Mock(), [], None, mock.Mock(), [],
+            {'block_device_mapping': data_bdms})
+
+        self.assertEqual(
+            ['attach-' + _TEST_VOLUME_ID,
+             'attach-' + _TEST_VOLUME_ID_2,
+             'start'], events)
+
+    @mock.patch.object(driver.IncusDriver, 'attach_volume')
+    @mock.patch.object(driver.flavor, 'to_profile')
+    @mock.patch('nova.virt.configdrive.required_by', return_value=False)
+    def test_spawn_root_and_initial_data_volume_cardinality_matrix(
+            self, configdrive, to_profile, attach_volume):
+        self.client.host_info['api_extensions'].append(
+            'storage_driver_cephext')
+        self.CONF.incus.boot_from_volume_storage_pools = {
+            'cinder-volumes': 'cinder'}
+        self.client.storage_pools.get.return_value = mock.Mock(
+            driver='cephext', config={'source': 'cinder-volumes'})
+        not_found = incuscore_exceptions.LXDAPIException(MockResponse(404))
+        ctx = context.get_admin_context()
+
+        for root_mode in ('local', 'bfv'):
+            for volume_count in (0, 1, 3):
+                with self.subTest(
+                        root_mode=root_mode, volume_count=volume_count):
+                    self.client.instances.get.reset_mock()
+                    self.client.instances.create.reset_mock()
+                    self.client.instances.get.side_effect = not_found
+                    attach_volume.reset_mock()
+                    to_profile.reset_mock()
+
+                    events = []
+                    container = mock.Mock(status='Stopped')
+                    container.start.side_effect = (
+                        lambda **kwargs: events.append('start'))
+                    self.client.instances.create.return_value = container
+                    profile = mock.Mock()
+                    profile.name = 'profile-%s-%d' % (
+                        root_mode, volume_count)
+                    profile.devices = {}
+                    to_profile.return_value = profile
+
+                    attach_volume.side_effect = (
+                        lambda _ctx, connection, *_args, **_kwargs:
+                            events.append('attach-' + connection['serial']))
+                    data_bdms = []
+                    for index in range(volume_count):
+                        data_volume_id = (
+                            '9231d2e8-1111-4222-8333-%012d' %
+                            (volume_count * 10 + index))
+                        data_bdms.append(real_volume_driver_bdm(
+                            ctx, data_volume_id,
+                            '/dev/vd%s' % chr(ord('b') + index), None, {
+                                'driver_volume_type': 'rbd',
+                                'serial': data_volume_id,
+                                'data': {
+                                    'name': 'cinder-volumes/volume-%s' %
+                                            data_volume_id,
+                                },
+                            }))
+
+                    bdms = list(data_bdms)
+                    if root_mode == 'bfv':
+                        volume_id = (
+                            '8231d2e8-1111-4222-8333-%012d' % volume_count)
+                        bdms.insert(0, real_volume_driver_bdm(
+                            ctx, volume_id, '/dev/vda', 0, {
+                                'driver_volume_type': 'rbd',
+                                'serial': volume_id,
+                                'data': {
+                                    'name': 'cinder-volumes/volume-%s' %
+                                            volume_id,
+                                    'volume_id': volume_id,
+                                    'access_mode': 'rw',
+                                },
+                            }))
+
+                    system_metadata = {}
+                    if volume_count:
+                        system_metadata[
+                            'image_hw_incus_data_volume_fuse'] = 'true'
+                    instance = fake_instance.fake_instance_obj(
+                        ctx,
+                        name='test-%s-%d' % (root_mode, volume_count),
+                        memory_mb=512,
+                        root_gb=1,
+                        expected_attrs=['system_metadata'],
+                        system_metadata=system_metadata)
+                    incus_driver = driver.IncusDriver(
+                        manager.ComputeVirtAPI(mock.MagicMock()))
+                    incus_driver.init_host(None)
+                    incus_driver.firewall_driver = mock.Mock()
+
+                    incus_driver.spawn(
+                        ctx, instance, mock.Mock(properties={}), [], None,
+                        mock.Mock(), [], {'block_device_mapping': bdms})
+
+                    self.assertEqual(
+                        ['attach-' + bdm['connection_info']['serial']
+                         for bdm in data_bdms] + ['start'],
+                        events)
+                    source = self.client.instances.create.call_args.args[0][
+                        'source']
+                    self.assertEqual(
+                        'none' if root_mode == 'bfv' else 'image',
+                        source['type'])
+
+    def test_spawn_rejects_initial_encrypted_data_volume_before_side_effects(
+            self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-encrypted-data', memory_mb=512, root_gb=1,
+            expected_attrs=['system_metadata'],
+            system_metadata={
+                'image_hw_incus_data_volume_fuse': 'true'})
+        data_bdm = {
+            'boot_index': None,
+            'mount_device': '/dev/vdb',
+            'connection_info': {
+                'driver_volume_type': 'rbd',
+                'serial': 'volume-encrypted',
+                'data': {'encrypted': {'provider': 'luks'}},
+            },
+        }
+        incus_driver = driver.IncusDriver(
+            manager.ComputeVirtAPI(mock.MagicMock()))
+        incus_driver.init_host(None)
+
+        self.assertRaises(
+            exception.BuildAbortException,
+            incus_driver.spawn, ctx, instance,
+            mock.Mock(properties={}), [], None, mock.Mock(), [],
+            {'block_device_mapping': [data_bdm]})
+
+        self.client.instances.get.assert_not_called()
+        self.client.instances.create.assert_not_called()
+        self.client.profiles.create.assert_not_called()
+        self.vif_driver.plug.assert_not_called()
+        self.volume_api.get_volume_encryption_metadata.assert_called_once_with(
+            ctx, 'volume-encrypted')
+
+    def test_spawn_rejects_explicitly_encrypted_bfv_before_side_effects(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-encrypted-bfv', memory_mb=512)
+        root_bdm = {
+            'boot_index': 0,
+            'connection_info': {
+                'driver_volume_type': 'rbd',
+                'serial': '8231d2e8-1111-4222-8333-123456789abc',
+                'data': {},
+            },
+        }
+        incus_driver = driver.IncusDriver(
+            manager.ComputeVirtAPI(mock.MagicMock()))
+        incus_driver.init_host(None)
+        self.volume_api.get_volume_encryption_metadata.return_value = {
+            'provider': 'luks'}
+
+        self.assertRaises(
+            exception.BuildAbortException,
+            incus_driver.spawn, ctx, instance,
+            mock.Mock(properties={}), [], None, mock.Mock(), [],
+            {'block_device_mapping': [root_bdm]})
+
+        self.client.instances.get.assert_not_called()
+        self.client.instances.create.assert_not_called()
+        self.client.profiles.create.assert_not_called()
+        self.vif_driver.plug.assert_not_called()
+
+    def test_spawn_queries_authoritative_encryption_for_real_bdms(self):
+        ctx = context.get_admin_context()
+        root_id = '8231d2e8-1111-4222-8333-123456789abc'
+        data_id = '9231d2e8-1111-4222-8333-123456789abc'
+        root_bdm = real_volume_driver_bdm(
+            ctx, root_id, '/dev/vda', 0, {
+                'driver_volume_type': 'rbd',
+                'serial': root_id,
+                'data': {
+                    'name': 'cinder-volumes/volume-%s' % root_id,
+                    'access_mode': 'rw',
+                },
+            })
+        data_bdm = real_volume_driver_bdm(
+            ctx, data_id, '/dev/vdb', None, {
+                'driver_volume_type': 'rbd',
+                'serial': data_id,
+                'data': {
+                    'name': 'cinder-volumes/volume-%s' % data_id,
+                    'access_mode': 'rw',
+                },
+            })
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-real-encrypted-bdm', memory_mb=512, root_gb=1,
+            expected_attrs=['system_metadata'],
+            system_metadata={
+                'image_hw_incus_data_volume_fuse': 'true'})
+        incus_driver = driver.IncusDriver(
+            manager.ComputeVirtAPI(mock.MagicMock()))
+        incus_driver.init_host(None)
+        self.volume_api.get_volume_encryption_metadata.side_effect = [
+            {}, {'provider': 'luks'},
+        ]
+
+        self.assertRaises(
+            exception.BuildAbortException,
+            incus_driver.spawn, ctx, instance,
+            mock.Mock(properties={}), [], None, mock.Mock(), [],
+            {'block_device_mapping': [root_bdm, data_bdm]})
+
+        self.assertEqual([
+            mock.call(ctx, root_id), mock.call(ctx, data_id),
+        ], self.volume_api.get_volume_encryption_metadata.call_args_list)
+        self.client.instances.get.assert_not_called()
+        self.client.instances.create.assert_not_called()
+        self.client.profiles.create.assert_not_called()
+        self.vif_driver.plug.assert_not_called()
+
+    def test_initial_volume_encryption_ignores_unencrypted_metadata(self):
+        # cinderclient returns a truthy resource object (request-id
+        # tracking only) even for unencrypted volumes; it must not be
+        # mistaken for an encryption marker.
+        ctx = context.get_admin_context()
+        root_bdm = {
+            'boot_index': 0,
+            'connection_info': {
+                'driver_volume_type': 'rbd',
+                'serial': '8231d2e8-1111-4222-8333-123456789abc',
+                'data': {},
+            },
+        }
+        incus_driver = driver.IncusDriver(
+            manager.ComputeVirtAPI(mock.MagicMock()))
+        incus_driver.init_host(None)
+        self.volume_api.get_volume_encryption_metadata.return_value = (
+            mock.Mock(spec=[]))
+
+        incus_driver._validate_initial_volume_encryption(ctx, root_bdm, [])
+
+    def test_bdm_volume_id_uses_real_driver_bdm_attribute(self):
+        ctx = context.get_admin_context()
+        volume_id = '8231d2e8-1111-4222-8333-123456789abc'
+        bdm = real_volume_driver_bdm(
+            ctx, volume_id, '/dev/vdb', None, {
+                'driver_volume_type': 'rbd',
+                'data': {
+                    'name': 'cinder-volumes/volume-%s' % volume_id,
+                },
+            })
+
+        self.assertEqual(volume_id, driver._bdm_volume_id(bdm))
+
+    def test_bdm_volume_id_uses_legacy_connection_info(self):
+        volume_id = '8231d2e8-1111-4222-8333-123456789abc'
+        bdm = {
+            'connection_info': {
+                'driver_volume_type': 'rbd',
+                'serial': volume_id,
+                'data': {
+                    'name': 'cinder-volumes/volume-%s' % volume_id,
+                },
+            },
+        }
+
+        self.assertEqual(volume_id, driver._bdm_volume_id(bdm))
+
+    def test_spawn_preflights_all_data_volumes_before_first_connector(self):
+        ctx = context.get_admin_context()
+        first_id = '8231d2e8-1111-4222-8333-123456789abc'
+        second_id = '9231d2e8-1111-4222-8333-123456789abc'
+        first = real_volume_driver_bdm(
+            ctx, first_id, '/dev/vdb', None, {
+                'driver_volume_type': 'rbd',
+                'serial': first_id,
+                'data': {
+                    'name': 'cinder-volumes/volume-%s' % first_id,
+                    'access_mode': 'rw',
+                },
+            })
+        second = real_volume_driver_bdm(
+            ctx, second_id, '/dev/vdc', None, {
+                'driver_volume_type': 'rbd',
+                'serial': second_id,
+                'data': {
+                    'name': 'cinder-volumes/volume-%s' % second_id,
+                    'access_mode': 'ro',
+                },
+            })
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-preflight-all-data', memory_mb=512, root_gb=1,
+            expected_attrs=['system_metadata'],
+            system_metadata={
+                'image_hw_incus_data_volume_fuse': 'true'})
+        incus_driver = driver.IncusDriver(
+            manager.ComputeVirtAPI(mock.MagicMock()))
+        incus_driver.init_host(None)
+
+        with mock.patch.object(driver, 'brick_get_connector') as get_connector:
+            self.assertRaises(
+                exception.BuildAbortException,
+                incus_driver.spawn, ctx, instance,
+                mock.Mock(properties={}), [], None, mock.Mock(), [],
+                {'block_device_mapping': [first, second]})
+
+        get_connector.assert_not_called()
+        self.client.instances.get.assert_not_called()
+        self.client.instances.create.assert_not_called()
+        self.client.profiles.create.assert_not_called()
+        self.vif_driver.plug.assert_not_called()
+
+    def test_spawn_multiattach_preflight_aborts_without_reschedule(self):
+        ctx = context.get_admin_context()
+        volume_id = '8231d2e8-1111-4222-8333-123456789abc'
+        bdm = real_volume_driver_bdm(
+            ctx, volume_id, '/dev/vdb', None, {
+                'driver_volume_type': 'rbd',
+                'serial': volume_id,
+                'data': {
+                    'name': 'cinder-volumes/volume-%s' % volume_id,
+                    'multiattach': True,
+                },
+            })
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-multiattach-preflight', memory_mb=512, root_gb=1,
+            expected_attrs=['system_metadata'], system_metadata={
+                'image_hw_incus_data_volume_fuse': 'true'})
+        incus_driver = driver.IncusDriver(
+            manager.ComputeVirtAPI(mock.MagicMock()))
+        incus_driver.init_host(None)
+
+        with mock.patch.object(driver, 'brick_get_connector') as connector:
+            self.assertRaises(
+                exception.BuildAbortException,
+                incus_driver.spawn, ctx, instance,
+                mock.Mock(properties={}), [], None, mock.Mock(), [],
+                {'block_device_mapping': [bdm]})
+
+        connector.assert_not_called()
+        self.client.instances.get.assert_not_called()
+        self.client.instances.create.assert_not_called()
+        self.client.profiles.create.assert_not_called()
+        self.vif_driver.plug.assert_not_called()
+
+    def test_spawn_non_rbd_data_volume_aborts_before_side_effects(self):
+        ctx = context.get_admin_context()
+        volume_id = '8231d2e8-1111-4222-8333-123456789abc'
+        bdm = real_volume_driver_bdm(
+            ctx, volume_id, '/dev/vdb', None, {
+                'driver_volume_type': 'iscsi',
+                'serial': volume_id,
+                'data': {'volume_id': volume_id},
+            })
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-non-rbd-preflight', memory_mb=512, root_gb=1,
+            expected_attrs=['system_metadata'], system_metadata={
+                'image_hw_incus_data_volume_fuse': 'true'})
+        incus_driver = driver.IncusDriver(
+            manager.ComputeVirtAPI(mock.MagicMock()))
+        incus_driver.init_host(None)
+
+        with mock.patch.object(driver, 'brick_get_connector') as connector:
+            self.assertRaises(
+                exception.BuildAbortException,
+                incus_driver.spawn, ctx, instance,
+                mock.Mock(properties={}), [], None, mock.Mock(), [],
+                {'block_device_mapping': [bdm]})
+
+        connector.assert_not_called()
+        self.client.instances.get.assert_not_called()
+        self.client.instances.create.assert_not_called()
+        self.client.profiles.create.assert_not_called()
+        self.vif_driver.plug.assert_not_called()
+
+    def test_spawn_rejects_data_rbd_image_for_different_volume(self):
+        ctx = context.get_admin_context()
+        bdm = real_volume_driver_bdm(
+            ctx, _TEST_VOLUME_ID, '/dev/vdb', None, {
+                'driver_volume_type': 'rbd',
+                'serial': _TEST_VOLUME_ID,
+                'data': {
+                    'name': 'volumes/volume-%s' % _TEST_VOLUME_ID_2,
+                },
+            })
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-rbd-identity-mismatch', memory_mb=512, root_gb=1,
+            expected_attrs=['system_metadata'], system_metadata={
+                'image_hw_incus_data_volume_fuse': 'true'})
+        incus_driver = driver.IncusDriver(
+            manager.ComputeVirtAPI(mock.MagicMock()))
+        incus_driver.init_host(None)
+
+        with mock.patch.object(driver, 'brick_get_connector') as connector:
+            self.assertRaisesRegex(
+                exception.BuildAbortException,
+                'image UUID does not match',
+                incus_driver.spawn, ctx, instance,
+                mock.Mock(properties={}), [], None, mock.Mock(), [],
+                {'block_device_mapping': [bdm]})
+
+        connector.assert_not_called()
+        self.client.instances.get.assert_not_called()
+        self.client.instances.create.assert_not_called()
+        self.client.profiles.create.assert_not_called()
+        self.vif_driver.plug.assert_not_called()
+
+    def test_recovery_record_rejects_different_rbd_namespace(self):
+        connection_info = {
+            'driver_volume_type': 'rbd',
+            'serial': _TEST_VOLUME_ID,
+            'data': {
+                'name': 'volumes/volume-%s' % _TEST_VOLUME_ID,
+                'rbd_namespace': 'tenant-a',
+            },
+        }
+        recorded = copy.deepcopy(connection_info)
+        recorded['data']['rbd_namespace'] = 'tenant-b'
+        record = jsonutils.loads(driver._serialize_volume_attachment(
+            recorded, {'path': '/dev/rbd0'}, '/dev/vdb'))
+
+        self.assertRaisesRegex(
+            exception.InvalidVolume, 'different RBD namespace',
+            driver._validate_volume_recovery_record,
+            record, _TEST_VOLUME_ID, '/dev/vdb', connection_info)
+
+    def test_spawn_initial_data_volume_requires_image_capability(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-data-image-gate', memory_mb=512, root_gb=1,
+            image_ref='00000000-0000-0000-0000-000000000010',
+            system_metadata={})
+        data_bdm = {
+            'boot_index': None,
+            'mount_device': '/dev/vdb',
+            'connection_info': {
+                'driver_volume_type': 'rbd',
+                'serial': _TEST_VOLUME_ID,
+                'data': {
+                    'name': 'volumes/volume-%s' % _TEST_VOLUME_ID,
+                },
+            },
+        }
+        incus_driver = driver.IncusDriver(
+            manager.ComputeVirtAPI(mock.MagicMock()))
+        incus_driver.init_host(None)
+
+        self.assertRaises(
+            exception.BuildAbortException,
+            incus_driver.spawn, ctx, instance,
+            mock.Mock(properties={}), [], None, mock.Mock(), [],
+            {'block_device_mapping': [data_bdm]})
+
+        self.client.instances.get.assert_not_called()
+        self.client.instances.create.assert_not_called()
+        self.client.profiles.create.assert_not_called()
+        self.vif_driver.plug.assert_not_called()
+
+    def test_initial_data_volume_image_capability_prefers_system_metadata(
+            self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, expected_attrs=['system_metadata'], system_metadata={
+                'image_hw_incus_data_volume_fuse': 'true'})
+
+        self.assertTrue(driver._initial_data_volume_image_capability(
+            instance, mock.Mock(properties={
+                'hw_incus_data_volume_fuse': 'false'})))
+
+    def test_spawn_data_volumes_reject_duplicate_volume(self):
+        connection_info = {
+            'driver_volume_type': 'rbd',
+            'serial': 'volume-1',
+            'data': {},
+        }
+        block_device_info = {'block_device_mapping': [{
+            'boot_index': 0,
+            'connection_info': connection_info,
+        }, {
+            'boot_index': None,
+            'mount_device': '/dev/vdb',
+            'connection_info': connection_info,
+        }]}
+
+        self.assertRaises(
+            exception.InvalidVolume,
+            driver._spawn_data_volume_bdms, block_device_info)
+
+    def test_spawn_data_volumes_reject_missing_connection_info(self):
+        block_device_info = {'block_device_mapping': [{
+            'boot_index': None,
+            'mount_device': '/dev/vdb',
+            'connection_info': None,
+        }]}
+
+        self.assertRaisesRegex(
+            exception.InvalidVolume, 'no connection information',
+            driver._spawn_data_volume_bdms, block_device_info)
+
+    def test_spawn_data_volumes_accept_authoritative_root_mountpoint(self):
+        root_bdm = {
+            'boot_index': 0,
+            'mount_device': '/dev/vda',
+            'connection_info': {
+                'driver_volume_type': 'rbd',
+                'serial': 'root-volume',
+                'data': {},
+            },
+        }
+        data_bdm = {
+            'boot_index': None,
+            'mount_device': '/dev/vdb',
+            'connection_info': {
+                'driver_volume_type': 'rbd',
+                'serial': 'data-volume',
+                'data': {},
+            },
+        }
+
+        result = driver._spawn_data_volume_bdms(
+            {'block_device_mapping': [root_bdm, data_bdm]},
+            root_device_name='/dev/vda')
+
+        self.assertEqual([data_bdm], result)
+
+    def test_spawn_data_volumes_reject_authoritative_root_collision(self):
+        block_device_info = {'block_device_mapping': [{
+            'boot_index': 0,
+            'mount_device': '/dev/vda',
+            'connection_info': {
+                'driver_volume_type': 'rbd',
+                'serial': 'root-volume',
+                'data': {},
+            },
+        }, {
+            'boot_index': None,
+            'mount_device': '/dev/vda',
+            'connection_info': {
+                'driver_volume_type': 'rbd',
+                'serial': 'data-volume',
+                'data': {},
+            },
+        }]}
+
+        self.assertRaises(
+            exception.DevicePathInUse,
+            driver._spawn_data_volume_bdms, block_device_info,
+            root_device_name='/dev/vda')
+
+    def test_reboot_data_volumes_reject_multiple_boot_volumes(self):
+        block_device_info = {'block_device_mapping': [{
+            'boot_index': 0,
+            'mount_device': '/dev/vda',
+            'connection_info': {
+                'driver_volume_type': 'rbd',
+                'serial': 'root-volume-1',
+                'data': {},
+            },
+        }, {
+            'boot_index': 0,
+            'mount_device': '/dev/vdc',
+            'connection_info': {
+                'driver_volume_type': 'rbd',
+                'serial': 'root-volume-2',
+                'data': {},
+            },
+        }]}
+
+        self.assertRaisesRegex(
+            exception.InvalidConfiguration,
+            'only one boot_index=0 volume',
+            driver._reboot_data_volume_bdms, block_device_info,
+            root_device_name='/dev/vda')
+
+    def test_spawn_rejects_bfv_root_data_mountpoint_collision_first(self):
+        root_connection = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'}, '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        data_connection = fake_connection_info(
+            {'id': 2, 'name': 'volume-00000002'}, '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000002')
+        block_device_info = {'block_device_mapping': [{
+            'boot_index': 0,
+            'mount_device': '/dev/vda',
+            'connection_info': root_connection,
+        }, {
+            'boot_index': None,
+            'mount_device': '/dev/vda',
+            'connection_info': data_connection,
+        }]}
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-bfv-path-collision', root_device_name='/dev/vda',
+            memory_mb=512, root_gb=1, system_metadata={})
+        incus_driver = driver.IncusDriver(
+            manager.ComputeVirtAPI(mock.MagicMock()))
+        incus_driver.init_host(None)
+
+        with mock.patch.object(driver, 'brick_get_connector') as connector:
+            self.assertRaises(
+                exception.BuildAbortException,
+                incus_driver.spawn, ctx, instance, mock.Mock(properties={}),
+                [], None, mock.Mock(), [], block_device_info)
+            connector.assert_not_called()
+
+        self.client.instances.get.assert_not_called()
+        self.client.instances.create.assert_not_called()
+        self.client.profiles.create.assert_not_called()
+
+    def test_reboot_rejects_authoritative_root_data_mountpoint_collision(self):
+        root_connection = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'}, '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        data_connection = fake_connection_info(
+            {'id': 2, 'name': 'volume-00000002'}, '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000002')
+        block_device_info = {'block_device_mapping': [{
+            'boot_index': 0,
+            'mount_device': None,
+            'connection_info': root_connection,
+        }, {
+            'boot_index': None,
+            'mount_device': '/dev/vda',
+            'connection_info': data_connection,
+        }]}
+        instance = mock.Mock(
+            name='instance-00000001', root_device_name='/dev/vda')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        with mock.patch.object(driver, 'brick_get_connector') as connector:
+            self.assertRaises(
+                exception.DevicePathInUse,
+                incus_driver._reconcile_reboot_data_volumes,
+                mock.sentinel.context, instance, block_device_info)
+            connector.assert_not_called()
+
+        self.client.instances.get.assert_not_called()
+        self.client.profiles.get.assert_not_called()
+
+    @mock.patch('nova.virt.configdrive.required_by', return_value=False)
+    def test_spawn_data_volume_failure_rolls_back_in_reverse_order(
+            self, configdrive):
+        self.client.instances.get.side_effect = (
+            incuscore_exceptions.LXDAPIException(MockResponse(404)))
+        data_bdms = []
+        volume_ids = (
+            _TEST_VOLUME_ID, _TEST_VOLUME_ID_2, _TEST_VOLUME_ID_3)
+        for index, device in enumerate(('vdb', 'vdc', 'vdd')):
+            volume_id = volume_ids[index]
+            data_bdms.append({
+                'boot_index': None,
+                'mount_device': '/dev/' + device,
+                'connection_info': {
+                    'driver_volume_type': 'rbd',
+                    'serial': volume_id,
+                    'data': {
+                        'name': 'volumes/volume-%s' % volume_id,
+                    },
+                },
+            })
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-data-rollback', memory_mb=512, root_gb=1,
+            expected_attrs=['system_metadata'],
+            system_metadata={
+                'image_hw_incus_data_volume_fuse': 'true'})
+        incus_driver = driver.IncusDriver(
+            manager.ComputeVirtAPI(mock.MagicMock()))
+        incus_driver.init_host(None)
+        incus_driver.firewall_driver = mock.Mock()
+        incus_driver.attach_volume = mock.Mock(
+            side_effect=[None, None, RuntimeError('third attach failed')])
+        incus_driver.detach_volume = mock.Mock()
+        incus_driver.cleanup = mock.Mock()
+
+        self.assertRaisesRegex(
+            RuntimeError, 'third attach failed', incus_driver.spawn,
+            ctx, instance, mock.Mock(), [], None, mock.Mock(), [],
+            {'block_device_mapping': data_bdms})
+
+        self.assertEqual(
+            [mock.call(
+                ctx, data_bdms[1]['connection_info'], instance, '/dev/vdc',
+                encryption=None),
+             mock.call(
+                 ctx, data_bdms[0]['connection_info'], instance, '/dev/vdb',
+                 encryption=None)],
+            incus_driver.detach_volume.call_args_list)
+        self.client.instances.create.return_value.start.assert_not_called()
+        incus_driver.cleanup.assert_called_once()
+
+    @mock.patch('nova.virt.configdrive.required_by', return_value=False)
+    def test_spawn_firewall_failure_fences_before_detaching_volumes(
+            self, configdrive):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-spawn-fence-order', memory_mb=512, root_gb=1,
+            expected_attrs=['system_metadata'],
+            system_metadata={
+                'image_hw_incus_data_volume_fuse': 'true'})
+        container = self.client.instances.create.return_value
+        container.status = 'Running'
+        not_found = incuscore_exceptions.NotFound(MockResponse(404))
+        self.client.instances.get.side_effect = [not_found, container]
+        data_bdms = [{
+            'boot_index': None,
+            'mount_device': '/dev/vdb',
+            'connection_info': {
+                'driver_volume_type': 'rbd',
+                'serial': _TEST_VOLUME_ID,
+                'data': {
+                    'name': 'volumes/volume-%s' % _TEST_VOLUME_ID,
+                },
+            },
+        }, {
+            'boot_index': None,
+            'mount_device': '/dev/vdc',
+            'connection_info': {
+                'driver_volume_type': 'rbd',
+                'serial': _TEST_VOLUME_ID_2,
+                'data': {
+                    'name': 'volumes/volume-%s' % _TEST_VOLUME_ID_2,
+                },
+            },
+        }]
+        events = []
+        container.start.side_effect = (
+            lambda **kwargs: events.append('start'))
+        container.stop.side_effect = (
+            lambda **kwargs: events.append('stop'))
+        container.delete.side_effect = (
+            lambda **kwargs: events.append('delete'))
+        incus_driver = driver.IncusDriver(
+            manager.ComputeVirtAPI(mock.MagicMock()))
+        incus_driver.init_host(None)
+        incus_driver.attach_volume = mock.Mock(
+            side_effect=lambda _ctx, connection, *_args, **_kwargs:
+                events.append('attach-' + connection['serial']))
+        incus_driver.detach_volume = mock.Mock(
+            side_effect=lambda _ctx, connection, *_args, **_kwargs:
+                events.append('detach-' + connection['serial']))
+        incus_driver.cleanup = mock.Mock(
+            side_effect=lambda *_args, **_kwargs: events.append('cleanup'))
+        incus_driver.firewall_driver = mock.Mock()
+
+        def firewall_failure(*_args):
+            events.append('firewall')
+            raise RuntimeError('firewall failed')
+
+        incus_driver.firewall_driver.apply_instance_filter.side_effect = (
+            firewall_failure)
+
+        self.assertRaisesRegex(
+            RuntimeError, 'firewall failed', incus_driver.spawn,
+            ctx, instance, mock.Mock(), [], None, mock.Mock(), [],
+            {'block_device_mapping': data_bdms})
+
+        self.assertEqual([
+            'attach-' + _TEST_VOLUME_ID,
+            'attach-' + _TEST_VOLUME_ID_2,
+            'start', 'firewall', 'stop', 'delete',
+            'detach-' + _TEST_VOLUME_ID_2,
+            'detach-' + _TEST_VOLUME_ID,
+            'cleanup',
+        ], events)
+
+    @mock.patch('nova.virt.configdrive.required_by', return_value=False)
+    def test_spawn_fencing_failure_retains_all_attached_resources(
+            self, configdrive):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-spawn-fence-failure', memory_mb=512, root_gb=1,
+            expected_attrs=['system_metadata'],
+            system_metadata={
+                'image_hw_incus_data_volume_fuse': 'true'})
+        container = self.client.instances.create.return_value
+        container.status = 'Running'
+        calls = {'get': 0}
+
+        def get_instance(_name):
+            calls['get'] += 1
+            if calls['get'] == 1:
+                raise incuscore_exceptions.NotFound(MockResponse(404))
+            return container
+
+        self.client.instances.get.side_effect = get_instance
+        container.stop.side_effect = (
+            incuscore_exceptions.ClientConnectionFailed('response lost'))
+        data_bdm = {
+            'boot_index': None,
+            'mount_device': '/dev/vdb',
+            'connection_info': {
+                'driver_volume_type': 'rbd',
+                'serial': _TEST_VOLUME_ID,
+                'data': {
+                    'name': 'volumes/volume-%s' % _TEST_VOLUME_ID,
+                },
+            },
+        }
+        incus_driver = driver.IncusDriver(
+            manager.ComputeVirtAPI(mock.MagicMock()))
+        incus_driver.init_host(None)
+        incus_driver.attach_volume = mock.Mock()
+        incus_driver.detach_volume = mock.Mock()
+        incus_driver.cleanup = mock.Mock()
+        incus_driver.firewall_driver = mock.Mock()
+        incus_driver.firewall_driver.apply_instance_filter.side_effect = (
+            RuntimeError('firewall failed'))
+
+        self.assertRaisesRegex(
+            RuntimeError, 'firewall failed', incus_driver.spawn,
+            ctx, instance, mock.Mock(), [], None, mock.Mock(), [],
+            {'block_device_mapping': [data_bdm]})
+
+        incus_driver.attach_volume.assert_called_once()
+        incus_driver.detach_volume.assert_not_called()
+        incus_driver.cleanup.assert_not_called()
+        container.delete.assert_not_called()
 
     def test_boot_from_volume_rejects_non_rbd(self):
         bdm = {'connection_info': {
@@ -1026,7 +4443,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         """InstanceExists is raised if the container already exists."""
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
-            ctx, name='test', memory_mb=0)
+            ctx, name='test', memory_mb=0, root_gb=1)
         image_meta = mock.Mock()
         injected_files = mock.Mock()
         admin_password = mock.Mock()
@@ -1052,13 +4469,13 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
-            ctx, name='test', memory_mb=0)
+            ctx, name='test', memory_mb=0, root_gb=1)
         image_meta = mock.Mock()
         injected_files = mock.Mock()
         admin_password = mock.Mock()
         allocations = mock.Mock()
         network_info = [_VIF]
-        block_device_info = mock.Mock()
+        block_device_info = {'block_device_mapping': []}
         virtapi = manager.ComputeVirtAPI(mock.MagicMock())
 
         incus_driver = driver.IncusDriver(virtapi)
@@ -1106,7 +4523,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             execute_mock, listdir_mock, ensure_tree_mock):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
-            ctx, name='test', memory_mb=0)
+            ctx, name='test', memory_mb=0, root_gb=1)
         injected_files = [('etc/example', b'content')]
         network_info = [_VIF]
         container = self.client.instances.get.return_value
@@ -1145,13 +4562,13 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         configdrive.return_value = False
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
-            ctx, name='test', memory_mb=0)
+            ctx, name='test', memory_mb=0, root_gb=1)
         image_meta = mock.Mock()
         injected_files = mock.Mock()
         admin_password = mock.Mock()
         allocations = mock.Mock()
         network_info = [_VIF]
-        block_device_info = mock.Mock()
+        block_device_info = {'block_device_mapping': []}
         virtapi = manager.ComputeVirtAPI(mock.MagicMock())
 
         incus_driver = driver.IncusDriver(virtapi)
@@ -1165,6 +4582,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             allocations, network_info, block_device_info)
         incus_driver.cleanup.assert_called_once_with(
             ctx, instance, network_info, block_device_info)
+        self.begin_idmap_materialization.assert_called_once()
 
     @mock.patch('nova.virt.configdrive.required_by')
     def test_spawn_container_fail(self, configdrive, neutron_failure=None):
@@ -1179,13 +4597,13 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         configdrive.return_value = False
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
-            ctx, name='test', memory_mb=0)
+            ctx, name='test', memory_mb=0, root_gb=1)
         image_meta = mock.Mock()
         injected_files = mock.Mock()
         admin_password = mock.Mock()
         allocations = mock.Mock()
         network_info = [_VIF]
-        block_device_info = mock.Mock()
+        block_device_info = {'block_device_mapping': []}
         virtapi = manager.ComputeVirtAPI(mock.MagicMock())
 
         incus_driver = driver.IncusDriver(virtapi)
@@ -1199,24 +4617,27 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             allocations, network_info, block_device_info)
         incus_driver.cleanup.assert_called_once_with(
             ctx, instance, network_info, block_device_info)
+        self.begin_idmap_materialization.assert_called_once()
 
     @mock.patch('nova.virt.configdrive.required_by', return_value=False)
     def test_spawn_container_cleanup_fail(self, configdrive):
         """Cleanup is called but also fail when container creation fails."""
-        self.client.instances.get.side_effect = (
-            incuscore_exceptions.LXDAPIException(MockResponse(404)))
         container = mock.Mock()
+        self.client.instances.get.side_effect = [
+            incuscore_exceptions.LXDAPIException(MockResponse(404)),
+            container,
+        ]
         self.client.instances.create.return_value = container
 
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
-            ctx, name='test', memory_mb=0)
+            ctx, name='test', memory_mb=0, root_gb=1)
         image_meta = mock.Mock()
         injected_files = mock.Mock()
         admin_password = mock.Mock()
         allocations = mock.Mock()
         network_info = [_VIF]
-        block_device_info = mock.Mock()
+        block_device_info = {'block_device_mapping': []}
         virtapi = manager.ComputeVirtAPI(mock.MagicMock())
 
         incus_driver = driver.IncusDriver(virtapi)
@@ -1247,13 +4668,13 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         container = mock.Mock()
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
-            ctx, name='test', memory_mb=0)
+            ctx, name='test', memory_mb=0, root_gb=1)
         image_meta = mock.Mock()
         injected_files = mock.Mock()
         admin_password = mock.Mock()
         allocations = mock.Mock()
         network_info = [_VIF]
-        block_device_info = mock.Mock()
+        block_device_info = {'block_device_mapping': []}
         virtapi = manager.ComputeVirtAPI(mock.MagicMock())
 
         incus_driver = driver.IncusDriver(virtapi)
@@ -1271,85 +4692,65 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         incus_driver.cleanup.assert_called_once_with(
             ctx, instance, network_info, block_device_info)
 
-    def _test_spawn_instance_with_network_events(self, neutron_failure=None):
-        generated_events = []
+    def _driver_with_vif_event_timeout(self):
+        virtapi = mock.Mock()
+        waiter = mock.MagicMock()
+        waiter.__exit__.side_effect = exception.InstanceEventTimeout()
+        virtapi.wait_for_instance_event.return_value = waiter
+        incus_driver = driver.IncusDriver(virtapi)
+        incus_driver.plug_vifs = mock.Mock()
+        incus_driver.cleanup = mock.Mock()
+        return incus_driver, virtapi
 
-        def wait_timeout():
-            event = mock.MagicMock()
-            if neutron_failure == 'timeout':
-                raise eventlet.timeout.Timeout()
-            elif neutron_failure == 'error':
-                event.status = 'failed'
-            else:
-                event.status = 'completed'
-            return event
+    def test_spawn_vif_event_timeout_is_nonfatal_when_configured(self):
+        self.CONF.vif_plugging_timeout = 5
+        self.CONF.vif_plugging_is_fatal = False
+        incus_driver, virtapi = self._driver_with_vif_event_timeout()
+        ctxt = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctxt, name='test', memory_mb=0)
+        network_info = [dict(_VIF, id='vif1', active=False)]
+        block_device_info = mock.sentinel.block_device_info
 
-        def fake_prepare(instance, event_name):
-            m = mock.MagicMock()
-            m.instance = instance
-            m.event_name = event_name
-            m.wait.side_effect = wait_timeout
-            generated_events.append(m)
-            return m
+        incus_driver._plug_vifs_for_spawn(
+            ctxt, instance, network_info, block_device_info)
 
-        virtapi = manager.ComputeVirtAPI(mock.MagicMock())
-        prepare = virtapi._compute.instance_events.prepare_for_instance_event
-        prepare.side_effect = fake_prepare
-        drv = driver.IncusDriver(virtapi)
+        incus_driver.plug_vifs.assert_called_once_with(
+            instance, network_info)
+        incus_driver.cleanup.assert_not_called()
+        virtapi.wait_for_instance_event.assert_called_once_with(
+            instance,
+            [('network-vif-plugged', 'vif1')],
+            timeout=5,
+            error_callback=driver._neutron_failed_callback)
 
-        instance_href = fake_instance.fake_instance_obj(
-            context.get_admin_context(), name='test', memory_mb=0)
+    def test_spawn_vif_event_timeout_is_fatal_when_configured(self):
+        self.CONF.vif_plugging_timeout = 5
+        self.CONF.vif_plugging_is_fatal = True
+        incus_driver, _virtapi = self._driver_with_vif_event_timeout()
+        ctxt = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctxt, name='test', memory_mb=0)
+        network_info = [dict(_VIF, id='vif1', active=False)]
+        block_device_info = mock.sentinel.block_device_info
 
-        @mock.patch.object(drv, 'plug_vifs')
-        @mock.patch('nova.virt.configdrive.required_by')
-        def test_spawn(configdrive, plug_vifs):
-            def container_get(*args, **kwargs):
-                raise incuscore_exceptions.LXDAPIException(MockResponse(404))
-            self.client.instances.get.side_effect = container_get
-            configdrive.return_value = False
+        self.assertRaises(
+            exception.VirtualInterfaceCreateException,
+            incus_driver._plug_vifs_for_spawn,
+            ctxt, instance, network_info, block_device_info)
 
-            ctx = context.get_admin_context()
-            instance = fake_instance.fake_instance_obj(
-                ctx, name='test', memory_mb=0)
-            image_meta = mock.Mock()
-            injected_files = mock.Mock()
-            admin_password = mock.Mock()
-            allocations = mock.Mock()
-            network_info = [_VIF]
-            block_device_info = mock.Mock()
-
-            drv.init_host(None)
-            drv.spawn(
-                ctx, instance, image_meta, injected_files, admin_password,
-                allocations, network_info, block_device_info)
-
-        test_spawn()
-
-        if cfg.CONF.vif_plugging_timeout:
-            prepare.assert_has_calls([
-                mock.call(instance_href, 'network-vif-plugged-vif1'),
-                mock.call(instance_href, 'network-vif-plugged-vif2')])
-            for event in generated_events:
-                if neutron_failure and generated_events.index(event) != 0:
-                    self.assertEqual(0, event.call_count)
-        else:
-            self.assertEqual(0, prepare.call_count)
-
-    def test_spawn_instance_with_network_events(self):
-        self.flags(vif_plugging_timeout=0)
-        self._test_spawn_instance_with_network_events()
-
-    def test_spawn_instance_with_events_neutron_failed_nonfatal_timeout(self):
-        self.flags(vif_plugging_timeout=0)
-        self.flags(vif_plugging_is_fatal=False)
-        self._test_spawn_instance_with_network_events(
-            neutron_failure='timeout')
+        incus_driver.plug_vifs.assert_called_once_with(
+            instance, network_info)
+        incus_driver.cleanup.assert_called_once_with(
+            ctxt, instance, network_info, block_device_info)
 
     @mock.patch('nova.virt.incus.driver.lockutils.lock')
     def test_destroy(self, lock):
         mock_container = mock.Mock()
         mock_container.status = 'Running'
+        mock_container.config = {}
         self.client.instances.get.return_value = mock_container
+        self.client.storage_pools.get.return_value.driver = 'ceph'
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
@@ -1357,16 +4758,196 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
+        self._configure_exact_idmap_release(
+            incus_driver, instance, mock_container)
         incus_driver.cleanup = mock.Mock()  # There is a separate cleanup test
+        broker = mock.Mock()
+        incus_driver._serial_consoles[instance.uuid] = broker
 
         incus_driver.destroy(ctx, instance, network_info)
 
+        broker.close.assert_called_once_with()
+        self.assertNotIn(instance.uuid, incus_driver._serial_consoles)
+        self.assertNotIn(
+            instance.uuid, incus_driver._serial_console_destroying)
         incus_driver.cleanup.assert_called_once_with(
-            ctx, instance, network_info, None)
-        incus_driver.client.instances.get.assert_called_once_with(
-            instance.name)
+            ctx, instance, network_info, None,
+            destroy_disks=True, destroy_secrets=True)
+        self.assertEqual(2, incus_driver.client.instances.get.call_count)
+        self.assertEqual(
+            [mock.call(instance.name), mock.call(instance.name)],
+            incus_driver.client.instances.get.call_args_list)
         mock_container.stop.assert_called_once_with(wait=True)
         mock_container.delete.assert_called_once_with(wait=True)
+        tokenized_delete = (
+            incus_driver._delete_instance_with_rootfs_release_receipt)
+        tokenized_delete.assert_called_once_with(
+            mock_container, instance, mock.ANY)
+
+    @mock.patch('nova.virt.incus.driver.lockutils.lock')
+    def test_destroy_does_not_claim_protected_migration_target(self, lock):
+        mock_container = mock.Mock(
+            status='Stopped',
+            config={
+                'volatile.migration.storage_delete_protection': 'true',
+            })
+        self.client.instances.get.return_value = mock_container
+        self.client.storage_pools.get.return_value.driver = 'ceph'
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        network_info = [_VIF]
+
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        self._configure_exact_idmap_release(
+            incus_driver, instance, mock_container)
+        incus_driver.cleanup = mock.Mock()
+
+        self.assertRaises(
+            exception.MigrationError,
+            incus_driver.destroy, ctx, instance, network_info,
+            destroy_disks=True)
+
+        mock_container.stop.assert_not_called()
+        mock_container.delete.assert_not_called()
+        incus_driver.cleanup.assert_not_called()
+
+    @mock.patch.object(driver, '_set_storage_handover_state')
+    @mock.patch('nova.virt.incus.driver.lockutils.lock')
+    def test_destroy_without_disks_deletes_only_protected_record(
+            self, lock, set_handover):
+        mock_container = mock.Mock(
+            status='Stopped',
+            config={
+                'volatile.migration.storage_delete_protection': 'true',
+            })
+        self.client.instances.get.return_value = mock_container
+        self.client.storage_pools.get.return_value.driver = 'ceph'
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        self._configure_exact_idmap_release(
+            incus_driver, instance, mock_container)
+        incus_driver.cleanup = mock.Mock()
+
+        incus_driver.destroy(
+            ctx, instance, [_VIF], destroy_disks=False)
+
+        set_handover.assert_called_once_with(
+            self.client, instance.name, 'protected',
+            container=mock_container)
+        mock_container.delete.assert_called_once_with(wait=True)
+        incus_driver.cleanup.assert_called_once()
+
+    @mock.patch.object(
+        driver, '_storage_handover_is_owned', return_value=True)
+    @mock.patch.object(driver, '_converge_migration_target_ownership')
+    @mock.patch('nova.virt.incus.driver.lockutils.lock')
+    def test_destroy_converges_current_migration_owner_before_final_delete(
+            self, lock, converge, is_owned):
+        token = '10000000-0000-0000-0000-000000000001'
+        container = mock.Mock(status='Stopped', config={})
+        self.client.instances.get.return_value = container
+        initial_profile = mock.Mock(config={
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: token,
+        })
+        retired_profile = mock.Mock(config={})
+        self.client.profiles.get.side_effect = [
+            initial_profile, retired_profile]
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        self._configure_exact_idmap_release(
+            incus_driver, instance, container)
+        instance.host = incus_driver.host
+        incus_driver.cleanup = mock.Mock()
+        incus_driver._acknowledge_cleanup_profile = mock.Mock()
+
+        incus_driver.destroy(ctx, instance, [_VIF], destroy_disks=True)
+
+        converge.assert_called_once_with(self.client, instance)
+        is_owned.assert_called_once_with(
+            self.client, instance.name, container=container)
+        container.delete.assert_called_once_with(wait=True)
+        incus_driver.cleanup.assert_called_once()
+        incus_driver._acknowledge_cleanup_profile.assert_not_called()
+
+    @mock.patch.object(
+        driver, '_storage_handover_is_owned', return_value=True)
+    @mock.patch.object(driver, '_converge_migration_target_ownership')
+    @mock.patch('nova.virt.incus.driver.lockutils.lock')
+    def test_destroy_blocks_current_owner_with_unretired_migration_token(
+            self, lock, converge, is_owned):
+        token = '10000000-0000-0000-0000-000000000001'
+        container = mock.Mock(status='Stopped', config={})
+        self.client.instances.get.return_value = container
+        profile = mock.Mock(config={
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: token,
+        })
+        self.client.profiles.get.return_value = profile
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        self._configure_exact_idmap_release(
+            incus_driver, instance, container)
+        instance.host = incus_driver.host
+        incus_driver.cleanup = mock.Mock()
+        incus_driver._acknowledge_cleanup_profile = mock.Mock()
+
+        self.assertRaises(
+            exception.MigrationError,
+            incus_driver.destroy, ctx, instance, [_VIF],
+            destroy_disks=True)
+
+        converge.assert_called_once_with(self.client, instance)
+        container.delete.assert_not_called()
+        incus_driver.cleanup.assert_not_called()
+        incus_driver._acknowledge_cleanup_profile.assert_not_called()
+
+    @mock.patch.object(driver, '_set_storage_handover_state')
+    @mock.patch.object(driver, '_converge_migration_target_ownership')
+    @mock.patch('nova.virt.incus.driver.lockutils.lock')
+    def test_destroy_without_disks_keeps_current_host_in_loser_cleanup(
+            self, lock, converge, set_handover):
+        token = '10000000-0000-0000-0000-000000000001'
+        container = mock.Mock(status='Stopped', config={
+            'volatile.migration.storage_delete_protection': 'true',
+        })
+        self.client.instances.get.return_value = container
+        self.client.storage_pools.get.return_value.driver = 'ceph'
+        self.client.profiles.get.return_value.config = {
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: token,
+        }
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        self._configure_exact_idmap_release(
+            incus_driver, instance, container)
+        instance.host = incus_driver.host
+        incus_driver._cleanup = mock.Mock()
+        incus_driver._acknowledge_cleanup_profile = mock.Mock()
+
+        incus_driver.destroy(
+            ctx, instance, [_VIF], destroy_disks=False)
+
+        converge.assert_not_called()
+        set_handover.assert_called_once_with(
+            self.client, instance.name, 'protected', container=container)
+        incus_driver._cleanup.assert_called_once_with(
+            ctx, instance, [_VIF], block_device_info=None,
+            destroy_disks=False, destroy_secrets=True,
+            delete_profile=False)
+        incus_driver._acknowledge_cleanup_profile.assert_called_once_with(
+            instance, token)
 
     @mock.patch('nova.virt.incus.driver.lockutils.lock')
     def test_destroy_retries_busy_stop_before_cleanup(self, lock):
@@ -1386,6 +4967,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
+        self._configure_exact_idmap_release(
+            incus_driver, instance, mock_container)
         incus_driver.cleanup = mock.Mock()
 
         incus_driver.destroy(ctx, instance, network_info)
@@ -1393,7 +4976,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertEqual(2, mock_container.stop.call_count)
         mock_container.delete.assert_called_once_with(wait=True)
         incus_driver.cleanup.assert_called_once_with(
-            ctx, instance, network_info, None)
+            ctx, instance, network_info, None,
+            destroy_disks=True, destroy_secrets=True)
 
     @mock.patch('nova.virt.incus.driver.lockutils.lock')
     def test_destroy_busy_stop_failure_does_not_cleanup(self, lock):
@@ -1410,6 +4994,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
+        self._configure_exact_idmap_release(
+            incus_driver, instance, mock_container)
         incus_driver.cleanup = mock.Mock(
             side_effect=RuntimeError('profile still in use'))
 
@@ -1420,6 +5006,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertEqual(
             self.CONF.incus.migration_finish_retries,
             mock_container.stop.call_count)
+        self.assertNotIn(
+            instance.uuid, incus_driver._serial_console_destroying)
         mock_container.delete.assert_not_called()
         incus_driver.cleanup.assert_not_called()
 
@@ -1441,6 +5029,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
+        self._configure_exact_idmap_release(
+            incus_driver, instance, mock_container)
         incus_driver.cleanup = mock.Mock()
 
         incus_driver.destroy(ctx, instance, network_info)
@@ -1448,7 +5038,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         mock_container.stop.assert_not_called()
         self.assertEqual(2, mock_container.delete.call_count)
         incus_driver.cleanup.assert_called_once_with(
-            ctx, instance, network_info, None)
+            ctx, instance, network_info, None,
+            destroy_disks=True, destroy_secrets=True)
 
     @mock.patch('nova.virt.incus.driver.lockutils.lock')
     def test_destroy_refreshes_state_after_busy_delete(self, lock):
@@ -1471,17 +5062,20 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
+        self._configure_exact_idmap_release(
+            incus_driver, instance, stopped_container, running_container)
         incus_driver.cleanup = mock.Mock()
 
         incus_driver.destroy(ctx, instance, network_info)
 
-        self.assertEqual(2, self.client.instances.get.call_count)
+        self.assertEqual(3, self.client.instances.get.call_count)
         stopped_container.stop.assert_not_called()
         stopped_container.delete.assert_called_once_with(wait=True)
         running_container.stop.assert_called_once_with(wait=True)
         running_container.delete.assert_called_once_with(wait=True)
         incus_driver.cleanup.assert_called_once_with(
-            ctx, instance, network_info, None)
+            ctx, instance, network_info, None,
+            destroy_disks=True, destroy_secrets=True)
 
     @mock.patch('nova.virt.incus.driver.lockutils.lock')
     def test_destroy_retries_async_busy_stop_before_cleanup(self, lock):
@@ -1501,6 +5095,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
+        self._configure_exact_idmap_release(
+            incus_driver, instance, mock_container)
         incus_driver.cleanup = mock.Mock()
 
         incus_driver.destroy(ctx, instance, network_info)
@@ -1508,7 +5104,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertEqual(2, mock_container.stop.call_count)
         mock_container.delete.assert_called_once_with(wait=True)
         incus_driver.cleanup.assert_called_once_with(
-            ctx, instance, network_info, None)
+            ctx, instance, network_info, None,
+            destroy_disks=True, destroy_secrets=True)
 
     @mock.patch('nova.virt.incus.driver.lockutils.lock')
     def test_destroy_async_busy_stop_failure_does_not_cleanup(self, lock):
@@ -1524,6 +5121,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
+        self._configure_exact_idmap_release(
+            incus_driver, instance, mock_container)
         incus_driver.cleanup = mock.Mock()
 
         self.assertRaises(
@@ -1549,6 +5148,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
+        self._configure_exact_idmap_release(
+            incus_driver, instance, mock_stopped_container)
         incus_driver.cleanup = mock.Mock()
 
         # set the vm_state on the fake instance to RESCUED
@@ -1562,7 +5163,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         incus_driver.destroy(ctx, instance, network_info)
 
         incus_driver.cleanup.assert_called_once_with(
-            ctx, instance, network_info, None)
+            ctx, instance, network_info, None,
+            destroy_disks=True, destroy_secrets=True)
         incus_driver.client.instances.get.assert_has_calls([
             mock.call(instance.name),
             mock.call('{}-rescue'.format(instance.name))])
@@ -1571,8 +5173,9 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         mock_rescued_container.stop.assert_called_once_with(wait=True)
         mock_rescued_container.delete.assert_called_once_with(wait=True)
 
+    @mock.patch.object(driver.LOG, 'debug')
     @mock.patch('nova.virt.incus.driver.lockutils.lock')
-    def test_destroy_without_instance(self, lock):
+    def test_destroy_without_instance(self, lock, debug):
         def side_effect(*args, **kwargs):
             raise incuscore_exceptions.LXDAPIException(MockResponse(404))
         self.client.instances.get.side_effect = side_effect
@@ -1584,11 +5187,43 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
+        self._configure_exact_idmap_release(incus_driver, instance)
         incus_driver.cleanup = mock.Mock()  # There is a separate cleanup test
 
         incus_driver.destroy(ctx, instance, network_info)
         incus_driver.cleanup.assert_called_once_with(
-            ctx, instance, network_info, None)
+            ctx, instance, network_info, None,
+            destroy_disks=True, destroy_secrets=True)
+        debug.assert_called_once_with(
+            "Incus container is already absent for "
+            "%(instance)s; continuing idempotent cleanup.",
+            {'instance': instance.name})
+
+    @mock.patch.object(driver.LOG, 'debug')
+    @mock.patch('nova.virt.incus.driver.lockutils.lock')
+    def test_destroy_without_instance_accepts_async_not_found(
+            self, lock, debug):
+        self.client.instances.get.side_effect = incus_operation_exception(
+            404, 'Instance not found')
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        network_info = [_VIF]
+
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        self._configure_exact_idmap_release(incus_driver, instance)
+        incus_driver.cleanup = mock.Mock()
+
+        incus_driver.destroy(ctx, instance, network_info)
+
+        incus_driver.cleanup.assert_called_once_with(
+            ctx, instance, network_info, None,
+            destroy_disks=True, destroy_secrets=True)
+        debug.assert_called_once_with(
+            "Incus container is already absent for "
+            "%(instance)s; continuing idempotent cleanup.",
+            {'instance': instance.name})
 
     @mock.patch('nova.virt.incus.driver.neutron')
     @mock.patch('os.path.exists', mock.Mock(return_value=True))
@@ -1621,6 +5256,68 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             instance_dir, uid=1001, gid=1001, recursive=True)
         rmtree.assert_called_once_with(instance_dir)
         mock_profile.delete.assert_called_once_with()
+
+    @mock.patch.object(driver.LOG, 'debug')
+    @mock.patch.object(driver.storage, 'detach_ephemeral')
+    @mock.patch.object(driver.IncusDriver, 'unplug_vifs')
+    @mock.patch.object(driver, '_remove_instance_directory')
+    def test_cleanup_missing_profile_is_idempotent(
+            self, remove_instance_directory, unplug_vifs, detach_ephemeral,
+            debug):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', root_gb=1)
+        self.client.profiles.get.side_effect = (
+            incuscore_exceptions.LXDAPIException(MockResponse(404)))
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver.firewall_driver = mock.Mock()
+
+        incus_driver.cleanup(ctx, instance, [], {'block_device_mapping': []})
+
+        remove_instance_directory.assert_called_once_with(instance)
+        debug.assert_called_once_with(
+            "Incus profile is already absent for %(instance)s; "
+            "cleanup is complete.",
+            {'instance': instance.name})
+
+    @mock.patch.object(driver, '_cleanup_share_journal_mounts')
+    @mock.patch.object(
+        driver, '_cleanup_profile_share_mounts',
+        side_effect=exception.ShareUmountError(
+            share_id='10000000-0000-0000-0000-000000000001',
+            server_id='20000000-0000-0000-0000-000000000002',
+            reason='busy'))
+    @mock.patch.object(driver.storage, 'detach_ephemeral')
+    @mock.patch.object(driver, '_remove_instance_directory')
+    def test_cleanup_manila_failure_marks_and_retains_profile(
+            self, remove_instance_directory, detach_ephemeral,
+            cleanup_shares, cleanup_journals):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        profile = self.client.profiles.get.return_value
+        profile.devices = {}
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+        }
+        profile.used_by = []
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver._disconnect_profile_volume_connections = mock.Mock(
+            return_value=[])
+
+        self.assertRaises(
+            exception.MigrationError, incus_driver._cleanup,
+            ctx, instance, [], block_device_info=None,
+            destroy_vifs=False, delete_profile=True)
+
+        self.assertEqual(
+            'true', profile.config[driver.CLEANUP_RECOVERY_KEY])
+        profile.save.assert_called_once_with(wait=True)
+        profile.delete.assert_not_called()
+        cleanup_shares.assert_called_once_with(profile, instance)
+        cleanup_journals.assert_called_once_with(instance)
 
     @mock.patch.object(driver.storage, 'detach_ephemeral')
     @mock.patch.object(driver.IncusDriver, 'unplug_vifs')
@@ -1672,6 +5369,55 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         profile.delete.assert_called_once_with()
 
     @mock.patch.object(driver.storage, 'detach_ephemeral')
+    @mock.patch.object(driver.os.path, 'exists', return_value=False)
+    def test_cleanup_does_not_reread_profile_per_data_volume(
+            self, _exists, _detach_ephemeral):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        volume_ids = ('data-volume-1', 'data-volume-2')
+        block_device_info = {'block_device_mapping': [
+            {
+                'boot_index': None,
+                'connection_info': {
+                    'driver_volume_type': 'rbd',
+                    'serial': volume_id,
+                    'data': {'volume_id': volume_id},
+                },
+                'mount_device': '/dev/sd%s' % chr(ord('b') + index),
+            }
+            for index, volume_id in enumerate(volume_ids)
+        ]}
+        profile = self.client.profiles.get.return_value
+        profile.devices = {
+            volume_id: {'type': 'unix-block'}
+            for volume_id in volume_ids
+        }
+        profile.config = {
+            driver._volume_device_info_key(volume_id): '{}'
+            for volume_id in volume_ids
+        }
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver._disconnect_profile_volume_connections = mock.Mock(
+            return_value=[])
+
+        def detach(_context, connection_info, _instance, _mountpoint):
+            volume_id = connection_info['serial']
+            profile.devices.pop(volume_id)
+            profile.config.pop(driver._volume_device_info_key(volume_id))
+
+        incus_driver.detach_volume = mock.Mock(side_effect=detach)
+
+        incus_driver.cleanup(
+            ctx, instance, [], block_device_info, destroy_vifs=False)
+
+        self.assertEqual(2, incus_driver.detach_volume.call_count)
+        # One initial snapshot and one final deletion-safety read. The number
+        # is independent of the number of Nova BDMs.
+        self.assertEqual(2, self.client.profiles.get.call_count)
+        profile.delete.assert_called_once_with()
+
+    @mock.patch.object(driver.storage, 'detach_ephemeral')
     @mock.patch.object(driver.IncusDriver, 'unplug_vifs')
     @mock.patch.object(driver.os.path, 'exists', return_value=False)
     def test_cleanup_retains_profile_when_data_disconnect_fails(
@@ -1691,7 +5437,10 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         profile = self.client.profiles.get.return_value
         profile.devices = {'data-volume': {'type': 'unix-block'}}
         profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
             driver._volume_device_info_key('data-volume'): '{}'}
+        profile.used_by = []
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
         incus_driver.firewall_driver = mock.Mock()
@@ -1699,10 +5448,12 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             side_effect=RuntimeError('disconnect failed'))
 
         self.assertRaises(
-            RuntimeError, incus_driver.cleanup, ctx, instance, [],
+            exception.MigrationError, incus_driver.cleanup, ctx, instance, [],
             block_device_info, destroy_vifs=False)
 
         profile.delete.assert_not_called()
+        self.assertEqual(
+            'true', profile.config[driver.CLEANUP_RECOVERY_KEY])
 
     def test_reboot(self):
         ctx = context.get_admin_context()
@@ -1714,9 +5465,31 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         incus_driver.reboot(ctx, instance, None, None)
 
-        self.client.instances.get.assert_called_once_with(instance.name)
+        self.assertEqual(2, self.client.instances.get.call_count)
         self.client.instances.get.return_value.restart.assert_called_once_with(
             force=True, wait=True)
+        self.ensure_start_idmap.assert_called_once_with(
+            instance, self.client.instances.get.return_value,
+            _claim_lock_held=True)
+
+    def test_reboot_idmap_failure_blocks_restart(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        container = self.client.instances.get.return_value
+        failure = driver.incus_idmap.IDMapIntegrityError(
+            reason='allocator generation is absent')
+        self.ensure_start_idmap.side_effect = failure
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        raised = self.assertRaises(
+            driver.incus_idmap.IDMapIntegrityError,
+            incus_driver.reboot, ctx, instance, None, 'HARD')
+
+        self.assertIs(failure, raised)
+        container.restart.assert_not_called()
+        container.start.assert_not_called()
 
     def test_soft_reboot_is_graceful(self):
         ctx = context.get_admin_context()
@@ -1761,7 +5534,63 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             mock.call(force=True, wait=True),
         ], container.restart.call_args_list)
 
-    def test_cleanup_lingering_bfv_source_record(self):
+    def test_soft_reboot_does_not_mask_authorization_failure(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        container = self.client.instances.get.return_value
+        failure = incus_api_exception(403, 'not authorized')
+        container.restart.side_effect = failure
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        raised = self.assertRaises(
+            incuscore_exceptions.LXDAPIException,
+            incus_driver.reboot, ctx, instance, None, 'SOFT')
+
+        self.assertIs(failure, raised)
+        container.restart.assert_called_once_with(force=False, wait=True)
+
+    def test_reboot_busy_retry_refreshes_instance_model(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        initial = mock.Mock(status='Running')
+        busy = mock.Mock(status='Running')
+        replacement = mock.Mock(status='Running')
+        busy.restart.side_effect = incus_operation_exception(
+            409, 'Instance is busy running an "update" operation')
+        self.client.instances.get.side_effect = [
+            initial, busy, replacement]
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.reboot(ctx, instance, None, 'HARD')
+
+        busy.restart.assert_called_once_with(force=True, wait=True)
+        replacement.restart.assert_called_once_with(force=True, wait=True)
+
+    def test_reboot_stopped_converges_after_lost_start_response(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        initial = mock.Mock(status='Stopped')
+        starting = mock.Mock(status='Stopped')
+        running = mock.Mock(status='Running')
+        starting.start.side_effect = (
+            incuscore_exceptions.ClientConnectionFailed('response lost'))
+        self.client.instances.get.side_effect = [
+            initial, starting, running]
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.reboot(ctx, instance, None, 'HARD')
+
+        starting.start.assert_called_once_with(wait=True)
+        running.start.assert_not_called()
+
+    @mock.patch.object(driver.IncusDriver, '_cleanup')
+    def test_cleanup_lingering_bfv_source_record(self, cleanup):
         instance = fake_instance.fake_instance_obj(
             context.get_admin_context(), name='test')
         container = self.client.instances.get.return_value
@@ -1777,15 +5606,32 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                 'path': '/',
             },
         }
-        profile = self.client.profiles.get.return_value
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
+        fixture = self._configure_exact_idmap_release(
+            incus_driver, instance, container,
+            storage_driver='cephext', cleanup_disposition='detach',
+            outcome='detached')
+        tokenized_delete = fixture[-1]
+        incus_driver._instance_inventory_cache = mock.sentinel.instances
+        incus_driver._metric_devices_cache = mock.sentinel.devices
+        incus_driver._metric_instance_devices_cache = {
+            instance.name: mock.sentinel.device}
+        incus_driver._disk_metrics_cache = mock.sentinel.metrics
 
         result = incus_driver.cleanup_lingering_instance_resources(instance)
 
         self.assertTrue(result)
+        self.assertIsNone(incus_driver._instance_inventory_cache)
+        self.assertIsNone(incus_driver._metric_devices_cache)
+        self.assertEqual({}, incus_driver._metric_instance_devices_cache)
+        self.assertIsNone(incus_driver._disk_metrics_cache)
+        tokenized_delete.assert_called_once_with(
+            container, instance, mock.ANY, client=self.client)
         container.delete.assert_called_once_with(wait=True)
-        profile.delete.assert_called_once_with()
+        cleanup.assert_called_once_with(
+            None, instance, [], block_device_info=None,
+            destroy_vifs=False, delete_profile=True)
 
     def test_cleanup_lingering_bfv_requires_handover_protection(self):
         instance = fake_instance.fake_instance_obj(
@@ -1838,6 +5684,383 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertFalse(result)
         container.delete.assert_not_called()
 
+    @mock.patch.object(driver.IncusDriver, '_cleanup')
+    def test_cleanup_lingering_replays_journals_after_record_is_absent(
+            self, cleanup):
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test')
+        self.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        result = incus_driver.cleanup_lingering_instance_resources(instance)
+
+        self.assertTrue(result)
+        cleanup.assert_called_once_with(
+            None, instance, [], block_device_info=None,
+            destroy_vifs=False, delete_profile=True)
+
+    def test_list_cleanup_recovery_candidates_uses_recursive_inventory(self):
+        response = self.client.api.profiles.get.return_value
+        response.json.return_value = {'metadata': [
+            {
+                'name': 'instance-b',
+                'config': {
+                    'environment.product_name': 'OpenStack Nova',
+                    'user.openstack.uuid':
+                        '20000000-0000-0000-0000-000000000002',
+                    driver.CLEANUP_RECOVERY_KEY: 'true',
+                },
+            },
+            {
+                'name': 'foreign',
+                'config': {
+                    'environment.product_name': 'other',
+                    'user.openstack.uuid':
+                        '30000000-0000-0000-0000-000000000003',
+                    driver.CLEANUP_RECOVERY_KEY: 'true',
+                },
+            },
+            {
+                'name': 'instance-a',
+                'config': {
+                    'environment.product_name': 'OpenStack Nova',
+                    'user.openstack.uuid':
+                        '10000000-0000-0000-0000-000000000001',
+                    driver.CLEANUP_RECOVERY_KEY: 'true',
+                },
+            },
+        ]}
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertEqual([
+            {
+                'name': 'instance-a',
+                'uuid': '10000000-0000-0000-0000-000000000001',
+            },
+            {
+                'name': 'instance-b',
+                'uuid': '20000000-0000-0000-0000-000000000002',
+            },
+        ], incus_driver.list_cleanup_recovery_candidates())
+        self.client.api.profiles.get.assert_called_once_with(
+            params={'recursion': 1})
+
+    def test_lists_destination_prepared_profiles_after_journal_loss(self):
+        token = '20000000-0000-0000-0000-000000000002'
+        instance_uuid = '10000000-0000-0000-0000-000000000001'
+        response = self.client.api.profiles.get.return_value
+        response.json.return_value = {'metadata': [{
+            'name': 'instance-target',
+            'config': {
+                'environment.product_name': 'OpenStack Nova',
+                'user.openstack.uuid': instance_uuid,
+                driver.MIGRATION_CLEANUP_TOKEN_KEY: token,
+                driver.MIGRATION_DESTINATION_PREPARED_KEY: token,
+                'security.idmap.base': '1065536',
+                'security.idmap.size': '65536',
+            },
+        }]}
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertEqual([{
+            'name': 'instance-target',
+            'uuid': instance_uuid,
+            'operation_token': token,
+            'idmap_base': 1065536,
+            'idmap_size': 65536,
+        }], incus_driver.list_destination_prepared_recovery_candidates())
+
+    @mock.patch.object(driver.IncusDriver, '_acknowledge_cleanup_profile')
+    @mock.patch.object(driver.IncusDriver, '_cleanup')
+    def test_destination_prepared_committed_without_instance_is_retained(
+            self, cleanup, acknowledge):
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='instance-target')
+        token = '20000000-0000-0000-0000-000000000002'
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: token,
+            driver.MIGRATION_DESTINATION_PREPARED_KEY: token,
+            'security.idmap.base': '1065536',
+            'security.idmap.size': '65536',
+        }
+        self.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+        self._get_migration_attempt.return_value = {
+            'state': 'committed', 'finished': True}
+        candidate = {
+            'name': instance.name,
+            'uuid': instance.uuid,
+            'operation_token': token,
+            'idmap_base': 1065536,
+            'idmap_size': 65536,
+        }
+        migration = mock.Mock(uuid=token, status='completed')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaises(
+            exception.MigrationError,
+            incus_driver.recover_destination_prepared_profile,
+            mock.sentinel.context, instance, candidate, migration,
+            mock.sentinel.network_info)
+
+        cleanup.assert_not_called()
+        acknowledge.assert_not_called()
+
+    @mock.patch.object(driver, '_converge_migration_target_ownership')
+    @mock.patch.object(driver.IncusDriver, '_acknowledge_cleanup_profile')
+    @mock.patch.object(driver.IncusDriver, '_cleanup')
+    def test_destination_prepared_committed_target_never_unmounts(
+            self, cleanup, acknowledge, converge):
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='instance-target',
+            host='destination-compute')
+        token = '20000000-0000-0000-0000-000000000002'
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: token,
+            driver.MIGRATION_DESTINATION_PREPARED_KEY: token,
+            'security.idmap.base': '1065536',
+            'security.idmap.size': '65536',
+        }
+        self.client.instances.get.return_value = mock.Mock(config={
+            'user.openstack.uuid': instance.uuid,
+        })
+        self._get_migration_attempt.return_value = {
+            'state': 'committed', 'finished': True}
+        candidate = {
+            'name': instance.name,
+            'uuid': instance.uuid,
+            'operation_token': token,
+            'idmap_base': 1065536,
+            'idmap_size': 65536,
+        }
+        migration = mock.Mock(
+            uuid=token, status='completed',
+            dest_compute='destination-compute')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertTrue(incus_driver.recover_destination_prepared_profile(
+            mock.sentinel.context, instance, candidate, migration,
+            mock.sentinel.network_info))
+
+        converge.assert_called_once_with(self.client, instance)
+        cleanup.assert_not_called()
+        acknowledge.assert_not_called()
+
+    @mock.patch.object(driver.IncusDriver, '_acknowledge_cleanup_profile')
+    @mock.patch.object(driver.IncusDriver, '_cleanup')
+    def test_destination_prepared_uncommitted_owner_fails_closed(
+            self, cleanup, acknowledge):
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='instance-target',
+            host='destination-compute')
+        token = '20000000-0000-0000-0000-000000000002'
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: token,
+            driver.MIGRATION_DESTINATION_PREPARED_KEY: token,
+            'security.idmap.base': '1065536',
+            'security.idmap.size': '65536',
+        }
+        self.client.instances.get.return_value = mock.Mock(config={
+            'user.openstack.uuid': instance.uuid,
+        })
+        self._get_migration_attempt.return_value = {
+            'state': 'active', 'finished': False}
+        candidate = {
+            'name': instance.name,
+            'uuid': instance.uuid,
+            'operation_token': token,
+            'idmap_base': 1065536,
+            'idmap_size': 65536,
+        }
+        migration = mock.Mock(
+            uuid=token, status='error',
+            dest_compute='destination-compute')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaises(
+            exception.MigrationError,
+            incus_driver.recover_destination_prepared_profile,
+            mock.sentinel.context, instance, candidate, migration,
+            mock.sentinel.network_info)
+
+        self._abort_migration_attempt.assert_not_called()
+        cleanup.assert_not_called()
+        acknowledge.assert_not_called()
+
+    @mock.patch.object(driver.IncusDriver, '_acknowledge_cleanup_profile')
+    @mock.patch.object(driver.IncusDriver, '_cleanup')
+    def test_destination_prepared_profile_only_cleanup_is_idempotent(
+            self, cleanup, acknowledge):
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='instance-target',
+            host='source-compute')
+        token = '20000000-0000-0000-0000-000000000002'
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: token,
+            driver.MIGRATION_DESTINATION_PREPARED_KEY: token,
+            'security.idmap.base': '1065536',
+            'security.idmap.size': '65536',
+        }
+        self.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+        self._get_migration_attempt.return_value = {
+            'state': 'active', 'finished': False}
+        self._abort_migration_attempt.return_value = {
+            'state': 'aborted', 'finished': True}
+        candidate = {
+            'name': instance.name,
+            'uuid': instance.uuid,
+            'operation_token': token,
+            'idmap_base': 1065536,
+            'idmap_size': 65536,
+        }
+        migration = mock.Mock(uuid=token, status='error')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertTrue(incus_driver.recover_destination_prepared_profile(
+            mock.sentinel.context, instance, candidate, migration,
+            mock.sentinel.network_info))
+
+        cleanup.assert_called_once_with(
+            mock.sentinel.context, instance, mock.sentinel.network_info,
+            block_device_info=None, destroy_vifs=True,
+            delete_profile=False)
+        acknowledge.assert_called_once_with(instance, token)
+
+    @mock.patch.object(driver.IncusDriver, '_acknowledge_cleanup_profile')
+    @mock.patch.object(driver.IncusDriver, '_cleanup')
+    def test_recover_destination_cleanup_profile_persists_ack(
+            self, cleanup, acknowledge):
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test')
+        token = '10000000-0000-0000-0000-000000000001'
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: token,
+            driver.CLEANUP_RECOVERY_KEY: 'true',
+            'security.idmap.base': '1065536',
+            'security.idmap.size': '65536',
+        }
+        self.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+        self._get_migration_attempt.return_value = {
+            'state': 'aborted', 'finished': True}
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.recover_cleanup_profile(
+            mock.sentinel.context, instance, mock.sentinel.network_info)
+
+        cleanup.assert_called_once_with(
+            mock.sentinel.context, instance, mock.sentinel.network_info,
+            block_device_info=None, destroy_vifs=True,
+            delete_profile=False)
+        acknowledge.assert_called_once_with(instance, token)
+        self._get_migration_attempt.assert_called_once_with(
+            self.client, instance, token, 1065536, 65536)
+
+    @mock.patch.object(driver.IncusDriver, '_cleanup')
+    def test_recover_destination_cleanup_refuses_committed_attempt(
+            self, cleanup):
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test')
+        token = '10000000-0000-0000-0000-000000000001'
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: token,
+            driver.CLEANUP_RECOVERY_KEY: 'true',
+            'security.idmap.base': '1065536',
+            'security.idmap.size': '65536',
+        }
+        self._get_migration_attempt.return_value = {
+            'state': 'committed', 'finished': True}
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaises(
+            exception.MigrationError,
+            incus_driver.recover_cleanup_profile,
+            mock.sentinel.context, instance, mock.sentinel.network_info)
+
+        cleanup.assert_not_called()
+
+    @mock.patch.object(driver.IncusDriver, '_cleanup')
+    def test_recover_cleanup_refuses_existing_instance_record(self, cleanup):
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test')
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_DESTINATION_KEY:
+                'https://compute-2.example.test:8443',
+            driver.CLEANUP_RECOVERY_KEY: 'true',
+        }
+        self.client.instances.get.return_value = mock.Mock(status='Stopped')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaises(
+            exception.MigrationError,
+            incus_driver.recover_cleanup_profile,
+            mock.sentinel.context, instance, mock.sentinel.network_info)
+
+        cleanup.assert_not_called()
+
+    @mock.patch.object(driver.IncusDriver, '_acknowledge_cleanup_profile')
+    @mock.patch.object(driver.IncusDriver, '_cleanup')
+    def test_recover_source_cleanup_profile_deletes_after_replay(
+            self, cleanup, acknowledge):
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test')
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_CLEANUP_TOKEN_KEY:
+                '10000000-0000-0000-0000-000000000001',
+            driver.MIGRATION_DESTINATION_KEY:
+                'https://compute-2.example.test:8443',
+            driver.CLEANUP_RECOVERY_KEY: 'true',
+        }
+        self.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.recover_cleanup_profile(
+            mock.sentinel.context, instance, mock.sentinel.network_info)
+
+        cleanup.assert_called_once_with(
+            mock.sentinel.context, instance, mock.sentinel.network_info,
+            block_device_info=None, destroy_vifs=True,
+            delete_profile=True)
+        acknowledge.assert_not_called()
+
     @mock.patch('nova.virt.incus.driver.neutron')
     def test_get_console_output(self, _):
         ctx = context.get_admin_context()
@@ -1878,25 +6101,45 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         data = {
             'boot_index': 1,
             'connection_info': {
-                'serial': 'volume-data',
+                'serial': _TEST_VOLUME_ID,
                 'driver_volume_type': 'rbd',
-                'data': {},
+                'data': {
+                    'name': 'volumes/volume-%s' % _TEST_VOLUME_ID,
+                },
             },
             'mount_device': '/dev/vdb',
         }
         get_mapping.return_value = [root, data]
         profile = self.client.profiles.get.return_value
         profile.devices = {}
-        profile.config = {}
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+        }
         container = self.client.instances.get.return_value
         container.status = 'Stopped'
         container.devices = {}
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
-        incus_driver.attach_volume = mock.Mock()
 
-        incus_driver.reboot(
-            ctx, instance, None, 'HARD', block_device_info={})
+        def attach(_ctx, connection_info, _instance, mountpoint):
+            profile.devices[_TEST_VOLUME_ID] = {
+                'type': 'unix-block',
+                'path': mountpoint,
+                'required': 'true',
+                'source': '/dev/rbd0',
+            }
+            profile.config[
+                driver._volume_device_info_key(_TEST_VOLUME_ID)] = (
+                driver._serialize_volume_attachment(
+                    connection_info, {'path': '/dev/rbd0'}, mountpoint))
+
+        incus_driver.attach_volume = mock.Mock(side_effect=attach)
+
+        with mock.patch.object(
+                driver, '_mapped_rbd_device', return_value='/dev/rbd0'):
+            incus_driver.reboot(
+                ctx, instance, None, 'HARD', block_device_info={})
 
         incus_driver.attach_volume.assert_called_once_with(
             ctx, data['connection_info'], instance, '/dev/vdb')
@@ -1925,6 +6168,280 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertFalse(incus_driver.needs_migration_recovery(instance))
         profile.config[driver.MIGRATION_RECOVERY_KEY] = 'true'
         self.assertTrue(incus_driver.needs_migration_recovery(instance))
+
+    def test_lists_migration_recovery_candidates_with_one_recursive_call(self):
+        marked = mock.Mock(
+            type='container',
+            status='Stopped',
+            config={'user.openstack.uuid': 'marked-uuid'},
+            expanded_config={driver.MIGRATION_RECOVERY_KEY: 'running'},
+            expanded_devices={
+                'root': {
+                    'initial.ceph.rbd.image_name': 'volume-marked',
+                },
+            },
+            devices={})
+        marked.name = 'instance-marked'
+        running = mock.Mock(
+            type='container',
+            status='Running',
+            config={'user.openstack.uuid': 'running-uuid'},
+            expanded_config={driver.MIGRATION_RECOVERY_KEY: 'running'},
+            expanded_devices={
+                'root': {
+                    'initial.ceph.rbd.image_name': 'volume-running',
+                },
+            },
+            devices={})
+        running.name = 'instance-running'
+        unmarked = mock.Mock(
+            type='container',
+            status='Stopped',
+            config={'user.openstack.uuid': 'unmarked-uuid'},
+            expanded_config={},
+            expanded_devices={
+                'root': {
+                    'initial.ceph.rbd.image_name': 'volume-unmarked',
+                },
+            },
+            devices={})
+        unmarked.name = 'instance-unmarked'
+        self.client.instances.all.return_value = [running, unmarked, marked]
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+        instance = mock.Mock()
+        instance.name = 'instance-test'
+
+        self.assertEqual(
+            [
+                {'name': 'instance-marked', 'uuid': 'marked-uuid'},
+                {'name': 'instance-running', 'uuid': 'running-uuid'},
+            ],
+            incus_driver.list_migration_recovery_candidates())
+        self.client.instances.all.assert_called_once_with(recursion=1)
+        self.client.profiles.get.assert_not_called()
+
+    def test_storage_handover_rejects_unnegotiated_ceph(self):
+        self.client.api.instances = mock.MagicMock()
+        container = mock.Mock(config={}, expanded_devices={
+            'root': {'pool': 'ceph-root'},
+        })
+        self.client.storage_pools.get.return_value.driver = 'ceph'
+
+        self.assertRaises(
+            exception.MigrationError,
+            driver._set_storage_handover_state,
+            self.client, 'instance-test', 'protected',
+            container=container)
+
+        self.client.storage_pools.get.assert_called_once_with('ceph-root')
+        self.client.api.instances.__getitem__.assert_not_called()
+
+    def test_storage_handover_requires_persisted_delete_protection(self):
+        self.client.api.instances = mock.MagicMock()
+        container = mock.Mock(config={
+            'volatile.migration.storage_handover': 'pending',
+            'volatile.migration.storage_handover_role': 'source',
+        }, expanded_devices={
+            'root': {'pool': 'ceph-root'},
+        })
+        self.client.storage_pools.get.return_value.driver = 'ceph'
+        self.client.instances.get.return_value = container
+
+        self.assertRaises(
+            exception.MigrationError,
+            driver._set_storage_handover_state,
+            self.client, 'instance-test', 'protected',
+            container=container)
+
+        endpoint = self.client.api.instances[
+            'instance-test']['storage-handover']
+        endpoint.put.assert_called_once_with(
+            params={'project': self.CONF.incus.project},
+            json={'state': 'protected'})
+
+    def test_storage_handover_commits_only_negotiated_ceph(self):
+        self.client.api.instances = mock.MagicMock()
+        container = mock.Mock(config={
+            'volatile.migration.storage_handover': 'committed',
+            'volatile.migration.storage_delete_protection': 'true',
+        }, expanded_devices={
+            'root': {'pool': 'ceph-root'},
+        })
+        pool = self.client.storage_pools.get.return_value
+        pool.driver = 'ceph'
+        self.client.host_info['api_extensions'].append(
+            driver.INCUS_STORAGE_HANDOVER_PROOF_EXTENSION)
+        self.client.instances.get.return_value = mock.Mock(
+            config={}, expanded_devices={
+                'root': {'pool': 'ceph-root'},
+            })
+
+        self.assertTrue(driver._set_storage_handover_state(
+            self.client, 'instance-test', 'owned',
+            container=container,
+            migration_attempt='10000000-0000-0000-0000-000000000001',
+            operation_uuid='20000000-0000-0000-0000-000000000002'))
+
+        endpoint = self.client.api.instances[
+            'instance-test']['storage-handover']
+        endpoint.put.assert_called_once_with(
+            params={'project': self.CONF.incus.project},
+            json={
+                'state': 'owned',
+                'migration_attempt':
+                    '10000000-0000-0000-0000-000000000001',
+                'operation_uuid':
+                    '20000000-0000-0000-0000-000000000002',
+            })
+
+    def test_storage_handover_rejects_unpersisted_owned_state(self):
+        self.client.api.instances = mock.MagicMock()
+        container = mock.Mock(config={
+            'volatile.migration.storage_handover': 'committed',
+            'volatile.migration.storage_delete_protection': 'true',
+        }, expanded_devices={
+            'root': {'pool': 'ceph-root'},
+        })
+        pool = self.client.storage_pools.get.return_value
+        pool.driver = 'ceph'
+        self.client.host_info['api_extensions'].append(
+            driver.INCUS_STORAGE_HANDOVER_PROOF_EXTENSION)
+        self.client.instances.get.return_value = container
+
+        self.assertRaises(
+            exception.MigrationError,
+            driver._set_storage_handover_state,
+            self.client, 'instance-test', 'owned',
+            container=container,
+            migration_attempt='10000000-0000-0000-0000-000000000001',
+            operation_uuid='20000000-0000-0000-0000-000000000002')
+
+    def test_storage_handover_restores_committed_source(self):
+        self.client.api.instances = mock.MagicMock()
+        container = mock.Mock(config={
+            'volatile.migration.storage_handover': 'committed',
+            'volatile.migration.storage_handover_role': 'source',
+            'volatile.migration.storage_delete_protection': 'true',
+        }, expanded_devices={
+            'root': {'pool': 'ceph-root'},
+        })
+        self.client.storage_pools.get.return_value.driver = 'ceph'
+        self.client.host_info['api_extensions'].append(
+            driver.INCUS_STORAGE_HANDOVER_PROOF_EXTENSION)
+        self.client.instances.get.return_value = mock.Mock(
+            config={}, expanded_devices={
+                'root': {'pool': 'ceph-root'},
+            })
+
+        self.assertTrue(driver._set_storage_handover_state(
+            self.client, 'instance-test', 'source-owned',
+            container=container))
+
+        endpoint = self.client.api.instances[
+            'instance-test']['storage-handover']
+        endpoint.put.assert_called_once_with(
+            params={'project': self.CONF.incus.project},
+            json={'state': 'source-owned'})
+
+    def test_storage_handover_rejects_target_as_source_owner(self):
+        self.client.api.instances = mock.MagicMock()
+        container = mock.Mock(config={
+            'volatile.migration.storage_handover': 'committed',
+            'volatile.migration.storage_handover_role': 'target',
+            'volatile.migration.storage_delete_protection': 'true',
+        }, expanded_devices={
+            'root': {'pool': 'ceph-root'},
+        })
+        self.client.storage_pools.get.return_value.driver = 'ceph'
+
+        self.assertRaises(
+            exception.MigrationError,
+            driver._set_storage_handover_state,
+            self.client, 'instance-test', 'source-owned',
+            container=container)
+
+        self.client.api.instances.__getitem__.assert_not_called()
+
+    def test_storage_handover_owned_rejects_missing_receive_proof(self):
+        container = mock.Mock(config={
+            'volatile.migration.storage_handover': 'committed',
+        }, expanded_devices={
+            'root': {'pool': 'ceph-root'},
+        })
+        self.client.storage_pools.get.return_value.driver = 'ceph'
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            driver.MIGRATION_CLEANUP_TOKEN_KEY:
+                '10000000-0000-0000-0000-000000000001',
+        }
+
+        self.assertRaises(
+            exception.MigrationError,
+            driver._set_storage_handover_state,
+            self.client, 'instance-test', 'owned',
+            container=container)
+
+    def test_shared_storage_check_requires_negotiated_handover(self):
+        instance = mock.Mock()
+        instance.name = 'instance-test'
+        instance.uuid = '10000000-0000-0000-0000-000000000001'
+        container = mock.Mock(config={}, expanded_devices={
+            'root': {'pool': 'ceph-root'},
+        })
+        self.client.instances.get.return_value = container
+        pool = self.client.storage_pools.get.return_value
+        pool.driver = 'ceph'
+        pool.config = {
+            'source': 'incus-rootfs',
+            'ceph.cluster_name': 'ceph',
+        }
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        self.assertEqual(
+            {
+                'shared': False,
+                'driver': 'ceph',
+                'cluster': 'ceph',
+                'source': 'incus-rootfs',
+                'instance_name': 'instance-test',
+            },
+            incus_driver.check_instance_shared_storage_local(
+                mock.sentinel.context,
+                instance))
+
+        container.config[
+            'volatile.migration.storage_delete_protection'] = 'true'
+        self.assertTrue(
+            incus_driver.check_instance_shared_storage_local(
+                mock.sentinel.context,
+                instance)['shared'])
+
+    @mock.patch.object(driver.LOG, 'error')
+    def test_recovery_candidates_reject_duplicate_uuid(self, error):
+        containers = []
+        for name in ('instance-current', 'instance-stale'):
+            container = mock.Mock(
+                type='container',
+                status='Stopped',
+                config={'user.openstack.uuid': 'duplicate-uuid'},
+                expanded_config={driver.MIGRATION_RECOVERY_KEY: 'true'},
+                expanded_devices={
+                    'root': {
+                        'initial.ceph.rbd.image_name': 'volume-duplicate',
+                    },
+                },
+                devices={})
+            container.name = name
+            containers.append(container)
+        self.client.instances.all.return_value = containers
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        self.assertEqual(
+            [], incus_driver.list_migration_recovery_candidates())
+        error.assert_called_once()
 
     def test_reboot_clears_migration_recovery_marker(self):
         ctx = context.get_admin_context()
@@ -1960,11 +6477,20 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         incus_driver._reconcile_reboot_data_volumes = mock.Mock()
         incus_driver._validate_reboot_vifs = mock.Mock()
         incus_driver.plug_vifs = mock.Mock()
+        incus_driver._instance_inventory_cache = mock.sentinel.instances
+        incus_driver._metric_devices_cache = mock.sentinel.devices
+        incus_driver._metric_instance_devices_cache = {
+            instance.name: mock.sentinel.device}
+        incus_driver._disk_metrics_cache = mock.sentinel.metrics
 
         should_run = incus_driver.recover_migration_target(
             ctx, instance, [], {'block_device_mapping': []})
 
         self.assertFalse(should_run)
+        self.assertIsNone(incus_driver._instance_inventory_cache)
+        self.assertIsNone(incus_driver._metric_devices_cache)
+        self.assertEqual({}, incus_driver._metric_instance_devices_cache)
+        self.assertIsNone(incus_driver._disk_metrics_cache)
         container.start.assert_not_called()
         container.stop.assert_not_called()
         self.assertNotIn(driver.MIGRATION_RECOVERY_KEY, profile.config)
@@ -2020,15 +6546,17 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         container.start.assert_not_called()
 
     @mock.patch('nova.virt.driver.block_device_info_get_mapping')
-    def test_reboot_rejects_inconsistent_data_volume_before_start(
+    def test_reboot_repairs_inconsistent_data_volume_before_start(
             self, get_mapping):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
         connection_info = {
-            'serial': 'volume-data',
+            'serial': _TEST_VOLUME_ID,
             'driver_volume_type': 'rbd',
-            'data': {},
+            'data': {
+                'name': 'volumes/volume-%s' % _TEST_VOLUME_ID,
+            },
         }
         get_mapping.return_value = [{
             'boot_index': 1,
@@ -2037,21 +6565,325 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         }]
         profile = self.client.profiles.get.return_value
         profile.devices = {
-            'volume-data': {'type': 'unix-block', 'path': '/dev/vdc'}}
+            _TEST_VOLUME_ID: {
+                'type': 'unix-block', 'path': '/dev/vdc'}}
         profile.config = {
-            driver._volume_device_info_key('volume-data'): '{}'}
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver._volume_device_info_key(_TEST_VOLUME_ID):
+                driver._serialize_volume_attachment(
+                    connection_info, {'path': '/dev/rbd9'}, '/dev/vdc'),
+        }
         container = self.client.instances.get.return_value
         container.status = 'Stopped'
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
-        self.assertRaises(
-            exception.InvalidVolume,
-            incus_driver.reboot,
-            ctx, instance, None, 'HARD', block_device_info={})
+        def disconnect(*args, **kwargs):
+            profile.devices.pop(_TEST_VOLUME_ID, None)
+            profile.config.pop(
+                driver._volume_device_info_key(_TEST_VOLUME_ID), None)
 
-        container.start.assert_not_called()
+        def attach(_ctx, requested, _instance, mountpoint):
+            profile.devices[_TEST_VOLUME_ID] = {
+                'type': 'unix-block',
+                'path': mountpoint,
+                'required': 'true',
+                'source': '/dev/rbd0',
+            }
+            profile.config[
+                driver._volume_device_info_key(_TEST_VOLUME_ID)] = (
+                driver._serialize_volume_attachment(
+                    requested, {'path': '/dev/rbd0'}, mountpoint))
+
+        incus_driver._disconnect_profile_volume_connection = mock.Mock(
+            side_effect=disconnect)
+        incus_driver.attach_volume = mock.Mock(side_effect=attach)
+
+        with mock.patch.object(
+                driver, '_mapped_rbd_device', return_value='/dev/rbd0'):
+            incus_driver.reboot(
+                ctx, instance, None, 'HARD', block_device_info={})
+
+        disconnect = incus_driver._disconnect_profile_volume_connection
+        disconnect.assert_called_once_with(
+            ctx, instance, _TEST_VOLUME_ID,
+            connection_info=connection_info, mountpoint='/dev/vdb')
+        incus_driver.attach_volume.assert_called_once_with(
+            ctx, connection_info, instance, '/dev/vdb')
+        container.start.assert_called_once_with(wait=True)
         container.restart.assert_not_called()
+
+    def test_power_on_accepts_exact_real_bdm_volume_topology(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-exact-data-topology', memory_mb=0)
+        volume_id = '8231d2e8-1111-4222-8333-123456789abc'
+        connection_info = {
+            'driver_volume_type': 'rbd',
+            'serial': volume_id,
+            'data': {'name': 'volumes/volume-%s' % volume_id},
+        }
+        bdm = real_volume_driver_bdm(
+            ctx, volume_id, '/dev/vdb', None, connection_info)
+        profile = self.client.profiles.get.return_value
+        profile.devices = {
+            volume_id: {
+                'type': 'unix-block',
+                'path': '/dev/vdb',
+                'required': 'true',
+                'source': '/dev/rbd0',
+            },
+        }
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver._volume_device_info_key(volume_id):
+                driver._serialize_volume_attachment(
+                    connection_info, {'path': '/dev/rbd0'}, '/dev/vdb'),
+        }
+        container = self.client.instances.get.return_value
+        container.status = 'Stopped'
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver.attach_volume = mock.Mock()
+        incus_driver._disconnect_profile_volume_connection = mock.Mock()
+
+        with mock.patch.object(
+                driver, '_mapped_rbd_device', return_value='/dev/rbd0'):
+            incus_driver.power_on(
+                ctx, instance, None, {'block_device_mapping': [bdm]})
+
+        incus_driver.attach_volume.assert_not_called()
+        incus_driver._disconnect_profile_volume_connection.assert_not_called()
+        container.start.assert_called_once_with(wait=True)
+
+    def test_power_on_cleans_only_proven_extra_data_volume(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-extra-data-topology', memory_mb=0)
+        volume_id = 'stale-volume'
+        connection_info = {
+            'driver_volume_type': 'rbd',
+            'serial': volume_id,
+            'data': {'name': 'volumes/volume-stale'},
+        }
+        profile = self.client.profiles.get.return_value
+        profile.devices = {
+            volume_id: {
+                'type': 'unix-block', 'path': '/dev/vdb',
+                'source': '/dev/rbd9'},
+        }
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver._volume_device_info_key(volume_id):
+                driver._serialize_volume_attachment(
+                    connection_info, {'path': '/dev/rbd9'}, '/dev/vdb'),
+        }
+        container = self.client.instances.get.return_value
+        container.status = 'Stopped'
+        events = []
+
+        def disconnect(*_args, **_kwargs):
+            events.append('disconnect')
+            profile.devices.pop(volume_id)
+            profile.config.pop(driver._volume_device_info_key(volume_id))
+
+        container.start.side_effect = lambda **_kwargs: events.append('start')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver._disconnect_profile_volume_connection = mock.Mock(
+            side_effect=disconnect)
+
+        incus_driver.power_on(
+            ctx, instance, None, {'block_device_mapping': []})
+
+        self.assertEqual(['disconnect', 'start'], events)
+        disconnect_mock = incus_driver._disconnect_profile_volume_connection
+        disconnect_mock.assert_called_once_with(ctx, instance, volume_id)
+
+    def test_power_on_cleans_proven_stale_volume_journal(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-stale-volume-journal', memory_mb=0)
+        volume_id = 'stale-volume'
+        connection_info = {
+            'driver_volume_type': 'rbd',
+            'serial': volume_id,
+            'data': {'name': 'volumes/volume-stale'},
+        }
+        driver._write_volume_journal(
+            instance, volume_id, connection_info, {'path': '/dev/rbd9'},
+            '/dev/vdb', phase='connected')
+        profile = self.client.profiles.get.return_value
+        profile.devices = {}
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+        }
+        container = self.client.instances.get.return_value
+        container.status = 'Stopped'
+
+        def disconnect(*_args, **_kwargs):
+            driver._remove_volume_journal(instance, volume_id)
+
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver._disconnect_profile_volume_connection = mock.Mock(
+            side_effect=disconnect)
+
+        incus_driver.power_on(
+            ctx, instance, None, {'block_device_mapping': []})
+
+        disconnect_mock = incus_driver._disconnect_profile_volume_connection
+        disconnect_mock.assert_called_once_with(ctx, instance, volume_id)
+        self.assertIsNone(driver._read_volume_journal(instance, volume_id))
+        container.start.assert_called_once_with(wait=True)
+
+    def test_power_on_rejects_opaque_unix_block_without_cleanup(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-opaque-data-topology', memory_mb=0)
+        profile = self.client.profiles.get.return_value
+        profile.devices = {
+            'foreign': {
+                'type': 'unix-block', 'path': '/dev/vdb',
+                'source': '/dev/mapper/foreign'},
+        }
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+        }
+        container = self.client.instances.get.return_value
+        container.status = 'Stopped'
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver._disconnect_profile_volume_connection = mock.Mock()
+
+        self.assertRaisesRegex(
+            exception.InvalidVolume, 'opaque unix-block',
+            incus_driver.power_on, ctx, instance, None,
+            {'block_device_mapping': []})
+
+        incus_driver._disconnect_profile_volume_connection.assert_not_called()
+        container.start.assert_not_called()
+
+    def test_power_on_rejects_running_data_volume_mismatch_no_cleanup(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-running-data-topology', memory_mb=0)
+        volume_id = 'stale-volume'
+        connection_info = {
+            'driver_volume_type': 'rbd',
+            'serial': volume_id,
+            'data': {'name': 'volumes/volume-stale'},
+        }
+        profile = self.client.profiles.get.return_value
+        profile.devices = {
+            volume_id: {
+                'type': 'unix-block', 'path': '/dev/vdb',
+                'source': '/dev/rbd9'},
+        }
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver._volume_device_info_key(volume_id):
+                driver._serialize_volume_attachment(
+                    connection_info, {'path': '/dev/rbd9'}, '/dev/vdb'),
+        }
+        container = self.client.instances.get.return_value
+        container.status = 'Running'
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver._disconnect_profile_volume_connection = mock.Mock()
+
+        self.assertRaisesRegex(
+            exception.InvalidVolume, 'topology differs',
+            incus_driver.power_on, ctx, instance, None,
+            {'block_device_mapping': []})
+
+        incus_driver._disconnect_profile_volume_connection.assert_not_called()
+        container.start.assert_not_called()
+
+    def test_power_on_rejects_running_rbd_namespace_mismatch(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-running-namespace-mismatch', memory_mb=0)
+        requested = {
+            'driver_volume_type': 'rbd',
+            'serial': _TEST_VOLUME_ID,
+            'data': {
+                'name': 'volumes/volume-%s' % _TEST_VOLUME_ID,
+                'rbd_namespace': 'tenant-a',
+            },
+        }
+        recorded = copy.deepcopy(requested)
+        recorded['data']['rbd_namespace'] = 'tenant-b'
+        bdm = real_volume_driver_bdm(
+            ctx, _TEST_VOLUME_ID, '/dev/vdb', None, requested)
+        profile = self.client.profiles.get.return_value
+        profile.devices = {
+            _TEST_VOLUME_ID: {
+                'type': 'unix-block', 'path': '/dev/vdb',
+                'required': 'true', 'source': '/dev/rbd0'},
+        }
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver._volume_device_info_key(_TEST_VOLUME_ID):
+                driver._serialize_volume_attachment(
+                    recorded, {'path': '/dev/rbd0'}, '/dev/vdb'),
+        }
+        container = self.client.instances.get.return_value
+        container.status = 'Running'
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver._disconnect_profile_volume_connection = mock.Mock()
+
+        self.assertRaisesRegex(
+            exception.InvalidVolume, 'Stored RBD namespace',
+            incus_driver.power_on, ctx, instance, None,
+            {'block_device_mapping': [bdm]})
+
+        incus_driver._disconnect_profile_volume_connection.assert_not_called()
+        container.start.assert_not_called()
+
+    def test_power_on_without_bdm_rejects_retained_volume_state(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-missing-bdm-topology', memory_mb=0)
+        volume_id = 'retained-volume'
+        connection_info = {
+            'driver_volume_type': 'rbd',
+            'serial': volume_id,
+            'data': {'name': 'volumes/volume-retained'},
+        }
+        profile = self.client.profiles.get.return_value
+        profile.devices = {
+            volume_id: {
+                'type': 'unix-block', 'path': '/dev/vdb',
+                'source': '/dev/rbd9'},
+        }
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver._volume_device_info_key(volume_id):
+                driver._serialize_volume_attachment(
+                    connection_info, {'path': '/dev/rbd9'}, '/dev/vdb'),
+        }
+        container = self.client.instances.get.return_value
+        container.status = 'Stopped'
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver._disconnect_profile_volume_connection = mock.Mock()
+
+        self.assertRaisesRegex(
+            exception.InvalidVolume, 'did not provide block-device mappings',
+            incus_driver.power_on, ctx, instance, None)
+
+        incus_driver._disconnect_profile_volume_connection.assert_not_called()
+        container.start.assert_not_called()
 
     def test_reboot_repairs_host_vif_before_starting_retained_target(self):
         ctx = context.get_admin_context()
@@ -2150,7 +6982,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     def test_update_provider_tree(self, _host_has_swap):
         incus_driver = driver.IncusDriver(None)
         incus_driver.client = self.client
-        incus_driver.get_available_resource = mock.Mock(return_value={
+        incus_driver._get_host_resource_snapshot = mock.Mock(return_value={
             'vcpus': 8,
             'memory_mb': 16384,
             'local_gb': 100,
@@ -2171,6 +7003,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         incus_driver.update_provider_tree(provider_tree, 'compute-1')
 
+        incus_driver._get_host_resource_snapshot.assert_called_once_with(
+            'compute-1', use_cache=True)
         provider_tree.update_inventory.assert_called_once_with(
             'compute-1', {
                 'VCPU': {
@@ -2198,7 +7032,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     @mock.patch('nova.virt.incus.driver._host_has_swap', return_value=True)
     def test_update_provider_tree_reports_swap_trait(self, _host_has_swap):
         incus_driver = driver.IncusDriver(None)
-        incus_driver.get_available_resource = mock.Mock(return_value={
+        incus_driver._get_host_resource_snapshot = mock.Mock(return_value={
             'vcpus': 8, 'memory_mb': 16384, 'local_gb': 100})
         incus_driver._get_allocation_ratios = mock.Mock(return_value={
             'VCPU': 4.0, 'MEMORY_MB': 1.5, 'DISK_GB': 1.0})
@@ -2223,7 +7057,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     def test_update_provider_tree_reports_root_pool_traits(
             self, _host_has_swap):
         incus_driver = driver.IncusDriver(None)
-        incus_driver.get_available_resource = mock.Mock(return_value={
+        incus_driver.client = self.client
+        incus_driver._get_host_resource_snapshot = mock.Mock(return_value={
             'vcpus': 8, 'memory_mb': 16384, 'local_gb': 100})
         incus_driver._get_allocation_ratios = mock.Mock(return_value={
             'VCPU': 4.0, 'MEMORY_MB': 1.5, 'DISK_GB': 1.0})
@@ -2239,6 +7074,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'local-nvme': 'local-zfs',
             'durable': 'ceph-rootfs',
         }
+        self.client.storage_pools.get.return_value.status = 'Created'
         self.CONF.reserved_host_cpus = 0
         self.CONF.reserved_host_memory_mb = 0
 
@@ -2268,7 +7104,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             self, _host_has_swap, get_pool_info):
         incus_driver = driver.IncusDriver(None)
         incus_driver.client = self.client
-        incus_driver.get_available_resource = mock.Mock(return_value={
+        incus_driver._get_host_resource_snapshot = mock.Mock(return_value={
             'vcpus': 8, 'memory_mb': 16384, 'local_gb': 100})
         incus_driver._get_allocation_ratios = mock.Mock(return_value={
             'VCPU': 4.0, 'MEMORY_MB': 1.5, 'DISK_GB': 1.0})
@@ -2284,6 +7120,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.CONF.incus.root_storage_pools = {
             'local-nvme': 'local-zfs',
         }
+        self.client.storage_pools.get.return_value.status = 'Created'
         self.CONF.incus.root_storage_pool_resource_classes = {
             'local-nvme': 'CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME_DISK_GB',
         }
@@ -2301,14 +7138,16 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'allocation_ratio': 1.0,
             'reserved': 0,
         }, inventory['CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME_DISK_GB'])
-        get_pool_info.assert_called_once_with(self.client, 'local-zfs')
+        get_pool_info.assert_called_once_with(
+            self.client, 'local-zfs',
+            pool=self.client.storage_pools.get.return_value)
 
     @mock.patch('nova.virt.incus.driver._host_has_swap', return_value=False)
     def test_update_provider_tree_slices_shared_pool_capacity(
             self, _host_has_swap):
         incus_driver = driver.IncusDriver(None)
         incus_driver.client = self.client
-        incus_driver.get_available_resource = mock.Mock(return_value={
+        incus_driver._get_host_resource_snapshot = mock.Mock(return_value={
             'vcpus': 8, 'memory_mb': 16384, 'local_gb': 100})
         incus_driver._get_allocation_ratios = mock.Mock(return_value={
             'VCPU': 4.0, 'MEMORY_MB': 1.5, 'DISK_GB': 1.0})
@@ -2319,6 +7158,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             inventory={}, traits=set())
         pool = self.client.storage_pools.get.return_value
         pool.driver = 'ceph'
+        pool.status = 'Created'
         self.CONF.incus.root_storage_pools = {
             'durable': 'ceph-rootfs',
         }
@@ -2344,7 +7184,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             self, _host_has_swap):
         incus_driver = driver.IncusDriver(None)
         incus_driver.client = self.client
-        incus_driver.get_available_resource = mock.Mock(return_value={
+        incus_driver._get_host_resource_snapshot = mock.Mock(return_value={
             'vcpus': 8, 'memory_mb': 16384, 'local_gb': 100})
         incus_driver._get_allocation_ratios = mock.Mock(return_value={
             'VCPU': 4.0, 'MEMORY_MB': 1.5, 'DISK_GB': 1.0})
@@ -2354,6 +7194,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         provider_tree.data.return_value = mock.Mock(
             inventory={}, traits=set())
         self.client.storage_pools.get.return_value.driver = 'ceph'
+        self.client.storage_pools.get.return_value.status = 'Created'
         self.CONF.incus.root_storage_pools = {
             'durable': 'ceph-rootfs',
         }
@@ -2370,10 +7211,166 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'compute-1')
 
     @mock.patch('nova.virt.incus.driver._host_has_swap', return_value=False)
-    def test_update_provider_tree_reports_manila_live_migration_trait(
+    def test_update_provider_tree_suppresses_unavailable_root_pool(
             self, _host_has_swap):
         incus_driver = driver.IncusDriver(None)
-        incus_driver.get_available_resource = mock.Mock(return_value={
+        incus_driver.client = self.client
+        incus_driver._get_host_resource_snapshot = mock.Mock(return_value={
+            'vcpus': 8, 'memory_mb': 16384, 'local_gb': 100})
+        incus_driver._get_allocation_ratios = mock.Mock(return_value={
+            'VCPU': 4.0, 'MEMORY_MB': 1.5, 'DISK_GB': 1.0})
+        incus_driver._get_reserved_host_disk_gb_from_config = mock.Mock(
+            return_value=2)
+        stale_inventory = {
+            'total': 80,
+            'min_unit': 1,
+            'max_unit': 80,
+            'step_size': 1,
+            'allocation_ratio': 1.0,
+            'reserved': 0,
+        }
+        current = mock.Mock(
+            inventory={
+                'CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME_DISK_GB':
+                    stale_inventory,
+            },
+            traits={
+                'CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME',
+                'CUSTOM_OPERATOR_MANAGED',
+            })
+        provider_tree = mock.Mock()
+        provider_tree.data.return_value = current
+        pool = self.client.storage_pools.get.return_value
+        pool.status = 'Unavailable'
+        self.CONF.incus.root_storage_pools = {
+            'local-nvme': 'local-zfs',
+        }
+        self.CONF.incus.root_storage_pool_resource_classes = {
+            'local-nvme': 'CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME_DISK_GB',
+        }
+        self.CONF.reserved_host_cpus = 0
+        self.CONF.reserved_host_memory_mb = 0
+
+        with mock.patch.object(driver.LOG, 'error') as log_error:
+            incus_driver.update_provider_tree(provider_tree, 'compute-1')
+
+        inventory = provider_tree.update_inventory.call_args.args[1]
+        self.assertEqual(
+            dict(stale_inventory, reserved=80),
+            inventory['CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME_DISK_GB'])
+        self.assertIsNot(
+            stale_inventory,
+            inventory['CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME_DISK_GB'])
+        provider_tree.update_traits.assert_called_once_with(
+            'compute-1', {
+                'CUSTOM_INCUS_SYSTEM_CONTAINER',
+                'CUSTOM_OPERATOR_MANAGED',
+            })
+        log_error.assert_called_once()
+        self.assertIn(
+            'state %(status)s', log_error.call_args.args[0])
+        pool.resources.get.assert_not_called()
+
+    @mock.patch('nova.virt.incus.driver._host_has_swap', return_value=False)
+    def test_update_provider_tree_suppresses_pool_capacity_error(
+            self, _host_has_swap):
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+        incus_driver._get_host_resource_snapshot = mock.Mock(return_value={
+            'vcpus': 8, 'memory_mb': 16384, 'local_gb': 100})
+        incus_driver._get_allocation_ratios = mock.Mock(return_value={
+            'VCPU': 4.0, 'MEMORY_MB': 1.5, 'DISK_GB': 1.0})
+        incus_driver._get_reserved_host_disk_gb_from_config = mock.Mock(
+            return_value=2)
+        stale_inventory = {
+            'total': 80,
+            'min_unit': 1,
+            'max_unit': 80,
+            'step_size': 1,
+            'allocation_ratio': 1.0,
+            'reserved': 0,
+        }
+        current = mock.Mock(
+            inventory={
+                'CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME_DISK_GB':
+                    stale_inventory,
+            },
+            traits={'CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME'})
+        provider_tree = mock.Mock()
+        provider_tree.data.return_value = current
+        pool = self.client.storage_pools.get.return_value
+        pool.status = 'Created'
+        pool.driver = 'zfs'
+        pool.resources.get.side_effect = incus_api_exception(
+            500, 'cannot open zpool')
+        self.CONF.incus.root_storage_pools = {
+            'local-nvme': 'local-zfs',
+        }
+        self.CONF.incus.root_storage_pool_resource_classes = {
+            'local-nvme': 'CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME_DISK_GB',
+        }
+        self.CONF.reserved_host_cpus = 0
+        self.CONF.reserved_host_memory_mb = 0
+
+        with mock.patch.object(driver.LOG, 'error') as log_error:
+            incus_driver.update_provider_tree(provider_tree, 'compute-1')
+
+        inventory = provider_tree.update_inventory.call_args.args[1]
+        self.assertEqual(
+            dict(stale_inventory, reserved=80),
+            inventory['CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME_DISK_GB'])
+        provider_tree.update_traits.assert_called_once_with(
+            'compute-1', {'CUSTOM_INCUS_SYSTEM_CONTAINER'})
+        log_error.assert_called_once()
+        self.assertIn(
+            'cannot report capacity', log_error.call_args.args[0])
+
+    @mock.patch('nova.virt.incus.driver._host_has_swap', return_value=False)
+    def test_update_provider_tree_quiesces_unavailable_default_pool(
+            self, _host_has_swap):
+        incus_driver = driver.IncusDriver(None)
+        incus_driver._get_host_resource_snapshot = mock.Mock(return_value={
+            'vcpus': 8,
+            'memory_mb': 16384,
+            'local_gb': 0,
+            'default_storage_pool_available': False,
+        })
+        incus_driver._get_allocation_ratios = mock.Mock(return_value={
+            'VCPU': 4.0, 'MEMORY_MB': 1.5, 'DISK_GB': 1.0})
+        incus_driver._get_reserved_host_disk_gb_from_config = mock.Mock(
+            return_value=2)
+        current = mock.Mock(
+            inventory={
+                'DISK_GB': {
+                    'total': 100,
+                    'min_unit': 1,
+                    'max_unit': 100,
+                    'step_size': 1,
+                    'allocation_ratio': 1.0,
+                    'reserved': 2,
+                },
+            },
+            traits={
+                'CUSTOM_INCUS_SYSTEM_CONTAINER',
+                'CUSTOM_OPERATOR_MANAGED',
+            })
+        provider_tree = mock.Mock()
+        provider_tree.data.return_value = current
+        self.CONF.reserved_host_cpus = 0
+        self.CONF.reserved_host_memory_mb = 0
+
+        incus_driver.update_provider_tree(provider_tree, 'compute-1')
+
+        inventory = provider_tree.update_inventory.call_args.args[1]
+        self.assertEqual(100, inventory['DISK_GB']['reserved'])
+        provider_tree.update_traits.assert_called_once_with(
+            'compute-1', {'CUSTOM_OPERATOR_MANAGED'})
+
+    @mock.patch('nova.virt.incus.driver._host_has_swap', return_value=False)
+    def test_update_provider_tree_reports_manila_migration_traits(
+            self, _host_has_swap):
+        incus_driver = driver.IncusDriver(None)
+        incus_driver._get_host_resource_snapshot = mock.Mock(return_value={
             'vcpus': 8, 'memory_mb': 16384, 'local_gb': 100})
         incus_driver._get_allocation_ratios = mock.Mock(return_value={
             'VCPU': 4.0, 'MEMORY_MB': 1.5, 'DISK_GB': 1.0})
@@ -2384,11 +7381,13 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             inventory={}, traits=set())
         self.CONF.incus.enable_manila_shares = True
         self.CONF.incus.allow_live_migration = True
+        self.CONF.incus.allow_cold_migration = True
 
         incus_driver.update_provider_tree(provider_tree, 'compute-1')
 
         provider_tree.update_traits.assert_called_once_with(
             'compute-1', {
+                'CUSTOM_INCUS_MANILA_COLD_MIGRATION',
                 'CUSTOM_INCUS_MANILA_LIVE_MIGRATION',
                 'CUSTOM_INCUS_MANILA_SHARE',
                 'CUSTOM_INCUS_SYSTEM_CONTAINER',
@@ -2457,6 +7456,70 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertNotIn('tap0123456789a', container.devices)
         incus_driver.firewall_driver.unfilter_instance.assert_called_once_with(
             instance, [vif])
+        self.vif_driver.unplug.assert_called_once_with(instance, vif)
+
+    def test_attach_interface_rolls_back_vif_after_filter_failure(self):
+        container = mock.Mock(devices={})
+        self.client.instances.get.return_value = container
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        vif = {
+            'id': '0123456789abcdef',
+            'type': network_model.VIF_TYPE_OVS,
+            'address': '00:11:22:33:44:55',
+            'network': {'bridge': 'fakebr'},
+            'devname': 'tap0123456789a',
+        }
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver.firewall_driver = mock.Mock()
+        incus_driver.firewall_driver.setup_basic_filtering.side_effect = (
+            RuntimeError('filter failed'))
+
+        self.assertRaises(
+            RuntimeError,
+            incus_driver.attach_interface,
+            context.get_admin_context(),
+            instance,
+            None,
+            vif)
+
+        container.save.assert_not_called()
+        incus_driver.firewall_driver.unfilter_instance.assert_called_once_with(
+            instance, [vif])
+        self.vif_driver.unplug.assert_called_once_with(instance, vif)
+
+    def test_attach_interface_preserves_original_error_on_cleanup_failure(
+            self):
+        container = mock.Mock(devices={})
+        self.client.instances.get.return_value = container
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        vif = {
+            'id': '0123456789abcdef',
+            'type': network_model.VIF_TYPE_OVS,
+            'address': '00:11:22:33:44:55',
+            'network': {'bridge': 'fakebr'},
+            'devname': 'tap0123456789a',
+        }
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver.firewall_driver = mock.Mock()
+        incus_driver.firewall_driver.setup_basic_filtering.side_effect = (
+            RuntimeError('filter failed'))
+        incus_driver.firewall_driver.unfilter_instance.side_effect = (
+            RuntimeError('unfilter failed'))
+        self.vif_driver.unplug.side_effect = RuntimeError('unplug failed')
+
+        raised = self.assertRaises(
+            RuntimeError,
+            incus_driver.attach_interface,
+            context.get_admin_context(),
+            instance,
+            None,
+            vif)
+
+        self.assertEqual('filter failed', str(raised))
         self.vif_driver.unplug.assert_called_once_with(instance, vif)
 
     def test_attach_interface_retains_vif_if_incus_still_references_it(self):
@@ -2748,6 +7811,83 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertEqual(2, container.save.call_count)
         self.vif_driver.unplug.assert_called_once_with(instance, vif)
 
+    def test_detach_interface_restores_local_state_if_profile_save_fails(self):
+        device = {
+            'nictype': 'physical',
+            'parent': 'tin0123456789a',
+            'hwaddr': '00:11:22:33:44:55',
+            'type': 'nic',
+        }
+        container = mock.Mock()
+        container.devices = {'tap0123456789a': dict(device)}
+        self.client.instances.get.return_value = container
+        profile = mock.Mock()
+        profile.devices = {'tap0123456789a': dict(device)}
+        profile.save.side_effect = RuntimeError('profile save failed')
+        saved_profile = mock.Mock(
+            devices={'tap0123456789a': dict(device)})
+        self.client.profiles.get.side_effect = [profile, saved_profile]
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        vif = {
+            'id': '0123456789abcdef',
+            'type': network_model.VIF_TYPE_OVS,
+            'address': '00:11:22:33:44:55',
+            'network': {'bridge': 'fakebr'},
+        }
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaises(
+            RuntimeError,
+            incus_driver.detach_interface,
+            context.get_admin_context(),
+            instance,
+            vif)
+
+        self.assertEqual(
+            {'tap0123456789a': device}, container.devices)
+        self.assertEqual(2, container.save.call_count)
+        self.vif_driver.unplug.assert_not_called()
+
+    def test_detach_interface_restores_different_local_device_on_failure(self):
+        device = {
+            'nictype': 'physical',
+            'parent': 'tin0123456789a',
+            'hwaddr': '00:11:22:33:44:55',
+            'type': 'nic',
+        }
+        container = mock.Mock()
+        container.devices = {'tap0123456789a': dict(device)}
+        self.client.instances.get.return_value = container
+        profile = mock.Mock()
+        profile.devices = {'eth0': dict(device)}
+        profile.save.side_effect = RuntimeError('profile save failed')
+        saved_profile = mock.Mock(devices={'eth0': dict(device)})
+        self.client.profiles.get.side_effect = [profile, saved_profile]
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        vif = {
+            'id': '0123456789abcdef',
+            'type': network_model.VIF_TYPE_OVS,
+            'address': '00:11:22:33:44:55',
+            'network': {'bridge': 'fakebr'},
+        }
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaises(
+            RuntimeError,
+            incus_driver.detach_interface,
+            context.get_admin_context(),
+            instance,
+            vif)
+
+        self.assertEqual(
+            {'tap0123456789a': device}, container.devices)
+        self.assertEqual(4, container.save.call_count)
+        self.vif_driver.unplug.assert_not_called()
+
     def test_detach_interface_during_delete_only_unplugs_vif(self):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
@@ -2815,18 +7955,45 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         profile.save.assert_not_called()
         container.stop.assert_not_called()
 
-    def test_migrate_disk_and_power_off_different_host(self):
+    def test_migrate_disk_and_power_off_rejects_same_host_first(self):
+        self.CONF.incus.allow_cold_migration = True
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        raised = self.assertRaises(
+            exception.InstanceFaultRollback,
+            incus_driver.migrate_disk_and_power_off,
+            ctx, instance, incus_driver.host, instance.flavor, [])
+
+        self.assertIsInstance(
+            raised.inner_exception, exception.UnableToMigrateToSelf)
+        self.client.instances.get.assert_not_called()
+        self.client.profiles.get.assert_not_called()
+
+    @mock.patch.object(driver, '_migration_client')
+    def test_migrate_disk_and_power_off_different_host(
+            self, migration_client):
         container = mock.Mock()
         container.status = 'Running'
+        container.config = {'volatile.idmap.base': '1065536'}
         container.generate_migration_data.return_value = {
             'name': 'test',
             'source': {
                 'type': 'migration',
-                'operation': 'http+unix://incus/1.0/operations/op-id',
+                'operation': (
+                    'http+unix://incus/1.0/operations/'
+                    '20000000-0000-0000-0000-000000000002'),
                 'secrets': {'0': 'secret'},
             },
         }
         self.client.instances.get.return_value = container
+        migration_client.return_value = self.client
+        profile = mock.Mock()
+        profile.config = {'security.idmap.size': '65536'}
+        self.client.profiles.get.return_value = profile
         self.CONF.incus.allow_cold_migration = True
         self.CONF.incus.migration_address = 'https://10.224.0.16:8443'
 
@@ -2843,11 +8010,17 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         result = jsonutils.loads(incus_driver.migrate_disk_and_power_off(
             ctx, instance, dest, flavor, network_info))
 
+        self.cold_migration_cleanup_token.assert_called_once_with(
+            ctx, instance)
+        self.assertEqual(
+            '20000000-0000-0000-0000-000000000002',
+            result['cleanup_token'])
         self.assertEqual('incus-pull-v1', result['format'])
         self.assertFalse(result['boot_from_volume'])
         self.assertTrue(result['was_running'])
         self.assertEqual(
-            'https://10.224.0.16:8443/1.0/operations/op-id',
+            'https://10.224.0.16:8443/1.0/operations/'
+            '20000000-0000-0000-0000-000000000002',
             result['migration_data']['source']['operation'])
         self.assertEqual(
             [instance.name], result['migration_data']['profiles'])
@@ -2876,6 +8049,33 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         self.client.storage_pools.get.assert_not_called()
 
+    def test_bfv_migration_requires_ready_fence_extension(self):
+        volume_id = '8231d2e8-1111-4222-8333-123456789abc'
+        root_bdm = {
+            'connection_info': {
+                'driver_volume_type': 'rbd',
+                'serial': volume_id,
+                'data': {
+                    'name': 'cinder-volumes/volume-%s' % volume_id,
+                    'access_mode': 'rw',
+                },
+            },
+        }
+        extensions = self.client.host_info['api_extensions']
+        extensions.remove(driver.INCUS_STORAGE_READY_FENCE_EXTENSION)
+        extensions.extend([
+            'migration_shared_ceph_storage',
+            'storage_driver_cephext',
+        ])
+
+        self.assertRaisesRegex(
+            exception.MigrationError,
+            driver.INCUS_STORAGE_READY_FENCE_EXTENSION,
+            driver._require_bfv_migration_support,
+            self.client, root_bdm)
+
+        self.client.storage_pools.get.assert_not_called()
+
     def test_bfv_migration_validates_cephext_pool(self):
         volume_id = '8231d2e8-1111-4222-8333-123456789abc'
         root_bdm = {
@@ -2890,6 +8090,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         }
         self.client.host_info['api_extensions'].extend([
             'migration_shared_ceph_storage',
+            driver.INCUS_STORAGE_READY_FENCE_EXTENSION,
             'storage_driver_cephext',
         ])
         self.CONF.incus.boot_from_volume_storage_pools = {
@@ -2902,11 +8103,23 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             ('cinder-volumes', 'volume-%s' % volume_id),
             driver._require_bfv_migration_support(self.client, root_bdm))
 
-    def test_migrate_disk_failure_restarts_source(self):
+    @mock.patch.object(driver, '_settle_instance_migration_operations')
+    @mock.patch.object(driver, '_migration_client')
+    def test_migrate_disk_failure_restarts_source(
+            self, migration_client, settle_operations):
         container = mock.Mock(status='Running')
+        container.config = {'volatile.idmap.base': '1065536'}
+        container.expanded_devices = {
+            'root': {'type': 'disk', 'path': '/', 'pool': 'root'}}
         container.generate_migration_data.side_effect = RuntimeError(
             'migration operation failed')
+        container.stop.side_effect = (
+            lambda **kwargs: setattr(container, 'status', 'Stopped'))
         self.client.instances.get.return_value = container
+        self.client.profiles.get.return_value.config = {
+            'security.idmap.size': '65536'}
+        self.client.api.operations.get.return_value.json.return_value = {
+            'metadata': {}}
         self.CONF.incus.allow_cold_migration = True
         self.CONF.incus.migration_address = 'https://10.224.0.16:8443'
         ctx = context.get_admin_context()
@@ -2922,19 +8135,30 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         container.stop.assert_called_once_with(wait=True)
         container.start.assert_called_once_with(wait=True)
 
+    @mock.patch.object(driver, '_migration_client')
     @mock.patch.object(driver, '_preflight_bfv_migration_destination')
     @mock.patch.object(driver, '_require_bfv_migration_support')
     @mock.patch.object(driver, '_boot_from_volume')
     @mock.patch('nova.virt.driver.block_device_info_get_mapping')
     def test_migrate_disk_detaches_only_data_volumes(
-            self, get_mapping, boot_from_volume, require_bfv, preflight):
+            self, get_mapping, boot_from_volume, require_bfv, preflight,
+            migration_client):
         container = mock.Mock(status='Running')
+        container.config = {'volatile.idmap.base': '1065536'}
+        container.expanded_devices = {
+            'root': {'type': 'disk', 'path': '/', 'pool': 'root'}}
         container.generate_migration_data.return_value = {
             'source': {
-                'operation': 'http+unix://incus/1.0/operations/op-id',
+                'operation': (
+                    'http+unix://incus/1.0/operations/'
+                    '20000000-0000-0000-0000-000000000002'),
             },
         }
         self.client.instances.get.return_value = container
+        self.client.profiles.get.return_value.config = {
+            'security.idmap.size': '65536'}
+        self.client.api.operations.get.return_value.json.return_value = {
+            'metadata': {}}
         self.CONF.incus.allow_cold_migration = True
         self.CONF.incus.migration_address = 'https://10.224.0.16:8443'
         connection_info = {'driver_volume_type': 'local', 'data': {
@@ -3011,8 +8235,11 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             '10.224.0.17': '/etc/nova/compute-2.crt'}
         remote = get_remote.return_value
         remote.host_info = {'api_extensions': [
+            driver.INCUS_STORAGE_HANDOVER_EXTENSION,
+            driver.INCUS_STORAGE_HANDOVER_PROOF_EXTENSION,
             'migration_shared_ceph_storage',
             'migration_live_shared_cephext_storage',
+            driver.INCUS_STORAGE_READY_FENCE_EXTENSION,
             'storage_driver_cephext']}
         remote.projects.get.return_value.config = {
             'user.openstack.preflight_protocol': '1',
@@ -3039,6 +8266,9 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     def test_bfv_destination_preflight_rejects_missing_extension(
             self, connect, get_remote):
         get_remote.return_value.host_info = {'api_extensions': [
+            driver.INCUS_STORAGE_HANDOVER_EXTENSION,
+            driver.INCUS_STORAGE_HANDOVER_PROOF_EXTENSION,
+            driver.INCUS_STORAGE_READY_FENCE_EXTENSION,
             'storage_driver_cephext']}
 
         self.assertRaisesRegex(
@@ -3050,14 +8280,138 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     @mock.patch.object(driver.incus_client,
                        'get_migration_preflight_client')
     @mock.patch.object(driver.socket, 'create_connection')
+    def test_bfv_destination_preflight_rejects_missing_ready_fence(
+            self, connect, get_remote):
+        get_remote.return_value.host_info = {'api_extensions': [
+            'migration_shared_ceph_storage',
+            'storage_driver_cephext',
+        ]}
+
+        self.assertRaisesRegex(
+            exception.MigrationError,
+            driver.INCUS_STORAGE_READY_FENCE_EXTENSION,
+            driver._preflight_bfv_migration_destination,
+            'compute-2.example.test', 'cinder-volumes')
+
+    @mock.patch.object(driver, '_migration_client')
+    @mock.patch.object(
+        driver, '_migration_address_for_host',
+        return_value='https://compute-2.example.test:8443')
+    def test_shared_ceph_preflight_rejects_missing_ready_fence(
+            self, migration_address, migration_client):
+        remote = migration_client.return_value
+        remote.host_info = {
+            'api_extensions': [driver.INCUS_STORAGE_HANDOVER_EXTENSION],
+        }
+
+        self.assertRaisesRegex(
+            exception.MigrationError,
+            driver.INCUS_STORAGE_READY_FENCE_EXTENSION,
+            driver._preflight_shared_ceph_handover_destination,
+            'compute-2.example.test', 'ceph-root', {
+                'shared': True,
+                'driver': 'ceph',
+                'cluster': 'ceph',
+                'source': 'incus-rootfs',
+            })
+
+        remote.storage_pools.get.assert_not_called()
+
+    @mock.patch.object(driver, '_migration_client')
+    @mock.patch.object(
+        driver, '_migration_address_for_host',
+        return_value='https://compute-2.example.test:8443')
+    def test_shared_ceph_preflight_accepts_redacted_destination_config(
+            self, migration_address, migration_client):
+        # Incus redacts pool config for the restricted preflight identity;
+        # exact cluster/source equality is then enforced by the Incus
+        # migration negotiation, not this preflight.
+        remote = migration_client.return_value
+        remote.host_info = {'api_extensions': [
+            driver.INCUS_STORAGE_HANDOVER_EXTENSION,
+            driver.INCUS_STORAGE_HANDOVER_PROOF_EXTENSION,
+            driver.INCUS_STORAGE_READY_FENCE_EXTENSION,
+        ]}
+        remote.storage_pools.get.return_value = mock.Mock(
+            driver='ceph', config=None)
+
+        driver._preflight_shared_ceph_handover_destination(
+            'compute-2.example.test', 'ceph-root', {
+                'shared': True,
+                'driver': 'ceph',
+                'cluster': 'ceph',
+                'source': 'incus-rootfs',
+            })
+
+    @mock.patch.object(driver, '_migration_client')
+    @mock.patch.object(
+        driver, '_migration_address_for_host',
+        return_value='https://compute-2.example.test:8443')
+    def test_shared_ceph_preflight_rejects_redacted_driver_mismatch(
+            self, migration_address, migration_client):
+        remote = migration_client.return_value
+        remote.host_info = {'api_extensions': [
+            driver.INCUS_STORAGE_HANDOVER_EXTENSION,
+            driver.INCUS_STORAGE_HANDOVER_PROOF_EXTENSION,
+            driver.INCUS_STORAGE_READY_FENCE_EXTENSION,
+        ]}
+        remote.storage_pools.get.return_value = mock.Mock(
+            driver='cephext', config=None)
+
+        self.assertRaisesRegex(
+            exception.MigrationError,
+            'pool identities differ',
+            driver._preflight_shared_ceph_handover_destination,
+            'compute-2.example.test', 'ceph-root', {
+                'shared': True,
+                'driver': 'ceph',
+                'cluster': 'ceph',
+                'source': 'incus-rootfs',
+            })
+
+    @mock.patch.object(driver, '_migration_client')
+    @mock.patch.object(
+        driver, '_migration_address_for_host',
+        return_value='https://compute-2.example.test:8443')
+    def test_shared_ceph_preflight_rejects_visible_identity_mismatch(
+            self, migration_address, migration_client):
+        remote = migration_client.return_value
+        remote.host_info = {'api_extensions': [
+            driver.INCUS_STORAGE_HANDOVER_EXTENSION,
+            driver.INCUS_STORAGE_HANDOVER_PROOF_EXTENSION,
+            driver.INCUS_STORAGE_READY_FENCE_EXTENSION,
+        ]}
+        remote.storage_pools.get.return_value = mock.Mock(
+            driver='ceph', config={
+                'ceph.cluster_name': 'ceph',
+                'source': 'another-osd-pool',
+            })
+
+        self.assertRaisesRegex(
+            exception.MigrationError,
+            'pool identities differ',
+            driver._preflight_shared_ceph_handover_destination,
+            'compute-2.example.test', 'ceph-root', {
+                'shared': True,
+                'driver': 'ceph',
+                'cluster': 'ceph',
+                'source': 'incus-rootfs',
+            })
+
+    @mock.patch.object(driver.incus_client,
+                       'get_migration_preflight_client')
+    @mock.patch.object(driver.socket, 'create_connection')
     def test_bfv_destination_preflight_rejects_cinder_pool_mismatch(
             self, connect, get_remote):
         self.CONF.incus.boot_from_volume_storage_pools = {
             'cinder-volumes': 'cinder-bfv'}
         remote = get_remote.return_value
         remote.host_info = {'api_extensions': [
+            driver.INCUS_STORAGE_HANDOVER_EXTENSION,
+            driver.INCUS_STORAGE_HANDOVER_PROOF_EXTENSION,
             'migration_shared_ceph_storage',
             'migration_live_shared_cephext_storage',
+            driver.INCUS_STORAGE_READY_FENCE_EXTENSION,
             'storage_driver_cephext']}
         remote.projects.get.return_value.config = {
             'user.openstack.preflight_protocol': '1',
@@ -3072,15 +8426,29 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             driver._preflight_bfv_migration_destination,
             'compute-2.example.test', 'cinder-volumes')
 
+    @mock.patch.object(driver, '_settle_instance_migration_operations')
+    @mock.patch.object(driver, '_migration_client')
     @mock.patch('nova.virt.driver.block_device_info_get_mapping')
-    def test_migrate_disk_volume_failure_restores_source(self, get_mapping):
+    def test_migrate_disk_volume_failure_restores_source(
+            self, get_mapping, migration_client, settle_operations):
         container = mock.Mock(status='Running')
+        container.config = {'volatile.idmap.base': '1065536'}
+        container.expanded_devices = {
+            'root': {'type': 'disk', 'path': '/', 'pool': 'root'}}
         container.generate_migration_data.return_value = {
             'source': {
-                'operation': 'http+unix://incus/1.0/operations/op-id',
+                'operation': (
+                    'http+unix://incus/1.0/operations/'
+                    '20000000-0000-0000-0000-000000000002'),
             },
         }
+        container.stop.side_effect = (
+            lambda **kwargs: setattr(container, 'status', 'Stopped'))
         self.client.instances.get.return_value = container
+        self.client.profiles.get.return_value.config = {
+            'security.idmap.size': '65536'}
+        self.client.api.operations.get.return_value.json.return_value = {
+            'metadata': {}}
         self.CONF.incus.allow_cold_migration = True
         self.CONF.incus.migration_address = 'https://10.224.0.16:8443'
         first = {'driver_volume_type': 'local', 'data': {
@@ -3104,9 +8472,76 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             ctx, instance, '10.224.0.17',
             instance.flavor, [], block_device_info={})
 
-        incus_driver.attach_volume.assert_called_once_with(
-            ctx, first, instance, '/dev/vdb')
+        self.assertEqual(
+            [
+                mock.call(ctx, second, instance, '/dev/vdc'),
+                mock.call(ctx, first, instance, '/dev/vdb'),
+            ],
+            incus_driver.attach_volume.call_args_list)
         container.start.assert_called_once_with(wait=True)
+
+    @mock.patch.object(driver, '_settle_instance_migration_operations')
+    @mock.patch.object(driver, '_migration_client')
+    @mock.patch('nova.virt.driver.block_device_info_get_mapping')
+    def test_migrate_disk_volume_rollback_failure_keeps_source_stopped(
+            self, get_mapping, migration_client, settle_operations):
+        container = mock.Mock(status='Running')
+        container.config = {'volatile.idmap.base': '1065536'}
+        container.expanded_devices = {
+            'root': {'type': 'disk', 'path': '/', 'pool': 'root'}}
+        container.generate_migration_data.return_value = {
+            'source': {
+                'operation': (
+                    'http+unix://incus/1.0/operations/'
+                    '20000000-0000-0000-0000-000000000002'),
+            },
+        }
+        container.stop.side_effect = (
+            lambda **kwargs: setattr(container, 'status', 'Stopped'))
+        self.client.instances.get.return_value = container
+        self.client.profiles.get.return_value.config = {
+            'security.idmap.size': '65536'}
+        self.CONF.incus.allow_cold_migration = True
+        self.CONF.incus.migration_address = 'https://10.224.0.16:8443'
+        first = {
+            'driver_volume_type': 'local',
+            'data': {'volume_id': 'first'},
+        }
+        second = {
+            'driver_volume_type': 'local',
+            'data': {'volume_id': 'second'},
+        }
+        get_mapping.return_value = [
+            {'connection_info': first, 'mount_device': '/dev/vdb'},
+            {'connection_info': second, 'mount_device': '/dev/vdc'},
+        ]
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver.detach_volume = mock.Mock(
+            side_effect=[None, RuntimeError('disconnect failed')])
+
+        def attach_volume(
+                context, connection_info, instance, mountpoint):
+            if connection_info is second:
+                raise RuntimeError('second restore failed')
+
+        incus_driver.attach_volume = mock.Mock(side_effect=attach_volume)
+
+        self.assertRaises(
+            exception.MigrationError,
+            incus_driver.migrate_disk_and_power_off,
+            ctx, instance, '10.224.0.17',
+            instance.flavor, [], block_device_info={})
+
+        self.assertEqual(
+            [
+                mock.call(ctx, second, instance, '/dev/vdc'),
+                mock.call(ctx, first, instance, '/dev/vdb'),
+            ],
+            incus_driver.attach_volume.call_args_list)
+        container.start.assert_not_called()
 
     def test_migrate_disk_rejects_non_https_address_before_shutdown(self):
         self.CONF.incus.allow_cold_migration = True
@@ -3142,14 +8577,17 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
     @mock.patch('os.path.realpath')
     def test_attach_volume(self, realpath):
-        profile = mock.Mock()
-        profile.devices = {}
-        profile.config = {}
-        self.client.profiles.get.return_value = profile
-        realpath.return_value = '/dev/sdc'
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
+        profile = mock.Mock()
+        profile.devices = {}
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+        }
+        self.client.profiles.get.return_value = profile
+        realpath.return_value = '/dev/sdc'
         connection_info = fake_connection_info(
             {'id': 1, 'name': 'volume-00000001'},
             '10.0.2.15:3260', 'iqn.2010-10.org.openstack:volume-00000001',
@@ -3169,11 +8607,17 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         incus_driver.attach_volume(
             ctx, connection_info, instance, mountpoint, None, None, None)
 
-        incus_driver.client.profiles.get.assert_called_once_with(instance.name)
+        self.assertEqual(
+            3, incus_driver.client.profiles.get.call_count)
+        self.assertEqual([
+            mock.call(instance.name),
+            mock.call(instance.name),
+            mock.call(instance.name),
+        ], incus_driver.client.profiles.get.call_args_list)
         volume_connector.connect_volume.assert_called_once_with(
             connection_info['data'])
         self.assertEqual({
-            '1': {
+            _TEST_VOLUME_ID: {
                 'path': '/dev/sdd',
                 'required': 'true',
                 'source': '/dev/sdc',
@@ -3182,10 +8626,337 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                 'limits.write': '1048576B',
             },
         }, profile.devices)
+        expected_connection_data = dict(connection_info['data'])
+        expected_connection_data.pop('auth_password')
         self.assertEqual(
-            {'path': '/dev/disk/x'},
-            jsonutils.loads(profile.config['user.openstack.volume.1']))
-        profile.save.assert_called_once_with(wait=True)
+            {
+                'version': 2,
+                'phase': 'connected',
+                'driver_volume_type': 'rbd',
+                'connection_data': expected_connection_data,
+                'device_info': {'path': '/dev/disk/x'},
+                'mountpoint': '/dev/sdd',
+            },
+            jsonutils.loads(profile.config[
+                driver._volume_device_info_key(_TEST_VOLUME_ID)]))
+        self.assertEqual(2, profile.save.call_count)
+        profile.save.assert_has_calls([
+            mock.call(wait=True),
+            mock.call(wait=True),
+        ])
+
+    def test_attach_volume_rejects_non_rbd_before_side_effects(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-non-rbd-attach', memory_mb=0)
+        connection_info = {
+            'driver_volume_type': 'iscsi',
+            'serial': 'volume-1',
+            'data': {'volume_id': 'volume-1'},
+        }
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        with mock.patch.object(driver, 'brick_get_connector') as connector:
+            self.assertRaisesRegex(
+                exception.InvalidVolume, 'require the Cinder RBD protocol',
+                incus_driver.attach_volume, ctx, connection_info, instance,
+                '/dev/vdb')
+
+        connector.assert_not_called()
+        self.client.instances.get.assert_not_called()
+        self.client.profiles.get.assert_not_called()
+
+    @mock.patch.object(driver.IncusDriver, '_attach_volume_locked')
+    def test_stage_live_volume_allows_missing_verified_target(
+            self, attach_locked):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        cleanup_token = '10000000-0000-0000-0000-000000000001'
+        connection_info = {
+            'serial': 'volume-id',
+            'driver_volume_type': 'rbd',
+            'data': {},
+        }
+        self.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: cleanup_token,
+        }
+        profile.used_by = []
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver._stage_volume_for_live_migration(
+            ctx, connection_info, instance, '/dev/vdb', cleanup_token)
+
+        attach_locked.assert_called_once_with(
+            ctx, connection_info, instance, '/dev/vdb',
+            allow_missing_instance=True,
+            expected_migration_token=cleanup_token)
+
+    @mock.patch.object(driver.IncusDriver, '_attach_volume_locked')
+    def test_stage_live_volume_rejects_unverified_profile(
+            self, attach_locked):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        self.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_CLEANUP_TOKEN_KEY:
+                '10000000-0000-0000-0000-000000000009',
+        }
+        profile.used_by = []
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaises(
+            exception.MigrationError,
+            incus_driver._stage_volume_for_live_migration,
+            ctx, {'serial': 'volume-id', 'data': {}},
+            instance, '/dev/vdb',
+            '10000000-0000-0000-0000-000000000001')
+
+        attach_locked.assert_not_called()
+
+    @mock.patch('os.path.realpath', return_value='/dev/sdc')
+    def test_attach_volume_resumes_connecting_journal(self, realpath):
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'},
+            '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        pending = driver._serialize_volume_attachment(
+            connection_info, {}, '/dev/sdd', phase='connecting')
+        profile = mock.Mock(
+            devices={},
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                'user.openstack.uuid': instance.uuid,
+                driver._volume_device_info_key(_TEST_VOLUME_ID): pending,
+            })
+        self.client.profiles.get.return_value = profile
+        driver._write_volume_journal(
+            instance, _TEST_VOLUME_ID, connection_info, {}, '/dev/sdd',
+            'connecting')
+        connector = mock.Mock()
+        connector.connect_volume.return_value = {'path': '/dev/sdc'}
+        driver.brick_get_connector = mock.Mock(return_value=connector)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.attach_volume(
+            context.get_admin_context(), connection_info, instance,
+            '/dev/sdd')
+
+        connector.connect_volume.assert_called_once_with(
+            connection_info['data'])
+        self.assertEqual('connected', jsonutils.loads(
+            profile.config[
+                driver._volume_device_info_key(_TEST_VOLUME_ID)])['phase'])
+        self.assertEqual(
+            '/dev/sdc', profile.devices[_TEST_VOLUME_ID]['source'])
+        self.assertIsNone(
+            driver._read_volume_journal(instance, _TEST_VOLUME_ID))
+
+    @mock.patch('os.path.realpath', return_value='/dev/sdc')
+    def test_detach_volume_reconnects_matching_connecting_journal(
+            self, realpath):
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'},
+            '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        pending = driver._serialize_volume_attachment(
+            connection_info, {}, '/dev/sdd', phase='connecting')
+        profile = mock.Mock(
+            devices={},
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                'user.openstack.uuid': instance.uuid,
+                driver._volume_device_info_key(_TEST_VOLUME_ID): pending,
+            })
+        self.client.profiles.get.return_value = profile
+        driver._write_volume_journal(
+            instance, _TEST_VOLUME_ID, connection_info, {}, '/dev/sdd',
+            'connecting')
+        connector = mock.Mock()
+        connector.connect_volume.return_value = {'path': '/dev/sdc'}
+        driver.brick_get_connector = mock.Mock(return_value=connector)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.detach_volume(
+            context.get_admin_context(), connection_info, instance,
+            '/dev/sdd')
+
+        connector.connect_volume.assert_called_once_with(
+            connection_info['data'])
+        connector.disconnect_volume.assert_called_once_with(
+            connection_info['data'], {'path': '/dev/sdc'})
+        self.assertIsNone(
+            driver._read_volume_journal(instance, _TEST_VOLUME_ID))
+        self.assertNotIn(
+            driver._volume_device_info_key(_TEST_VOLUME_ID), profile.config)
+
+    @mock.patch('os.path.realpath', return_value='/dev/sdc')
+    def test_detach_volume_recovers_connecting_journal_without_profile(
+            self, realpath):
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'},
+            '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        self.client.profiles.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+        driver._write_volume_journal(
+            instance, _TEST_VOLUME_ID, connection_info, {}, '/dev/sdd',
+            'connecting')
+        connector = mock.Mock()
+        connector.connect_volume.return_value = {'path': '/dev/sdc'}
+        driver.brick_get_connector = mock.Mock(return_value=connector)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.detach_volume(
+            context.get_admin_context(), connection_info, instance,
+            '/dev/sdd')
+
+        connector.connect_volume.assert_called_once_with(
+            connection_info['data'])
+        connector.disconnect_volume.assert_called_once_with(
+            connection_info['data'], {'path': '/dev/sdc'})
+        self.assertIsNone(
+            driver._read_volume_journal(instance, _TEST_VOLUME_ID))
+
+    def test_detach_volume_rejects_connecting_journal_for_other_rbd(self):
+        volume_id = '8231d2e8-1111-4222-8333-123456789abc'
+        recorded = {
+            'driver_volume_type': 'rbd',
+            'serial': volume_id,
+            'data': {'name': 'pool/volume-%s' % volume_id},
+        }
+        requested = copy.deepcopy(recorded)
+        requested['data']['name'] = 'other/volume-%s' % volume_id
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        pending = driver._serialize_volume_attachment(
+            recorded, {}, '/dev/sdd', phase='connecting')
+        profile = mock.Mock(
+            devices={},
+            config={driver._volume_device_info_key(volume_id): pending})
+        self.client.profiles.get.return_value = profile
+        driver._write_volume_journal(
+            instance, volume_id, recorded, {}, '/dev/sdd', 'connecting')
+        connector = mock.Mock()
+        driver.brick_get_connector = mock.Mock(return_value=connector)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaises(
+            exception.InvalidVolume, incus_driver.detach_volume,
+            context.get_admin_context(), requested, instance, '/dev/sdd')
+
+        connector.connect_volume.assert_not_called()
+        connector.disconnect_volume.assert_not_called()
+        self.assertEqual(
+            'connecting',
+            driver._read_volume_journal(instance, volume_id)['phase'])
+
+    @mock.patch('os.path.realpath', return_value='/dev/sdc')
+    def test_attach_volume_recovers_connected_journal_before_profile(
+            self, realpath):
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'},
+            '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        pending = driver._serialize_volume_attachment(
+            connection_info, {}, '/dev/sdd', phase='connecting')
+        profile = mock.Mock(
+            devices={},
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                'user.openstack.uuid': instance.uuid,
+                driver._volume_device_info_key(_TEST_VOLUME_ID): pending,
+            })
+        self.client.profiles.get.return_value = profile
+        driver._write_volume_journal(
+            instance, _TEST_VOLUME_ID, connection_info,
+            {'path': '/dev/sdc'},
+            '/dev/sdd', 'connected')
+        connector = mock.Mock()
+        connector.connect_volume.return_value = {'path': '/dev/sdc'}
+        driver.brick_get_connector = mock.Mock(return_value=connector)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.attach_volume(
+            context.get_admin_context(), connection_info, instance,
+            '/dev/sdd')
+
+        connector.connect_volume.assert_called_once_with(
+            connection_info['data'])
+        self.assertEqual('connected', jsonutils.loads(
+            profile.config[
+                driver._volume_device_info_key(_TEST_VOLUME_ID)])['phase'])
+        self.assertIsNone(
+            driver._read_volume_journal(instance, _TEST_VOLUME_ID))
+
+    @mock.patch('os.path.realpath', return_value='/dev/sdc')
+    def test_attach_volume_finishes_disconnect_before_reconnect(
+            self, realpath):
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'},
+            '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        disconnecting = driver._serialize_volume_attachment(
+            connection_info, {'path': '/dev/sdc'}, '/dev/sdd',
+            phase='disconnecting')
+        profile = mock.Mock(
+            devices={},
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                'user.openstack.uuid': instance.uuid,
+                driver._volume_device_info_key(
+                    _TEST_VOLUME_ID): disconnecting,
+            })
+        self.client.profiles.get.return_value = profile
+        driver._write_volume_journal(
+            instance, _TEST_VOLUME_ID, connection_info,
+            {'path': '/dev/sdc'},
+            '/dev/sdd', 'disconnecting')
+        connector = mock.Mock()
+        connector.connect_volume.return_value = {'path': '/dev/sdc'}
+        driver.brick_get_connector = mock.Mock(return_value=connector)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.attach_volume(
+            context.get_admin_context(), connection_info, instance,
+            '/dev/sdd')
+
+        connector.disconnect_volume.assert_called_once_with(
+            connection_info['data'], {'path': '/dev/sdc'})
+        connector.connect_volume.assert_called_once_with(
+            connection_info['data'])
+        self.assertEqual('connected', jsonutils.loads(
+            profile.config[
+                driver._volume_device_info_key(_TEST_VOLUME_ID)])['phase'])
+        self.assertIsNone(
+            driver._read_volume_journal(instance, _TEST_VOLUME_ID))
 
     def test_attach_volume_requires_guest_fuse_helper_before_connect(self):
         profile = mock.Mock(devices={}, config={})
@@ -3215,10 +8986,21 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
     @mock.patch('os.path.realpath', return_value='/dev/sdc')
     def test_attach_volume_rolls_back_host_connection(self, realpath):
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
         profile = mock.Mock()
         profile.devices = {}
-        profile.config = {}
-        profile.save.side_effect = RuntimeError('Incus API failed')
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+        }
+        profile.save.side_effect = [
+            None,
+            RuntimeError('Incus API failed'),
+            None,
+            None,
+            None,
+        ]
         self.client.profiles.get.return_value = profile
         volume_connector = mock.Mock()
         device_info = {'path': '/dev/sdc'}
@@ -3228,8 +9010,6 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             {'id': 1, 'name': 'volume-00000001'},
             '10.0.2.15:3260',
             'iqn.2010-10.org.openstack:volume-00000001')
-        instance = fake_instance.fake_instance_obj(
-            context.get_admin_context(), name='test', memory_mb=0)
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
@@ -3244,16 +9024,26 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     @mock.patch('os.path.realpath', return_value='/dev/sdc')
     def test_attach_volume_retains_mapping_when_profile_still_references_it(
             self, realpath):
-        initial = mock.Mock(devices={}, config={})
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        owner_config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+        }
+        initial = mock.Mock(devices={}, config=dict(owner_config))
         initial.save.side_effect = RuntimeError('profile update failed')
         persisted = mock.Mock(
-            devices={'1': {
+            devices={_TEST_VOLUME_ID: {
                 'path': '/dev/sdd',
                 'required': 'true',
                 'source': '/dev/sdc',
                 'type': 'unix-block',
             }},
-            config={'user.openstack.volume.1': '{"path":"/dev/sdc"}'})
+            config={
+                **owner_config,
+                driver._volume_device_info_key(_TEST_VOLUME_ID):
+                    '{"path":"/dev/sdc"}',
+            })
         persisted.save.side_effect = RuntimeError('instance is busy')
         still_persisted = mock.Mock(
             devices=dict(persisted.devices),
@@ -3266,8 +9056,6 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         connection_info = fake_connection_info(
             {'id': 1, 'name': 'volume-00000001'}, '10.0.2.15:3260',
             'iqn.2010-10.org.openstack:volume-00000001')
-        instance = fake_instance.fake_instance_obj(
-            context.get_admin_context(), name='test', memory_mb=0)
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
@@ -3295,6 +9083,28 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             incus_driver.attach_volume,
             context.get_admin_context(), connection_info, instance,
             '/dev/sdd', encryption={'provider': 'luks'})
+
+        volume_connector.connect_volume.assert_not_called()
+
+    def test_attach_connection_encryption_marker_is_rejected_before_connect(
+            self):
+        volume_connector = mock.Mock()
+        driver.brick_get_connector = mock.Mock(return_value=volume_connector)
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'},
+            '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        connection_info['data']['encrypted'] = {'provider': 'luks'}
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaises(
+            exception.VolumeEncryptionNotSupported,
+            incus_driver.attach_volume,
+            context.get_admin_context(), connection_info, instance,
+            '/dev/sdd')
 
         volume_connector.connect_volume.assert_not_called()
 
@@ -3384,8 +9194,13 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         }, ['unix_block_limits']))
 
     def test_attach_volume_rejects_duplicate_mountpoint_before_connect(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
         profile = mock.Mock()
-        profile.config = {}
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+        }
         profile.devices = {
             'existing-volume': {
                 'path': '/dev/sdd',
@@ -3404,18 +9219,93 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                 'nova.virt.incus.driver.brick_get_connector') as get_connector:
             self.assertRaises(
                 exception.DevicePathInUse, incus_driver.attach_volume,
-                context.get_admin_context(), connection_info,
-                fake_instance.fake_instance_obj(
-                    context.get_admin_context(), name='test'),
-                '/dev/sdd')
+                ctx, connection_info, instance, '/dev/sdd')
 
         get_connector.assert_not_called()
 
+    def test_attach_volume_serializes_different_ids_for_same_mountpoint(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-topology-lock', memory_mb=0)
+        profile = mock.Mock(
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                'user.openstack.uuid': instance.uuid,
+            },
+            devices={})
+        self.client.profiles.get.return_value = profile
+        self.client.instances.get.return_value = mock.Mock(status='Stopped')
+
+        first_connect_entered = threading.Event()
+        release_first_connect = threading.Event()
+        second_started = threading.Event()
+        connector = mock.Mock()
+
+        def connect_volume(connection_data):
+            first_connect_entered.set()
+            if not release_first_connect.wait(5):
+                raise RuntimeError('test timed out waiting to release connect')
+            return {'path': '/dev/sdc'}
+
+        connector.connect_volume.side_effect = connect_volume
+        driver.brick_get_connector = mock.Mock(return_value=connector)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        connections = [
+            fake_connection_info(
+                {'id': index, 'name': 'volume-%d' % index},
+                '10.0.2.15:3260',
+                'iqn.2010-10.org.openstack:volume-%d' % index)
+            for index in (1, 2)
+        ]
+        results = []
+
+        def attach(connection_info, started=None):
+            if started is not None:
+                started.set()
+            try:
+                incus_driver.attach_volume(
+                    ctx, connection_info, instance, '/dev/sdd')
+            except Exception as exc:
+                results.append(exc)
+            else:
+                results.append(None)
+
+        first = threading.Thread(target=attach, args=(connections[0],))
+        second = threading.Thread(
+            target=attach, args=(connections[1], second_started))
+        first.start()
+        self.assertTrue(first_connect_entered.wait(5))
+        second.start()
+        self.assertTrue(second_started.wait(5))
+        time.sleep(0.1)
+        self.assertEqual(1, connector.connect_volume.call_count)
+        self.assertTrue(second.is_alive())
+
+        release_first_connect.set()
+        first.join(5)
+        second.join(5)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(1, connector.connect_volume.call_count)
+        self.assertEqual(1, sum(result is None for result in results))
+        failures = [result for result in results if result is not None]
+        self.assertEqual(1, len(failures))
+        self.assertIsInstance(failures[0], exception.DevicePathInUse)
+        self.assertEqual(['/dev/sdd'], [
+            device['path'] for device in profile.devices.values()])
+
     def test_attach_volume_rejects_duplicate_volume_before_connect(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
         profile = mock.Mock()
-        profile.config = {}
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+        }
         profile.devices = {
-            '1': {
+            _TEST_VOLUME_ID: {
                 'path': '/dev/sdc',
                 'source': '/dev/dm-0',
                 'type': 'unix-block',
@@ -3432,18 +9322,20 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                 'nova.virt.incus.driver.brick_get_connector') as get_connector:
             self.assertRaises(
                 exception.InvalidVolume, incus_driver.attach_volume,
-                context.get_admin_context(), connection_info,
-                fake_instance.fake_instance_obj(
-                    context.get_admin_context(), name='test'),
-                '/dev/sdd')
+                ctx, connection_info, instance, '/dev/sdd')
 
         get_connector.assert_not_called()
 
     @mock.patch('os.path.realpath', return_value='/var/lib/tenant-volume')
     def test_attach_volume_rejects_non_device_connector_path(self, realpath):
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
         profile = mock.Mock()
         profile.devices = {}
-        profile.config = {}
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+        }
         self.client.profiles.get.return_value = profile
         volume_connector = mock.Mock()
         device_info = {'path': '/var/lib/tenant-volume'}
@@ -3452,8 +9344,6 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         connection_info = fake_connection_info(
             {'id': 1, 'name': 'volume-00000001'},
             '10.0.2.15', 'iqn.2010-10.org.openstack:volume-00000001')
-        instance = fake_instance.fake_instance_obj(
-            context.get_admin_context(), name='test', memory_mb=0)
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
@@ -3466,9 +9356,14 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             connection_info['data'], device_info)
 
     def test_attach_volume_without_device_path_disconnects(self):
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
         profile = mock.Mock()
         profile.devices = {}
-        profile.config = {}
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+        }
         self.client.profiles.get.return_value = profile
         volume_connector = mock.Mock()
         device_info = {}
@@ -3478,8 +9373,6 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             {'id': 1, 'name': 'volume-00000001'},
             '10.0.2.15:3260',
             'iqn.2010-10.org.openstack:volume-00000001')
-        instance = fake_instance.fake_instance_obj(
-            context.get_admin_context(), name='test', memory_mb=0)
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
@@ -3505,7 +9398,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                 'path': '/',
                 'type': 'disk'
             },
-            '1': {
+            _TEST_VOLUME_ID: {
                 'path': '/dev/sdc',
                 'source': '/dev/drbd1000',
                 'type': 'unix-block'
@@ -3533,7 +9426,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             {'id': 1, 'name': 'volume-00000001'},
             '10.0.2.15:3260', 'iqn.2010-10.org.openstack:volume-00000001',
             auth=True)
-        mountpoint = mock.Mock()
+        mountpoint = '/dev/sdc'
 
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
@@ -3543,10 +9436,14 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         incus_driver.detach_volume(ctx, connection_info, instance,
                                    mountpoint, None)
 
-        incus_driver.client.profiles.get.assert_called_once_with(instance.name)
+        self.assertEqual(
+            [mock.call(instance.name)] * 3,
+            incus_driver.client.profiles.get.call_args_list)
 
         self.assertEqual(expected, profile.devices)
-        profile.save.assert_called_once_with(wait=True)
+        self.assertEqual(
+            [mock.call(wait=True), mock.call(wait=True)],
+            profile.save.call_args_list)
         volume_connector.disconnect_volume.assert_called_once_with(
             connection_info['data'], {'path': '/dev/drbd1000'})
 
@@ -3556,11 +9453,18 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'source': '/dev/rbd0',
             'type': 'unix-block',
         }
-        profile = mock.Mock(devices={'1': device}, config={})
-        profile.save.side_effect = incus_operation_exception(
-            400, 'profile change still saved')
+        profile = mock.Mock(devices={_TEST_VOLUME_ID: device}, config={})
         persisted = mock.Mock(devices={}, config={})
-        self.client.profiles.get.side_effect = [profile, persisted]
+
+        def save_with_persisted_failure(wait=True):
+            persisted.devices = copy.deepcopy(profile.devices)
+            persisted.config = copy.deepcopy(profile.config)
+            raise incus_operation_exception(
+                400, 'profile change still saved')
+
+        profile.save.side_effect = save_with_persisted_failure
+        self.client.profiles.get.side_effect = [
+            profile, profile, persisted, persisted]
         connector = mock.Mock()
         driver.brick_get_connector = mock.Mock(return_value=connector)
         connection_info = fake_connection_info(
@@ -3584,10 +9488,11 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'source': '/dev/rbd0',
             'type': 'unix-block',
         }
-        profile = mock.Mock(devices={'1': device}, config={})
+        profile = mock.Mock(devices={_TEST_VOLUME_ID: device}, config={})
         profile.save.side_effect = RuntimeError('instance is busy')
-        persisted = mock.Mock(devices={'1': device}, config={})
-        self.client.profiles.get.side_effect = [profile, persisted]
+        persisted = mock.Mock(
+            devices={_TEST_VOLUME_ID: device}, config={})
+        self.client.profiles.get.side_effect = [profile, profile, persisted]
         connector = mock.Mock()
         driver.brick_get_connector = mock.Mock(return_value=connector)
         connection_info = fake_connection_info(
@@ -3635,7 +9540,9 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         self.assertNotIn(volume_id, profile.devices)
         self.assertNotIn(metadata_key, profile.config)
-        profile.save.assert_called_once_with(wait=True)
+        self.assertEqual(
+            [mock.call(wait=True), mock.call(wait=True)],
+            profile.save.call_args_list)
         driver.brick_get_connector.assert_called_once_with('rbd')
         connector.disconnect_volume.assert_called_once_with(
             connection_info['data'], {'path': '/dev/rbd7'})
@@ -3670,7 +9577,9 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         self.assertNotIn(volume_id, profile.devices)
         self.assertNotIn(metadata_key, profile.config)
-        profile.save.assert_called_once_with(wait=True)
+        self.assertEqual(
+            [mock.call(wait=True), mock.call(wait=True)],
+            profile.save.call_args_list)
         connector.disconnect_volume.assert_called_once_with(
             connection_info['data'], {'path': '/dev/rbd7'})
 
@@ -3710,23 +9619,60 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                 'name': 'cinder-volumes/volume-%s' % volume_id,
             },
         }
-        instance = mock.Mock(
-            name='instance-00000001', root_device_name='/dev/sda')
-        self.client.profiles.get.side_effect = incuscore_exceptions.NotFound(
-            mock.Mock())
+        instance = mock.Mock(root_device_name='/dev/sda')
+        instance.name = 'instance-00000001'
+        instance.uuid = '10000000-0000-0000-0000-000000000001'
+        not_found = incuscore_exceptions.NotFound(MockResponse(404))
+        self.client.instances.get.side_effect = not_found
+        self.client.profiles.get.side_effect = not_found
         incus_driver = driver.IncusDriver(None)
         incus_driver.client = self.client
 
         incus_driver.detach_volume(
             mock.sentinel.context, connection_info, instance, '/dev/sda')
 
+        self.client.instances.get.assert_called_once_with(instance.name)
         self.client.profiles.get.assert_called_once_with(instance.name)
+
+    def test_detach_bfv_root_rejects_existing_instance(self):
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'}, '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        instance = mock.Mock(
+            name='instance-00000001', root_device_name='/dev/sda')
+        self.client.instances.get.return_value = mock.sentinel.container
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        self.assertRaisesRegex(
+            exception.InvalidVolume, 'instance still exists',
+            incus_driver.detach_volume, mock.sentinel.context,
+            connection_info, instance, '/dev/sda')
+
+        self.client.profiles.get.assert_not_called()
+
+    def test_detach_bfv_root_rejects_existing_profile(self):
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'}, '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        instance = mock.Mock(
+            name='instance-00000001', root_device_name='/dev/sda')
+        self.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+        self.client.profiles.get.return_value = mock.sentinel.profile
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        self.assertRaisesRegex(
+            exception.InvalidVolume, 'profile still exists',
+            incus_driver.detach_volume, mock.sentinel.context,
+            connection_info, instance, '/dev/sda')
 
     def test_detach_missing_profile_does_not_hide_data_volume(self):
         instance = mock.Mock(
             name='instance-00000001', root_device_name='/dev/sda')
         self.client.profiles.get.side_effect = incuscore_exceptions.NotFound(
-            mock.Mock())
+            MockResponse(404))
         incus_driver = driver.IncusDriver(None)
         incus_driver.client = self.client
 
@@ -3743,7 +9689,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'type': 'unix-block',
         }
         profile = mock.Mock()
-        profile.devices = {'1': device}
+        profile.devices = {_TEST_VOLUME_ID: device}
         profile.config = {}
         self.client.profiles.get.return_value = profile
         volume_connector = mock.Mock()
@@ -3762,12 +9708,16 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             RuntimeError, incus_driver.detach_volume,
             ctx, connection_info, instance, '/dev/sdc')
 
-        self.assertEqual({'1': device}, profile.devices)
-        self.assertEqual(2, profile.save.call_count)
+        self.assertEqual({}, profile.devices)
+        self.assertEqual(1, profile.save.call_count)
+        record = driver._read_volume_journal(instance, _TEST_VOLUME_ID)
+        self.assertEqual('disconnecting', record['phase'])
+        self.assertIn(
+            driver._volume_device_info_key(_TEST_VOLUME_ID), profile.config)
 
     def test_detach_volume_uses_persisted_connector_device_info(self):
         profile = mock.Mock()
-        profile.devices = {'1': {
+        profile.devices = {_TEST_VOLUME_ID: {
             'path': '/dev/sdc',
             'source': '/dev/rbd0',
             'type': 'unix-block',
@@ -3778,7 +9728,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'conf': '/run/os-brick/volume.conf',
         }
         profile.config = {
-            'user.openstack.volume.1': jsonutils.dumps(device_info),
+            driver._volume_device_info_key(_TEST_VOLUME_ID):
+                jsonutils.dumps(device_info),
         }
         self.client.profiles.get.return_value = profile
         volume_connector = mock.Mock()
@@ -3796,7 +9747,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         volume_connector.disconnect_volume.assert_called_once_with(
             connection_info['data'], device_info)
-        self.assertNotIn('user.openstack.volume.1', profile.config)
+        self.assertNotIn(
+            driver._volume_device_info_key(_TEST_VOLUME_ID), profile.config)
 
     def test_swap_volume_is_rejected_without_block_copy(self):
         old_info = fake_connection_info(
@@ -3974,6 +9926,12 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         instance.config_drive = True
+        container = self.client.instances.get.return_value
+        container.config = {'volatile.idmap.base': '1065536'}
+        container.expanded_devices = {
+            'root': {'type': 'disk', 'path': '/', 'pool': 'root'}}
+        self.client.profiles.get.return_value.config = {
+            'security.idmap.size': '65536'}
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
@@ -3982,7 +9940,6 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             incus_driver.migrate_disk_and_power_off,
             ctx, instance, '10.224.0.17', instance.flavor, [])
 
-        container = self.client.instances.get.return_value
         pack_configdrive.assert_called_once_with(instance, container)
         container.stop.assert_not_called()
 
@@ -4108,6 +10065,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
     def test_resume_state_on_host_boot(self):
         container = mock.Mock()
+        container.status = 'Stopped'
+        container.status_code = None
         state = mock.Mock()
         state.memory = dict({'usage': 0, 'usage_peak': 0})
         state.status_code = 102
@@ -4116,12 +10075,41 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
+        container.name = instance.name
+        container.type = 'container'
+        self.client.instances.all.return_value = [container]
 
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
         incus_driver.resume_state_on_host_boot(ctx, instance, None, None, None)
         container.start.assert_called_once_with(wait=True)
+        self.ensure_start_idmap.assert_called_once_with(
+            instance, container, _claim_lock_held=True)
+
+    def test_resume_state_on_host_boot_forwards_bdm_and_fails_closed(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-host-boot-volume-failure', memory_mb=0)
+        block_device_info = {'block_device_mapping': [mock.sentinel.bdm]}
+        network_info = mock.sentinel.network_info
+        share_info = [mock.sentinel.share]
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver.get_info = mock.Mock(
+            return_value=mock.Mock(state=power_state.SHUTDOWN))
+        failure = exception.InvalidVolume(reason='topology mismatch')
+        incus_driver.power_on = mock.Mock(side_effect=failure)
+
+        raised = self.assertRaises(
+            exception.InvalidVolume,
+            incus_driver.resume_state_on_host_boot,
+            ctx, instance, network_info, share_info, block_device_info)
+
+        self.assertIs(failure, raised)
+        incus_driver.power_on.assert_called_once_with(
+            ctx, instance, network_info, block_device_info,
+            share_info=share_info)
 
     def test_rescue_is_rejected_without_storage_native_implementation(self):
         ctx = context.get_admin_context()
@@ -4161,7 +10149,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         incus_driver.power_off(instance)
 
         self.client.instances.get.assert_called_once_with(instance.name)
-        container.stop.assert_called_once_with(wait=True)
+        container.stop.assert_called_once_with(
+            timeout=0, force=True, wait=True)
 
     def test_power_off_retries_busy_operation(self):
         container = mock.Mock(status='Running')
@@ -4180,6 +10169,72 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         self.assertEqual(2, container.stop.call_count)
 
+    def test_power_off_honors_graceful_timeout(self):
+        container = mock.Mock(status='Running')
+        self.client.instances.get.return_value = container
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.power_off(instance, timeout=15, retry_interval=3)
+
+        container.stop.assert_called_once_with(
+            timeout=15, force=False, wait=True)
+
+    def test_power_off_forces_after_guest_shutdown_failure(self):
+        graceful = mock.Mock(status='Running')
+        forced = mock.Mock(status='Running')
+        graceful.stop.side_effect = incus_operation_exception(
+            400, 'Guest failed to shut down')
+        self.client.instances.get.side_effect = [graceful, forced]
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.power_off(instance, timeout=15)
+
+        graceful.stop.assert_called_once_with(
+            timeout=15, force=False, wait=True)
+        forced.stop.assert_called_once_with(
+            timeout=0, force=True, wait=True)
+
+    def test_power_off_does_not_mask_authorization_failure(self):
+        container = mock.Mock(status='Running')
+        failure = incus_api_exception(403, 'not authorized')
+        container.stop.side_effect = failure
+        self.client.instances.get.return_value = container
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        raised = self.assertRaises(
+            incuscore_exceptions.LXDAPIException,
+            incus_driver.power_off, instance, timeout=15)
+
+        self.assertIs(failure, raised)
+        container.stop.assert_called_once_with(
+            timeout=15, force=False, wait=True)
+
+    def test_power_off_converges_after_lost_response(self):
+        stopping = mock.Mock(status='Running')
+        stopped = mock.Mock(status='Stopped')
+        stopping.stop.side_effect = (
+            incuscore_exceptions.ClientConnectionFailed('response lost'))
+        self.client.instances.get.side_effect = [stopping, stopped]
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.power_off(instance)
+
+        stopping.stop.assert_called_once_with(
+            timeout=0, force=True, wait=True)
+        stopped.stop.assert_not_called()
+
     def test_power_on(self):
         container = mock.Mock()
         container.status = 'Stopped'
@@ -4194,6 +10249,27 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         self.client.instances.get.assert_called_once_with(instance.name)
         container.start.assert_called_once_with(wait=True)
+        self.ensure_start_idmap.assert_called_once_with(
+            instance, container, _claim_lock_held=True)
+
+    def test_power_on_idmap_failure_blocks_start(self):
+        container = self.client.instances.get.return_value
+        container.status = 'Stopped'
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        failure = driver.incus_idmap.IDMapIntegrityError(
+            reason='allocator generation changed')
+        self.ensure_start_idmap.side_effect = failure
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        raised = self.assertRaises(
+            driver.incus_idmap.IDMapIntegrityError,
+            incus_driver.power_on,
+            context.get_admin_context(), instance, None)
+
+        self.assertIs(failure, raised)
+        container.start.assert_not_called()
 
     def test_power_on_reasserts_vifs_after_start(self):
         container = mock.Mock(status='Stopped')
@@ -4227,6 +10303,23 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         self.assertEqual(2, container.start.call_count)
 
+    def test_power_on_converges_after_lost_response(self):
+        starting = mock.Mock(status='Stopped')
+        running = mock.Mock(status='Running')
+        starting.start.side_effect = (
+            incuscore_exceptions.ClientConnectionFailed('response lost'))
+        self.client.instances.get.side_effect = [starting, running]
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test', memory_mb=0)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.power_on(
+            context.get_admin_context(), instance, None)
+
+        starting.start.assert_called_once_with(wait=True)
+        running.start.assert_not_called()
+
     @mock.patch('socket.gethostname', mock.Mock(return_value='fake_hostname'))
     @mock.patch('os.statvfs', return_value=mock.Mock(
         f_blocks=131072000, f_bsize=8192, f_bavail=65536000))
@@ -4243,7 +10336,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             },
             'hypervisor_hostname': 'fake_hostname',
             'hypervisor_type': 'lxd',
-            'hypervisor_version': '011',
+            'hypervisor_version': 7002,
             'local_gb': 1000,
             'local_gb_used': 500,
             'memory_mb': 10000,
@@ -4278,6 +10371,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         incus_config = {
             'environment': {
                 'storage': 'dir',
+                'server_version': '7.2',
             },
             'config': {}
         }
@@ -4289,6 +10383,61 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         value['cpu_info'] = jsonutils.loads(value['cpu_info'])
 
         self.assertEqual(expected, value)
+
+    @mock.patch.object(
+        driver, '_get_fs_info',
+        return_value={
+            'total': 100 * units.Gi,
+            'used': 20 * units.Gi,
+            'available': 80 * units.Gi,
+        })
+    @mock.patch.object(
+        driver, '_get_ram_usage',
+        return_value={
+            'total': 16 * units.Gi,
+            'used': 4 * units.Gi,
+        })
+    @mock.patch.object(
+        driver, '_get_cpu_info',
+        return_value={
+            'flags': 'flag',
+            'model name': 'model',
+            'socket(s)': '1',
+            'core(s) per socket': '4',
+            'thread(s) per core': '2',
+            'vendor id': 'vendor',
+        })
+    def test_host_resource_snapshot_cache_is_single_use(
+            self, get_cpu_info, get_ram_usage, get_fs_info):
+        self.client.host_info = {
+            'environment': {
+                'storage': 'dir',
+                'server_version': '7.2',
+            },
+        }
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        initial = incus_driver._get_host_resource_snapshot('compute-1')
+        get_cpu_info.reset_mock()
+        get_ram_usage.reset_mock()
+        get_fs_info.reset_mock()
+
+        cached = incus_driver._get_host_resource_snapshot(
+            'compute-1', use_cache=True)
+
+        self.assertEqual(initial, cached)
+        get_cpu_info.assert_not_called()
+        get_ram_usage.assert_not_called()
+        get_fs_info.assert_not_called()
+
+        refreshed = incus_driver._get_host_resource_snapshot(
+            'compute-1', use_cache=True)
+
+        self.assertEqual(initial, refreshed)
+        get_cpu_info.assert_called_once_with()
+        get_ram_usage.assert_called_once_with()
+        get_fs_info.assert_called_once_with(self.CONF.incus.root_dir)
 
     @mock.patch.object(driver.processutils, 'execute')
     def test__get_zpool_info(self, execute):
@@ -4347,6 +10496,21 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         }, result)
         pool.resources.get.assert_not_called()
 
+    def test_placement_storage_pool_info_reads_local_pool_once(self):
+        pool = self.client.storage_pools.get.return_value
+        pool.driver = 'zfs'
+        pool.resources.get.return_value.space = {
+            'total': 30 * units.Gi,
+            'used': 10 * units.Gi,
+        }
+
+        result = driver._placement_storage_pool_info(
+            self.client, 'local-rootfs')
+
+        self.assertEqual(30 * units.Gi, result['total'])
+        self.client.storage_pools.get.assert_called_once_with('local-rootfs')
+        pool.resources.get.assert_called_once_with()
+
     def test_placement_storage_pool_info_requires_shared_budget(self):
         self.client.storage_pools.get.return_value.driver = 'ceph'
 
@@ -4380,7 +10544,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             },
             'hypervisor_hostname': 'fake_hostname',
             'hypervisor_type': 'lxd',
-            'hypervisor_version': '011',
+            'hypervisor_version': 7002,
             'local_gb': 2222,
             'local_gb_used': 200,
             'memory_mb': 10000,
@@ -4420,6 +10584,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         incus_config = {
             'environment': {
                 'storage': 'zfs',
+                'server_version': '7.2',
             },
             'config': {
                 'storage.zfs_pool_name': 'incus',
@@ -4654,7 +10819,35 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         self.client.instances.get.assert_not_called()
 
-    def test_finish_revert_migration(self):
+    def _prepare_cold_revert_protocol(self, instance, container, remote):
+        cleanup_token = '10000000-0000-0000-0000-000000000001'
+        container.config = {'volatile.idmap.base': '1065536'}
+        container.expanded_devices = {
+            'root': {'type': 'disk', 'path': '/', 'pool': 'root'}}
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: cleanup_token,
+            driver.MIGRATION_DESTINATION_KEY:
+                'https://192.0.2.20:8443',
+            'security.idmap.size': '65536',
+        }
+        self.client.storage_pools.get.return_value.driver = 'zfs'
+        self._get_migration_attempt.return_value = {
+            'state': 'aborted',
+            'finished': True,
+            'operation_uuid': '',
+        }
+        self.client.api.operations.get.return_value.json.return_value = {
+            'metadata': {}}
+        remote.instances.get.side_effect = incuscore_exceptions.NotFound(
+            MockResponse(404))
+        remote.profiles.get.side_effect = incuscore_exceptions.NotFound(
+            MockResponse(404))
+        return profile
+
+    @mock.patch.object(driver, '_migration_client')
+    def test_finish_revert_migration(self, migration_client):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
@@ -4663,6 +10856,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         container = mock.Mock()
         container.status = 'Stopped'
         self.client.instances.get.return_value = container
+        self._prepare_cold_revert_protocol(
+            instance, container, migration_client.return_value)
         migration = mock.Mock(
             source_compute='compute', dest_compute='compute')
 
@@ -4674,9 +10869,45 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         container.start.assert_called_once_with(wait=True)
 
+    @mock.patch.object(driver, '_migration_client')
+    def test_finish_revert_migration_replays_completion_marker(
+            self, migration_client):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        container = mock.Mock(status='Running')
+        self.client.instances.get.return_value = container
+        profile = self._prepare_cold_revert_protocol(
+            instance, container, migration_client.return_value)
+        cleanup_token = profile.config[
+            driver.MIGRATION_CLEANUP_TOKEN_KEY]
+        profile.config[driver.MIGRATION_ROLLBACK_COMPLETE_KEY] = cleanup_token
+        migration = mock.Mock(
+            source_compute='source', dest_compute='destination')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver.attach_volume = mock.Mock()
+        incus_driver._refresh_vifs = mock.Mock()
+
+        # Simulate a compute-process restart after the source was restored and
+        # marked but before Nova observed the first return. Replaying the
+        # manager callback must only finish the remote protocol.
+        incus_driver.finish_revert_migration(
+            ctx, instance, [mock.sentinel.vif], migration)
+        incus_driver.finish_revert_migration(
+            ctx, instance, [mock.sentinel.vif], migration)
+
+        self.assertEqual(2, container.sync.call_count)
+        self.assertEqual(2, self._retire_migration_attempt.call_count)
+        self._get_migration_attempt.assert_not_called()
+        incus_driver.attach_volume.assert_not_called()
+        incus_driver._refresh_vifs.assert_not_called()
+        container.start.assert_not_called()
+
     def test_get_vcpus_used_counts_only_nova_owned_records(self):
         owned = mock.Mock(
             name='owned',
+            type='container',
             expanded_config={
                 'user.openstack.uuid': '00000000-0000-0000-0000-000000000001',
                 'limits.cpu': '4',
@@ -4684,6 +10915,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         owned.name = 'instance-owned'
         stopped = mock.Mock(
             name='stopped',
+            type='container',
             expanded_config={
                 'user.openstack.uuid': '00000000-0000-0000-0000-000000000002',
                 'limits.cpu': '2',
@@ -4691,10 +10923,12 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         stopped.name = 'instance-stopped'
         foreign = mock.Mock(
             name='foreign',
+            type='container',
             expanded_config={'limits.cpu': '32'})
         foreign.name = 'operator-container'
         malformed = mock.Mock(
             name='malformed',
+            type='container',
             expanded_config={
                 'user.openstack.uuid': '00000000-0000-0000-0000-000000000003',
                 'limits.cpu': '0-3',
@@ -4706,6 +10940,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         incus_driver.client = self.client
 
         self.assertEqual(6, incus_driver._get_vcpus_used())
+        self.client.instances.all.assert_called_once_with(recursion=1)
 
     def test_set_admin_password_uses_stdin_and_image_admin_user(self):
         instance = mock.Mock(
@@ -4779,6 +11014,87 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertIs(first.__class__, second.__class__)
         broker_factory.assert_called_once_with('192.0.2.10', container)
 
+    @mock.patch.object(driver.incus_console, 'SerialConsoleBroker')
+    def test_get_serial_console_serializes_concurrent_broker_creation(
+            self, broker_factory):
+        self.CONF.serial_console.enabled = True
+        self.CONF.serial_console.proxyclient_address = '192.0.2.10'
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-console')
+        container = self.client.instances.get.return_value
+        container.status = 'Running'
+        broker = mock.Mock(port=10001)
+
+        def create_broker(*args):
+            # Yield the GIL so an implementation without registry locking
+            # enters the constructor twice.
+            time.sleep(0.05)
+            return broker
+
+        broker_factory.side_effect = create_broker
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+        barrier = threading.Barrier(3)
+        results = []
+        errors = []
+
+        def get_console():
+            barrier.wait()
+            try:
+                results.append(
+                    incus_driver.get_serial_console(None, instance))
+            except Exception as exc:
+                errors.append(exc)
+
+        workers = [
+            threading.Thread(target=get_console),
+            threading.Thread(target=get_console),
+        ]
+        for worker in workers:
+            worker.start()
+        barrier.wait()
+        for worker in workers:
+            worker.join(timeout=5)
+
+        self.assertFalse(errors)
+        self.assertEqual(2, len(results))
+        broker_factory.assert_called_once_with('192.0.2.10', container)
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+
+    def test_get_serial_console_rejects_destroy_in_progress(self):
+        self.CONF.serial_console.enabled = True
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-console')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+        incus_driver._serial_console_destroying.add(instance.uuid)
+
+        self.assertRaises(
+            exception.InstanceNotRunning,
+            incus_driver.get_serial_console, None, instance)
+
+        self.client.instances.get.assert_not_called()
+
+    def test_cleanup_host_closes_every_serial_console_broker(self):
+        incus_driver = driver.IncusDriver(None)
+        first = mock.Mock()
+        first.close.side_effect = RuntimeError('close failed')
+        second = mock.Mock()
+        incus_driver._serial_consoles = {
+            'first': first,
+            'second': second,
+        }
+        incus_driver._serial_console_destroying.add('first')
+
+        incus_driver.cleanup_host(None)
+
+        first.close.assert_called_once_with()
+        second.close.assert_called_once_with()
+        self.assertEqual({}, incus_driver._serial_consoles)
+        self.assertEqual(set(), incus_driver._serial_console_destroying)
+
     def test_get_serial_console_rejects_stopped_instance(self):
         self.CONF.serial_console.enabled = True
         instance = mock.Mock(
@@ -4793,7 +11109,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             incus_driver.get_serial_console, None, instance)
 
     @mock.patch.object(driver.os.path, 'ismount', return_value=False)
-    @mock.patch.object(driver.privsep_fs, 'mount')
+    @mock.patch.object(driver.incus_privsep, 'mount')
     @mock.patch.object(driver.os, 'chmod')
     def test_mount_nfs_share_stages_incus_device(
             self, chmod, mount, ismount):
@@ -4803,10 +11119,12 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         instance = mock.Mock(
             uuid='00000000-0000-0000-0000-000000000001',
             name='instance-share')
+        instance.name = 'instance-share'
         share = mock.Mock(
             share_id='10000000-0000-0000-0000-000000000001',
             instance_uuid=instance.uuid,
             tag='project-data',
+            export_location='server:/project-data',
             share_proto='NFS')
         profile = self.client.profiles.get.return_value
         profile.devices = {}
@@ -4824,14 +11142,15 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             mock.call(instance_root, mode=0o711),
             mock.call(mount_path, mode=0o700),
         ], driver.fileutils.ensure_tree.call_args_list)
-        self.assertEqual([
+        chmod.assert_has_calls([
             mock.call(share_root, 0o711),
             mock.call(instance_root, 0o711),
             mock.call(mount_path, 0o700),
-        ], chmod.call_args_list)
+        ])
         mount.assert_called_once_with(
             'nfs', share.export_location, mount_path,
-            ['-o', 'nosuid,nodev'])
+            ['rw', 'nosuid', 'nodev'],
+            self.CONF.incus.share_mount_timeout)
         self.assertEqual({
             'type': 'disk',
             'source': mount_path,
@@ -4841,20 +11160,114 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         }, profile.devices[driver._share_device_name(share)])
         profile.save.assert_called_once_with(wait=True)
 
-    @mock.patch.object(driver.os.path, 'ismount', return_value=True)
-    @mock.patch.object(driver.privsep_fs, 'mount')
+    @mock.patch.object(driver.os.path, 'ismount', return_value=False)
+    @mock.patch.object(driver.incus_privsep, 'mount')
     @mock.patch.object(driver.os, 'chmod')
-    def test_mount_nfs_share_does_not_chmod_existing_mount(
+    def test_mount_cephfs_share_uses_private_secretfile(
             self, chmod, mount, ismount):
+        self.CONF.incus.enable_manila_shares = True
+        ismount.side_effect = [False, False, True]
+        driver.fileutils.ensure_tree.side_effect = (
+            lambda path, mode=0o755:
+            os.makedirs(path, mode=mode, exist_ok=True))
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            export_location='mon1:/volumes/project',
+            share_proto='CEPHFS',
+            access_to='nova-client',
+            access_key='secret')
+        profile = self.client.profiles.get.return_value
+        profile.devices = {}
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        incus_driver.mount_share(None, instance, share)
+
+        args = mount.call_args.args
+        self.assertEqual(
+            ('ceph', share.export_location,
+             driver._share_mount_path(instance, share)), args[:3])
+        self.assertEqual(
+            ['rw', 'nosuid', 'nodev', 'name=nova-client'],
+            args[3][:4])
+        secret_path = args[3][4].removeprefix('secretfile=')
+        self.assertEqual(
+            os.path.dirname(driver._share_mount_path(instance, share)),
+            os.path.dirname(secret_path))
+        self.assertFalse(os.path.exists(secret_path))
+        self.assertEqual(self.CONF.incus.share_mount_timeout, args[4])
+
+    @mock.patch.object(driver.os.path, 'ismount')
+    @mock.patch.object(driver.incus_privsep, 'mount')
+    @mock.patch.object(driver.os, 'chmod')
+    @mock.patch.object(driver.lockutils, 'lock')
+    def test_mount_share_holds_profile_lock_only_for_profile_update(
+            self, lock, chmod, mount, ismount):
+        self.CONF.incus.enable_manila_shares = True
+        ismount.side_effect = [False, False, True]
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            export_location='server:/project-data',
+            share_proto='NFS')
+        profile = self.client.profiles.get.return_value
+        profile.devices = {}
+        profile_lock_name = driver._profile_lock_name(instance)
+        profile_lock_active = [False]
+
+        def fake_lock(name):
+            context_manager = mock.MagicMock()
+            if name == profile_lock_name:
+                context_manager.__enter__.side_effect = (
+                    lambda: profile_lock_active.__setitem__(0, True))
+                context_manager.__exit__.side_effect = (
+                    lambda *args: profile_lock_active.__setitem__(0, False))
+            return context_manager
+
+        lock.side_effect = fake_lock
+        mount.side_effect = (
+            lambda *args, **kwargs:
+            self.assertFalse(profile_lock_active[0]))
+        profile.save.side_effect = (
+            lambda *args, **kwargs:
+            self.assertTrue(profile_lock_active[0]))
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        incus_driver.mount_share(None, instance, share)
+
+        mount.assert_called_once()
+        profile.save.assert_called_once_with(wait=True)
+        self.assertFalse(profile_lock_active[0])
+
+    @mock.patch.object(driver.os.path, 'ismount', return_value=True)
+    @mock.patch.object(driver.incus_privsep, 'mount')
+    @mock.patch.object(driver.os, 'chmod')
+    @mock.patch.object(driver, '_validate_existing_share_mount')
+    def test_mount_nfs_share_does_not_chmod_existing_mount(
+            self, validate_mount, chmod, mount, ismount):
         driver.fileutils.ensure_tree.reset_mock()
         self.CONF.incus.enable_manila_shares = True
         instance = mock.Mock(
             uuid='00000000-0000-0000-0000-000000000001',
             name='instance-share')
+        instance.name = 'instance-share'
         share = mock.Mock(
             share_id='10000000-0000-0000-0000-000000000001',
             instance_uuid=instance.uuid,
             tag='project-data',
+            export_location='server:/project-data',
             share_proto='NFS')
         profile = self.client.profiles.get.return_value
         profile.devices = {}
@@ -4866,16 +11279,19 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         mount_path = driver._share_mount_path(instance, share)
         self.assertNotIn(mock.call(mount_path, 0o700), chmod.call_args_list)
         mount.assert_not_called()
+        validate_mount.assert_called_once_with(
+            mount_path, share, mount_table=mock.ANY)
         self.assertEqual(
             mount_path,
             profile.devices[driver._share_device_name(share)]['source'])
 
+    @mock.patch.object(driver, '_share_mount_table_index')
     @mock.patch.object(driver.os.path, 'ismount')
-    @mock.patch.object(driver.privsep_fs, 'umount')
-    @mock.patch.object(driver.privsep_fs, 'mount')
+    @mock.patch.object(driver.incus_privsep, 'umount')
+    @mock.patch.object(driver.incus_privsep, 'mount')
     @mock.patch.object(driver, '_ensure_share_mount_path')
-    def test_mount_share_unmounts_new_mount_when_profile_disappears(
-            self, ensure_path, mount, umount, ismount):
+    def test_mount_share_rolls_back_when_profile_is_not_created(
+            self, ensure_path, mount, umount, ismount, mount_table):
         self.CONF.incus.enable_manila_shares = True
         mount_path = '/instances/incus-shares/instance/share'
         ensure_path.return_value = mount_path
@@ -4883,34 +11299,1034 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         response = mock.Mock(status_code=404)
         self.client.profiles.get.side_effect = (
             incuscore_exceptions.LXDAPIException(response))
-        instance = mock.Mock(uuid='instance', name='instance-share')
-        share = mock.Mock(
-            share_id='share',
-            instance_uuid=instance.uuid,
-            tag='project-data',
-            share_proto='NFS')
-        incus_driver = driver.IncusDriver(None)
-        incus_driver.client = self.client
-
-        incus_driver.mount_share(None, instance, share)
-
-        mount.assert_called_once()
-        umount.assert_called_once_with(mount_path)
-
-    @mock.patch.object(driver.os.path, 'ismount', return_value=True)
-    @mock.patch.object(driver.privsep_fs, 'umount')
-    @mock.patch.object(driver.os, 'rmdir')
-    def test_umount_share_removes_device_before_host_mount(
-            self, rmdir, umount, ismount):
-        self.CONF.incus.enable_manila_shares = True
         instance = mock.Mock(
             uuid='00000000-0000-0000-0000-000000000001',
             name='instance-share')
+        instance.name = 'instance-share'
         share = mock.Mock(
             share_id='10000000-0000-0000-0000-000000000001',
             instance_uuid=instance.uuid,
             tag='project-data',
+            export_location='server:/project-data',
             share_proto='NFS')
+        journal_mount_path = driver._share_mount_path(instance, share)
+        mount_table.return_value = {
+            journal_mount_path: {
+                'device': share.export_location,
+                'fstype': 'nfs',
+                'opts': frozenset(('rw', 'nosuid', 'nodev')),
+            },
+        }
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        self.assertRaises(
+            exception.ShareMountError,
+            incus_driver.mount_share, None, instance, share)
+
+        mount.assert_called_once()
+        umount.assert_called_once_with(
+            driver._share_mount_path(instance, share),
+            self.CONF.incus.share_unmount_timeout)
+        self.assertFalse(os.path.exists(
+            driver._share_journal_path(instance, share.share_id)))
+
+    @mock.patch.object(driver.os.path, 'ismount')
+    @mock.patch.object(driver.incus_privsep, 'umount')
+    @mock.patch.object(driver.incus_privsep, 'mount')
+    @mock.patch.object(driver, '_ensure_share_mount_path')
+    def test_mount_share_profile_failure_retains_owned_mount(
+            self, ensure_path, mount, umount, ismount):
+        self.CONF.incus.enable_manila_shares = True
+        mount_path = '/instances/incus-shares/instance/share'
+        ensure_path.return_value = mount_path
+        ismount.side_effect = [False, True]
+        profile = mock.Mock(devices={})
+        profile.save.side_effect = RuntimeError('profile write failed')
+        persisted = mock.Mock(devices={})
+        self.client.profiles.get.side_effect = [profile, persisted]
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            export_location='server:/project-data',
+            share_proto='NFS')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        self.assertRaises(
+            exception.ShareMountError,
+            incus_driver.mount_share, None, instance, share)
+
+        mount.assert_called_once()
+        umount.assert_not_called()
+        self.assertTrue(os.path.exists(
+            driver._share_journal_path(instance, share.share_id)))
+
+    @mock.patch.object(driver.os.path, 'ismount', return_value=False)
+    @mock.patch.object(driver.incus_privsep, 'mount')
+    @mock.patch.object(driver.os, 'chmod')
+    def test_live_migration_share_stage_does_not_require_profile(
+            self, chmod, mount, ismount):
+        self.CONF.incus.enable_manila_shares = True
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            export_location='server:/project-data',
+            share_proto='NFS')
+        self.client.profiles.get.side_effect = (
+            incuscore_exceptions.LXDAPIException(MockResponse(404)))
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        self.assertTrue(incus_driver.stage_share_for_live_migration(
+            None, instance, share,
+            '20000000-0000-0000-0000-000000000002'))
+
+        mount.assert_called_once()
+        self.client.profiles.get.assert_not_called()
+
+    @mock.patch.object(driver, '_retire_migration_attempt')
+    @mock.patch.object(
+        driver, '_abort_migration_attempt',
+        return_value={'state': 'aborted', 'finished': True})
+    @mock.patch.object(driver.os.path, 'ismount', return_value=False)
+    @mock.patch.object(
+        driver.incus_privsep, 'mount',
+        side_effect=RuntimeError('first NFS mount failed'))
+    def test_cold_first_mount_failure_releases_token_for_retry(
+            self, mount, ismount, abort_attempt, retire_attempt):
+        self.CONF.incus.enable_manila_shares = True
+        driver.fileutils.ensure_tree.side_effect = (
+            lambda path, mode=0o755:
+            os.makedirs(path, mode=mode, exist_ok=True))
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            export_location='server:/project-data',
+            share_proto='NFS')
+        first_token = '20000000-0000-0000-0000-000000000002'
+        second_token = '30000000-0000-0000-0000-000000000003'
+        disk_info = migration_disk_info({
+            'format': 'incus-pull-v1',
+            'cleanup_token': first_token,
+            'migration_data': {},
+        })
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+        not_found = incus_api_exception(404, 'not found')
+        self.client.instances.get.side_effect = not_found
+        self.client.profiles.get.side_effect = not_found
+
+        first_error = self.assertRaises(
+            exception.ShareMountError,
+            incus_driver.stage_share_for_cold_migration,
+            None, instance, share, first_token)
+        self.assertIn('first NFS mount failed', str(first_error))
+        self.assertIsNotNone(driver._read_share_journal(
+            instance, share, operation_token=first_token))
+
+        self.assertFalse(
+            incus_driver.rollback_cold_migration_preparation(
+                None, instance, disk_info))
+
+        self.assertEqual([], driver._share_journal_records(instance))
+        abort_args, abort_kwargs = abort_attempt.call_args
+        self.assertEqual(
+            (self.client, instance, first_token, 1065536, 65536),
+            abort_args)
+        self.assertEqual({}, abort_kwargs)
+        retire_attempt.assert_called_once_with(
+            self.client, instance, first_token, 1065536, 65536)
+
+        mount.side_effect = None
+        self.assertTrue(incus_driver.stage_share_for_cold_migration(
+            None, instance, share, second_token))
+        self.assertEqual(
+            second_token,
+            driver._read_share_journal(
+                instance, share,
+                operation_token=second_token)['operation_token'])
+        incus_driver.unstage_share_for_cold_migration(
+            None, instance, share, second_token)
+        self.assertEqual([], driver._share_journal_records(instance))
+
+    @mock.patch.object(driver, '_retire_migration_attempt')
+    @mock.patch.object(
+        driver, '_abort_migration_attempt',
+        side_effect=incus_api_exception(404, 'attempt not registered'))
+    @mock.patch.object(driver.os.path, 'ismount', return_value=False)
+    @mock.patch.object(
+        driver.incus_privsep, 'mount',
+        side_effect=RuntimeError('first NFS mount failed'))
+    def test_live_first_mount_failure_cleanup_allows_new_token(
+            self, mount, ismount, abort_attempt, retire_attempt):
+        self.CONF.incus.enable_manila_shares = True
+        driver.fileutils.ensure_tree.side_effect = (
+            lambda path, mode=0o755:
+            os.makedirs(path, mode=mode, exist_ok=True))
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001')
+        instance.name = 'instance-share'
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            export_location='server:/project-data',
+            share_proto='NFS')
+        first_token = '20000000-0000-0000-0000-000000000002'
+        second_token = '30000000-0000-0000-0000-000000000003'
+        data = migrate_data.IncusLiveMigrateData(
+            cleanup_token=first_token,
+            idmap_base=1065536,
+            idmap_size=65536)
+        not_found = incus_api_exception(404, 'not found')
+        self.client.instances.get.side_effect = not_found
+        self.client.profiles.get.side_effect = not_found
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        first_error = self.assertRaises(
+            exception.ShareMountError,
+            incus_driver.stage_share_for_live_migration,
+            None, instance, share, first_token)
+        self.assertIn('first NFS mount failed', str(first_error))
+
+        self.assertTrue(
+            incus_driver.cleanup_pre_live_migration_destination(
+                None, instance, data))
+        self.assertEqual([], driver._share_journal_records(instance))
+        abort_attempt.assert_called_once_with(
+            self.client, instance, first_token, 1065536, 65536,
+            target_cleanup=mock.ANY)
+        retire_attempt.assert_not_called()
+
+        mount.side_effect = None
+        self.assertTrue(incus_driver.stage_share_for_live_migration(
+            None, instance, share, second_token))
+        incus_driver.unstage_share_for_live_migration(
+            None, instance, share, second_token)
+        self.assertEqual([], driver._share_journal_records(instance))
+
+    @mock.patch.object(driver, '_retire_migration_attempt')
+    @mock.patch.object(driver, '_cleanup_share_journal_mounts')
+    @mock.patch.object(driver, '_abort_migration_attempt')
+    def test_cold_failed_finish_marker_error_retains_share_transaction(
+            self, abort_attempt, cleanup_journals, retire_attempt):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        token = '20000000-0000-0000-0000-000000000002'
+        disk_info = migration_disk_info({
+            'format': 'incus-pull-v1',
+            'cleanup_token': token,
+            'migration_data': {},
+            'was_running': True,
+        })
+        container = mock.Mock(config={
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_RECEIVE_COMPLETE_KEY: 'true',
+        })
+        self.client.instances.get.return_value = container
+        self.client.profiles.get.return_value = mock.Mock(config={
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: token,
+            driver.MIGRATION_DESTINATION_PREPARED_KEY: token,
+            'security.idmap.base': '1065536',
+            'security.idmap.size': '65536',
+        })
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+        incus_driver._mark_migration_recovery_required = mock.Mock(
+            side_effect=RuntimeError('profile save failed'))
+
+        self.assertTrue(
+            incus_driver.rollback_cold_migration_preparation(
+                None, instance, disk_info))
+
+        incus_driver._mark_migration_recovery_required.assert_called_once_with(
+            instance, power_on=True)
+        abort_attempt.assert_not_called()
+        cleanup_journals.assert_not_called()
+        retire_attempt.assert_not_called()
+
+    @mock.patch.object(driver.IncusDriver, '_acknowledge_cleanup_profile')
+    @mock.patch.object(driver.IncusDriver, '_cleanup')
+    def test_cold_profile_only_rollback_is_cleaned_and_acknowledged(
+            self, cleanup, acknowledge):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001')
+        instance.name = 'instance-share'
+        token = '20000000-0000-0000-0000-000000000002'
+        disk_info = migration_disk_info({
+            'format': 'incus-pull-v1',
+            'cleanup_token': token,
+            'migration_data': {},
+        })
+        profile = mock.Mock(config={
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: token,
+            driver.MIGRATION_DESTINATION_PREPARED_KEY: token,
+            'security.idmap.base': '1065536',
+            'security.idmap.size': '65536',
+        })
+        self.client.instances.get.side_effect = incus_api_exception(
+            404, 'not found')
+        self.client.profiles.get.return_value = profile
+        network_info = mock.sentinel.network_info
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+        incus_driver.network_api = mock.Mock()
+        incus_driver.network_api.get_instance_nw_info.return_value = (
+            network_info)
+
+        self.assertTrue(incus_driver.rollback_cold_migration_preparation(
+            mock.sentinel.context, instance, disk_info))
+
+        cleanup.assert_called_once_with(
+            mock.sentinel.context, instance, network_info,
+            block_device_info=None, destroy_vifs=True,
+            delete_profile=False)
+        acknowledge.assert_called_once_with(instance, token)
+
+    @mock.patch.object(driver, '_retire_migration_attempt')
+    @mock.patch.object(driver, '_cleanup_share_journal_mounts')
+    @mock.patch.object(
+        driver, '_abort_migration_attempt',
+        return_value={'state': 'committed', 'finished': True})
+    def test_cold_failed_finish_committed_attempt_retains_shares(
+            self, abort_attempt, cleanup_journals, retire_attempt):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001')
+        instance.name = 'instance-share'
+        token = '20000000-0000-0000-0000-000000000002'
+        disk_info = migration_disk_info({
+            'format': 'incus-pull-v1',
+            'cleanup_token': token,
+            'migration_data': {},
+        })
+        not_found = incus_api_exception(404, 'not found')
+        self.client.instances.get.side_effect = not_found
+        self.client.profiles.get.side_effect = not_found
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        self.assertTrue(
+            incus_driver.rollback_cold_migration_preparation(
+                None, instance, disk_info))
+
+        abort_attempt.assert_called_once_with(
+            self.client, instance, token, 1065536, 65536)
+        cleanup_journals.assert_not_called()
+        retire_attempt.assert_not_called()
+
+    @mock.patch.object(driver, '_cleanup_share_journal_mounts')
+    @mock.patch.object(driver, '_abort_migration_attempt')
+    def test_cold_failed_finish_unknown_target_state_fails_closed(
+            self, abort_attempt, cleanup_journals):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001')
+        instance.name = 'instance-share'
+        disk_info = migration_disk_info({
+            'format': 'incus-pull-v1',
+            'migration_data': {},
+        })
+        self.client.instances.get.side_effect = incus_api_exception(
+            503, 'Incus unavailable')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        self.assertRaises(
+            incuscore_exceptions.LXDAPIException,
+            incus_driver.rollback_cold_migration_preparation,
+            None, instance, disk_info)
+
+        self.client.profiles.get.assert_not_called()
+        abort_attempt.assert_not_called()
+        cleanup_journals.assert_not_called()
+
+    def test_share_journal_never_persists_cephfs_secret(self):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            export_location='mon1:/volumes/project',
+            share_proto='CEPHFS',
+            access_to='nova-client',
+            access_key='do-not-write-this-secret')
+        token = '20000000-0000-0000-0000-000000000002'
+
+        driver._write_share_journal(
+            instance, share, token, 'staging')
+
+        path = driver._share_journal_path(instance, share.share_id)
+        with open(path, encoding='utf-8') as stream:
+            serialized = stream.read()
+        self.assertNotIn('do-not-write-this-secret', serialized)
+        self.assertNotIn('access_key', serialized)
+        payload = jsonutils.loads(serialized)
+        self.assertEqual(token, payload['operation_token'])
+        self.assertEqual(instance.uuid, payload['instance_uuid'])
+        self.assertEqual(instance.name, payload['instance_name'])
+
+    def test_share_journal_rejects_different_migration_owner(self):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            export_location='server:/project-data',
+            share_proto='NFS')
+        driver._write_share_journal(
+            instance, share,
+            '20000000-0000-0000-0000-000000000002', 'mounted')
+
+        self.assertRaises(
+            exception.ShareMountError,
+            driver._read_share_journal,
+            instance, share,
+            operation_token='30000000-0000-0000-0000-000000000003')
+
+    def test_share_journal_write_rejects_different_owner(self):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            export_location='server:/project-data',
+            share_proto='NFS')
+        first_token = '20000000-0000-0000-0000-000000000002'
+        second_token = '30000000-0000-0000-0000-000000000003'
+        driver._write_share_journal(
+            instance, share, first_token, 'mounted')
+
+        self.assertRaises(
+            exception.ShareMountError,
+            driver._write_share_journal,
+            instance, share, second_token, 'unmounting')
+
+        payload = driver._read_share_journal(
+            instance, share, operation_token=first_token)
+        self.assertEqual('mounted', payload['phase'])
+
+    def test_share_journal_write_rejects_changed_binding(self):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            export_location='server:/project-data',
+            share_proto='NFS')
+        changed = mock.Mock(
+            share_id=share.share_id,
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            export_location='server:/different',
+            share_proto='NFS')
+        token = '20000000-0000-0000-0000-000000000002'
+        driver._write_share_journal(
+            instance, share, token, 'mounted')
+
+        self.assertRaises(
+            exception.ShareMountError,
+            driver._write_share_journal,
+            instance, changed, token, 'unmounting')
+
+        payload = driver._read_share_journal(
+            instance, share, operation_token=token)
+        self.assertEqual(share.export_location, payload['export_location'])
+        self.assertEqual('mounted', payload['phase'])
+
+    def test_share_journal_write_allows_same_owner_phase_update(self):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            export_location='server:/project-data',
+            share_proto='NFS')
+        token = '20000000-0000-0000-0000-000000000002'
+        driver._write_share_journal(
+            instance, share, token, 'staging')
+
+        driver._write_share_journal(
+            instance, share, token, 'mounted')
+
+        payload = driver._read_share_journal(
+            instance, share, operation_token=token)
+        self.assertEqual('mounted', payload['phase'])
+
+    def test_share_journal_lock_serializes_competing_owners(self):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            export_location='server:/project-data',
+            share_proto='NFS')
+        tokens = (
+            '20000000-0000-0000-0000-000000000002',
+            '30000000-0000-0000-0000-000000000003')
+        barrier = threading.Barrier(3)
+        outcomes = []
+
+        def write(token):
+            barrier.wait()
+            try:
+                with driver.lockutils.lock(
+                        driver._share_operation_lock_name(
+                            instance, share.share_id)):
+                    driver._write_share_journal(
+                        instance, share, token, 'staging')
+            except Exception as exc:
+                outcomes.append(exc)
+            else:
+                outcomes.append(None)
+
+        workers = [threading.Thread(target=write, args=(token,))
+                   for token in tokens]
+        for worker in workers:
+            worker.start()
+        barrier.wait()
+        for worker in workers:
+            worker.join(5)
+
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(1, sum(outcome is None for outcome in outcomes))
+        failures = [outcome for outcome in outcomes
+                    if outcome is not None]
+        self.assertEqual(1, len(failures))
+        self.assertIsInstance(failures[0], exception.ShareMountError)
+        payload = driver._read_share_journal(instance, share)
+        self.assertIn(payload['operation_token'], tokens)
+
+    @mock.patch.object(driver.psutil, 'disk_partitions')
+    def test_journaled_share_mount_table_is_indexed_once_at_scale(
+            self, disk_partitions):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        token = '20000000-0000-0000-0000-000000000002'
+        for cardinality in (32, 64):
+            with self.subTest(cardinality=cardinality):
+                shares = [
+                    mock.Mock(
+                        share_id=(
+                            '10000000-0000-0000-0000-%012d' % index),
+                        instance_uuid=instance.uuid,
+                        tag='share-%d' % index,
+                        export_location='server:/share-%d' % index,
+                        share_proto='NFS')
+                    for index in range(cardinality)
+                ]
+                for share in shares:
+                    driver._write_share_journal(
+                        instance, share, token, 'mounted')
+                disk_partitions.return_value = [
+                    mock.Mock(
+                        mountpoint=driver._share_mount_path(instance, share),
+                        device=share.export_location,
+                        fstype='nfs4', opts='rw,nosuid,nodev')
+                    for share in shares
+                ]
+                disk_partitions.reset_mock()
+
+                mappings = driver._journaled_share_mappings(
+                    instance, token,
+                    expected_share_ids=[share.share_id for share in shares])
+
+                self.assertEqual(cardinality, len(mappings))
+                disk_partitions.assert_called_once_with(all=True)
+                for share in shares:
+                    driver._remove_share_journal(
+                        instance, share.share_id, token)
+
+    def test_share_journal_candidates_exclude_ordinary_attach_owner(self):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        migration_share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid, tag='migration',
+            export_location='server:/migration', share_proto='NFS')
+        ordinary_share = mock.Mock(
+            share_id='30000000-0000-0000-0000-000000000003',
+            instance_uuid=instance.uuid, tag='ordinary',
+            export_location='server:/ordinary', share_proto='NFS', id=7)
+        token = '20000000-0000-0000-0000-000000000002'
+        driver._write_share_journal(
+            instance, migration_share, token, 'mounted')
+        driver._write_share_journal(
+            instance, ordinary_share,
+            driver._share_mapping_owner_token(instance, ordinary_share),
+            'mounted')
+
+        candidates = driver._share_journal_recovery_candidates()
+
+        self.assertEqual([{
+            'uuid': instance.uuid,
+            'name': instance.name,
+            'operation_token': token,
+            'share_ids': (migration_share.share_id,),
+        }], candidates)
+
+    @mock.patch.object(driver, '_cleanup_share_journal_mounts')
+    def test_recover_share_journal_rechecks_local_runtime_absence(
+            self, cleanup):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid, tag='migration',
+            export_location='server:/migration', share_proto='NFS')
+        token = '20000000-0000-0000-0000-000000000002'
+        driver._write_share_journal(instance, share, token, 'mounted')
+        not_found = incus_api_exception(404, 'not found')
+        self.client.instances.get.side_effect = not_found
+        self.client.profiles.get.side_effect = not_found
+        candidate = {
+            'uuid': instance.uuid,
+            'name': instance.name,
+            'operation_token': token,
+            'share_ids': (share.share_id,),
+        }
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        self.assertTrue(incus_driver.recover_share_journal_candidate(
+            instance, candidate))
+
+        cleanup.assert_called_once_with(
+            instance, operation_token=token)
+
+    @mock.patch.object(driver, '_cleanup_share_journal_mounts')
+    def test_recover_share_journal_refuses_existing_profile(self, cleanup):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid, tag='migration',
+            export_location='server:/migration', share_proto='NFS')
+        token = '20000000-0000-0000-0000-000000000002'
+        driver._write_share_journal(instance, share, token, 'mounted')
+        self.client.instances.get.side_effect = incus_api_exception(
+            404, 'not found')
+        self.client.profiles.get.return_value = mock.Mock()
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        self.assertRaises(
+            exception.MigrationError,
+            incus_driver.recover_share_journal_candidate,
+            instance, {
+                'uuid': instance.uuid,
+                'name': instance.name,
+                'operation_token': token,
+                'share_ids': (share.share_id,),
+            })
+
+        cleanup.assert_not_called()
+
+    @mock.patch.object(driver.os.path, 'ismount', return_value=True)
+    def test_share_profile_save_precedes_journal_removal(self, ismount):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            export_location='server:/project-data',
+            share_proto='NFS')
+        token = '20000000-0000-0000-0000-000000000002'
+        driver._write_share_journal(
+            instance, share, token, 'mounted')
+        profile = mock.Mock(devices={})
+        profile.save.side_effect = RuntimeError('profile write failed')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        self.assertRaises(
+            RuntimeError,
+            incus_driver._attach_share_devices,
+            profile, instance, [share], operation_token=token)
+        self.assertTrue(os.path.exists(
+            driver._share_journal_path(instance, share.share_id)))
+
+        profile.save.side_effect = None
+        incus_driver._attach_share_devices(
+            profile, instance, [share], operation_token=token)
+        self.assertFalse(os.path.exists(
+            driver._share_journal_path(instance, share.share_id)))
+
+    @mock.patch.object(driver.os.path, 'ismount', return_value=True)
+    def test_share_profile_save_accepts_persisted_device(self, ismount):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            export_location='server:/project-data',
+            share_proto='NFS')
+        token = '20000000-0000-0000-0000-000000000002'
+        driver._write_share_journal(
+            instance, share, token, 'mounted')
+        expected = {
+            'type': 'disk',
+            'source': driver._share_mount_path(instance, share),
+            'path': '/mnt/manila/project-data',
+            'readonly': 'false',
+            'recursive': 'true',
+        }
+        profile = mock.Mock(devices={})
+        profile.save.side_effect = incus_operation_exception(
+            400, 'profile change still saved')
+        persisted = mock.Mock(
+            devices={driver._share_device_name(share): expected})
+        self.client.profiles.get.return_value = persisted
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        incus_driver._attach_share_devices(
+            profile, instance, [share], operation_token=token)
+
+        self.assertFalse(os.path.exists(
+            driver._share_journal_path(instance, share.share_id)))
+
+    @mock.patch.object(driver.os.path, 'ismount', return_value=True)
+    @mock.patch.object(driver, '_validate_existing_share_mount')
+    def test_attach_journaled_shares_requires_exact_set(
+            self, validate_mount, ismount):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        token = '20000000-0000-0000-0000-000000000002'
+        shares = [
+            mock.Mock(
+                share_id=share_id,
+                instance_uuid=instance.uuid,
+                tag='project-%d' % index,
+                export_location='server:/project-%d' % index,
+                share_proto='NFS')
+            for index, share_id in enumerate((
+                '10000000-0000-0000-0000-000000000001',
+                '30000000-0000-0000-0000-000000000003',
+            ))
+        ]
+        for share in shares:
+            driver._write_share_journal(
+                instance, share, token, 'mounted')
+        profile = mock.Mock(devices={})
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        attached = incus_driver._attach_journaled_share_devices(
+            profile, instance, token,
+            [share.share_id for share in shares])
+
+        self.assertEqual(
+            [share.share_id for share in shares],
+            [share.share_id for share in attached])
+        profile.save.assert_called_once_with(wait=True)
+        self.assertEqual([], driver._share_journal_records(instance))
+
+    @mock.patch.object(
+        driver.incus_privsep, 'umount',
+        side_effect=RuntimeError('share is busy'))
+    @mock.patch.object(driver, '_share_mount_table_index')
+    @mock.patch.object(driver.os.path, 'ismount', return_value=True)
+    def test_share_umount_failure_retains_journal(
+            self, ismount, mount_table, umount):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            export_location='server:/project-data',
+            share_proto='NFS')
+        token = '20000000-0000-0000-0000-000000000002'
+        mount_path = driver._share_mount_path(instance, share)
+        mount_table.return_value = {
+            mount_path: {
+                'device': share.export_location,
+                'fstype': 'nfs',
+                'opts': frozenset(('rw', 'nosuid', 'nodev')),
+            },
+        }
+        driver._write_share_journal(
+            instance, share, token, 'mounted')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        self.assertRaises(
+            exception.ShareUmountError,
+            incus_driver.unstage_share_for_cold_migration,
+            None, instance, share, token)
+
+        payload = driver._read_share_journal(
+            instance, share, operation_token=token)
+        self.assertEqual('unmounting', payload['phase'])
+        umount.assert_called_once_with(
+            mount_path, self.CONF.incus.share_unmount_timeout)
+
+    def test_prepare_cold_migration_share_info_binds_ids_only(self):
+        token = '20000000-0000-0000-0000-000000000002'
+        disk_info = migration_disk_info({
+            'format': 'incus-pull-v1',
+            'cleanup_token': token,
+            'migration_data': {},
+        })
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid='00000000-0000-0000-0000-000000000003',
+            access_key='must-not-cross-the-rpc')
+
+        prepared, actual_token = (
+            driver.prepare_cold_migration_share_info(
+                disk_info, [share]))
+
+        self.assertEqual(token, actual_token)
+        payload = jsonutils.loads(prepared)
+        self.assertEqual(
+            [share.share_id], payload['manila_share_ids'])
+        self.assertNotIn('must-not-cross-the-rpc', prepared)
+
+    def test_cleanup_ack_rejects_retained_share_device(self):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        token = '20000000-0000-0000-0000-000000000002'
+        self.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: token,
+        }
+        profile.devices = {
+            'manila-10000000-0000-0000-0000-000000000001': {
+                'type': 'disk',
+                'source': '/missing',
+            },
+        }
+        profile.used_by = []
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        self.assertRaises(
+            exception.MigrationError,
+            incus_driver._acknowledge_cleanup_profile,
+            instance, token)
+
+        profile.save.assert_not_called()
+
+    def test_cleanup_ack_rejects_retained_share_journal(self):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        token = '20000000-0000-0000-0000-000000000002'
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            export_location='server:/project-data',
+            share_proto='NFS')
+        driver._write_share_journal(
+            instance, share, token, 'unmounting')
+        self.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: token,
+        }
+        profile.devices = {}
+        profile.used_by = []
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        self.assertRaises(
+            exception.MigrationError,
+            incus_driver._acknowledge_cleanup_profile,
+            instance, token)
+
+        profile.save.assert_not_called()
+
+    @mock.patch.object(driver.psutil, 'disk_partitions')
+    @mock.patch.object(
+        driver.os.path, 'realpath', side_effect=lambda path: path)
+    def test_existing_share_mount_rejects_wrong_export(
+            self, realpath, disk_partitions):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001')
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            export_location='server:/expected',
+            share_proto='NFS')
+        mount_path = driver._share_mount_path(instance, share)
+        disk_partitions.return_value = [mock.Mock(
+            mountpoint=mount_path,
+            device='server:/other',
+            fstype='nfs4', opts='rw,nosuid,nodev')]
+
+        self.assertRaises(
+            exception.ShareMountError,
+            driver._validate_existing_share_mount, mount_path, share)
+
+    @mock.patch.object(driver.psutil, 'disk_partitions')
+    @mock.patch.object(
+        driver.os.path, 'realpath', side_effect=lambda path: path)
+    def test_existing_share_mount_accepts_nfs4_export(
+            self, realpath, disk_partitions):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001')
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            export_location='server:/expected/',
+            share_proto='NFS')
+        mount_path = driver._share_mount_path(instance, share)
+        disk_partitions.return_value = [mock.Mock(
+            mountpoint=mount_path,
+            device='server:/expected',
+            fstype='nfs4', opts='rw,nosuid,nodev')]
+
+        driver._validate_existing_share_mount(mount_path, share)
+
+    @mock.patch.object(driver.psutil, 'disk_partitions')
+    def test_existing_share_mount_rejects_unsafe_options(
+            self, disk_partitions):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001')
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            export_location='server:/expected',
+            share_proto='NFS')
+        mount_path = driver._share_mount_path(instance, share)
+        disk_partitions.return_value = [mock.Mock(
+            mountpoint=mount_path,
+            device='server:/expected',
+            fstype='nfs4', opts='rw,suid,dev')]
+
+        error = self.assertRaises(
+            exception.ShareMountError,
+            driver._validate_existing_share_mount, mount_path, share)
+
+        self.assertIn('rw,nosuid,nodev', str(error))
+
+    def test_share_mount_path_rejects_noncanonical_instance_uuid(self):
+        instance = mock.Mock(uuid='not-a-uuid')
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001')
+
+        self.assertRaises(
+            exception.ShareMountError,
+            driver._share_mount_path, instance, share)
+
+    def test_existing_share_mount_rejects_symlink_escape(self):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001')
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            export_location='server:/expected',
+            share_proto='NFS')
+        mount_path = driver._share_mount_path(instance, share)
+        realpath = driver.os.path.realpath
+
+        def fake_realpath(path):
+            if os.path.abspath(path) == os.path.abspath(mount_path):
+                return os.path.join(self.CONF.instances_path, 'escaped')
+            return realpath(path)
+
+        with mock.patch.object(
+                driver.os.path, 'realpath', side_effect=fake_realpath):
+            self.assertRaises(
+                exception.ShareMountError,
+                driver._validate_existing_share_mount,
+                mount_path, share, mount_table={})
+
+    @mock.patch.object(driver, '_share_mount_table_index')
+    @mock.patch.object(driver.os.path, 'ismount', return_value=True)
+    @mock.patch.object(driver.incus_privsep, 'umount')
+    @mock.patch.object(driver.os, 'rmdir')
+    def test_umount_share_removes_device_before_host_mount(
+            self, rmdir, umount, ismount, mount_table):
+        self.CONF.incus.enable_manila_shares = True
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            export_location='server:/project-data',
+            share_proto='NFS')
+        mount_path = driver._share_mount_path(instance, share)
+        mount_table.return_value = {
+            mount_path: {
+                'device': share.export_location,
+                'fstype': 'nfs',
+                'opts': frozenset(('rw', 'nosuid', 'nodev')),
+            },
+        }
         profile = self.client.profiles.get.return_value
         profile.devices = {
             driver._share_device_name(share): {'type': 'disk'}}
@@ -4922,54 +12338,79 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertNotIn(driver._share_device_name(share), profile.devices)
         profile.save.assert_called_once_with(wait=True)
         umount.assert_called_once_with(
-            driver._share_mount_path(instance, share))
+            driver._share_mount_path(instance, share),
+            self.CONF.incus.share_unmount_timeout)
 
+    @mock.patch.object(driver, '_share_mount_table_index')
     @mock.patch.object(driver.os.path, 'isdir', return_value=True)
     @mock.patch.object(driver.os.path, 'ismount', return_value=True)
-    @mock.patch.object(driver.privsep_fs, 'umount')
+    @mock.patch.object(driver.incus_privsep, 'umount')
     @mock.patch.object(driver.os, 'rmdir')
     def test_umount_share_keeps_parent_with_other_share(
-            self, rmdir, umount, ismount, isdir):
+            self, rmdir, umount, ismount, isdir, mount_table):
         self.CONF.incus.enable_manila_shares = True
         instance = mock.Mock(
             uuid='00000000-0000-0000-0000-000000000001',
             name='instance-share')
+        instance.name = 'instance-share'
         share = mock.Mock(
             share_id='10000000-0000-0000-0000-000000000001',
             instance_uuid=instance.uuid,
             tag='project-data',
+            export_location='server:/project-data',
             share_proto='NFS')
+        mount_path = driver._share_mount_path(instance, share)
+        mount_table.return_value = {
+            mount_path: {
+                'device': share.export_location,
+                'fstype': 'nfs',
+                'opts': frozenset(('rw', 'nosuid', 'nodev')),
+            },
+        }
         profile = self.client.profiles.get.return_value
         profile.devices = {
             driver._share_device_name(share): {'type': 'disk'}}
         rmdir.side_effect = [
             None,
             OSError(errno.ENOTEMPTY, 'Directory not empty'),
+            None,
         ]
         incus_driver = driver.IncusDriver(None)
         incus_driver.client = self.client
 
         self.assertFalse(incus_driver.umount_share(None, instance, share))
 
-        self.assertEqual(2, rmdir.call_count)
+        self.assertEqual(3, rmdir.call_count)
         umount.assert_called_once_with(
-            driver._share_mount_path(instance, share))
+            driver._share_mount_path(instance, share),
+            self.CONF.incus.share_unmount_timeout)
 
+    @mock.patch.object(driver, '_share_mount_table_index')
     @mock.patch.object(driver.os.path, 'isdir', return_value=True)
     @mock.patch.object(driver.os.path, 'ismount', return_value=True)
-    @mock.patch.object(driver.privsep_fs, 'umount')
+    @mock.patch.object(driver.incus_privsep, 'umount')
     @mock.patch.object(driver.os, 'rmdir')
     def test_umount_share_reports_parent_removal_error(
-            self, rmdir, umount, ismount, isdir):
+            self, rmdir, umount, ismount, isdir, mount_table):
         self.CONF.incus.enable_manila_shares = True
         instance = mock.Mock(
             uuid='00000000-0000-0000-0000-000000000001',
             name='instance-share')
+        instance.name = 'instance-share'
         share = mock.Mock(
             share_id='10000000-0000-0000-0000-000000000001',
             instance_uuid=instance.uuid,
             tag='project-data',
+            export_location='server:/project-data',
             share_proto='NFS')
+        mount_path = driver._share_mount_path(instance, share)
+        mount_table.return_value = {
+            mount_path: {
+                'device': share.export_location,
+                'fstype': 'nfs',
+                'opts': frozenset(('rw', 'nosuid', 'nodev')),
+            },
+        }
         profile = self.client.profiles.get.return_value
         profile.devices = {
             driver._share_device_name(share): {'type': 'disk'}}
@@ -4997,11 +12438,51 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             exception.ShareProtocolNotSupported,
             incus_driver.mount_share, None, instance, share)
 
-    @mock.patch.object(driver.os.path, 'ismount', return_value=True)
-    @mock.patch.object(driver.privsep_fs, 'umount')
+    @mock.patch.object(driver.os.path, 'isdir', return_value=True)
+    @mock.patch.object(driver, '_share_mount_table_index')
+    @mock.patch.object(driver.incus_privsep, 'umount')
+    @mock.patch.object(driver.os, 'rmdir')
+    def test_cleanup_profile_share_mounts_attempts_all_after_failure(
+            self, rmdir, umount, mount_table, isdir):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001')
+        profile = mock.Mock()
+        share_ids = [
+            '10000000-0000-0000-0000-000000000001',
+            '20000000-0000-0000-0000-000000000002',
+            '30000000-0000-0000-0000-000000000003',
+        ]
+        profile.devices = {
+            'manila-' + share_id: {
+                'type': 'disk',
+                'source': os.path.join(
+                    self.CONF.instances_path, 'incus-shares',
+                    instance.uuid, share_id),
+            }
+            for share_id in share_ids
+        }
+        mount_table.return_value = {
+            os.path.realpath(device['source']): {
+                'device': 'server:/%s' % name,
+                'fstype': 'nfs',
+                'opts': frozenset(('rw', 'nosuid', 'nodev')),
+            }
+            for name, device in profile.devices.items()
+        }
+        umount.side_effect = [RuntimeError('first failed'), None, None]
+        rmdir.side_effect = OSError(errno.ENOTEMPTY, 'not empty')
+
+        self.assertRaises(
+            exception.ShareUmountError,
+            driver._cleanup_profile_share_mounts, profile, instance)
+
+        self.assertEqual(3, umount.call_count)
+
+    @mock.patch.object(driver, '_share_mount_table_index')
+    @mock.patch.object(driver.incus_privsep, 'umount')
     @mock.patch.object(driver.os, 'rmdir')
     def test_post_live_migration_source_cleans_validated_share_mount(
-            self, rmdir, umount, ismount):
+            self, rmdir, umount, mount_table):
         instance = mock.Mock(
             uuid='00000000-0000-0000-0000-000000000001',
             name='instance-share')
@@ -5022,26 +12503,40 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             },
             'root': {'type': 'disk', 'source': mount_path},
         }
+        mount_table.return_value = {
+            os.path.realpath(mount_path): {
+                'device': 'server:/project-data',
+                'fstype': 'nfs',
+                'opts': frozenset(('rw', 'nosuid', 'nodev')),
+            },
+        }
         incus_driver = driver.IncusDriver(None)
         incus_driver.client = self.client
-        incus_driver.cleanup = mock.Mock()
+        incus_driver._cleanup = mock.Mock()
 
         incus_driver.post_live_migration_at_source(
             None, instance, mock.sentinel.network_info)
 
-        umount.assert_called_once_with(os.path.realpath(mount_path))
-        incus_driver.cleanup.assert_called_once_with(
-            None, instance, mock.sentinel.network_info)
+        umount.assert_called_once_with(
+            os.path.realpath(mount_path),
+            self.CONF.incus.share_unmount_timeout)
+        incus_driver._cleanup.assert_called_once_with(
+            None, instance, mock.sentinel.network_info,
+            delete_profile=True)
         self.vif_driver.plug.assert_not_called()
         self.vif_driver.unplug.assert_not_called()
 
-    def test_finish_revert_migration_refreshes_retained_vif(self):
+    @mock.patch.object(driver, '_migration_client')
+    def test_finish_revert_migration_refreshes_retained_vif(
+            self, migration_client):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
         vif = mock.Mock()
         container = mock.Mock(status='Stopped')
         self.client.instances.get.return_value = container
+        self._prepare_cold_revert_protocol(
+            instance, container, migration_client.return_value)
         migration = mock.Mock(
             source_compute='source', dest_compute='destination')
         incus_driver = driver.IncusDriver(None)
@@ -5060,15 +12555,19 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
              mock.call.start(wait=True)],
             parent.mock_calls)
 
+    @mock.patch.object(driver, '_migration_client')
     @mock.patch.object(driver, '_require_bfv_migration_support')
     @mock.patch.object(driver, '_boot_from_volume')
     @mock.patch('nova.virt.driver.block_device_info_get_mapping')
     def test_finish_revert_migration_attaches_only_data_volumes(
-            self, get_mapping, boot_from_volume, require_bfv):
+            self, get_mapping, boot_from_volume, require_bfv,
+            migration_client):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         container = mock.Mock(status='Stopped')
         self.client.instances.get.return_value = container
+        self._prepare_cold_revert_protocol(
+            instance, container, migration_client.return_value)
         migration = mock.Mock(
             source_compute='source', dest_compute='destination')
         root_bdm = {
@@ -5096,81 +12595,147 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         require_bfv.assert_called_once_with(self.client, root_bdm)
         container.start.assert_called_once_with(wait=True)
 
+    @mock.patch.object(driver, '_migration_client')
     @mock.patch.object(driver, '_require_bfv_migration_support')
     @mock.patch.object(driver, '_boot_from_volume')
     @mock.patch('nova.virt.driver.block_device_info_get_mapping',
                 return_value=[])
     def test_finish_revert_migration_marks_failed_bfv_owner(
-            self, get_mapping, boot_from_volume, require_bfv):
+            self, get_mapping, boot_from_volume, require_bfv,
+            migration_client):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         boot_from_volume.return_value = {'boot_index': 0}
         container = mock.Mock(status='Stopped')
         container.start.side_effect = RuntimeError('start failed')
         self.client.instances.get.return_value = container
-        profile = self.client.profiles.get.return_value
-        profile.config = {}
+        profile = self._prepare_cold_revert_protocol(
+            instance, container, migration_client.return_value)
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
         incus_driver.finish_revert_migration(
-            ctx, instance, [], mock.Mock(), block_device_info={},
+            ctx, instance, [],
+            mock.Mock(source_compute='source', dest_compute='destination'),
+            block_device_info={},
             power_on=True)
 
-        self.assertEqual(
-            self.CONF.incus.migration_finish_retries,
-            container.start.call_count)
+        container.start.assert_called_once_with(wait=True)
         self.assertEqual(
             'running', profile.config[driver.MIGRATION_RECOVERY_KEY])
         profile.save.assert_called_once_with(wait=True)
 
     @mock.patch.object(driver.flavor, 'to_profile')
-    def test_finish_migration_same_host(self, to_profile):
+    def test_finish_migration_rejects_same_host_before_side_effects(
+            self, to_profile):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         migration = mock.Mock(
             source_compute='compute', dest_compute='compute')
-        container = mock.Mock()
-        self.client.instances.create.return_value = container
         self.CONF.incus.allow_cold_migration = True
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
-        disk_info = jsonutils.dumps({
+        self.assertRaises(
+            exception.UnableToMigrateToSelf,
+            incus_driver.finish_migration,
+            ctx, migration, instance, '{}', [], mock.Mock(), True, {},
+            block_device_info=None, power_on=True)
+
+        to_profile.assert_not_called()
+        self.client.instances.create.assert_not_called()
+        self.client.profiles.get.assert_not_called()
+
+    @mock.patch.object(driver.os.path, 'ismount', return_value=True)
+    @mock.patch.object(driver, '_validate_existing_share_mount')
+    @mock.patch.object(driver.flavor, 'to_profile')
+    def test_finish_migration_consumes_staged_manila_journal(
+            self, to_profile, validate_mount, ismount):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', root_gb=1)
+        migration = mock.Mock(
+            source_compute='source', dest_compute='destination')
+        cleanup_token = '10000000-0000-0000-0000-000000000001'
+        share = mock.Mock(
+            share_id='20000000-0000-0000-0000-000000000002',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            export_location='server:/project-data',
+            share_proto='NFS')
+        driver._write_share_journal(
+            instance, share, cleanup_token, 'mounted')
+        profile = mock.Mock(config={}, devices={})
+        timeline = []
+        profile.save.side_effect = lambda wait: timeline.append(
+            ('profile', dict(profile.devices)))
+        to_profile.return_value = profile
+        self.client.profiles.get.return_value = profile
+        container = mock.Mock()
+        container.start.side_effect = lambda wait: timeline.append(
+            ('start', None))
+        self.client.instances.create.return_value = container
+        self.CONF.incus.allow_cold_migration = True
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        disk_info = migration_disk_info({
             'format': 'incus-pull-v1',
+            'cleanup_token': cleanup_token,
             'migration_data': {
                 'name': instance.name,
                 'source': {'type': 'migration'},
             },
+            'manila_share_ids': [share.share_id],
             'was_running': True,
         })
+
         incus_driver.finish_migration(
             ctx, migration, instance, disk_info, [], mock.Mock(), True, {},
             block_device_info=None, power_on=True)
 
-        to_profile.assert_called_once_with(
-            self.client, instance, [], None)
-        self.client.instances.create.assert_called_once_with(
-            {
-                'name': instance.name,
-                'source': {'type': 'migration'},
-                'config': {'boot.autostart': 'false'},
-            },
-            wait=True)
+        initial_config = to_profile.call_args.kwargs['config_overrides']
+        self.assertEqual(
+            cleanup_token,
+            initial_config[driver.MIGRATION_DESTINATION_PREPARED_KEY])
+        self.assertEqual(
+            cleanup_token,
+            initial_config[driver.MIGRATION_CLEANUP_TOKEN_KEY])
+        self.assertEqual('1065536', initial_config['security.idmap.base'])
+        self.assertEqual('65536', initial_config['security.idmap.size'])
+
+        device = profile.devices[driver._share_device_name(share)]
+        self.assertEqual(
+            driver._share_mount_path(instance, share),
+            device['source'])
+        self.assertEqual('/mnt/manila/project-data', device['path'])
+        self.assertEqual([], driver._share_journal_records(instance))
         container.start.assert_called_once_with(wait=True)
+        share_save = next(
+            index for index, event in enumerate(timeline)
+            if driver._share_device_name(share) in (event[1] or {}))
+        start = next(
+            index for index, event in enumerate(timeline)
+            if event[0] == 'start')
+        self.assertLess(share_save, start)
 
     @mock.patch.object(driver.flavor, 'to_profile')
     def test_finish_migration_create_failure_rolls_back(self, to_profile):
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', root_gb=1)
         migration = mock.Mock(
             source_compute='source', dest_compute='destination')
-        network_info = [mock.sentinel.vif]
+        vif = network_model.VIF(id='test-vif')
+        network_info = [vif]
         profile = to_profile.return_value
+        profile.config = {}
+        self.client.profiles.get.return_value = profile
         self.client.instances.create.side_effect = RuntimeError(
             'destination pull failed')
+        self.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
         self.CONF.incus.allow_cold_migration = True
-        disk_info = jsonutils.dumps({
+        disk_info = migration_disk_info({
             'format': 'incus-pull-v1',
             'migration_data': {
                 'name': instance.name,
@@ -5187,10 +12752,95 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             True, {}, block_device_info=None, power_on=True)
 
         self.vif_driver.plug.assert_called_once_with(
-            instance, mock.sentinel.vif)
+            instance, vif)
         self.vif_driver.unplug.assert_called_once_with(
-            instance, mock.sentinel.vif)
+            instance, vif)
         profile.delete.assert_called_once_with()
+
+    @mock.patch.object(driver.flavor, 'to_profile')
+    def test_finish_migration_partial_vif_cleanup_retains_profile(
+            self, to_profile):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', root_gb=1)
+        migration = mock.Mock(
+            source_compute='source', dest_compute='destination')
+        vifs = [
+            network_model.VIF(id='first-vif'),
+            network_model.VIF(id='second-vif'),
+        ]
+        profile = mock.Mock(
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                'user.openstack.uuid': instance.uuid,
+            },
+            devices={},
+            used_by=[])
+        to_profile.return_value = profile
+        self.client.profiles.get.return_value = profile
+        self.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+        self.vif_driver.plug.side_effect = [
+            None, RuntimeError('second plug failed')]
+        self.vif_driver.unplug.side_effect = [
+            RuntimeError('initial rollback failed'),
+            RuntimeError('cleanup retry failed'),
+            None,
+        ]
+        self.CONF.incus.allow_cold_migration = True
+        disk_info = migration_disk_info({
+            'format': 'incus-pull-v1',
+            'migration_data': {
+                'name': instance.name,
+                'source': {'type': 'migration'},
+            },
+        })
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaisesRegex(
+            RuntimeError, 'second plug failed',
+            incus_driver.finish_migration,
+            ctx, migration, instance, disk_info, vifs, mock.Mock(),
+            True, {}, block_device_info=None, power_on=True)
+
+        self.assertEqual(
+            [
+                mock.call(instance, vifs[0]),
+                mock.call(instance, vifs[0]),
+                mock.call(instance, vifs[1]),
+            ],
+            self.vif_driver.unplug.call_args_list)
+        self.assertEqual(
+            'true', profile.config[driver.CLEANUP_RECOVERY_KEY])
+        profile.delete.assert_not_called()
+        self._retire_migration_attempt.assert_not_called()
+
+    def test_failed_finish_cleanup_failure_retains_attempt_for_periodic_retry(
+            self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        self.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver._cleanup = mock.Mock(
+            side_effect=exception.MigrationError(reason='umount failed'))
+        attempt = {'state': 'active', 'finished': False}
+        self._abort_migration_attempt.return_value = {
+            'state': 'aborted', 'finished': True}
+
+        recovered = incus_driver._rollback_failed_finish_migration(
+            ctx, instance, [mock.sentinel.vif], None, attempt,
+            '10000000-0000-0000-0000-000000000001',
+            1065536, 65536, None, False, mock.Mock(), [], True, True, None)
+
+        self.assertFalse(recovered)
+        incus_driver._cleanup.assert_called_once_with(
+            ctx, instance, [mock.sentinel.vif],
+            block_device_info=None, destroy_vifs=True,
+            delete_profile=True)
+        self._retire_migration_attempt.assert_not_called()
 
     @mock.patch.object(driver, '_require_bfv_migration_support')
     @mock.patch.object(driver, '_boot_from_volume')
@@ -5207,10 +12857,11 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         boot_from_volume.return_value = root_bdm
         profile = to_profile.return_value
         profile.config = {}
+        self.client.profiles.get.return_value = profile
         container = self.client.instances.create.return_value
         container.start.side_effect = RuntimeError('target start failed')
         self.CONF.incus.allow_cold_migration = True
-        disk_info = jsonutils.dumps({
+        disk_info = migration_disk_info({
             'format': 'incus-pull-v1',
             'boot_from_volume': True,
             'migration_data': {
@@ -5226,7 +12877,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             mock.Mock(), True, {}, block_device_info={}, power_on=True)
 
         require_bfv.assert_called_once_with(self.client, root_bdm)
-        self.assertEqual(3, container.start.call_count)
+        self.assertEqual(1, container.start.call_count)
         self.assertEqual(
             'running',
             profile.config[driver.MIGRATION_RECOVERY_KEY])
@@ -5247,11 +12898,15 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         boot_from_volume.return_value = {'boot_index': 0}
         profile = to_profile.return_value
         profile.config = {}
-        profile.save.side_effect = [RuntimeError('database busy'), None]
+        self.client.profiles.get.return_value = profile
+        profile.save.side_effect = [
+            incuscore_exceptions.ClientConnectionFailed('database busy'),
+            None,
+        ]
         container = self.client.instances.create.return_value
         container.start.side_effect = RuntimeError('target start failed')
         self.CONF.incus.allow_cold_migration = True
-        disk_info = jsonutils.dumps({
+        disk_info = migration_disk_info({
             'format': 'incus-pull-v1',
             'boot_from_volume': True,
             'migration_data': {
@@ -5287,16 +12942,18 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         require_bfv.return_value = ('cinder-volumes', 'volume-root')
         profile = to_profile.return_value
         profile.devices = {}
+        profile.config = {}
+        self.client.profiles.get.return_value = profile
         profile.save.side_effect = [
-            None,
-            RuntimeError('database unavailable'),
-            RuntimeError('database unavailable'),
-            RuntimeError('database unavailable'),
+            incuscore_exceptions.ClientConnectionFailed(
+                'database unavailable')
+            for unused_attempt in range(
+                self.CONF.incus.migration_finish_retries)
         ]
         container = self.client.instances.create.return_value
         container.start.side_effect = RuntimeError('target start failed')
         self.CONF.incus.allow_cold_migration = True
-        disk_info = jsonutils.dumps({
+        disk_info = migration_disk_info({
             'format': 'incus-pull-v1',
             'boot_from_volume': True,
             'migration_data': {
@@ -5307,17 +12964,18 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
+        vif = network_model.VIF(id='test-vif')
         self.assertRaises(
             RuntimeError,
             incus_driver.finish_migration,
-            ctx, mock.Mock(), instance, disk_info, [mock.sentinel.vif],
+            ctx, mock.Mock(), instance, disk_info, [vif],
             mock.Mock(), True, {}, block_device_info={}, power_on=True)
 
         container.delete.assert_not_called()
         profile.delete.assert_not_called()
         self.vif_driver.unplug.assert_not_called()
         self.assertEqual(
-            self.CONF.incus.migration_finish_retries + 1,
+            self.CONF.incus.migration_finish_retries,
             profile.save.call_count)
 
     @mock.patch.object(driver, '_require_bfv_migration_support')
@@ -5335,9 +12993,15 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         boot_from_volume.return_value = root_bdm
         container = self.client.instances.create.return_value
         container.start.side_effect = [
-            RuntimeError('transient target start failure'), None]
+            incuscore_exceptions.ClientConnectionFailed(
+                'transient target start failure'),
+            None,
+        ]
+        profile = to_profile.return_value
+        profile.config = {}
+        self.client.profiles.get.return_value = profile
         self.CONF.incus.allow_cold_migration = True
-        disk_info = jsonutils.dumps({
+        disk_info = migration_disk_info({
             'format': 'incus-pull-v1',
             'boot_from_volume': True,
             'migration_data': {
@@ -5370,12 +13034,15 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         boot_from_volume.return_value = root_bdm
         profile = to_profile.return_value
         profile.config = {}
-        claimed_container = mock.Mock()
+        self.client.profiles.get.return_value = profile
+        claimed_container = mock.Mock(config={
+            driver.MIGRATION_RECEIVE_COMPLETE_KEY: 'true',
+        })
         self.client.instances.create.side_effect = RuntimeError(
             'response timed out after server accepted create')
         self.client.instances.get.return_value = claimed_container
         self.CONF.incus.allow_cold_migration = True
-        disk_info = jsonutils.dumps({
+        disk_info = migration_disk_info({
             'format': 'incus-pull-v1',
             'boot_from_volume': True,
             'migration_data': {
@@ -5398,13 +13065,53 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         profile.delete.assert_not_called()
         self.vif_driver.unplug.assert_not_called()
 
+    @mock.patch.object(driver, '_require_bfv_migration_support')
+    @mock.patch.object(driver, '_boot_from_volume')
+    @mock.patch.object(driver.flavor, 'to_profile')
+    def test_finish_migration_rolls_back_incomplete_timeout_target(
+            self, to_profile, boot_from_volume, require_bfv):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        root_bdm = {'boot_index': 0}
+        boot_from_volume.return_value = root_bdm
+        profile = to_profile.return_value
+        profile.config = {}
+        self.client.profiles.get.return_value = profile
+        self.client.instances.create.side_effect = RuntimeError(
+            'response timed out before receive completed')
+        self.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+        self.CONF.incus.allow_cold_migration = True
+        disk_info = migration_disk_info({
+            'format': 'incus-pull-v1',
+            'boot_from_volume': True,
+            'migration_data': {
+                'name': instance.name,
+                'source': {'type': 'migration'},
+            },
+        })
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        vif = network_model.VIF(id='test-vif')
+        self.assertRaises(
+            RuntimeError,
+            incus_driver.finish_migration,
+            ctx, mock.Mock(), instance, disk_info, [vif],
+            mock.Mock(), True, {}, block_device_info={}, power_on=True)
+
+        self.assertNotIn(driver.MIGRATION_RECOVERY_KEY, profile.config)
+        profile.delete.assert_called_once_with()
+        self.vif_driver.unplug.assert_called_once_with(
+            instance, vif)
+
     def test_finish_migration_rejects_bfv_mode_mismatch(self):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         migration = mock.Mock(
             source_compute='source', dest_compute='destination')
         self.CONF.incus.allow_cold_migration = True
-        disk_info = jsonutils.dumps({
+        disk_info = migration_disk_info({
             'format': 'incus-pull-v1',
             'boot_from_volume': True,
             'migration_data': {
@@ -5458,10 +13165,12 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         get_mapping.return_value = [root_bdm, data_bdm]
         profile = to_profile.return_value
         profile.devices = {'root': {'size': '10GB'}}
+        profile.config = {}
+        self.client.profiles.get.return_value = profile
         self.CONF.incus.allow_cold_migration = True
         self.CONF.incus.boot_from_volume_storage_pools = {
             'cinder-volumes': 'cinder'}
-        disk_info = jsonutils.dumps({
+        disk_info = migration_disk_info({
             'format': 'incus-pull-v1',
             'boot_from_volume': True,
             'migration_data': {
@@ -5498,6 +13207,24 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             exception.MigrationPreCheckError,
             incus_driver.check_can_live_migrate_destination,
             ctx, instance, src_compute_info, dst_compute_info)
+
+    def test_check_can_live_migrate_destination_rejects_same_host_first(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        self.CONF.incus.allow_live_migration = True
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        instance.host = incus_driver.host
+
+        raised = self.assertRaises(
+            exception.MigrationPreCheckError,
+            incus_driver.check_can_live_migrate_destination,
+            ctx, instance, mock.Mock(), mock.Mock())
+
+        self.assertIn('source compute', str(raised))
+        self.client.instances.get.assert_not_called()
+        self.client.profiles.get.assert_not_called()
 
     def test_check_can_live_migrate_destination_returns_host_facts(self):
         ctx = context.get_admin_context()
@@ -5537,7 +13264,9 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertIn(
             'migration_live_shared_ceph_storage', str(exc))
 
-    def test_check_can_live_migrate_source_accepts_compatible_container(self):
+    @mock.patch.object(driver, '_migration_client')
+    def test_check_can_live_migrate_source_accepts_compatible_container(
+            self, migration_client):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', config_drive=False)
@@ -5557,7 +13286,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             destination_address='https://192.0.2.20:8443',
             destination_architecture='x86_64',
             destination_kernel_version='6.8.0-test',
-            destination_server_version='7.2')
+            destination_server_version='7.2',
+            cleanup_token='10000000-0000-0000-0000-000000000001')
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
@@ -5569,11 +13299,14 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertEqual('1065536',
                          source_profile['config']['security.idmap.base'])
         self.assertEqual(profile.devices, source_profile['devices'])
+        migration_client.assert_called_once_with(
+            'https://192.0.2.20:8443')
 
+    @mock.patch.object(driver, '_migration_client')
     @mock.patch.object(
         driver.objects.ShareMappingList, 'get_by_instance_uuid')
     def test_check_can_live_migrate_source_accepts_manila_share(
-            self, get_shares):
+            self, get_shares, migration_client):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', config_drive=False)
@@ -5609,7 +13342,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             destination_address='https://192.0.2.20:8443',
             destination_architecture='x86_64',
             destination_kernel_version='6.8.0-test',
-            destination_server_version='7.2')
+            destination_server_version='7.2',
+            cleanup_token='10000000-0000-0000-0000-000000000001')
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
@@ -5620,6 +13354,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             share_device,
             jsonutils.loads(result.source_profile)['devices'][
                 'manila-' + share_id])
+        migration_client.assert_called_once_with(
+            'https://192.0.2.20:8443')
 
     @mock.patch.object(
         driver.objects.ShareMappingList, 'get_by_instance_uuid')
@@ -5647,7 +13383,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             destination_address='https://192.0.2.20:8443',
             destination_architecture='x86_64',
             destination_kernel_version='6.8.0-test',
-            destination_server_version='7.2')
+            destination_server_version='7.2',
+            cleanup_token='10000000-0000-0000-0000-000000000001')
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
@@ -5657,10 +13394,11 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             incus_driver.check_can_live_migrate_source,
             ctx, instance, data, {'block_device_mapping': []})
 
+    @mock.patch.object(driver, '_migration_client')
     @mock.patch.object(driver, '_preflight_bfv_migration_destination')
     @mock.patch.object(driver, '_require_bfv_live_migration_support')
     def test_check_can_live_migrate_source_accepts_bfv_root(
-            self, require_bfv, preflight_destination):
+            self, require_bfv, preflight_destination, migration_client):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', config_drive=False)
@@ -5677,7 +13415,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             destination_address='https://192.0.2.20:8443',
             destination_architecture='x86_64',
             destination_kernel_version='6.8.0-test',
-            destination_server_version='7.2')
+            destination_server_version='7.2',
+            cleanup_token='10000000-0000-0000-0000-000000000001')
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
         root_bdm = {
@@ -5696,6 +13435,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         require_bfv.assert_called_once_with(self.client, root_bdm)
         preflight_destination.assert_called_once_with(
             '192.0.2.20', 'cinder-volumes', live=True)
+        migration_client.assert_called_once_with(
+            'https://192.0.2.20:8443')
 
     @mock.patch.object(driver.incus_client,
                        'get_migration_preflight_client')
@@ -5703,7 +13444,9 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     def test_bfv_live_destination_preflight_requires_live_extension(
             self, connect, get_remote):
         get_remote.return_value.host_info = {'api_extensions': [
-            'migration_shared_ceph_storage', 'storage_driver_cephext']}
+            'migration_shared_ceph_storage',
+            driver.INCUS_STORAGE_READY_FENCE_EXTENSION,
+            'storage_driver_cephext']}
 
         self.assertRaisesRegex(
             exception.MigrationError,
@@ -5726,7 +13469,9 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             driver._require_bfv_live_migration_support,
             self.client, mock.sentinel.root_bdm)
 
-    def test_check_can_live_migrate_source_accepts_cinder_data_volume(self):
+    @mock.patch.object(driver, '_migration_client')
+    def test_check_can_live_migrate_source_accepts_cinder_data_volume(
+            self, migration_client):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', config_drive=False)
@@ -5750,7 +13495,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             destination_address='https://192.0.2.20:8443',
             destination_architecture='x86_64',
             destination_kernel_version='6.8.0-test',
-            destination_server_version='7.2')
+            destination_server_version='7.2',
+            cleanup_token='10000000-0000-0000-0000-000000000001')
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
@@ -5768,6 +13514,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         source_profile = jsonutils.loads(result.source_profile)
         self.assertNotIn('volume-id', source_profile['devices'])
         self.assertIn('root', source_profile['devices'])
+        migration_client.assert_called_once_with(
+            'https://192.0.2.20:8443')
 
     def test_check_can_live_migrate_source_rejects_kernel_mismatch(self):
         ctx = context.get_admin_context()
@@ -5780,11 +13528,14 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         profile.devices = {'root': {'type': 'disk', 'path': '/'}}
         self.client.profiles.get.return_value = profile
         self.client.instances.get.return_value.status = 'Running'
+        self.client.instances.get.return_value.config = {
+            'volatile.idmap.base': '1065536'}
         data = migrate_data.IncusLiveMigrateData(
             destination_address='https://192.0.2.20:8443',
             destination_architecture='x86_64',
             destination_kernel_version='6.9.0-other',
-            destination_server_version='7.2')
+            destination_server_version='7.2',
+            cleanup_token='10000000-0000-0000-0000-000000000001')
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
@@ -5793,21 +13544,29 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             incus_driver.check_can_live_migrate_source,
             ctx, instance, data, {'block_device_mapping': []})
 
-    @mock.patch.object(driver.IncusDriver, 'attach_volume')
+    @mock.patch.object(
+        driver.IncusDriver, '_stage_volume_for_live_migration')
     @mock.patch.object(driver, '_remove_stale_live_migration_profile')
     def test_pre_live_migration_creates_profile_and_attaches_data_volume(
-            self, remove_stale_profile, attach_volume):
+            self, remove_stale_profile, stage_volume):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
+        cleanup_token = '10000000-0000-0000-0000-000000000001'
         data = migrate_data.IncusLiveMigrateData(
             destination_address='https://192.0.2.20:8443',
             destination_architecture='x86_64',
             destination_kernel_version='6.8.0-test',
             destination_server_version='7.2',
+            cleanup_token=cleanup_token,
+            idmap_base=1065536,
+            idmap_size=65536,
             source_profile=jsonutils.dumps({
                 'config': {
                     'migration.stateful': 'true',
                     'security.idmap.base': '1065536',
+                    'security.idmap.size': '65536',
+                    'user.openstack.uuid': instance.uuid,
+                    driver.MIGRATION_CLEANUP_TOKEN_KEY: cleanup_token,
                 },
                 'devices': {'root': {'type': 'disk', 'path': '/'}},
             }))
@@ -5836,10 +13595,15 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             {
                 'migration.stateful': 'true',
                 'security.idmap.base': '1065536',
+                'security.idmap.size': '65536',
+                'user.openstack.uuid': instance.uuid,
+                driver.MIGRATION_CLEANUP_TOKEN_KEY: cleanup_token,
+                driver.MIGRATION_CLEANUP_COMPLETE_KEY: '',
+                driver.MIGRATION_DESTINATION_PREPARED_KEY: cleanup_token,
             },
             {'root': {'type': 'disk', 'path': '/'}})
-        attach_volume.assert_called_once_with(
-            ctx, connection_info, instance, '/dev/vdb')
+        stage_volume.assert_called_once_with(
+            ctx, connection_info, instance, '/dev/vdb', cleanup_token)
 
     @mock.patch.object(driver.os.path, 'ismount', return_value=True)
     @mock.patch.object(driver.os, 'chmod')
@@ -5863,24 +13627,44 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             mock.call(instance_root, 0o711),
         ], chmod.call_args_list)
 
+    @mock.patch.object(driver, '_validate_existing_share_mount')
     @mock.patch.object(driver.IncusDriver, 'mount_share')
     @mock.patch.object(driver, '_remove_stale_live_migration_profile')
     def test_pre_live_migration_leaves_manila_mount_to_manager(
-            self, remove_stale_profile, mount_share):
+            self, remove_stale_profile, mount_share, validate_mount):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
+        cleanup_token = '10000000-0000-0000-0000-000000000001'
+        share = mock.Mock(
+            share_id='20000000-0000-0000-0000-000000000002',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            export_location='server:/project-data',
+            share_proto='NFS')
+        source = driver._share_mount_path(instance, share)
+        driver._write_share_journal(
+            instance, share, cleanup_token, 'mounted')
         data = migrate_data.IncusLiveMigrateData(
             destination_address='https://192.0.2.20:8443',
             destination_architecture='x86_64',
             destination_kernel_version='6.8.0-test',
             destination_server_version='7.2',
+            cleanup_token=cleanup_token,
+            idmap_base=1065536,
+            idmap_size=65536,
             source_profile=jsonutils.dumps({
-                'config': {'migration.stateful': 'true'},
+                'config': {
+                    'migration.stateful': 'true',
+                    'security.idmap.base': '1065536',
+                    'security.idmap.size': '65536',
+                    'user.openstack.uuid': instance.uuid,
+                    driver.MIGRATION_CLEANUP_TOKEN_KEY: cleanup_token,
+                },
                 'devices': {
                     'root': {'type': 'disk', 'path': '/'},
-                    'manila-10000000-0000-0000-0000-000000000001': {
+                    driver._share_device_name(share): {
                         'type': 'disk',
-                        'source': '/var/lib/nova/incus-shares/share',
+                        'source': source,
                         'path': '/mnt/manila/project-data',
                     },
                 },
@@ -5893,25 +13677,47 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             [], None, data)
 
         mount_share.assert_not_called()
+        validate_mount.assert_called_once()
+        self.assertFalse(os.path.exists(
+            driver._share_journal_path(instance, share.share_id)))
 
     @mock.patch.object(driver.eventlet, 'sleep')
     @mock.patch.object(driver.os.path, 'ismount', return_value=True)
+    @mock.patch.object(driver, '_validate_existing_share_mount')
     @mock.patch.object(driver, '_remove_stale_live_migration_profile')
     def test_pre_live_migration_retries_manila_mount_propagation(
-            self, remove_stale_profile, ismount, sleep):
+            self, remove_stale_profile, validate_mount, ismount, sleep):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
-        share_source = '/var/lib/nova/incus-shares/instance/share'
+        cleanup_token = '10000000-0000-0000-0000-000000000001'
+        share = mock.Mock(
+            share_id='20000000-0000-0000-0000-000000000002',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            export_location='server:/project-data',
+            share_proto='NFS')
+        share_source = driver._share_mount_path(instance, share)
+        driver._write_share_journal(
+            instance, share, cleanup_token, 'mounted')
         data = migrate_data.IncusLiveMigrateData(
             destination_address='https://192.0.2.20:8443',
             destination_architecture='x86_64',
             destination_kernel_version='6.8.0-test',
             destination_server_version='7.2',
+            cleanup_token=cleanup_token,
+            idmap_base=1065536,
+            idmap_size=65536,
             source_profile=jsonutils.dumps({
-                'config': {'migration.stateful': 'true'},
+                'config': {
+                    'migration.stateful': 'true',
+                    'security.idmap.base': '1065536',
+                    'security.idmap.size': '65536',
+                    'user.openstack.uuid': instance.uuid,
+                    driver.MIGRATION_CLEANUP_TOKEN_KEY: cleanup_token,
+                },
                 'devices': {
                     'root': {'type': 'disk', 'path': '/'},
-                    'manila-10000000-0000-0000-0000-000000000001': {
+                    driver._share_device_name(share): {
                         'type': 'disk',
                         'source': share_source,
                         'path': '/mnt/manila/project-data',
@@ -5939,12 +13745,17 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             self.CONF.incus.migration_finish_retry_interval)
 
     def test_remove_stale_live_migration_profile(self):
-        instance = mock.Mock(name='instance')
+        instance = mock.Mock()
         instance.name = 'instance-00000001'
+        instance.uuid = '10000000-0000-0000-0000-000000000001'
         self.client.instances.get.side_effect = incuscore_exceptions.NotFound(
             MockResponse(404))
         profile = self.client.profiles.get.return_value
-        profile.config = {'environment.product_name': 'OpenStack Nova'}
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+        }
+        profile.devices = {}
         profile.used_by = []
 
         driver._remove_stale_live_migration_profile(
@@ -5961,22 +13772,34 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             driver._remove_stale_live_migration_profile,
             self.client, instance)
 
+        self.client.instances.get.assert_called_once_with(instance.name)
         self.client.profiles.get.assert_not_called()
 
     @mock.patch.object(driver, '_require_bfv_live_migration_support')
-    @mock.patch.object(driver.IncusDriver, 'attach_volume')
+    @mock.patch.object(
+        driver.IncusDriver, '_stage_volume_for_live_migration')
     @mock.patch.object(driver, '_remove_stale_live_migration_profile')
     def test_pre_live_migration_leaves_bfv_root_to_cephext(
-            self, remove_stale_profile, attach_volume, require_bfv):
+            self, remove_stale_profile, stage_volume, require_bfv):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
+        cleanup_token = '10000000-0000-0000-0000-000000000001'
         data = migrate_data.IncusLiveMigrateData(
             destination_address='https://192.0.2.20:8443',
             destination_architecture='x86_64',
             destination_kernel_version='6.8.0-test',
             destination_server_version='7.2',
+            cleanup_token=cleanup_token,
+            idmap_base=1065536,
+            idmap_size=65536,
             source_profile=jsonutils.dumps({
-                'config': {'migration.stateful': 'true'},
+                'config': {
+                    'migration.stateful': 'true',
+                    'security.idmap.base': '1065536',
+                    'security.idmap.size': '65536',
+                    'user.openstack.uuid': instance.uuid,
+                    driver.MIGRATION_CLEANUP_TOKEN_KEY: cleanup_token,
+                },
                 'devices': {
                     'root': {
                         'type': 'disk',
@@ -6000,22 +13823,32 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         self.assertIs(data, result)
         require_bfv.assert_called_once_with(self.client, root_bdm)
-        attach_volume.assert_not_called()
+        stage_volume.assert_not_called()
 
-    @mock.patch.object(driver.IncusDriver, 'unplug_vifs')
-    @mock.patch.object(driver.IncusDriver, 'attach_volume')
+    @mock.patch.object(
+        driver.IncusDriver, '_stage_volume_for_live_migration')
     @mock.patch.object(driver, '_remove_stale_live_migration_profile')
     def test_pre_live_migration_failure_removes_profile_and_network(
-            self, remove_stale_profile, attach_volume, unplug_vifs):
+            self, remove_stale_profile, stage_volume):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
+        cleanup_token = '10000000-0000-0000-0000-000000000001'
         data = migrate_data.IncusLiveMigrateData(
             destination_address='https://192.0.2.20:8443',
             destination_architecture='x86_64',
             destination_kernel_version='6.8.0-test',
             destination_server_version='7.2',
+            cleanup_token=cleanup_token,
+            idmap_base=1065536,
+            idmap_size=65536,
             source_profile=jsonutils.dumps({
-                'config': {'migration.stateful': 'true'},
+                'config': {
+                    'migration.stateful': 'true',
+                    'security.idmap.base': '1065536',
+                    'security.idmap.size': '65536',
+                    'user.openstack.uuid': instance.uuid,
+                    driver.MIGRATION_CLEANUP_TOKEN_KEY: cleanup_token,
+                },
                 'devices': {'root': {'type': 'disk', 'path': '/'}},
             }))
         connection_info = {
@@ -6023,7 +13856,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'driver_volume_type': 'rbd',
             'data': {},
         }
-        attach_volume.side_effect = RuntimeError('connect failed')
+        vif = network_model.VIF(id='test-vif')
+        stage_volume.side_effect = RuntimeError('connect failed')
         profile = self.client.profiles.get.return_value
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
@@ -6035,14 +13869,231 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                 'boot_index': None,
                 'mount_device': '/dev/vdb',
                 'connection_info': connection_info,
-            }]}, [mock.sentinel.vif], None, data)
+            }]}, [vif], None, data)
 
         profile.delete.assert_called_once_with()
-        unplug_vifs.assert_called_once_with(
-            instance, [mock.sentinel.vif])
+        self.vif_driver.unplug.assert_called_once_with(
+            instance, vif)
         self.assertIs(
             True,
             connection_info['data'][driver._PRE_LIVE_DISCONNECTED_KEY])
+
+    @mock.patch.object(driver, '_remove_stale_live_migration_profile')
+    def test_pre_live_partial_vif_cleanup_retains_profile(
+            self, remove_stale_profile):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        cleanup_token = '10000000-0000-0000-0000-000000000001'
+        vifs = [
+            network_model.VIF(id='first-vif'),
+            network_model.VIF(id='second-vif'),
+        ]
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            destination_architecture='x86_64',
+            destination_kernel_version='6.8.0-test',
+            destination_server_version='7.2',
+            cleanup_token=cleanup_token,
+            idmap_base=1065536,
+            idmap_size=65536,
+            source_profile=jsonutils.dumps({
+                'config': {
+                    'migration.stateful': 'true',
+                    'security.idmap.base': '1065536',
+                    'security.idmap.size': '65536',
+                    'user.openstack.uuid': instance.uuid,
+                    driver.MIGRATION_CLEANUP_TOKEN_KEY: cleanup_token,
+                },
+                'devices': {'root': {'type': 'disk', 'path': '/'}},
+            }))
+        profile = mock.Mock(
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                'security.idmap.base': '1065536',
+                'security.idmap.size': '65536',
+                'user.openstack.uuid': instance.uuid,
+                driver.MIGRATION_CLEANUP_TOKEN_KEY: cleanup_token,
+            },
+            devices={'root': {'type': 'disk', 'path': '/'}},
+            used_by=[])
+        self.client.profiles.get.return_value = profile
+        self.vif_driver.plug.side_effect = [
+            None, RuntimeError('second plug failed')]
+        self.vif_driver.unplug.side_effect = [
+            RuntimeError('initial rollback failed'),
+            RuntimeError('cleanup retry failed'),
+            None,
+        ]
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaisesRegex(
+            RuntimeError, 'second plug failed',
+            incus_driver.pre_live_migration,
+            ctx, instance, {'block_device_mapping': []},
+            vifs, None, data)
+
+        self.assertEqual(
+            [
+                mock.call(instance, vifs[0]),
+                mock.call(instance, vifs[0]),
+                mock.call(instance, vifs[1]),
+            ],
+            self.vif_driver.unplug.call_args_list)
+        self.assertEqual(
+            'true', profile.config[driver.CLEANUP_RECOVERY_KEY])
+        profile.delete.assert_not_called()
+        self._retire_migration_attempt.assert_not_called()
+
+    @mock.patch.object(
+        driver.IncusDriver, '_stage_volume_for_live_migration',
+        side_effect=RuntimeError('connect failed'))
+    @mock.patch.object(driver.incus_privsep, 'umount',
+                       side_effect=RuntimeError('NFS umount failed'))
+    @mock.patch.object(driver, '_share_mount_table_index')
+    @mock.patch.object(driver, '_validate_existing_share_mount')
+    @mock.patch.object(driver, '_remove_stale_live_migration_profile')
+    def test_pre_live_manila_cleanup_failure_retains_profile(
+            self, remove_stale_profile, validate_mount, mount_table, umount,
+            stage_volume):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        cleanup_token = '10000000-0000-0000-0000-000000000001'
+        share = mock.Mock(
+            share_id='20000000-0000-0000-0000-000000000002',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            export_location='server:/project-data',
+            share_proto='NFS')
+        driver._write_share_journal(
+            instance, share, cleanup_token, 'mounted')
+        share_device = driver._share_device_name(share)
+        share_path = driver._share_mount_path(instance, share)
+        mount_table.return_value = {
+            os.path.realpath(share_path): {
+                'device': share.export_location,
+                'fstype': 'nfs',
+                'opts': frozenset(('rw', 'nosuid', 'nodev')),
+            },
+        }
+        devices = {
+            'root': {'type': 'disk', 'path': '/'},
+            share_device: {
+                'type': 'disk',
+                'source': share_path,
+                'path': '/mnt/manila/project-data',
+                'readonly': 'false',
+                'recursive': 'true',
+            },
+        }
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            destination_architecture='x86_64',
+            destination_kernel_version='6.8.0-test',
+            destination_server_version='7.2',
+            cleanup_token=cleanup_token,
+            idmap_base=1065536,
+            idmap_size=65536,
+            source_profile=jsonutils.dumps({
+                'config': {
+                    'migration.stateful': 'true',
+                    'security.idmap.base': '1065536',
+                    'security.idmap.size': '65536',
+                    'user.openstack.uuid': instance.uuid,
+                    driver.MIGRATION_CLEANUP_TOKEN_KEY: cleanup_token,
+                },
+                'devices': devices,
+            }))
+        profile = mock.Mock(
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                'security.idmap.base': '1065536',
+                'security.idmap.size': '65536',
+                'user.openstack.uuid': instance.uuid,
+                driver.MIGRATION_CLEANUP_TOKEN_KEY: cleanup_token,
+            },
+            devices=copy.deepcopy(devices),
+            used_by=[])
+        self.client.profiles.get.return_value = profile
+        connection_info = {
+            'serial': 'volume-id',
+            'driver_volume_type': 'rbd',
+            'data': {},
+        }
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaisesRegex(
+            RuntimeError, 'connect failed',
+            incus_driver.pre_live_migration,
+            ctx, instance, {'block_device_mapping': [{
+                'boot_index': None,
+                'mount_device': '/dev/vdb',
+                'connection_info': connection_info,
+            }]}, [], None, data)
+
+        self.assertEqual([], driver._share_journal_records(instance))
+        self.assertIn(share_device, profile.devices)
+        self.assertEqual(
+            'true', profile.config[driver.CLEANUP_RECOVERY_KEY])
+        umount.assert_called_once_with(
+            os.path.realpath(share_path),
+            self.CONF.incus.share_unmount_timeout)
+        profile.delete.assert_not_called()
+        self._retire_migration_attempt.assert_not_called()
+
+    def test_cleanup_pre_live_destination_retries_vifs_idempotently(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        cleanup_token = '10000000-0000-0000-0000-000000000001'
+        data = migrate_data.IncusLiveMigrateData(
+            cleanup_token=cleanup_token,
+            idmap_base=1065536,
+            idmap_size=65536)
+        vifs = [
+            network_model.VIF(id='first-vif'),
+            network_model.VIF(id='second-vif'),
+        ]
+        profile = mock.Mock(
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                'security.idmap.base': '1065536',
+                'security.idmap.size': '65536',
+                'user.openstack.uuid': instance.uuid,
+                driver.MIGRATION_CLEANUP_TOKEN_KEY: cleanup_token,
+            },
+            devices={'root': {'type': 'disk', 'path': '/'}},
+            used_by=[])
+        self.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+        self.client.profiles.get.return_value = profile
+        self.vif_driver.unplug.side_effect = [
+            RuntimeError('first cleanup failed'),
+            None,
+            None,
+            None,
+        ]
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver.network_api = mock.Mock()
+        incus_driver.network_api.get_instance_nw_info.return_value = vifs
+
+        self.assertFalse(
+            incus_driver.cleanup_pre_live_migration_destination(
+                ctx, instance, data))
+        self.assertEqual(
+            'true', profile.config[driver.CLEANUP_RECOVERY_KEY])
+        profile.delete.assert_not_called()
+        self._retire_migration_attempt.assert_not_called()
+
+        self.assertTrue(
+            incus_driver.cleanup_pre_live_migration_destination(
+                ctx, instance, data))
+
+        profile.delete.assert_called_once_with()
+        self._retire_migration_attempt.assert_called_once_with(
+            self.client, instance, cleanup_token, 1065536, 65536)
+        self.assertEqual(4, self.vif_driver.unplug.call_count)
 
     def test_detach_volume_skips_pre_live_double_disconnect(self):
         ctx = context.get_admin_context()
@@ -6054,13 +14105,16 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         }
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
+        self.client.profiles.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
 
         incus_driver.detach_volume(
             ctx, connection_info, instance, '/dev/vdb')
 
-        self.client.profiles.get.assert_not_called()
-        self.assertNotIn(
-            driver._PRE_LIVE_DISCONNECTED_KEY, connection_info['data'])
+        self.client.profiles.get.assert_called_once_with(instance.name)
+        self.assertIs(
+            True,
+            connection_info['data'][driver._PRE_LIVE_DISCONNECTED_KEY])
 
     def test_migration_operation_url_uses_public_endpoint(self):
         result = driver._migration_operation_url(
@@ -6121,7 +14175,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'default': ['test'],
             'source': {
                 'operation': (
-                    'http+unix://incus/1.0/operations/op'),
+                    'http+unix://incus/1.0/operations/'
+                    '20000000-0000-0000-0000-000000000002'),
             },
         }
         self.client.instances.get.return_value = container
@@ -6130,37 +14185,56 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         profile.devices = {'root': {'type': 'disk', 'path': '/'}}
         self.client.profiles.get.return_value = profile
         remote = get_remote.return_value
-        remote.profiles.get.side_effect = incuscore_exceptions.NotFound(
-            MockResponse(404))
+        remote.profiles.get.return_value = mock.Mock(
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                driver.MIGRATION_CLEANUP_TOKEN_KEY:
+                    '10000000-0000-0000-0000-000000000001',
+            },
+            used_by=[])
         post = mock.Mock()
         recover = mock.Mock()
         data = migrate_data.IncusLiveMigrateData(
             destination_address='https://192.0.2.20:8443',
             destination_architecture='x86_64',
             destination_kernel_version='6.8.0-test',
-            destination_server_version='7.2')
+            destination_server_version='7.2',
+            cleanup_token='10000000-0000-0000-0000-000000000001',
+            idmap_base=1065536,
+            idmap_size=65536)
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
-
+        destination_claim = mock.Mock(
+            host_id='30000000-0000-0000-0000-000000000003',
+            materialization_id=data.cleanup_token)
+        source_claim = mock.Mock(
+            materialization_id=(
+                '40000000-0000-0000-0000-000000000004'))
+        incus_driver._idmap_claim_from_local_config = mock.Mock(
+            return_value=(mock.sentinel.assignment, destination_claim))
+        incus_driver._instance_local_idmap_claim = mock.Mock(
+            return_value=(mock.sentinel.assignment, source_claim))
+        incus_driver._resume_idmap_materialization = mock.Mock(
+            return_value=None)
         incus_driver.live_migration(
             ctx, instance, 'destination', post, recover,
             migrate_data=data)
 
         payload = remote.instances.create.call_args.args[0]
-        remote.profiles.create.assert_called_once_with(
-            instance.name,
-            {
-                'migration.stateful': 'true',
-                'security.idmap.base': '1065536',
-            },
-            {'root': {'type': 'disk', 'path': '/'}})
+        remote.profiles.create.assert_not_called()
         self.assertEqual([instance.name], payload['profiles'])
         self.assertNotIn('default', payload)
+        self.assertEqual(
+            instance.uuid, payload['config']['user.openstack.uuid'])
         self.assertIs(True, payload['source']['live'])
         self.assertEqual(
-            'https://192.0.2.10:8443/1.0/operations/op',
+            'https://192.0.2.10:8443/1.0/operations/'
+            '20000000-0000-0000-0000-000000000002',
             payload['source']['operation'])
         remote.instances.create.assert_called_once_with(payload, wait=True)
+        incus_driver._resume_idmap_materialization.assert_called_once_with(
+            remote, instance, data.cleanup_token,
+            destination_claim.host_id, mock.ANY, 1065536, 65536)
         post.assert_called_once_with(
             ctx, instance, 'destination', False, data)
         recover.assert_not_called()
@@ -6185,7 +14259,9 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         container.config = {'volatile.idmap.base': '1065536'}
         container.generate_migration_data.return_value = {
             'source': {
-                'operation': 'http+unix://incus/1.0/operations/op',
+                'operation': (
+                    'http+unix://incus/1.0/operations/'
+                    '20000000-0000-0000-0000-000000000002'),
             },
         }
         self.client.instances.get.return_value = container
@@ -6197,13 +14273,18 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         remote.profiles.get.side_effect = incuscore_exceptions.NotFound(
             MockResponse(404))
         remote.instances.create.side_effect = RuntimeError('restore failed')
+        self.client.api.operations.get.return_value.json.return_value = {
+            'metadata': {}}
         post = mock.Mock()
         recover = mock.Mock()
         data = migrate_data.IncusLiveMigrateData(
             destination_address='https://192.0.2.20:8443',
             destination_architecture='x86_64',
             destination_kernel_version='6.8.0-test',
-            destination_server_version='7.2')
+            destination_server_version='7.2',
+            cleanup_token='10000000-0000-0000-0000-000000000001',
+            idmap_base=1065536,
+            idmap_size=65536)
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
@@ -6225,19 +14306,41 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         container.config = {'volatile.idmap.base': '1065536'}
         container.generate_migration_data.return_value = {
             'source': {
-                'operation': 'http+unix://incus/1.0/operations/op',
+                'operation': (
+                    'http+unix://incus/1.0/operations/'
+                    '20000000-0000-0000-0000-000000000002'),
             },
         }
         self.client.instances.get.return_value = container
         remote = get_remote.return_value
+        remote.profiles.get.return_value = mock.Mock(
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                driver.MIGRATION_CLEANUP_TOKEN_KEY:
+                    '10000000-0000-0000-0000-000000000001',
+            },
+            used_by=[])
         remote.instances.create.side_effect = RuntimeError('restore failed')
+        self.client.api.operations = mock.MagicMock()
+        self.client.api.operations.get.return_value.json.return_value = {
+            'metadata': {}}
+        operation = self.client.api.operations[
+            '20000000-0000-0000-0000-000000000002']
+        operation.get.return_value.json.return_value = {
+            'metadata': {
+                'id': '20000000-0000-0000-0000-000000000002',
+                'status_code': 400,
+            }}
         post = mock.Mock()
         recover = mock.Mock()
         data = migrate_data.IncusLiveMigrateData(
             destination_address='https://192.0.2.20:8443',
             destination_architecture='x86_64',
             destination_kernel_version='6.8.0-test',
-            destination_server_version='7.2')
+            destination_server_version='7.2',
+            cleanup_token='10000000-0000-0000-0000-000000000001',
+            idmap_base=1065536,
+            idmap_size=65536)
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
@@ -6250,54 +14353,112 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             ctx, instance, 'destination', data)
         post.assert_not_called()
 
-    def test_rollback_live_migration_source_start_failure_is_nonfatal(self):
+    @mock.patch.object(driver, '_settle_instance_migration_operations')
+    @mock.patch.object(
+        driver, '_abort_migration_attempt',
+        return_value={'state': 'aborted'})
+    @mock.patch.object(driver, '_migration_client')
+    def test_rollback_live_migration_source_stays_fenced(
+            self, migration_client, abort_attempt, settle_operations):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         container = mock.Mock(status='Stopped')
-        container.start.side_effect = RuntimeError('restore failed')
         self.client.instances.get.return_value = container
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            cleanup_token='10000000-0000-0000-0000-000000000001',
+            source_operation_id=None,
+            idmap_base=1065536,
+            idmap_size=65536)
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
 
         incus_driver.rollback_live_migration_at_source(
-            ctx, instance, migrate_data.IncusLiveMigrateData())
+            ctx, instance, data)
 
-        container.start.assert_called_once_with(wait=True)
-
-    def test_rollback_live_migration_source_waits_for_criu_restore(self):
-        ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(ctx, name='test')
-        container = mock.Mock(status='Stopped')
-
-        def sync():
-            if container.sync.call_count == 2:
-                container.status = 'Running'
-
-        container.sync.side_effect = sync
-        self.client.instances.get.return_value = container
-        incus_driver = driver.IncusDriver(None)
-        incus_driver.init_host(None)
-
-        incus_driver.rollback_live_migration_at_source(
-            ctx, instance, migrate_data.IncusLiveMigrateData())
-
-        self.assertEqual(2, container.sync.call_count)
+        abort_attempt.assert_called_once()
+        self.assertEqual(
+            (migration_client.return_value, instance, data.cleanup_token,
+             data.idmap_base, data.idmap_size),
+            abort_attempt.call_args.args)
+        self.assertTrue(callable(
+            abort_attempt.call_args.kwargs['target_cleanup']))
+        settle_operations.assert_called_once_with(
+            self.client, instance, operation_ids=(None,))
+        container.sync.assert_called_once_with()
+        container.stop.assert_not_called()
         container.start.assert_not_called()
 
-    @mock.patch('nova.virt.incus.driver._migration_client')
-    def test_finalize_live_migration_rollback_reasserts_original_vifs(
-            self, get_remote):
+    @mock.patch.object(driver, '_settle_instance_migration_operations')
+    @mock.patch.object(
+        driver, '_abort_migration_attempt',
+        return_value={'state': 'aborted'})
+    @mock.patch.object(driver, '_migration_client')
+    def test_rollback_live_migration_source_fences_running_container(
+            self, migration_client, abort_attempt, settle_operations):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
+        container = mock.Mock(status='Running')
+        self.client.instances.get.return_value = container
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            cleanup_token='10000000-0000-0000-0000-000000000001',
+            source_operation_id=None,
+            idmap_base=1065536,
+            idmap_size=65536)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.rollback_live_migration_at_source(
+            ctx, instance, data)
+
+        abort_attempt.assert_called_once()
+        self.assertEqual(
+            (migration_client.return_value, instance, data.cleanup_token,
+             data.idmap_base, data.idmap_size),
+            abort_attempt.call_args.args)
+        self.assertTrue(callable(
+            abort_attempt.call_args.kwargs['target_cleanup']))
+        settle_operations.assert_called_once_with(
+            self.client, instance, operation_ids=(None,))
+        container.sync.assert_called_once_with()
+        container.stop.assert_called_once_with(
+            timeout=-1, force=True, wait=True)
+        container.start.assert_not_called()
+
+    @mock.patch.object(driver, '_restore_source_storage_ownership')
+    @mock.patch.object(driver, '_settle_instance_migration_operations')
+    @mock.patch('nova.virt.incus.driver._migration_client')
+    def test_finalize_live_migration_rollback_reasserts_original_vifs(
+            self, get_remote, settle_operations, restore_ownership):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        cleanup_token = '10000000-0000-0000-0000-000000000001'
         source_vif = network_model.VIF(id='test-vif')
         vif_data = nova_migrate_data.VIFMigrateData(source_vif=source_vif)
         data = migrate_data.IncusLiveMigrateData(
             destination_address='https://192.0.2.20:8443',
+            cleanup_token=cleanup_token,
+            source_operation_id=None,
+            idmap_base=1065536,
+            idmap_size=65536,
             vifs=[vif_data])
-        get_remote.return_value.profiles.get.side_effect = [
-            mock.sentinel.profile,
-            incuscore_exceptions.NotFound(MockResponse(404)),
-        ]
+        remote = get_remote.return_value
+        remote.instances.get.side_effect = incuscore_exceptions.NotFound(
+            MockResponse(404))
+        cleanup_profile = mock.Mock(
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                'user.openstack.uuid': instance.uuid,
+                driver.MIGRATION_CLEANUP_TOKEN_KEY: cleanup_token,
+                driver.MIGRATION_CLEANUP_COMPLETE_KEY: cleanup_token,
+            },
+            devices={},
+            used_by=[])
+        remote.profiles.get.return_value = cleanup_profile
+        source_profile = mock.Mock(config={}, devices={})
+        self.client.profiles.get.return_value = source_profile
+        self.client.instances.get.return_value = mock.Mock(status='Running')
         inactive_vif = network_model.VIF(id='test-vif', active=False)
         active_vif = network_model.VIF(id='test-vif', active=True)
         incus_driver = driver.IncusDriver(None)
@@ -6309,6 +14470,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             ])
         incus_driver.vif_driver.reassert = mock.Mock()
         incus_driver.unplug_vifs = mock.Mock()
+        incus_driver._validate_remote_cleanup_acknowledgement = mock.Mock()
 
         incus_driver.finalize_live_migration_rollback(
             ctx, instance, data)
@@ -6316,30 +14478,99 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         incus_driver.vif_driver.reassert.assert_called_once_with(
             instance, source_vif)
         incus_driver.unplug_vifs.assert_not_called()
+        settle_operations.assert_called_once_with(
+            self.client, instance, operation_ids=(None,))
+        restore_ownership.assert_called_once_with(self.client, instance)
+        cleanup_profile.delete.assert_called_once_with()
         self.assertEqual(
-            2, get_remote.return_value.profiles.get.call_count)
+            2,
+            incus_driver._validate_remote_cleanup_acknowledgement.call_count)
+        source_profile.save.assert_called_once_with(wait=True)
+        self.assertEqual(
+            2, remote.profiles.get.call_count)
 
+    @mock.patch.object(driver, '_abort_migration_attempt')
     @mock.patch.object(driver, '_cleanup_profile_share_mounts')
     def test_rollback_live_migration_destination_cleans_profile_last(
-            self, cleanup_shares):
+            self, cleanup_shares, abort_attempt):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         profile = self.client.profiles.get.return_value
+        target = self.client.instances.get.return_value
+        data = migrate_data.IncusLiveMigrateData(
+            cleanup_token='10000000-0000-0000-0000-000000000001',
+            idmap_base=1065536,
+            idmap_size=65536)
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
-        incus_driver.cleanup = mock.Mock()
+        fixture = self._configure_exact_idmap_release(
+            incus_driver, instance, target, profile,
+            outcome='detached', idmap_base=1065536)
+        tokenized_delete = fixture[-1]
+        incus_driver._cleanup = mock.Mock()
+        incus_driver._acknowledge_cleanup_profile = mock.Mock()
 
         incus_driver.rollback_live_migration_at_destination(
             ctx, instance, mock.sentinel.network_info,
-            {'block_device_mapping': []}, destroy_disks=False)
+            {'block_device_mapping': []}, destroy_disks=False,
+            migrate_data=data)
 
+        abort_attempt.assert_called_once()
+        self.assertEqual(
+            (self.client, instance, data.cleanup_token,
+             data.idmap_base, data.idmap_size),
+            abort_attempt.call_args.args)
+        self.assertTrue(callable(
+            abort_attempt.call_args.kwargs['target_cleanup']))
+        tokenized_delete.assert_called_once_with(
+            target, instance, mock.ANY, client=self.client)
+        target.delete.assert_called_once_with(wait=True)
         cleanup_shares.assert_called_once_with(profile, instance)
-        incus_driver.cleanup.assert_called_once_with(
+        incus_driver._cleanup.assert_called_once_with(
             ctx, instance, mock.sentinel.network_info,
-            destroy_disks=False, destroy_vifs=True)
+            destroy_disks=False, destroy_vifs=True, delete_profile=False)
+        incus_driver._acknowledge_cleanup_profile.assert_called_once_with(
+            instance, data.cleanup_token)
+        incus_driver.idmap_allocator.request_release.assert_not_called()
+        incus_driver.idmap_allocator.release.assert_not_called()
         profile.delete.assert_not_called()
 
-    def test_confirm_migration(self):
+    @mock.patch.object(driver, '_retire_migration_attempt')
+    @mock.patch.object(driver, '_cleanup_share_journal_mounts')
+    @mock.patch.object(
+        driver, '_abort_migration_attempt',
+        side_effect=incus_api_exception(404, 'attempt not found'))
+    def test_rollback_live_pre_receive_needs_no_ack_profile(
+            self, abort_attempt, cleanup_journals, retire_attempt):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        self.client.profiles.get.side_effect = incus_api_exception(
+            404, 'profile not found')
+        data = migrate_data.IncusLiveMigrateData(
+            cleanup_token='10000000-0000-0000-0000-000000000001',
+            source_operation_id=None,
+            destination_operation_id=None,
+            idmap_base=1065536,
+            idmap_size=65536)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver._cleanup = mock.Mock()
+        incus_driver._acknowledge_cleanup_profile = mock.Mock()
+
+        incus_driver.rollback_live_migration_at_destination(
+            ctx, instance, mock.sentinel.network_info,
+            {'block_device_mapping': []}, destroy_disks=False,
+            migrate_data=data)
+
+        abort_attempt.assert_called_once()
+        cleanup_journals.assert_called_once_with(
+            instance, operation_token=data.cleanup_token)
+        retire_attempt.assert_not_called()
+        incus_driver._cleanup.assert_not_called()
+        incus_driver._acknowledge_cleanup_profile.assert_not_called()
+
+    @mock.patch.object(driver, '_migration_client')
+    def test_confirm_migration(self, migration_client):
         ctx = context.get_admin_context()
         migration = mock.Mock(
             source_compute='compute', dest_compute='compute')
@@ -6347,19 +14578,307 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             ctx, name='test', memory_mb=0)
         network_info = []
         profile = mock.Mock()
-        container = mock.Mock()
-        container.status = 'Stopped'
+        cleanup_token = '10000000-0000-0000-0000-000000000001'
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: cleanup_token,
+            driver.MIGRATION_DESTINATION_KEY:
+                'https://192.0.2.20:8443',
+            'security.idmap.size': '65536',
+        }
+        container = mock.Mock(
+            status='Stopped',
+            config={
+                'volatile.idmap.base': '1065536',
+                'volatile.migration.storage_handover': 'pending',
+            },
+            expanded_devices={
+                'root': {'type': 'disk', 'path': '/', 'pool': 'ceph-root'},
+            })
+        protected_source = mock.Mock(
+            status='Stopped',
+            config={
+                'volatile.idmap.base': '1065536',
+                'volatile.migration.storage_handover': 'pending',
+                'volatile.migration.storage_handover_role': 'source',
+                'volatile.migration.storage_delete_protection': 'true',
+            },
+            expanded_devices=container.expanded_devices)
         self.client.profiles.get.return_value = profile
-        self.client.instances.get.return_value = container
+        self.client.instances.get.side_effect = [
+            container, container, protected_source]
+        self.client.storage_pools.get.return_value.driver = 'ceph'
+        self.client.host_info['api_extensions'].append(
+            driver.INCUS_STORAGE_HANDOVER_EXTENSION)
+        self.client.api.instances = mock.MagicMock()
+        self.client.api.operations.get.return_value.json.return_value = {
+            'metadata': {}}
+        remote = migration_client.return_value
+        remote.api.instances = mock.MagicMock()
+        remote.host_info = {
+            'api_extensions': [
+                driver.INCUS_STORAGE_HANDOVER_EXTENSION,
+                driver.INCUS_STORAGE_HANDOVER_PROOF_EXTENSION,
+            ]}
+        destination = mock.Mock(
+            status='Stopped',
+            config={
+                'user.openstack.uuid': instance.uuid,
+                driver.MIGRATION_RECEIVE_COMPLETE_KEY: 'true',
+            },
+            expanded_devices={
+                'root': {'type': 'disk', 'path': '/', 'pool': 'ceph-root'},
+            })
+        owned_destination = mock.Mock(
+            status='Stopped',
+            config={'user.openstack.uuid': instance.uuid},
+            expanded_devices=destination.expanded_devices)
+        remote.instances.get.side_effect = [
+            destination, owned_destination]
+        remote.storage_pools.get.return_value.driver = 'ceph'
 
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
+        self._configure_exact_idmap_release(
+            incus_driver, instance, container, profile,
+            outcome='detached', idmap_base=1065536)
+        incus_driver._cleanup = mock.Mock()
+        ordered = mock.Mock()
+        ordered.attach_mock(profile.save, 'journal')
+        ordered.attach_mock(container.delete, 'delete')
 
         incus_driver.confirm_migration(
             ctx, migration, instance, network_info)
 
-        profile.delete.assert_called_once_with()
+        self.assertEqual(
+            'true', profile.config[driver.CLEANUP_RECOVERY_KEY])
+        profile.save.assert_called_once_with(wait=True)
+        self.assertEqual(
+            [mock.call.journal(wait=True), mock.call.delete(wait=True)],
+            ordered.mock_calls)
         container.delete.assert_called_once_with(wait=True)
+        self.client.api.instances[instance.name][
+            'storage-handover'].put.assert_called_once_with(
+                params={'project': self.CONF.incus.project},
+                json={'state': 'protected'})
+        remote.api.instances[instance.name][
+            'storage-handover'].put.assert_called_once_with(
+                params={'project': self.CONF.incus.project},
+                json={
+                    'state': 'owned',
+                    'migration_attempt': cleanup_token,
+                    'operation_uuid':
+                        '20000000-0000-0000-0000-000000000002',
+                })
+        incus_driver._cleanup.assert_called_once_with(
+            ctx, instance, network_info,
+            destroy_vifs=True, delete_profile=True)
+        self._finalize_committed_migration_attempt.assert_called_once_with(
+            remote, instance, cleanup_token, 1065536, 65536)
+
+    @mock.patch.object(driver, '_migration_client')
+    def test_confirm_migration_source_absent_converges_protected_target(
+            self, migration_client):
+        ctx = context.get_admin_context()
+        migration = mock.Mock(dest_compute='compute-dest')
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        absent = incuscore_exceptions.NotFound(MockResponse(404))
+        self.client.profiles.get.side_effect = absent
+        self.client.instances.get.side_effect = absent
+
+        cleanup_token = '10000000-0000-0000-0000-000000000001'
+        operation_id = '20000000-0000-0000-0000-000000000002'
+        remote = migration_client.return_value
+        remote.host_info = {
+            'api_extensions': [
+                driver.INCUS_STORAGE_HANDOVER_EXTENSION,
+                driver.INCUS_STORAGE_HANDOVER_PROOF_EXTENSION,
+            ]}
+        remote.api.instances = mock.MagicMock()
+        remote.storage_pools.get.return_value.driver = 'ceph'
+        protected_destination = mock.Mock(
+            config={
+                'user.openstack.uuid': instance.uuid,
+                'volatile.idmap.base': '1065536',
+                'volatile.migration.storage_handover_role': 'target',
+                'volatile.migration.storage_delete_protection': 'true',
+                driver.MIGRATION_RECEIVE_COMPLETE_KEY: 'true',
+            },
+            expanded_devices={
+                'root': {'type': 'disk', 'path': '/', 'pool': 'ceph-root'},
+            })
+        owned_destination = mock.Mock(
+            config={'user.openstack.uuid': instance.uuid},
+            expanded_devices=protected_destination.expanded_devices)
+        remote.instances.get.side_effect = [
+            protected_destination, owned_destination]
+        remote.profiles.get.return_value = mock.Mock(
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                'user.openstack.uuid': instance.uuid,
+                driver.MIGRATION_CLEANUP_TOKEN_KEY: cleanup_token,
+                driver.MIGRATION_TARGET_OPERATION_KEY: operation_id,
+                'security.idmap.size': '65536',
+            })
+
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        self._configure_exact_idmap_release(
+            incus_driver, instance, outcome='detached',
+            idmap_base=1065536)
+        incus_driver.confirm_migration(ctx, migration, instance, [])
+
+        remote.api.instances[instance.name][
+            'storage-handover'].put.assert_called_once_with(
+                params={'project': self.CONF.incus.project},
+                json={
+                    'state': 'owned',
+                    'migration_attempt': cleanup_token,
+                    'operation_uuid': operation_id,
+                })
+        self._finalize_committed_migration_attempt.assert_called_once_with(
+            remote, instance, cleanup_token, 1065536, 65536)
+
+    @mock.patch.object(
+        driver, '_set_storage_handover_state',
+        side_effect=RuntimeError('lost ownership response'))
+    def test_confirm_migration_source_absent_queues_ownership_recovery(
+            self, set_handover):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        cleanup_token = '10000000-0000-0000-0000-000000000001'
+        profile = mock.Mock(config={
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: cleanup_token,
+            driver.MIGRATION_TARGET_OPERATION_KEY:
+                '20000000-0000-0000-0000-000000000002',
+            'security.idmap.size': '65536',
+        })
+        self.client.profiles.get.return_value = profile
+        self.client.storage_pools.get.return_value.driver = 'ceph'
+        self.client.instances.get.return_value = mock.Mock(
+            status='Stopped',
+            config={
+                'volatile.idmap.base': '1065536',
+                'volatile.migration.storage_handover_role': 'target',
+                'volatile.migration.storage_delete_protection': 'true',
+                driver.MIGRATION_RECEIVE_COMPLETE_KEY: 'true',
+            },
+            expanded_config={'user.openstack.uuid': instance.uuid},
+            expanded_devices={
+                'root': {'type': 'disk', 'path': '/', 'pool': 'ceph-root'},
+            })
+
+        driver._converge_migration_target_ownership(
+            self.client, instance)
+
+        self.assertEqual(
+            'stopped', profile.config[driver.MIGRATION_RECOVERY_KEY])
+        profile.save.assert_called_once_with(wait=True)
+        self._finalize_committed_migration_attempt.assert_not_called()
+
+    @mock.patch.object(driver, '_migration_client')
+    def test_confirm_migration_source_absent_verifies_owned_target(
+            self, migration_client):
+        ctx = context.get_admin_context()
+        migration = mock.Mock(dest_compute='compute-dest')
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        absent = incuscore_exceptions.NotFound(MockResponse(404))
+        self.client.profiles.get.side_effect = absent
+        self.client.instances.get.side_effect = absent
+
+        remote = migration_client.return_value
+        remote.api.instances = mock.MagicMock()
+        remote.storage_pools.get.return_value.driver = 'ceph'
+        remote.instances.get.return_value = mock.Mock(
+            config={'user.openstack.uuid': instance.uuid},
+            expanded_devices={
+                'root': {'type': 'disk', 'path': '/', 'pool': 'ceph-root'},
+            })
+        remote.profiles.get.return_value = mock.Mock(config={
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+        })
+
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        self._configure_exact_idmap_release(
+            incus_driver, instance, outcome='detached',
+            idmap_base=1065536)
+        incus_driver.confirm_migration(ctx, migration, instance, [])
+
+        remote.api.instances[instance.name][
+            'storage-handover'].put.assert_not_called()
+        self._finalize_committed_migration_attempt.assert_not_called()
+
+    @mock.patch.object(driver, '_migration_client')
+    def test_confirm_migration_source_record_absent_cleans_retained_profile(
+            self, migration_client):
+        ctx = context.get_admin_context()
+        migration = mock.Mock(dest_compute='compute-dest')
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        source_profile = mock.Mock(config={
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_DESTINATION_KEY: 'https://192.0.2.20:8443',
+        })
+        self.client.profiles.get.return_value = source_profile
+        self.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+
+        remote = migration_client.return_value
+        remote.api.instances = mock.MagicMock()
+        remote.storage_pools.get.return_value.driver = 'ceph'
+        remote.instances.get.return_value = mock.Mock(
+            config={},
+            expanded_config={'user.openstack.uuid': instance.uuid},
+            expanded_devices={
+                'root': {'type': 'disk', 'path': '/', 'pool': 'ceph-root'},
+            })
+        remote.profiles.get.return_value = mock.Mock(config={
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+        })
+
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        self._configure_exact_idmap_release(
+            incus_driver, instance, source_profile, outcome='detached',
+            idmap_base=1065536)
+        incus_driver._cleanup = mock.Mock()
+        incus_driver.confirm_migration(ctx, migration, instance, [])
+
+        migration_client.assert_called_once_with(
+            'https://192.0.2.20:8443')
+        incus_driver._cleanup.assert_called_once_with(
+            ctx, instance, [], destroy_vifs=True, delete_profile=True)
+
+    def _prepare_post_live_migration_protocol(self, instance):
+        migration_client_patcher = mock.patch.object(
+            driver, '_migration_client')
+        self.patchers.append(migration_client_patcher)
+        migration_client = migration_client_patcher.start()
+        handover_patcher = mock.patch.object(
+            driver, '_set_storage_handover_state', return_value=True)
+        self.patchers.append(handover_patcher)
+        handover = handover_patcher.start()
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            cleanup_token='10000000-0000-0000-0000-000000000001',
+            idmap_base=1065536,
+            idmap_size=65536)
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+        }
+        return data, migration_client.return_value, handover
 
     def test_post_live_migration(self):
         ctx = context.get_admin_context()
@@ -6368,14 +14887,66 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         container = mock.Mock()
         container.status = 'Stopped'
         self.client.instances.get.return_value = container
+        data, remote, handover = (
+            self._prepare_post_live_migration_protocol(instance))
 
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
+        profile = self.client.profiles.get.return_value
+        self._configure_exact_idmap_release(
+            incus_driver, instance, container, profile,
+            outcome='detached', idmap_base=1065536)
+        ordered = mock.Mock()
+        ordered.attach_mock(profile.save, 'journal')
+        ordered.attach_mock(container.delete, 'delete')
 
-        incus_driver.post_live_migration(context, instance, None)
+        incus_driver.post_live_migration(
+            ctx, instance, None, migrate_data=data)
 
+        self.assertEqual(
+            [
+                mock.call(
+                    self.client, instance.name, 'protected',
+                    container=container),
+                mock.call(
+                    remote, instance.name, 'owned',
+                    migration_attempt=data.cleanup_token,
+                    operation_uuid=(
+                        '20000000-0000-0000-0000-000000000002')),
+            ],
+            handover.call_args_list)
+        self.assertEqual(
+            [mock.call.journal(wait=True), mock.call.delete(wait=True)],
+            ordered.mock_calls)
+        self.assertEqual(
+            'true', profile.config[driver.CLEANUP_RECOVERY_KEY])
         container.stop.assert_not_called()
         container.delete.assert_called_once_with(wait=True)
+
+    def test_post_live_migration_requires_durable_cleanup_journal(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        container = mock.Mock(status='Stopped')
+        self.client.instances.get.return_value = container
+        data, _remote, handover = (
+            self._prepare_post_live_migration_protocol(instance))
+        profile = self.client.profiles.get.return_value
+        profile.save.side_effect = RuntimeError('profile write failed')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        self._configure_exact_idmap_release(
+            incus_driver, instance, container, profile,
+            outcome='detached', idmap_base=1065536)
+
+        self.assertRaisesRegex(
+            RuntimeError, 'profile write failed',
+            incus_driver.post_live_migration,
+            ctx, instance, None, migrate_data=data)
+
+        handover.assert_not_called()
+        container.stop.assert_not_called()
+        container.delete.assert_not_called()
 
     def test_post_live_migration_force_stops_running_source(self):
         ctx = context.get_admin_context()
@@ -6383,11 +14954,18 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             ctx, name='test', memory_mb=0)
         container = mock.Mock(status='Running')
         self.client.instances.get.return_value = container
+        data, _remote, _handover = (
+            self._prepare_post_live_migration_protocol(instance))
 
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
+        self._configure_exact_idmap_release(
+            incus_driver, instance, container,
+            self.client.profiles.get.return_value,
+            outcome='detached', idmap_base=1065536)
 
-        incus_driver.post_live_migration(ctx, instance, None)
+        incus_driver.post_live_migration(
+            ctx, instance, None, migrate_data=data)
 
         container.stop.assert_called_once_with(
             timeout=-1, force=True, wait=True)
@@ -6404,11 +14982,18 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         container.stop.side_effect = incuscore_exceptions.LXDAPIException(
             response)
         self.client.instances.get.return_value = container
+        data, _remote, _handover = (
+            self._prepare_post_live_migration_protocol(instance))
 
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
+        self._configure_exact_idmap_release(
+            incus_driver, instance, container,
+            self.client.profiles.get.return_value,
+            outcome='detached', idmap_base=1065536)
 
-        incus_driver.post_live_migration(ctx, instance, None)
+        incus_driver.post_live_migration(
+            ctx, instance, None, migrate_data=data)
 
         container.stop.assert_called_once_with(
             timeout=-1, force=True, wait=True)
@@ -6424,13 +15009,20 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         container.stop.side_effect = incuscore_exceptions.LXDAPIException(
             response)
         self.client.instances.get.return_value = container
+        data, _remote, _handover = (
+            self._prepare_post_live_migration_protocol(instance))
 
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
+        self._configure_exact_idmap_release(
+            incus_driver, instance, container,
+            self.client.profiles.get.return_value,
+            outcome='detached', idmap_base=1065536)
 
         self.assertRaises(
             incuscore_exceptions.LXDAPIException,
-            incus_driver.post_live_migration, ctx, instance, None)
+            incus_driver.post_live_migration, ctx, instance, None,
+            migrate_data=data)
 
         container.delete.assert_not_called()
 
@@ -6464,10 +15056,16 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         ]}
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
+        self._configure_exact_idmap_release(
+            incus_driver, instance, container,
+            self.client.profiles.get.return_value,
+            outcome='detached', idmap_base=1065536)
         incus_driver.detach_volume = mock.Mock()
+        data, _remote, _handover = (
+            self._prepare_post_live_migration_protocol(instance))
 
         incus_driver.post_live_migration(
-            ctx, instance, block_device_info)
+            ctx, instance, block_device_info, migrate_data=data)
 
         container.delete.assert_called_once_with(wait=True)
         incus_driver.detach_volume.assert_called_once_with(
@@ -6482,11 +15080,203 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.client.profiles.get.return_value = profile
 
         incus_driver = driver.IncusDriver(None)
-        incus_driver.cleanup = mock.Mock()
+        incus_driver._cleanup = mock.Mock()
         incus_driver.init_host(None)
 
         incus_driver.post_live_migration_at_source(
             ctx, instance, network_info)
 
-        incus_driver.cleanup.assert_called_once_with(
-            ctx, instance, network_info)
+        incus_driver._cleanup.assert_called_once_with(
+            ctx, instance, network_info, delete_profile=True)
+
+    def test_post_live_migration_at_destination_is_idempotent_after_retire(
+            self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        self.client.storage_pools.get.return_value.driver = 'ceph'
+        self.client.instances.get.return_value = mock.Mock(
+            status='Running',
+            config={'user.openstack.uuid': instance.uuid},
+            expanded_devices={
+                'root': {'type': 'disk', 'path': '/', 'pool': 'ceph-root'},
+            })
+        self.client.profiles.get.return_value = mock.Mock(config={
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+        })
+        self.client.api.instances = mock.MagicMock()
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver.post_live_migration_at_destination(
+            ctx, instance, [], block_migration=False,
+            block_device_info={})
+
+        self.client.api.instances.__getitem__.assert_not_called()
+        self._finalize_committed_migration_attempt.assert_not_called()
+
+    def _failed_cleanup_test_driver(self):
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+        incus_driver.idmap_allocator = None
+        return incus_driver
+
+    def _failed_cleanup_test_instance(self):
+        return fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='instance-cleanup-assessment',
+            root_device_name='/dev/vda', memory_mb=512, root_gb=1,
+            expected_attrs=['system_metadata'], system_metadata={})
+
+    def _failed_cleanup_absent_incus_resources(self):
+        self.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+        self.client.profiles.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+
+    def test_failed_build_cleanup_assessment_retains_unproven_host_vif(self):
+        self._failed_cleanup_absent_incus_resources()
+        assessment = (
+            self._failed_cleanup_test_driver().assess_failed_build_cleanup(
+                self._failed_cleanup_test_instance(),
+                {'block_device_mapping': []}))
+
+        self.assertEqual(
+            driver.FailedBuildCleanupAssessment(
+                release_network=False,
+                release_cinder=True,
+                release_host=False,
+                release_placement=False,
+                reasons=(
+                    'host VIF absence is not proven after failed destroy',)),
+            assessment)
+
+    def test_failed_build_cleanup_assessment_retains_stale_instance(self):
+        instance = self._failed_cleanup_test_instance()
+        self.client.instances.get.return_value = mock.Mock(
+            config={'user.openstack.uuid': instance.uuid},
+            expanded_config={'user.openstack.uuid': instance.uuid})
+        self.client.profiles.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+
+        assessment = (
+            self._failed_cleanup_test_driver().assess_failed_build_cleanup(
+                instance, {'block_device_mapping': []}))
+
+        self.assertFalse(assessment.release_network)
+        self.assertTrue(assessment.release_cinder)
+        self.assertFalse(assessment.release_host)
+        self.assertFalse(assessment.release_placement)
+        self.assertIn('Incus instance still exists', assessment.reasons)
+
+    def test_failed_build_cleanup_assessment_api_uncertainty_fails_closed(
+            self):
+        self.client.instances.get.side_effect = RuntimeError('API unavailable')
+
+        assessment = (
+            self._failed_cleanup_test_driver().assess_failed_build_cleanup(
+                self._failed_cleanup_test_instance(),
+                {'block_device_mapping': []}))
+
+        self.assertEqual((False, False, False, False), (
+            assessment.release_network,
+            assessment.release_cinder,
+            assessment.release_host,
+            assessment.release_placement))
+        self.assertIn('inventory is uncertain', assessment.reasons[0])
+
+    def test_failed_build_cleanup_assessment_retains_profile_ownership(self):
+        instance = self._failed_cleanup_test_instance()
+        self.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+        self.client.profiles.get.return_value = mock.Mock(
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                'user.openstack.uuid': instance.uuid,
+                driver._volume_device_info_key(_TEST_VOLUME_ID): '{}',
+            },
+            devices={
+                'eth0': {'type': 'nic'},
+                _TEST_VOLUME_ID: {
+                    'type': 'unix-block',
+                    'path': '/dev/vdb',
+                    'source': '/dev/rbd0',
+                },
+            })
+
+        assessment = (
+            self._failed_cleanup_test_driver().assess_failed_build_cleanup(
+                instance, {'block_device_mapping': []}))
+
+        self.assertFalse(assessment.release_network)
+        self.assertFalse(assessment.release_cinder)
+        self.assertFalse(assessment.release_host)
+        self.assertFalse(assessment.release_placement)
+
+    @mock.patch.object(driver, '_volume_journal_records')
+    def test_failed_build_cleanup_assessment_retains_volume_journal(
+            self, journal_records):
+        self._failed_cleanup_absent_incus_resources()
+        journal_records.return_value = {
+            _TEST_VOLUME_ID: {'phase': 'connected'}}
+
+        assessment = (
+            self._failed_cleanup_test_driver().assess_failed_build_cleanup(
+                self._failed_cleanup_test_instance(),
+                {'block_device_mapping': []}))
+
+        self.assertFalse(assessment.release_network)
+        self.assertFalse(assessment.release_cinder)
+        self.assertFalse(assessment.release_host)
+        self.assertFalse(assessment.release_placement)
+
+    @mock.patch.object(driver, '_rbd_mapping_matches')
+    def test_failed_build_cleanup_assessment_checks_bfv_root_mapping(
+            self, mapping_matches):
+        self._failed_cleanup_absent_incus_resources()
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'}, '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        mapping_matches.return_value = (
+            connection_info['data']['name'], [{'device': '/dev/rbd0'}])
+        block_device_info = {'block_device_mapping': [{
+            'boot_index': 0,
+            'mount_device': '/dev/vda',
+            'connection_info': connection_info,
+        }]}
+
+        assessment = (
+            self._failed_cleanup_test_driver().assess_failed_build_cleanup(
+                self._failed_cleanup_test_instance(), block_device_info))
+
+        self.assertFalse(assessment.release_network)
+        self.assertFalse(assessment.release_cinder)
+        self.assertFalse(assessment.release_host)
+        self.assertFalse(assessment.release_placement)
+        self.assertIn('BFV root', ' '.join(assessment.reasons))
+        mapping_matches.assert_called_once_with(
+            connection_info['data'], mapping_cache=mock.ANY)
+
+    @mock.patch.object(driver, '_rbd_mapping_matches')
+    def test_failed_build_cleanup_assessment_mapping_query_fails_closed(
+            self, mapping_matches):
+        self._failed_cleanup_absent_incus_resources()
+        connection_info = fake_connection_info(
+            {'id': 2, 'name': 'volume-00000002'}, '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000002')
+        mapping_matches.side_effect = RuntimeError('rbd query failed')
+        block_device_info = {'block_device_mapping': [{
+            'boot_index': None,
+            'mount_device': '/dev/vdb',
+            'connection_info': connection_info,
+        }]}
+
+        assessment = (
+            self._failed_cleanup_test_driver().assess_failed_build_cleanup(
+                self._failed_cleanup_test_instance(), block_device_info))
+
+        self.assertFalse(assessment.release_network)
+        self.assertFalse(assessment.release_cinder)
+        self.assertFalse(assessment.release_host)
+        self.assertFalse(assessment.release_placement)
+        self.assertIn('mapping is uncertain', ' '.join(assessment.reasons))

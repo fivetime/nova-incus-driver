@@ -15,6 +15,7 @@
 """Start Nova compute with the Incus-specific manager extension."""
 
 from nova.cmd import compute
+from nova.compute import manager
 from nova import service
 
 
@@ -22,6 +23,12 @@ INCUS_COMPUTE_MANAGER = 'nova.virt.incus.manager.IncusComputeManager'
 
 
 def main():
+    if not callable(getattr(
+            manager.ComputeManager,
+            '_should_delete_allocation_for_failed_build', None)):
+        raise RuntimeError(
+            'Nova is missing the required failed-build allocation policy '
+            'hook; apply patches/nova/0005 before starting nova-compute')
     # Nova 2026.1 selects service managers from this process-local mapping;
     # the historical compute_manager configuration option is no longer used.
     service.SERVICE_MANAGERS['nova-compute'] = INCUS_COMPUTE_MANAGER

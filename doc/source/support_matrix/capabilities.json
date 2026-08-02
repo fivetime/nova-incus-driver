@@ -206,7 +206,7 @@
       "driver_hooks": ["spawn"],
       "applicability": "container",
       "status": "supported",
-      "evidence": "Spawn supplies NoCloud user-data, public-key metadata, and Nova-derived cloud-init v2 network-config with MAC matching, IPv4/IPv6, routes, DNS, and MTU. Rebuild exposes a read-only config-drive directory with rollback on construction failure; bounded SHA-256-verified cross-host transfer, target idmap ownership, revert, and confirm cleanup are covered"
+      "evidence": "Spawn supplies NoCloud user-data, public-key metadata, and Nova-derived cloud-init v2 network-config with stable port-derived interface names, IPv4/IPv6, routes, DNS, and MTU. Rebuild exposes a read-only config-drive directory with rollback on construction failure; bounded SHA-256-verified cross-host transfer, target idmap ownership, revert, and confirm cleanup are covered"
     },
     {
       "id": "rescue-unrescue",

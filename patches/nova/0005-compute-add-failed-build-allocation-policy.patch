@@ -1,0 +1,84 @@
+From: OpenStack Incus maintainers <openstack-incus@example.invalid>
+Subject: [PATCH] compute: Add failed-build allocation cleanup policy hook
+
+Out-of-tree compute managers can retain a local resource after virt-driver
+cleanup fails. Allow them to keep the corresponding Placement allocation
+until that resource is reconciled, while preserving Nova's current default.
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -2487,6 +2487,16 @@ class ComputeManager(manager.Manager):
+     def _build_succeeded(self, node):
+         self.rt.build_succeeded(node)
+ 
++    def _should_delete_allocation_for_failed_build(
++            self, context, instance):
++        """Return whether a failed build's allocation can be deleted.
++
++        A ComputeManager subclass returning False is responsible for
++        retaining ownership and deleting the allocation after its local
++        failed-build resources have been reconciled.
++        """
++        return True
++
+     # NOTE(gibi): The normal RPC handler decorators are here but please note
+     # that build_and_run_instance immediately spawns and returns. So any
+     # error from the real work is not propagated back to these decorators.
+@@ -2531,7 +2542,9 @@ class ComputeManager(manager.Manager):
+                     result = build_results.FAILED
+                     raise
+                 finally:
+-                    if result == build_results.FAILED:
++                    if (result == build_results.FAILED and
++                            self._should_delete_allocation_for_failed_build(
++                                context, instance)):
+                         # Remove the allocation records from Placement for the
+                         # instance if the build failed. The instance.host is
+                         # likely set to None in _do_build_and_run_instance
+diff --git a/nova/tests/unit/compute/test_compute_mgr.py b/nova/tests/unit/compute/test_compute_mgr.py
+--- a/nova/tests/unit/compute/test_compute_mgr.py
++++ b/nova/tests/unit/compute/test_compute_mgr.py
+@@ -9733,6 +9733,42 @@ class ComputeManagerBuildInstanceTestCase(test.NoDBTestCase):
+ 
+         self.assertEqual(10, mock_failed.call_count)
+ 
++    @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
++                'delete_allocation_for_instance')
++    @mock.patch.object(manager.ComputeManager, '_do_build_and_run_instance')
++    @mock.patch.object(manager.ComputeManager, '_build_failed')
++    def test_failed_build_deletes_allocation_by_default(
++            self, mock_failed, mock_build, delete_allocation):
++        mock_build.return_value = build_results.FAILED
++        instance = objects.Instance(uuid=uuids.instance)
++
++        self.compute.build_and_run_instance(
++            self.context, instance, None, None, None, [], node=self.node)
++
++        delete_allocation.assert_called_once_with(
++            self.context, instance.uuid, force=True)
++        mock_failed.assert_called_once_with(self.node)
++
++    @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
++                'delete_allocation_for_instance')
++    @mock.patch.object(manager.ComputeManager, '_do_build_and_run_instance')
++    @mock.patch.object(manager.ComputeManager, '_build_failed')
++    def test_failed_build_policy_can_retain_allocation(
++            self, mock_failed, mock_build, delete_allocation):
++        mock_build.return_value = build_results.FAILED
++        instance = objects.Instance(uuid=uuids.instance)
++
++        with mock.patch.object(
++                self.compute,
++                '_should_delete_allocation_for_failed_build',
++                return_value=False) as should_delete:
++            self.compute.build_and_run_instance(
++                self.context, instance, None, None, None, [], node=self.node)
++
++        should_delete.assert_called_once_with(self.context, instance)
++        delete_allocation.assert_not_called()
++        mock_failed.assert_called_once_with(self.node)
++
+     @mock.patch.object(manager.ComputeManager, '_do_build_and_run_instance')
+     @mock.patch('nova.compute.stats.Stats.build_failed')
+     def test_build_failures_not_reported(self, mock_failed, mock_dbari):

@@ -1,0 +1,2 @@
+^nova_incus_tempest_plugin\.tests\.scenario
+^tempest\.api\.compute

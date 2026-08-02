@@ -98,6 +98,10 @@ wait_status ACTIVE
 instance_name=$(openstack server show "$server_id" -f value \
     -c OS-EXT-SRV-ATTR:instance_name)
 port_id=$(openstack port list --server "$server_id" -f value -c ID)
+guest_iface="nic${port_id//-/}"
+guest_iface=${guest_iface,,}
+guest_iface=${guest_iface:0:15}
+[[ -n "$guest_iface" ]]
 fixed_ip=$(openstack port show "$port_id" -f json -c fixed_ips |
     python3 -c 'import ast,json,sys; v=json.load(sys.stdin)["fixed_ips"]; v=ast.literal_eval(v) if isinstance(v,str) else v; print(v[0]["ip_address"])')
 
@@ -151,7 +155,8 @@ wait_status VERIFY_RESIZE
     "incus exec '$instance_name' -- cat /root/nova-migration-marker")" == \
     "$marker" ]]
 remote "$DEST_SSH" \
-    "incus exec '$instance_name' -- ip -4 addr show eth0 | grep -F '$fixed_ip'"
+    "incus exec '$instance_name' -- ip -4 addr show dev '$guest_iface' | \
+     grep -F '$fixed_ip'"
 if [[ -n "$second_port_id" ]]; then
     remote "$DEST_SSH" \
         "incus exec '$instance_name' -- ip -4 addr show '$second_iface' | \

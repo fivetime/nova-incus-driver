@@ -8,13 +8,37 @@ E2E_SCRIPT=${E2E_SCRIPT:-"$SCRIPT_DIR/openstack-incus-bfv-migration-e2e.sh"}
 FLEET_PREFLIGHT=${FLEET_PREFLIGHT:-"$SCRIPT_DIR/openstack-incus-fleet-preflight.sh"}
 COMPUTE_NODES=${COMPUTE_NODES:?Set COMPUTE_NODES to name=ssh pairs}
 SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute test key}
+SSH_KNOWN_HOSTS_FILE=${SSH_KNOWN_HOSTS_FILE:-$HOME/.ssh/known_hosts}
 CONTROLLER_SSH=${CONTROLLER_SSH:?Set CONTROLLER_SSH}
 CONTROLLER_OPENRC=${CONTROLLER_OPENRC:-/opt/stack/devstack/openrc admin admin}
 RUN_FLEET_PREFLIGHT=${RUN_FLEET_PREFLIGHT:-true}
 NAME_PREFIX=${NAME_PREFIX:-incus-bfv-release}
 CASES=${CASES:-normal,post-claim-data,post-claim-start,stopped-post-claim-data,reverse-revert}
+COMMAND_TIMEOUT=${COMMAND_TIMEOUT:-30}
 
-SSH=(ssh -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=no)
+[[ -f "$SSH_IDENTITY" && -r "$SSH_IDENTITY" ]] || {
+    echo "SSH identity is not a readable regular file: $SSH_IDENTITY" >&2
+    exit 2
+}
+[[ -f "$SSH_KNOWN_HOSTS_FILE" && -r "$SSH_KNOWN_HOSTS_FILE" ]] || {
+    echo "SSH known_hosts is not a readable regular file: $SSH_KNOWN_HOSTS_FILE" >&2
+    exit 2
+}
+[[ "$COMMAND_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || {
+    echo "COMMAND_TIMEOUT must be a positive number of seconds" >&2
+    exit 2
+}
+command -v timeout >/dev/null || {
+    echo "timeout command is required" >&2
+    exit 2
+}
+SSH=(
+    ssh
+    -i "$SSH_IDENTITY"
+    -o BatchMode=yes
+    -o StrictHostKeyChecking=yes
+    -o "UserKnownHostsFile=$SSH_KNOWN_HOSTS_FILE"
+)
 IFS=, read -ra nodes <<<"$COMPUTE_NODES"
 declare -a node_names=() node_ssh=()
 
@@ -32,7 +56,25 @@ done
 }
 
 remote() {
-    "${SSH[@]}" "$@"
+    if [[ -n "${ACTIVE_COMMAND_TIMEOUT:-}" ]]; then
+        timeout --foreground "${ACTIVE_COMMAND_TIMEOUT}s" \
+            "${SSH[@]}" -o "ConnectTimeout=$ACTIVE_COMMAND_TIMEOUT" "$@"
+    else
+        "${SSH[@]}" "$@"
+    fi
+}
+
+# Keep residual-state polling bounded when a compute or control-plane endpoint
+# becomes unavailable during a matrix case.
+run_until_deadline() {
+    local deadline=$1
+    shift
+    local remaining=$((deadline - SECONDS))
+    ((remaining > 0)) || return 124
+
+    local ACTIVE_COMMAND_TIMEOUT=$COMMAND_TIMEOUT
+    ((ACTIVE_COMMAND_TIMEOUT > remaining)) && ACTIVE_COMMAND_TIMEOUT=$remaining
+    "$@"
 }
 
 openstack() {
@@ -81,13 +123,15 @@ run_case() {
         CONTROLLER_SSH="$CONTROLLER_SSH" \
         CONTROLLER_OPENRC="$CONTROLLER_OPENRC" \
         SSH_IDENTITY="$SSH_IDENTITY" \
+        SSH_KNOWN_HOSTS_FILE="$SSH_KNOWN_HOSTS_FILE" \
+        COMMAND_TIMEOUT="$COMMAND_TIMEOUT" \
         "$@" \
         bash "$E2E_SCRIPT"
     for ssh_host in "${node_ssh[@]}"; do
         before=${node_baseline["$ssh_host"]}
         deadline=$((SECONDS + 90))
         while ((SECONDS < deadline)); do
-            after=$(snapshot_node "$ssh_host")
+            after=$(run_until_deadline "$deadline" snapshot_node "$ssh_host")
             [[ "$after" == "$before" ]] && break
             sleep 2
         done
@@ -139,7 +183,7 @@ fi
 
 deadline=$((SECONDS + 90))
 while ((SECONDS < deadline)); do
-    current_resources=$(snapshot_resources)
+    current_resources=$(run_until_deadline "$deadline" snapshot_resources)
     [[ "$current_resources" == "$baseline" ]] && break
     sleep 2
 done
@@ -154,6 +198,7 @@ if [[ "$RUN_FLEET_PREFLIGHT" == true ]]; then
         CONTROLLER_SSH="$CONTROLLER_SSH" \
         CONTROLLER_OPENRC="$CONTROLLER_OPENRC" \
         SSH_IDENTITY="$SSH_IDENTITY" \
+        SSH_KNOWN_HOSTS_FILE="$SSH_KNOWN_HOSTS_FILE" \
         bash "$FLEET_PREFLIGHT"
 fi
 

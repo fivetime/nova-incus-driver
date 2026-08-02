@@ -14,6 +14,7 @@
 
 from unittest import mock
 
+from nova.compute import manager
 from nova import service
 from nova import test
 from nova.virt.incus.cmd import compute
@@ -21,8 +22,13 @@ from nova.virt.incus.cmd import compute
 
 class ComputeCommandTest(test.NoDBTestCase):
 
+    @mock.patch.object(
+        manager.ComputeManager,
+        '_should_delete_allocation_for_failed_build',
+        return_value=True, create=True)
     @mock.patch.object(compute.compute, 'main')
-    def test_selects_incus_manager_before_starting_nova(self, nova_main):
+    def test_selects_incus_manager_before_starting_nova(
+            self, nova_main, unused_policy):
         original = service.SERVICE_MANAGERS['nova-compute']
         self.addCleanup(
             service.SERVICE_MANAGERS.__setitem__, 'nova-compute', original)
@@ -33,3 +39,10 @@ class ComputeCommandTest(test.NoDBTestCase):
             compute.INCUS_COMPUTE_MANAGER,
             service.SERVICE_MANAGERS['nova-compute'])
         nova_main.assert_called_once_with()
+
+    def test_rejects_nova_without_failed_build_allocation_policy(self):
+        with mock.patch.object(
+                manager.ComputeManager,
+                '_should_delete_allocation_for_failed_build',
+                None, create=True):
+            self.assertRaises(RuntimeError, compute.main)
