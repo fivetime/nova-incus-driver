@@ -11,6 +11,82 @@ Entries are append-mostly and are release evidence, not permanent
 configuration. Each release must re-validate against its own approved
 digest/revision pair.
 
+## 2026-08-03 CRIU restore-failure injection case passes in full
+
+Runtime: all three nodes on ``incus-quadlet-candidate:776a23411-dirty-
+20260803-r8``; the test fleet was rebuilt mid-day by a site outage
+(DHCP re-address to .12/.13/.17) whose recovery is itself recorded
+below. Log: node01 ``/tmp/lminject10.log``.
+
+The case (``INJECT_RESTORE_FAILURE=1`` on bfv_data_manila): bind-mount
+``/bin/false`` over criu on the target, live-migrate, then require
+libvirt-like semantics — the failure must leave the workload as if
+nothing happened, and an immediate retry must succeed.
+
+- PASS injected live-restore failure rolled back to incus-node-01:
+  migration record failed, source container restored from its
+  checkpoint with the original PID, guest counter continued, target
+  fully fenced (no instance, no profile, no krbd mappings, no staging,
+  attempt settled).
+- PASS the same instance then completed the three-hop ring
+  01 -> 02 -> 03 -> 01: PID 282 held, counter 39 -> 367, Cinder data
+  volume and Manila share followed, residual-state audit clean. The
+  second hop leaves the previously-fenced host, proving no poisoned
+  state survives a fenced failure.
+
+Six defect layers were peeled to get here, each with its own commit and
+regression coverage (fork / driver):
+
+1. Durable profile markers aborted migrations when the backup.yaml
+   resync failed ("profile change still saved") — driver ``079513c``.
+2. backup.yaml refresh mounted volumes mid-handover or on pool-less
+   records — fork ``bbb222ed3`` + ``1b47f4221``.
+3. A failed migration receive leaks the volume mount and its reference
+   count; the detached claim release refused forever and fencing
+   deadlocked into the ambiguous-ownership stop — fork ``39df936f0``.
+4. finalize_live_migration_rollback (restart source from checkpoint,
+   restore ownership, reassert VIFs) was never wired into the rollback
+   — driver ``48ef103``.
+5. finalize's destination-acknowledgement barrier treated a mid-cleanup
+   profile as terminal instead of not-ready — driver ``af7b2e6``.
+6. The forced release left the stale in-memory reference count behind,
+   poisoning the next outbound migration from that host ("Failed
+   releasing source root volume after CRIU checkpoint: In use") — fork
+   ``3301d99d7``.
+
+Also fixed in the harness: wait_migration now judges the newest
+migration Id, since the injected failure stays in the server's
+migration history.
+
+### Site outage recovery evidence (same day)
+
+The full-fleet reboot with DHCP re-addressing exercised the recovery
+posture designed into the system, all of which held:
+
+- Returning-host admission quarantined all three computes
+  ("admission token missing"); the ownership audit passed on each and
+  the hosts were explicitly admitted (disable -> audit -> admit ->
+  enable).
+- The Geneve prefsrc netplan pin from 2026-07-26 kept tunnel routes
+  correct through the address change.
+- The idmap registry etcd bound to old DHCP addresses and could not
+  form quorum. Repaired without data loss via 0.0.0.0 listeners and
+  hostname peer URLs (certificates carry DNS SANs; /etc/hosts pins the
+  stable service addresses), then the registry was returned to its
+  pure-config zero baseline: all orphan claims and slots from the
+  pre-fix failure runs were backed up
+  (node01 /root/idmap-registry-backup-20260803T052220.tsv) and removed.
+- Manila's LVM backing loop device does not survive reboot; a
+  ``manila-lvm-loop.service`` unit now reattaches it before m-shr.
+  Residual resource locks and a wedged queued_to_deny rule from dead
+  instances had to be removed before shares worked again.
+- Operator procedures validated: two-step attempt settlement
+  (PUT aborted, then PUT settled), receipt-bound instance DELETE with
+  the four A/H/T/U query parameters, and orphan source records whose
+  volume was legitimately deleted require stripping the OpenStack
+  provenance keys (possible only since the r6 key registration) before
+  a plain delete.
+
 ## 2026-08-03 BFV live-migration matrix complete (backup.yaml handover fix)
 
 Runtime: all three nodes upgraded to
