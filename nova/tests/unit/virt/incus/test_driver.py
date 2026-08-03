@@ -14522,6 +14522,57 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertEqual(
             2, remote.profiles.get.call_count)
 
+    @mock.patch.object(driver, '_restore_source_storage_ownership')
+    @mock.patch.object(driver, '_settle_instance_migration_operations')
+    @mock.patch.object(driver, '_migration_client')
+    def test_finalize_rollback_waits_out_mid_cleanup_acknowledgement(
+            self, get_remote, settle_operations, restore_ownership):
+        """A mid-cleanup destination profile is not-ready, not terminal."""
+        self.flags(migration_finish_retry_interval=0, group='incus')
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        cleanup_token = '10000000-0000-0000-0000-000000000001'
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            cleanup_token=cleanup_token,
+            source_operation_id=None,
+            idmap_base=1065536,
+            idmap_size=65536)
+        remote = get_remote.return_value
+        remote.instances.get.side_effect = incuscore_exceptions.NotFound(
+            MockResponse(404))
+        cleanup_profile = mock.Mock(
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                'user.openstack.uuid': instance.uuid,
+                driver.MIGRATION_CLEANUP_TOKEN_KEY: cleanup_token,
+                driver.MIGRATION_CLEANUP_COMPLETE_KEY: cleanup_token,
+            },
+            devices={},
+            used_by=[])
+        remote.profiles.get.return_value = cleanup_profile
+        source_profile = mock.Mock(config={}, devices={})
+        self.client.profiles.get.return_value = source_profile
+        self.client.instances.get.return_value = mock.Mock(status='Running')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver.network_api.get_instance_nw_info = mock.Mock(
+            return_value=network_model.NetworkInfo())
+        incus_driver._validate_remote_cleanup_acknowledgement = mock.Mock(
+            side_effect=[
+                exception.MigrationError(
+                    reason='destination rollback still stripping devices'),
+                None,
+                None,
+            ])
+
+        incus_driver.finalize_live_migration_rollback(ctx, instance, data)
+
+        self.assertEqual(
+            3,
+            incus_driver._validate_remote_cleanup_acknowledgement.call_count)
+        cleanup_profile.delete.assert_called_once_with()
+
     @mock.patch.object(driver, '_abort_migration_attempt')
     @mock.patch.object(driver, '_cleanup_profile_share_mounts')
     def test_rollback_live_migration_destination_cleans_profile_last(

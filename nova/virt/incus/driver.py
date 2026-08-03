@@ -12366,9 +12366,16 @@ class IncusDriver(driver.ComputeDriver):
                         reason='Committed Incus live migration destination '
                                'cleanup has no positive acknowledgement')
                 return None
-            self._validate_remote_cleanup_acknowledgement(
-                profile, instance, cleanup_token,
-                idmap_base, idmap_size)
+            # The destination rollback strips devices and stamps the
+            # completion token asynchronously; a profile that fails the
+            # acknowledgement checks mid-cleanup is not yet terminal. The
+            # barrier deadline turns a persistent mismatch into a failure.
+            try:
+                self._validate_remote_cleanup_acknowledgement(
+                    profile, instance, cleanup_token,
+                    idmap_base, idmap_size)
+            except exception.MigrationError as exc:
+                raise _MigrationStateNotReady(str(exc))
             return profile
 
         # Destination rollback is an asynchronous Nova RPC. Require its

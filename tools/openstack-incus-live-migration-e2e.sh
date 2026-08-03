@@ -315,8 +315,11 @@ wait_migration() {
     local deadline=$((SECONDS + TIMEOUT))
     local status
     while ((SECONDS < deadline)); do
+        # An injected failure earlier in the case stays in the migration
+        # history, so judge only the newest record by migration Id.
         status=$(openstack server migration list --server "$server_id" \
-            -f value -c Status 2>/dev/null | head -n1 || true)
+            -f value -c Id -c Status 2>/dev/null |
+            sort -n | tail -n1 | awk "{print \$2}" || true)
         case "${status,,}" in
             completed)
                 return 0
