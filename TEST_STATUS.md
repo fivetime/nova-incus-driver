@@ -11,6 +11,43 @@ Entries are append-mostly and are release evidence, not permanent
 configuration. Each release must re-validate against its own approved
 digest/revision pair.
 
+## 2026-08-03 initial Cinder data-volume matrix and failed-build rollback
+
+Runtime: the re-addressed static network (10.32.32.128/27, see the
+testenv notes), image r8, driver tree at ce3f294. All four matrix cases
+of ``openstack-incus-initial-data-volume-e2e.sh`` pass through the
+public API — create with data BDMs, guest mkfs + fuse2fs mount + marker
+write, hard reboot, cross-boot persistence proof:
+
+- root=local data_volumes=1 and =2
+- root=bfv data_volumes=1 and =2
+
+Three harness/guest faults had hidden this since the case was written
+(commit e751b2e): stateful containers have no console device (CRIU PTY
+exclusion) so markers are now also journaled in the guest and read via
+incus exec; this fuse2fs build rejects ``-o rw+`` (rw is its default)
+and the mount is now asserted against /proc/mounts so a failed FUSE
+mount can never pass the marker round-trip against tmpfs; install -D
+creates /usr/local/sbin which the Alpine image lacks.
+
+Failed-build rollback is proven by the new
+``openstack-incus-initial-data-rollback-e2e.sh``: a data BDM plus an
+image without ``hw_incus_data_volume_fuse`` is refused with the designed
+ImageUnacceptable fault, the reserved volume returns to available, no
+hypervisor or idmap state leaks, and both resources delete cleanly. The
+probe first exposed a real defect (fixed in ce3f294):
+ImageMetaProps.get raises AttributeError for unregistered custom
+properties, so the absent capability crashed spawn with a raw
+AttributeError and three scheduler retries instead of the designed
+refusal.
+
+Operator warning from the same session: never delete an Incus instance
+record out-of-band for a protocol-protected instance. The receipt,
+registry-claim and Nova-metadata ledgers cross-check each other and a
+bypassed delete strands them in a mutually-locked state whose only exit
+is a Nova DB-level purge (instances.deleted, BDM, instance_mappings,
+placement allocation, Cinder reset-state).
+
 ## 2026-08-03 CRIU restore-failure injection case passes in full
 
 Runtime: all three nodes on ``incus-quadlet-candidate:776a23411-dirty-
