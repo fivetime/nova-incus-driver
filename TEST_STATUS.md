@@ -11,6 +11,36 @@ Entries are append-mostly and are release evidence, not permanent
 configuration. Each release must re-validate against its own approved
 digest/revision pair.
 
+## 2026-08-03 Manila pre-mount gating and host-reboot recovery
+
+``tools/openstack-incus-manila-gate-recovery-e2e.sh`` (new) passes all
+three cases on the three-node testbed, closing the Manila half of the
+plan's third item. Migration consistency itself was already proven by
+the 2x2x2 live matrix (bfv_manila and bfv_data_manila) and by the CRIU
+injection case, where the share followed the instance across the ring
+and across a rolled-back failure.
+
+- **gate**: with the destination unable to reach the Manila export
+  (NFS blocked toward the controller), ``pre_live_migration`` cannot
+  stage the share. The migration fails, the source instance stays
+  ACTIVE on its original host with an unchanged guest PID, and the
+  destination keeps no share mount and no instance record.
+- **retry**: with the block lifted the same migration succeeds and the
+  share content is intact on the destination.
+- **recovery**: a simulated host reboot (guest force-stopped and the
+  host NFS mount lazily unmounted) followed by a nova-compute restart
+  re-establishes the mount, resumes the guest, and leaves the share
+  writable with its mapping ACTIVE.
+
+The recovery case pins down a semantic worth remembering: host-local
+share mounts are re-established only by
+``_resume_guests_state -> _mount_all_shares``, which fires when Nova has
+to resume a guest that is not running. The Incus share-journal recovery
+loop is a different mechanism — it *cleans* journal-only mounts left by
+a terminal migration and never remounts under a live guest. An earlier
+probe that expected the journal loop to repair a mount lost beneath a
+running container was testing a behaviour that was never designed.
+
 ## 2026-08-03 initial Cinder data-volume matrix and failed-build rollback
 
 Runtime: the re-addressed static network (10.32.32.128/27, see the
