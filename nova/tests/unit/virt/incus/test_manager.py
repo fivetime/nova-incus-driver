@@ -1094,6 +1094,79 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         allocator.retire_claim.assert_not_called()
 
     @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_failed_build_releases_a_claim_that_never_materialized(
+            self, get_by_uuid):
+        """A build failing before commit leaves 'possible' and no proof."""
+        possible = self._host_claim(state='possible', proof=None)
+        cleaned = self._host_claim(proof=mock.Mock(
+            instance_name='instance-00000001'))
+        instance = self._idmap_instance()
+        instance.host = None
+        instance.task_state = None
+        instance.vm_state = manager.vm_states.ERROR
+        instance.deleted = False
+        get_by_uuid.return_value = instance
+        allocator = self.compute.driver.idmap_allocator
+        allocator.request_release.return_value = self.idmap_intent
+        promote = self.compute.driver._promote_idmap_claim_if_server_committed
+        # Incus reports the materialization never committed.
+        promote.return_value = (self.idmap_assignment, possible)
+        # The registry only shows the cleaned claim once settling wrote it.
+        settled_claims = []
+        allocator.get_host_claim.side_effect = (
+            lambda *a, **kw: cleaned if settled_claims else possible)
+
+        def settle(*args, **kwargs):
+            settled_claims.append(cleaned)
+            return cleaned
+
+        self.compute.driver._settle_idmap_host_claim.side_effect = settle
+
+        self.compute._reconcile_incus_idmap_host_claim(
+            context.get_admin_context(), allocator, possible, self.host_id)
+
+        # No rootfs was materialized, so it settles through the
+        # materialization abort rather than a release receipt.
+        self.compute.driver._settle_idmap_host_claim.assert_called_once_with(
+            instance, possible, final_delete=False)
+        allocator.request_release.assert_called_once_with(
+            instance.uuid, instance.name, assignment=self.idmap_assignment)
+
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_failed_build_promoted_by_server_uses_the_release_receipt(
+            self, get_by_uuid):
+        """A create that did commit still owns storage to release."""
+        possible = self._host_claim(state='possible', proof=None)
+        committed = self._host_claim(state='committed', proof=None)
+        cleaned = self._host_claim(proof=mock.Mock(
+            instance_name='instance-00000001'))
+        instance = self._idmap_instance()
+        instance.host = None
+        instance.task_state = None
+        instance.vm_state = manager.vm_states.ERROR
+        instance.deleted = False
+        get_by_uuid.return_value = instance
+        allocator = self.compute.driver.idmap_allocator
+        allocator.request_release.return_value = self.idmap_intent
+        promote = self.compute.driver._promote_idmap_claim_if_server_committed
+        promote.return_value = (self.idmap_assignment, committed)
+        settled_claims = []
+        allocator.get_host_claim.side_effect = (
+            lambda *a, **kw: cleaned if settled_claims else possible)
+
+        def settle(*args, **kwargs):
+            settled_claims.append(cleaned)
+            return cleaned
+
+        self.compute.driver._settle_idmap_host_claim.side_effect = settle
+
+        self.compute._reconcile_incus_idmap_host_claim(
+            context.get_admin_context(), allocator, possible, self.host_id)
+
+        self.compute.driver._settle_idmap_host_claim.assert_called_once_with(
+            instance, committed, final_delete=True)
+
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
     def test_purged_failed_build_fences_from_cleaned_claim_proof(
             self, get_by_uuid):
         proof = mock.Mock(instance_name='instance-00000001')

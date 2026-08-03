@@ -245,15 +245,51 @@ class IncusComputeManager(manager.ComputeManager):
         return True
 
     @staticmethod
-    def _idmap_claim_instance_name(claim):
-        proof = getattr(claim, 'proof', None)
-        instance_name = getattr(proof, 'instance_name', None)
-        if (claim.state != 'cleaned' or proof is None or
-                not isinstance(instance_name, str) or not instance_name):
+    def _idmap_claim_proof_instance_name(claim):
+        """Return the instance name a cleaned claim proves, else None.
+
+        A build that fails before its materialization commits leaves the
+        claim at 'possible' with no proof, which is the state this cleanup
+        exists to dispose of. Only an already-cleaned claim can name its
+        instance, so absence of a name is normal here rather than an error.
+        """
+        if claim.state != 'cleaned':
+            return None
+        instance_name = getattr(getattr(claim, 'proof', None),
+                                'instance_name', None)
+        if not isinstance(instance_name, str) or not instance_name:
+            raise incus_driver.incus_idmap.IDMapIntegrityError(
+                'Cleaned Incus idmap claim carries no instance name')
+        return instance_name
+
+    @classmethod
+    def _idmap_claim_instance_name(cls, claim):
+        instance_name = cls._idmap_claim_proof_instance_name(claim)
+        if instance_name is None:
             raise incus_driver.incus_idmap.IDMapIntegrityError(
                 'Terminal failed-build cleanup requires an exact cleaned '
                 'claim with its instance name')
         return instance_name
+
+    def _resolve_possible_failed_build_claim(self, instance, claim):
+        """Ask Incus whether a 'possible' claim actually materialized.
+
+        'possible' is the deliberately ambiguous state around the create
+        request: the rootfs may or may not exist. Resolving it against the
+        server decides the disposal — a committed materialization needs a
+        release receipt, an uncommitted one needs the materialization
+        abort. Without an instance record there is no name to build the
+        materialization identity from, so the claim is left as it is.
+        """
+        if claim.state != 'possible' or instance is None:
+            return claim
+        unused_assignment, promoted = (
+            self.driver._promote_idmap_claim_if_server_committed(
+                instance, claim))
+        if promoted is None:
+            raise incus_driver.incus_idmap.IDMapConflict(
+                reason='the exact Incus idmap host claim disappeared')
+        return promoted
 
     def _terminal_failed_build_release_state(
             self, context, assignment, host_id, expected_name):
@@ -280,15 +316,21 @@ class IncusComputeManager(manager.ComputeManager):
             instance=None):
         """Create the immutable release fence before a failed host is lost."""
         try:
-            instance_name = (
-                instance.name if instance is not None
-                else self._idmap_claim_instance_name(claim))
             if instance is not None:
-                claim_name = self._idmap_claim_instance_name(claim)
-                if claim_name != instance_name:
+                # Nova's own row is authoritative for the name. Cross-check
+                # it against the claim only once the claim can name itself;
+                # demanding that of a claim stuck at 'possible' would reject
+                # exactly the failed builds this path must dispose of.
+                instance_name = instance.name
+                claim_name = self._idmap_claim_proof_instance_name(claim)
+                if claim_name is not None and claim_name != instance_name:
                     raise incus_driver.incus_idmap.IDMapIntegrityError(
                         'Cleaned failed-build claim belongs to another Nova '
                         'instance name')
+            else:
+                # A purged Nova row leaves the cleaned claim as the only
+                # place the exact instance name survives.
+                instance_name = self._idmap_claim_instance_name(claim)
             state, current = self._terminal_failed_build_release_state(
                 context, assignment, host_id, instance_name)
             if state is None:
@@ -305,8 +347,14 @@ class IncusComputeManager(manager.ComputeManager):
                     assignment.instance_uuid, instance_name,
                     assignment.base, assignment.size):
                 return False
+            claim = self._resolve_possible_failed_build_claim(
+                current, claim)
+            # A claim still at 'possible' after the server was asked has no
+            # materialized rootfs to release, so it settles through the
+            # materialization abort instead of a release receipt. Demanding
+            # the receipt path here is what left these claims unreleased.
             settled = self._settle_idmap_host_claim(
-                current, claim, final_delete=True)
+                current, claim, final_delete=claim.state != 'possible')
         except Exception:
             LOG.exception(
                 'Cannot prove terminal failed-build idmap ownership for %s; '

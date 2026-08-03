@@ -294,7 +294,12 @@ class StorageOwnershipClient:
                 not storage_identity):
             raise idmap.IDMapIntegrityError(
                 reason="Incus detached materialization lacks identity")
-        if (storage_phase in ("materialized", "clean") and
+        # A materialized volume must be identifiable, but "clean" only
+        # states that no volume is left behind: a build that failed before
+        # materialization never created one, so it has nothing to identify.
+        # Requiring an identity there strands exactly the claims that this
+        # cleanup exists to release.
+        if (storage_phase == "materialized" and
                 binding.storage_driver in ("ceph", "cephext") and
                 not storage_identity):
             raise idmap.IDMapIntegrityError(

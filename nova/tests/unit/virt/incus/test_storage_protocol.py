@@ -124,9 +124,10 @@ class StorageOwnershipClientTest(test.NoDBTestCase):
         return dataclasses.replace(
             receipt, digest=idmap.rootfs_release_proof_digest(proof))
 
-    def _terminal_attempt_metadata(self):
+    def _terminal_attempt_metadata(
+            self, storage_identity="rbd_data.1234567890abcdef"):
         metadata = self._attempt_metadata(
-            storage_identity="rbd_data.1234567890abcdef",
+            storage_identity=storage_identity,
             state="clean",
             storage_phase="clean",
             started=True,
@@ -245,6 +246,30 @@ class StorageOwnershipClientTest(test.NoDBTestCase):
                 idmap.IDMapConfigurationError,
                 storage_protocol.StorageMaterializationBinding,
                 **dict(binding.__dict__, storage_driver=driver))
+
+    def test_clean_phase_without_identity_is_accepted(self):
+        """A build that failed before materialization has nothing to name."""
+        metadata, unused_proof = self._terminal_attempt_metadata(
+            storage_identity="")
+        self._materialization_endpoint().get.return_value = self._response(
+            metadata)
+
+        attempt = self.protocol.get_materialization(self.binding)
+
+        self.assertEqual("clean", attempt.storage_phase)
+        self.assertEqual("", attempt.storage_identity)
+
+    def test_materialized_phase_still_requires_an_identity(self):
+        endpoint = self._materialization_endpoint()
+        metadata = self._attempt_metadata(
+            state="committed", storage_phase="materialized",
+            storage_identity="", started=True, finished=True,
+            daemon_start=1722499200000000000)
+        endpoint.get.return_value = self._response(metadata)
+
+        self.assertRaises(
+            idmap.IDMapIntegrityError,
+            self.protocol.get_materialization, self.binding)
 
     def test_get_rejects_every_binding_class_mismatch(self):
         endpoint = self._materialization_endpoint()

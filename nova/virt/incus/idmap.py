@@ -1250,7 +1250,14 @@ class IDMapAllocator:
         if not valid_terminal:
             raise IDMapConfigurationError(
                 reason="materialization proof is not terminal")
+        # A shared disposition must always name the volume it left behind,
+        # which the detach/handover check above enforces unconditionally.
+        # For a delete disposition an empty identity is the server stating
+        # that nothing was ever materialized: there is no volume to name and
+        # none was removed. Rejecting that stranded exactly the failed-build
+        # claims this proof exists to release.
         if (proof.outcome == "reconciled-clean" and
+                proof.cleanup_disposition in ("detach", "handover") and
                 proof.storage_driver in ("ceph", "cephext") and
                 not proof.storage_identity):
             raise IDMapConfigurationError(
