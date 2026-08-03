@@ -34,6 +34,15 @@ DATA_DEVICES=${DATA_DEVICES:-}
 TIMEOUT=${TIMEOUT:-600}
 NAME=${NAME:-incus-initial-data-volume-e2e-$RANDOM}
 EVIDENCE_FILE=${EVIDENCE_FILE:-}
+# Stateful Incus containers exclude the console device (CRIU cannot restore
+# the console PTY), so Nova console output is empty for them. When
+# HOST_SSH_MAP maps hypervisor hostnames to SSH targets (host=user@addr,...),
+# markers are also read from the guest journal file via incus exec on the
+# instance's compute host. Console output remains the primary channel.
+HOST_SSH_MAP=${HOST_SSH_MAP:-}
+SSH_IDENTITY=${SSH_IDENTITY:-}
+SSH_KNOWN_HOSTS_FILE=${SSH_KNOWN_HOSTS_FILE:-$HOME/.ssh/known_hosts}
+GUEST_MARKER_LOG=/var/log/openstack-incus-data-e2e.log
 
 command -v openstack >/dev/null
 command -v python3 >/dev/null
@@ -154,14 +163,41 @@ wait_absent() {
     return 1
 }
 
+guest_marker_ssh_target() {
+    local host entry
+    host=$(openstack --os-compute-api-version 2.74 server show "$server_id" \
+        -f value -c "OS-EXT-SRV-ATTR:host" 2>/dev/null) || return 1
+    [[ -n "$host" && -n "$HOST_SSH_MAP" ]] || return 1
+    for entry in ${HOST_SSH_MAP//,/ }; do
+        if [[ "${entry%%=*}" == "$host" ]]; then
+            printf '%s\n' "${entry#*=}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+guest_marker_log() {
+    local target
+    target=$(guest_marker_ssh_target) || return 1
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no \
+        ${SSH_IDENTITY:+-i "$SSH_IDENTITY"} \
+        -o UserKnownHostsFile="$SSH_KNOWN_HOSTS_FILE" \
+        "$target" "podman exec incus incus exec '$instance_name' \
+        --project nova -- cat '$GUEST_MARKER_LOG'" 2>/dev/null
+}
+
 wait_console_marker() {
-    local marker=$1 deadline=$((SECONDS + TIMEOUT)) output=
+    local marker=$1 deadline=$((SECONDS + TIMEOUT)) output= guest_output=
     while ((SECONDS < deadline)); do
         output=$(openstack console log show "$server_id" 2>/dev/null || true)
         grep -Fqx "$marker" <<<"$output" && return 0
+        guest_output=$(guest_marker_log || true)
+        grep -Fqx "$marker" <<<"$guest_output" && return 0
         sleep 2
     done
-    printf '%s\n' "$output" >&2
+    printf 'console log:\n%s\nguest marker log:\n%s\n' \
+        "$output" "$guest_output" >&2
     echo "Console marker was not observed: $marker" >&2
     return 1
 }
@@ -262,7 +298,9 @@ TOKEN='$token'
 DEVICES='${devices[*]}'
 
 emit() {
-    printf '%s\n' "\$1" >/dev/console
+    printf '%s\n' "\$1" >/dev/console 2>/dev/null || true
+    printf '%s\n' "\$1" >>'$GUEST_MARKER_LOG'
+    sync
 }
 
 unmount_fuse() {
@@ -306,7 +344,15 @@ check_volume() {
         mkfs.ext4 -F "\$device" >/dev/null
     fi
     mkdir -p "\$mountpoint"
-    fuse2fs -o rw+ "\$device" "\$mountpoint"
+    # Read-write is the fuse2fs default; this build rejects "-o rw+".
+    fuse2fs "\$device" "\$mountpoint"
+    # A failed FUSE mount would leave the tmpfs directory in place and the
+    # marker round-trip below would silently pass against the wrong
+    # filesystem, so prove the mountpoint is a live fuse mount first.
+    grep -q " \$mountpoint fuse" /proc/mounts || {
+        emit "OPENSTACK_INCUS_DATA_ERROR:not-mounted:\$device"
+        return 1
+    }
     if [ "\$phase" = FIRST ]; then
         printf '%s\n' "\$TOKEN:\$index" >"\$marker"
         sync
@@ -336,7 +382,7 @@ if [ "\${1:-FIRST}" = REBOOT ]; then
 fi
 
 check_volumes FIRST
-install -m 0755 "\$0" /usr/local/sbin/openstack-incus-data-e2e
+install -D -m 0755 "\$0" /usr/local/sbin/openstack-incus-data-e2e
 if command -v systemctl >/dev/null 2>&1; then
     cat >/etc/systemd/system/openstack-incus-data-e2e.service <<'UNIT'
 [Unit]
