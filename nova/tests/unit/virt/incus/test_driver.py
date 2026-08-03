@@ -957,6 +957,61 @@ class IncusIDMapDriverTest(test.NoDBTestCase):
             request_config[driver.IDMAP_MATERIALIZATION_CONFIG_KEY])
         self.assertEqual(2, lock.call_count)
 
+    @mock.patch.object(driver, '_settle_incus_operation')
+    @mock.patch.object(driver.lockutils, 'lock')
+    def test_abort_settles_the_target_operation_before_settling(
+            self, lock, settle_operation):
+        """A create slower than the read timeout is still running."""
+        materialization = self._materialization()
+        protocol = self.driver.storage_ownership
+        aborted = self._attempt(state='aborted', finished=False)
+        settled = self._attempt(state='aborted', finished=True)
+        settled = dataclasses.replace(settled, proof=mock.sentinel.proof)
+        protocol.get_materialization.return_value = self._attempt(
+            state='active', finished=False)
+        protocol.abort_materialization.return_value = aborted
+        protocol.settle_materialization.return_value = settled
+        self.driver._record_and_ack_materialization_proof = mock.Mock(
+            return_value=mock.sentinel.recorded)
+
+        order = []
+        settle_operation.side_effect = lambda *a, **kw: order.append(
+            'operation')
+        protocol.settle_materialization.side_effect = (
+            lambda *a, **kw: order.append('attempt') or settled)
+
+        self.driver._abort_idmap_materialization(materialization)
+
+        settle_operation.assert_called_once_with(
+            materialization.client, aborted.operation_uuid)
+        protocol.settle_materialization.assert_called_once_with(
+            materialization.binding)
+        self.assertEqual(['operation', 'attempt'], order)
+
+    @mock.patch.object(driver.lockutils, 'lock')
+    def test_failed_abort_reports_the_original_build_error(self, lock):
+        """The abort's own failure must not mask why the build failed."""
+        materialization = self._materialization()
+        self.driver._exact_idmap_host_claim = mock.Mock(
+            return_value=(self.assignment, materialization.claim))
+        observe = self.driver.storage_ownership.observe_materialization_start
+        # A create that outlived the read timeout has not committed yet, so
+        # the barrier takes its abort path.
+        observe.return_value = self._attempt(state='active', finished=False)
+        original = TimeoutError('read timed out waiting for the operation')
+        create = mock.Mock(side_effect=original)
+        self.driver._abort_idmap_materialization = mock.Mock(
+            side_effect=incuscore_exceptions.LXDAPIException(
+                MockResponse(409)))
+
+        raised = self.assertRaises(
+            TimeoutError,
+            self.driver._with_rootfs_materialization_barrier,
+            materialization, {}, create)
+
+        self.assertIs(original, raised)
+        self.driver._abort_idmap_materialization.assert_called_once()
+
     @mock.patch.object(driver.lockutils, 'lock')
     def test_lost_create_response_recovers_only_after_exact_commit(self, lock):
         materialization = self._materialization()

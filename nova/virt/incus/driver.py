@@ -1721,6 +1721,52 @@ def _incus_operation(client, operation_id):
     return metadata
 
 
+def _settle_incus_operation(client, operation_id, instance=None):
+    """Cancel one Incus operation and wait until it is terminal.
+
+    Incus refuses to settle a materialization attempt while its target
+    operation is still pending, running or cancelling. A create that
+    outlives the client's read timeout is exactly that case, so the abort
+    path has to end the operation before it can settle the attempt.
+    """
+    operation_id = _migration_operation_id(operation_id)
+    if not operation_id:
+        return
+
+    try:
+        operation = _incus_operation(client, operation_id)
+    except incus_exceptions.LXDAPIException as exc:
+        if _is_incus_not_found(exc):
+            return
+        raise
+
+    if _operation_is_terminal(operation):
+        return
+
+    if operation.get('may_cancel'):
+        try:
+            client.api.operations[operation_id].delete(
+                params={'project': CONF.incus.project})
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+
+    def operation_is_terminal():
+        try:
+            current = _incus_operation(client, operation_id)
+        except incus_exceptions.LXDAPIException as exc:
+            if _is_incus_not_found(exc):
+                return
+            raise
+        if not _operation_is_terminal(current):
+            raise _MigrationStateNotReady(
+                'Incus operation %s is still active' % operation_id)
+
+    _wait_migration_finish_condition(
+        operation_is_terminal, 'operation %s settlement' % operation_id,
+        instance)
+
+
 def _instance_migration_operations(client, instance_name):
     response = client.api.operations.get(params={
         'project': CONF.incus.project,
@@ -5623,6 +5669,12 @@ class IncusDriver(driver.ComputeDriver):
             attempt = protocol.abort_materialization(
                 materialization.binding)
         if attempt.proof is None:
+            # Settling is refused while the target operation still runs. A
+            # create that outlived the client read timeout is still running
+            # at this point, so end it first; otherwise the 409 escapes and
+            # turns a slow but recoverable build into a hard failure.
+            _settle_incus_operation(
+                materialization.client, attempt.operation_uuid)
             attempt = protocol.settle_materialization(
                 materialization.binding)
         if attempt.proof is None:
@@ -5744,8 +5796,16 @@ class IncusDriver(driver.ComputeDriver):
                 'Incus create returned before materialization committed')
         try:
             self._abort_idmap_materialization(materialization)
-        except Exception as cleanup_error:
-            raise cleanup_error from original_error
+        except Exception:
+            # The caller must see why the build failed, not why the cleanup
+            # of that failure failed. Losing the original error hides
+            # recoverable causes (a create slower than the client read
+            # timeout) behind whatever the abort path happened to hit, and
+            # Nova's retry decision is made on the exception it receives.
+            LOG.exception(
+                'Failed to abort the Incus rootfs materialization after a '
+                'failed create; reporting the original failure')
+            raise original_error
         raise original_error
 
     def _idmap_rootfs_release_context(self, instance):
