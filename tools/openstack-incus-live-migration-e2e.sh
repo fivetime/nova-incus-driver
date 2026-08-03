@@ -8,10 +8,10 @@ FLAVOR=${FLAVOR:-ds512M}
 NETWORK=${NETWORK:-public}
 SOURCE_HOST=${SOURCE_HOST:-incus-node-01}
 DEST_HOST=${DEST_HOST:-incus-node-02}
-SOURCE_SSH=${SOURCE_SSH:-root@10.224.0.21}
-DEST_SSH=${DEST_SSH:-root@10.224.0.17}
+SOURCE_SSH=${SOURCE_SSH:-root@10.32.32.130}
+DEST_SSH=${DEST_SSH:-root@10.32.32.131}
 # Ordered host=ssh pairs. For example:
-# incus-node-02=root@10.224.0.17,incus-node-03=root@10.224.0.22,incus-node-01=root@10.224.0.21
+# incus-node-02=root@10.32.32.131,incus-node-03=root@10.32.32.132,incus-node-01=root@10.32.32.130
 MIGRATION_TARGETS=${MIGRATION_TARGETS:-$DEST_HOST=$DEST_SSH}
 # live keeps the source process identity; cold uses Nova's
 # VERIFY_RESIZE/confirm/revert state machine.

@@ -1,5 +1,5 @@
 param(
-    [string]$HostName = "10.224.0.16",
+    [string]$HostName = "10.32.32.132",
     [string]$RemotePath = "/opt/openstack-incus-src",
     [string]$SdkPath = "C:\MyProjects\IaasProjects\Incus\incus-python-sdk",
     [string]$RemoteSdkPath = "/opt/incus-python-sdk-src",
