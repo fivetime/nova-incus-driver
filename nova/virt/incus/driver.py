@@ -4816,7 +4816,14 @@ def _initial_data_volume_image_capability(instance, image_meta):
         properties = getattr(image_meta, 'properties', None)
         getter = getattr(properties, 'get', None)
         if callable(getter):
-            value = getter(INCUS_DATA_VOLUME_IMAGE_PROPERTY)
+            # ImageMetaProps.get raises AttributeError for custom
+            # properties that are not registered Nova object fields;
+            # an absent capability must read as False, not blow up the
+            # scheduler with three pointless build retries.
+            try:
+                value = getter(INCUS_DATA_VOLUME_IMAGE_PROPERTY)
+            except AttributeError:
+                value = None
         elif isinstance(image_meta, dict):
             properties = image_meta.get('properties') or {}
             value = properties.get(INCUS_DATA_VOLUME_IMAGE_PROPERTY)

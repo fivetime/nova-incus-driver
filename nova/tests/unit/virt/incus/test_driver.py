@@ -4038,6 +4038,19 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             instance, mock.Mock(properties={
                 'hw_incus_data_volume_fuse': 'false'})))
 
+    def test_initial_data_volume_capability_absent_reads_false(self):
+        """ImageMetaProps raises AttributeError for unregistered keys."""
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, expected_attrs=['system_metadata'], system_metadata={})
+        properties = mock.Mock(spec=['get'])
+        properties.get.side_effect = AttributeError(
+            'ImageMetaProps object has no attribute '
+            "'hw_incus_data_volume_fuse'")
+
+        self.assertFalse(driver._initial_data_volume_image_capability(
+            instance, mock.Mock(properties=properties)))
+
     def test_spawn_data_volumes_reject_duplicate_volume(self):
         connection_info = {
             'driver_volume_type': 'rbd',
