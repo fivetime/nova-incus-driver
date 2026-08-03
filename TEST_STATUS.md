@@ -11,6 +11,42 @@ Entries are append-mostly and are release evidence, not permanent
 configuration. Each release must re-validate against its own approved
 digest/revision pair.
 
+## 2026-08-03 Failed-build idmap claims were never released
+
+Third defect of the same family, also reported from the LB provider:
+``Cannot prove terminal failed-build idmap ownership ... retaining its
+exact claim``, 22 times in eleven minutes, for claims left by workers
+that had failed hours earlier. A retained claim keeps its ID map range
+allocated, so later builds keep paying for it.
+
+The cause was one wrong assumption repeated at four layers: **the
+failed-build cleanup asked for evidence only a successful build can
+produce.** A build that fails before its materialization commits leaves
+the claim at ``possible`` with no proof and no storage — exactly the
+state the cleanup exists to dispose of. Fixed in ``234fc49``:
+
+1. ``_idmap_claim_instance_name`` required a cleaned claim to learn the
+   instance name. Nova's row is authoritative when present; the claim is
+   cross-checked only once it can name itself. A purged Nova row still
+   requires the cleaned claim.
+2. The disposal always requested a release receipt. A claim still at
+   ``possible`` after consulting the server has no materialized rootfs
+   to release and settles through the materialization abort instead.
+3. Attempt parsing required a Ceph identity for the ``clean`` phase.
+   ``clean`` only states that nothing is left behind; a volume never
+   created cannot be identified. ``materialized`` still requires one.
+4. Proof validation required an identity for every reconciled-clean Ceph
+   proof. Detach and handover keep that requirement unconditionally; for
+   a delete disposition an empty identity means nothing was materialized
+   and nothing removed.
+
+Verified on the testbed: both stranded claims released, host claims fell
+from eight to six, retained-claim errors stopped. One claim was held at
+the last barrier by ``Incus profile still exists; retaining idmap
+release intent`` — that barrier was working as designed against a
+genuinely orphaned profile, and the claim released on its own once the
+profile was removed. Unit suite 788/788.
+
 ## 2026-08-03 Two abort-path defects reported from the LB provider
 
 Both were reported by the incus-octavia-provider work, which saw its
