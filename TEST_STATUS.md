@@ -11,6 +11,40 @@ Entries are append-mostly and are release evidence, not permanent
 configuration. Each release must re-validate against its own approved
 digest/revision pair.
 
+## 2026-08-03 Two abort-path defects reported from the LB provider
+
+Both were reported by the incus-octavia-provider work, which saw its
+load-balancer workers rebuilt in a loop. Neither was a provider defect,
+and the two share a shape worth naming: **an abort or cleanup path that
+replaces the original error, so only the secondary symptom is visible
+during diagnosis.**
+
+- Fork ``88fd0d129`` — ``Invalid RBD image ID: encoding/hex: odd length
+  hex string`` killed image-based builds about a minute in. Ceph builds
+  an image ID by concatenating an instance ID and a random value
+  formatted with ``std::hex``, which does not zero-pad, so odd-length
+  IDs are legal and roughly half of all images. Validating with
+  ``hex.DecodeString`` rejected them. The ID is only ever compared as a
+  string, so byte alignment was never needed; both call sites now check
+  for a non-empty lowercase hexadecimal string. The sha256 ownership
+  digest keeps ``DecodeString``, where the fixed length makes it right.
+  The existing trash test had asserted that ``"abc"`` must be rejected,
+  encoding the defect as expected behaviour.
+- Driver ``275f176`` — a create slower than the client read timeout left
+  its Incus operation running; the abort path then asked Incus to settle
+  the attempt, which Incus refuses while the target operation runs, and
+  the resulting 409 replaced the original timeout. A recoverable slow
+  build became a ``BuildAbortException`` and destroy repeated it. The
+  abort now ends the target operation first (cancel when allowed, wait
+  until terminal, mirroring ``_settle_instance_migration_operations``),
+  and a failure inside the abort no longer masks the build error, since
+  Nova's retry decision is made on the exception it receives.
+
+Verified on r9: six sequential builds on incus-node-02, the node that
+had logged 27 hex failures in ten minutes, all reached ACTIVE with zero
+hex errors fleet-wide. Unit suites: fork storage/instance/incusd green,
+driver 784/784.
+
 ## 2026-08-03 Manila pre-mount gating and host-reboot recovery
 
 ``tools/openstack-incus-manila-gate-recovery-e2e.sh`` (new) passes all
