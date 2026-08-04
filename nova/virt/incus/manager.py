@@ -79,6 +79,75 @@ def _share_recovery_lock_name(instance_uuid):
 class IncusComputeManager(manager.ComputeManager):
     """Nova manager extension for fenced BFV post-claim recovery."""
 
+    def init_host(self, service_ref):
+        """Resolve volumes this compute left mid-detach when it died."""
+        result = super().init_host(service_ref)
+        try:
+            self._roll_back_interrupted_detaches(
+                nova.context.get_admin_context())
+        except Exception:
+            LOG.exception(
+                'Failed to reconcile interrupted Cinder detaches at startup')
+        return result
+
+    def _roll_back_interrupted_detaches(self, context):
+        """Return a volume abandoned in 'detaching' to a definite state.
+
+        Nova marks a volume 'detaching' before the virt driver is entered,
+        so a process killed in that window leaves Cinder in an
+        intermediate state while the block device mapping and the host
+        mapping both still say attached. Nothing converges it: the API
+        refuses a retry because the volume is not 'in-use', and the volume
+        journal is empty because the driver never ran.
+
+        Host and Nova state are consistent here -- the guest still has its
+        volume and never stopped using it -- so the detach is treated as
+        not having happened, which is the same rule migration follows when
+        it fails. roll_detaching is what Nova's own detach failure path
+        calls; a killed process simply never reaches it.
+        """
+        for instance in objects.InstanceList.get_by_host(
+                context, self.host, expected_attrs=[]):
+            if instance.task_state is not None:
+                continue
+            try:
+                bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
+                    context, instance.uuid)
+            except Exception:
+                LOG.exception(
+                    'Cannot read block device mappings while reconciling '
+                    'interrupted detaches', instance=instance)
+                continue
+            for bdm in bdms:
+                if not bdm.volume_id or bdm.deleted:
+                    continue
+                try:
+                    volume = self.volume_api.get(context, bdm.volume_id)
+                except Exception:
+                    LOG.exception(
+                        'Cannot read Cinder volume %s while reconciling '
+                        'interrupted detaches', bdm.volume_id,
+                        instance=instance)
+                    continue
+                if volume.get('status') != 'detaching':
+                    continue
+                if not self.driver.holds_volume_attachment(
+                        instance, bdm.volume_id):
+                    # The driver did run and released host state, so the
+                    # detach is mid-flight rather than abandoned. Its own
+                    # journal recovery owns that case.
+                    continue
+                LOG.warning(
+                    'Returning volume %s to in-use: its detach did not '
+                    'survive this compute restart and the guest never lost '
+                    'it', bdm.volume_id, instance=instance)
+                try:
+                    self.volume_api.roll_detaching(context, bdm.volume_id)
+                except Exception:
+                    LOG.exception(
+                        'Failed to roll back the interrupted detach of '
+                        'volume %s', bdm.volume_id, instance=instance)
+
     def _local_node_uuid(self):
         """Return Nova's durable compute identity or fail closed."""
         host_id = virt_node.read_local_node_uuid()

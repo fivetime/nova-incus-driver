@@ -8159,6 +8159,26 @@ class IncusDriver(driver.ComputeDriver):
         """Return migration journal owners for manager-side validation."""
         return _share_journal_recovery_candidates()
 
+    def holds_volume_attachment(self, instance, volume_id):
+        """Return whether this host still owns the guest side of a volume.
+
+        Used to tell an abandoned detach from one that is merely in flight.
+        A journal means the driver reached the disconnect and its own
+        recovery owns the outcome; a profile device with no journal means
+        nothing was released and the guest never lost the volume. Any
+        uncertainty answers False so the caller leaves the volume alone.
+        """
+        try:
+            if _volume_journal_records(instance).get(volume_id) is not None:
+                return False
+            profile = self.client.profiles.get(instance.name)
+        except Exception:
+            return False
+        devices = profile.devices if isinstance(profile.devices, dict) else {}
+        device = devices.get(volume_id)
+        return (isinstance(device, dict) and
+                device.get('type') == 'unix-block')
+
     def recover_volume_journal_candidate(self, context, instance, candidate):
         """Replay an unfinished disconnect the manager has proven terminal."""
         if candidate.get('uuid') != instance.uuid:

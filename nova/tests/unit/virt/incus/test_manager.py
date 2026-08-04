@@ -1416,6 +1416,65 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         finalize = self.compute.driver.finalize_live_migration_rollback
         finalize.assert_not_called()
 
+    @mock.patch.object(manager.objects.BlockDeviceMappingList,
+                       'get_by_instance_uuid')
+    @mock.patch.object(manager.objects.InstanceList, 'get_by_host')
+    def test_startup_rolls_back_an_abandoned_detach(
+            self, get_by_host, get_bdms):
+        """A detach that never reached the driver must not stick."""
+        instance = self._idmap_instance()
+        instance.task_state = None
+        get_by_host.return_value = [instance]
+        bdm = mock.Mock(volume_id='vol-1', deleted=False)
+        get_bdms.return_value = [bdm]
+        self.compute.volume_api = mock.Mock()
+        self.compute.volume_api.get.return_value = {'status': 'detaching'}
+        self.compute.driver.holds_volume_attachment.return_value = True
+
+        self.compute._roll_back_interrupted_detaches(
+            context.get_admin_context())
+
+        self.compute.volume_api.roll_detaching.assert_called_once_with(
+            mock.ANY, 'vol-1')
+
+    @mock.patch.object(manager.objects.BlockDeviceMappingList,
+                       'get_by_instance_uuid')
+    @mock.patch.object(manager.objects.InstanceList, 'get_by_host')
+    def test_startup_leaves_an_in_flight_detach_alone(
+            self, get_by_host, get_bdms):
+        """A driver that reached the disconnect owns its own recovery."""
+        instance = self._idmap_instance()
+        instance.task_state = None
+        get_by_host.return_value = [instance]
+        bdm = mock.Mock(volume_id='vol-1', deleted=False)
+        get_bdms.return_value = [bdm]
+        self.compute.volume_api = mock.Mock()
+        self.compute.volume_api.get.return_value = {'status': 'detaching'}
+        self.compute.driver.holds_volume_attachment.return_value = False
+
+        self.compute._roll_back_interrupted_detaches(
+            context.get_admin_context())
+
+        self.compute.volume_api.roll_detaching.assert_not_called()
+
+    @mock.patch.object(manager.objects.BlockDeviceMappingList,
+                       'get_by_instance_uuid')
+    @mock.patch.object(manager.objects.InstanceList, 'get_by_host')
+    def test_startup_ignores_volumes_that_are_not_detaching(
+            self, get_by_host, get_bdms):
+        instance = self._idmap_instance()
+        instance.task_state = None
+        get_by_host.return_value = [instance]
+        get_bdms.return_value = [mock.Mock(volume_id='vol-1', deleted=False)]
+        self.compute.volume_api = mock.Mock()
+        self.compute.volume_api.get.return_value = {'status': 'in-use'}
+
+        self.compute._roll_back_interrupted_detaches(
+            context.get_admin_context())
+
+        self.compute.volume_api.roll_detaching.assert_not_called()
+        self.compute.driver.holds_volume_attachment.assert_not_called()
+
     def test_complete_live_migration_rollback_reasserts_network(self):
         ctxt = context.get_admin_context()
         instance = mock.sentinel.instance
