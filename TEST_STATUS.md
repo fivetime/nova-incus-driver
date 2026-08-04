@@ -498,12 +498,20 @@ Test-bed configuration requirement discovered by this run:
 
 ## Dedicated test topology
 
-- `root@10.224.0.15` (`incus-node-01`) is the DevStack controller and first
+- `root@10.32.32.130` (`incus-node-01`) is the DevStack controller and first
   Incus compute node. It runs Ubuntu Noble 24.04 and Python 3.12.
-- `root@10.224.0.17` (`incus-node-02`) is the second Incus compute node. It
+- `root@10.32.32.131` (`incus-node-02`) is the second Incus compute node. It
   runs Ubuntu Noble 24.04 and Python 3.12.
-- `root@10.224.0.16` (`incus-node-03`) is the third Incus compute node. It
+- `root@10.32.32.132` (`incus-node-03`) is the third Incus compute node. It
   runs Ubuntu Noble 24.04 and Python 3.12.
+- Addressing is static across three VLAN interfaces, replacing the DHCP
+  `10.224.0.0/24` network used before 2026-08-03: `k8s-ctl` (VLAN 11,
+  `10.32.32.128/27`) carries management, API and Incus migration traffic;
+  `ovn-ext` (VLAN 14, `10.128.32.128/27`) is the `br-ex` provider uplink;
+  `ovn-int` (VLAN 15, `10.160.32.128/27`) carries the OVN Geneve tunnels and
+  is what each chassis advertises as its `ovn-encap-ip`. Each interface also
+  has an IPv6 address; the control plane listens dual-stack, but its service
+  catalogue and inter-service URLs remain IPv4.
 - Stable hostnames and `/etc/hosts` self-resolution are configured on all
   three nodes as shown above.
 - All three nodes run independent, non-clustered Incus 7.2 daemons and expose

@@ -308,6 +308,38 @@ in `TEST_STATUS.md`; this section keeps only the rules.
   until the request fails with `NoValidHost`. Cold migration does not nest
   synchronous RPCs this way.
 
+### Guest interface naming
+
+- The in-guest name of a NIC is `nic` followed by the first 12 hexadecimal
+  characters of its Neutron port UUID (`vif.get_vif_guest_devname`). The same
+  name is written to the Incus NIC device and to the generated cloud-init
+  network-config, so the two always agree.
+- **Do not change this to `eth0`/`ethN` ordering.** The name is derived from
+  the port precisely so that detaching or attaching another port cannot
+  renumber the interfaces that remain; positional names would silently
+  invalidate what a multi-NIC guest already has configured, and the mapping
+  would stop surviving reboot and migration. Netplan MAC matching is ruled
+  out for the same reason it is elsewhere: it renders as
+  `PermanentMACAddress=`, which does not match a veth and leaves the
+  interface unmanaged.
+- A guest, image or test that hardcodes `eth0` is assuming something this
+  platform does not provide. Discover the interface instead, for example from
+  the default route. This is a deliberate interface contract, not a defect.
+
+### Cleanup and abort paths
+
+- A cleanup or abort path must never require evidence that only the success
+  path produces. Four defects in 2026-08 shared this shape: a build that
+  failed before its materialization committed leaves the claim at `possible`
+  with no proof, no storage identity and no receipt, and each layer that
+  demanded one of those stranded the very claims cleanup exists to release.
+  When reviewing such code, ask of every check: does this evidence exist when
+  the thing being cleaned up has failed?
+- A failure inside cleanup must not replace the original error. Nova decides
+  whether to reschedule from the exception it receives, so masking a
+  recoverable cause with a cleanup symptom converts a retryable failure into
+  a terminal one. Log the cleanup failure and re-raise the original.
+
 ### Data-volume attachment and filesystem safety
 
 - Cinder data-volume attach/detach is executed by host-side os-brick, not by
