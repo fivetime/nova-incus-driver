@@ -12,6 +12,7 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+import contextlib
 import dataclasses
 import os
 import threading
@@ -628,6 +629,65 @@ class IncusComputeManagerTest(test.NoDBTestCase):
     def _force_full_idmap_audit(self):
         """Make the next audit cycle owe its complete scan."""
         self.compute._incus_full_audit_deadline = time.monotonic() - 1
+
+    def test_release_and_claim_lock_names_are_the_same_lock(self):
+        """The aliasing is deliberate; the recursion hazard follows from it."""
+        self.assertEqual(
+            manager._idmap_release_lock_name('a-uuid'),
+            manager.incus_driver._idmap_host_claim_lock_name('a-uuid'))
+
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_replay_does_not_retake_the_lock_it_already_holds(
+            self, get_by_uuid):
+        """Re-entering oslo's non-reentrant lock wedges every periodic.
+
+        _replay_incus_idmap_release runs inside the release lock, which is
+        the host claim lock under another name. If the promotion helper is
+        allowed to acquire it again the green thread blocks on itself, and
+        because oslo runs all of a service's periodics in one green thread
+        that stops every periodic on the compute until it restarts.
+        """
+        # A deleted Nova row is what lets the replay reach the promotion
+        # helper; InstanceNotFound short-circuits before it.
+        deleted = self._idmap_instance()
+        deleted.deleted = True
+        deleted.name = self.idmap_intent.instance_name
+        get_by_uuid.return_value = deleted
+        allocator = self.compute.driver.idmap_allocator
+        possible = self._host_claim(state='possible', proof=None)
+        allocator.get_host_claim.return_value = possible
+        promote = self.compute.driver._promote_idmap_claim_if_server_committed
+        promote.return_value = (self.idmap_assignment, self.idmap_claim)
+
+        held = []
+
+        real_lock = manager.lockutils.lock
+
+        @contextlib.contextmanager
+        def tracking_lock(name, *args, **kwargs):
+            if name in held:
+                raise AssertionError(
+                    'lock {!r} was acquired while already held; oslo locks '
+                    'are not reentrant and this deadlocks'.format(name))
+            held.append(name)
+            try:
+                with real_lock(name, *args, **kwargs) as result:
+                    yield result
+            finally:
+                held.remove(name)
+
+        with mock.patch.object(manager.lockutils, 'lock', tracking_lock):
+            self.compute._replay_incus_idmap_releases(
+                context.get_admin_context())
+
+        # It must have been told the lock is already held, not simply have
+        # skipped the promotion.
+        self.assertTrue(promote.called)
+        for call in promote.call_args_list:
+            self.assertTrue(
+                call.kwargs.get('_claim_lock_held'),
+                'promotion helper was called without _claim_lock_held while '
+                'the caller holds that lock')
 
     def test_idmap_full_audit_is_skipped_without_allocator(self):
         self.compute.driver.idmap_allocator = None

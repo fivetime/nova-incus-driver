@@ -1034,10 +1034,19 @@ class IncusComputeManager(manager.ComputeManager):
                         allocator, assignment, host_id)
                     if (instance is not None and
                             exact_claim.state == 'possible'):
+                        # This whole block already holds that same lock:
+                        # _idmap_release_lock_name aliases the host claim
+                        # lock name so release and claim work mutually
+                        # exclude. Letting the promotion helper take it
+                        # again deadlocks the caller against itself, and
+                        # oslo runs every periodic task for a service in
+                        # one green thread, so that stops all of them on
+                        # this compute until the process restarts.
                         assignment, exact_claim = (
                             self.driver.
                             _promote_idmap_claim_if_server_committed(
-                                instance, exact_claim))
+                                instance, exact_claim,
+                                _claim_lock_held=True))
                     settled = self._settle_idmap_host_claim(
                         instance, exact_claim,
                         final_delete=(exact_claim.state == 'committed' or
