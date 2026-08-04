@@ -1810,3 +1810,66 @@ Lever 2 touches the ABA guard's semantics and must not be weakened
 unilaterally: caching the pool identity would still catch pool recreation
 between operations but no longer within one. Lever 1 requires no such
 trade-off. Not yet implemented.
+
+### Pool identity moved to `rados df`: delete 32.9 s -> 17.5 s
+
+Fork commit `40dcbf738`, image `incus-quadlet-candidate:radosdf-r12`, deployed
+to all three nodes.
+
+An ultracode study (23 agents) corrected the cost model that four of its own
+proposals had been sized against. `getRBDVolumeIdentity` returns on ENOENT
+**before** its trailing pool read, so probing an *absent* image costs one
+`ceph osd map`, not two. The corrected model reproduces three independent
+measurements exactly: 38 invocations, their sampled runtime, and the 5 plain
+`rbd info` calls. Composition: 12 standalone fences, 18 single reads from
+absent probes, 8 from four found-probe brackets.
+
+Measured per-call cost, five-run averages inside the daemon container:
+
+| client | per call |
+| --- | --- |
+| `ceph osd map` (Python) | 470 ms |
+| `rados df` (C++) | 94 ms |
+| `rbd info` (C++) | 164 ms |
+| bare `python3 -c pass` | 21 ms |
+
+The last row disproves the obvious explanation: interpreter startup accounts
+for none of the gap; the `ceph` CLI is simply a far heavier program. `rados df`
+returns the same pool id from the same osdmap under the existing `client.incus`
+caps, so `getRBDPoolIdentity` now tries it first and keeps `ceph osd map` as
+the authority for any transport failure, permission gap or unreadable output.
+The pool must appear exactly once by name with a numeric id or the report is
+treated as unusable. No guarantee changed.
+
+Result on an idle node, three runs: **17.44 / 17.48 / 17.59 s**, against 32.9 s
+before. Process sampling during the delete shows zero `ceph` invocations
+remaining; 28 `rados` and 34 `rbd`. Fleet returned to baseline after each probe
+(6 servers, 19 registry entries, 6 RBD roots).
+
+The guard is now assertable, which it was not. `fakeCephIdentityReleaseStore`
+reported a constant pool id that no test ever changed, so replacing
+`verifyRBDIdentityReleasePool`'s body with `return nil` passed the entire
+suite and every pool fence in that file was vacuously satisfied.
+`TestFakeStoreCanMovePoolUnderTheCaller` now proves both that a moved pool is
+refused and that it is the fence doing the refusing.
+
+**This still does not unblock the 3000-instance gate**: 27.4 h -> 14.6 h. The
+remaining ~17.5 s is 34 `rbd` forks plus unmount, `wipeDirectory`, the
+operations machinery and DB work, none of which was investigated. The lever
+that unblocks the gate is concurrency -- deletes are serialized per instance
+today, and `pool_load.go:149` builds a fresh driver per load, so no shared
+state prevents parallelism.
+
+Deliberately not done, each costing a named guarantee for 1.3-2.2 s:
+skipping the duplicate absence proof before `VolumeDBDelete`, skipping
+`HasVolumeIdentity` on a completed receipt `GET`, and restructuring
+`prepareRBDIdentityTombstone`. Not worth the review budget after this change.
+
+Flagged, unrelated to this work: `reconcileStorageMaterializationAttemptsAfterRestart`
+(`cmd/incusd/storage_materialization_create.go:487`) loops serially and runs
+synchronously at `daemon.go:1589` before `instance.LoadNodeAll`, so a
+500-instance compute rebooting after a mass failure blocks daemon startup for
+N x ~30 s. `reconcileMigrationAttemptsAfterRestart`, added in `87a638d77`,
+sits at the same point with the same serial shape; its work is bounded by
+unfinished migration attempts rather than instance count, so its exposure is
+smaller, but the pattern is identical.
