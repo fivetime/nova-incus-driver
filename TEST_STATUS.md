@@ -2089,3 +2089,62 @@ reconcile periodic that would have cleared it was dead.
 **Consequence for the gate.** A compute whose periodic loop dies after ~300
 creates cannot be asked for 1000. This has to be understood before the gate is
 attempted again, and it is independent of the create latency below.
+
+### Creates cap at 2.1x concurrency, and 86% of it is one per-image lock
+
+Measured after `7700759`, on a compute whose periodic loop was verified alive
+in every rung (a wedged loop invalidated the earlier gate numbers).
+
+**Concurrency ladder, all creates pinned to one compute, same image:**
+
+| C | wall | per create | effective | solved f | delete at same C |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 29.53 s | 29.53 s | 1.00x | - | 1.00x |
+| 2 | 44.63 s | 22.32 s | 1.32x | 0.51 | 1.95x |
+| 4 | 67.35 s | 16.84 s | 1.75x | 0.43 | 3.50x |
+| 8 | 132.16 s | 16.52 s | 1.79x | 0.50 | 6.20x |
+| 16 | 244.63 s | 15.29 s | **1.93x** | 0.48 | **9.10x** |
+
+Fitting `T(C) = T1 x (1 + (C-1)f)` gives f = 0.48 from three independent
+rungs. That model predicted C=16 at 242 s against 244.63 s measured, a **1%
+error**, so a single serialized segment explains the whole curve -- not
+multiple contended resources. The ceiling is 1/f ~ **2.1x**, unreachable by
+raising C.
+
+**Where it serializes.** Five SIGUSR2 guru meditation reports taken during a
+C=16 burst put 37 of the driver green-thread samples at the same frame:
+`nova/virt/incus/driver.py:7354`, the `self.client.instances.create(...,
+wait=True)` lambda. The threads are waiting on incusd, not on a Nova lock --
+unlike the delete-side defect.
+
+**Decisive experiment.** `internal/server/storage/backend.go:5005` locks
+`OperationLockName("EnsureImage", pool, VolumeTypeImage, "", fingerprint)`,
+which is per image fingerprint, and every instance in these runs used one
+image. Prediction fixed in advance: splitting the same concurrency across two
+fingerprints gives two independent serial chains, so ~70-90 s, while ~126 s
+refutes it. On an empty fleet (0 servers, registry holding only its config
+record):
+
+| run | wall |
+| --- | --- |
+| baseline A, C=1 | 29.55 s |
+| baseline B, C=1 | 29.02 s |
+| CONTROL, C=8 one image | 126.56 s |
+| **TEST, C=8 split 4+4** | **78.55 s** |
+
+Confirmed, 1.61x faster. Solving `126.56 = 29.5 + 7s` and
+`78.55 = 29.5 + 3s_img + 7s_glob` with `s_img + s_glob = s` gives
+**s_img = 12.0 s and s_glob = 1.9 s**: 86% of the serialized segment is the
+per-fingerprint lock and only 1.9 s is global.
+
+Two confounds were ruled out by measurement rather than argument. The two
+baselines differ by 1.8% despite one image being 28 MB and the other far
+larger, so image size does not drive create cost and the split needs no
+normalization. And C=1 measured 29.55 s on an empty fleet against 29.53 s on
+a fleet of 6 with 19 registry entries, so registry size contributes nothing
+at this scale -- the queueing is concurrency alone.
+
+**Consequence for the gate.** Every instance a gate run creates uses the same
+image, so all 3000 contend on one lock. `EnsureImage` holds it across a
+cluster database transaction and the volume config comparisons even when the
+image volume already exists, and that cluster pool has a single connection.
