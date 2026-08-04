@@ -1674,3 +1674,78 @@ hardening.
   flake8 run also repaired two continuation lines mangled by an earlier batch
   edit and a deprecated `LOG.warn`, both of which had been failing
   `tox -e pep8` since commit `0ad69cd`.
+
+## 2026-08-04 scale hotspot removal and first baseline attempt
+
+Candidate: driver commits `85a156b` (hotspot removal) and `108e0fa` (scale
+audit helpers, Placement microversion), deployed to all three computes.
+
+### Testbed configuration this evidence depends on
+
+- Flavor `incus.scale`: 128 MB, 1 vCPU, 1 GB, `incus:root_storage_pool=durable`,
+  `incus:process_limit=256`, `trait:CUSTOM_INCUS_SYSTEM_CONTAINER=required`.
+- `ram_allocation_ratio = 2.0` and `cpu_allocation_ratio = 20.0` on every
+  compute. A container memory limit is a cgroup ceiling, not a reservation,
+  so Placement capacity for idle scale guests is expressed as overcommit;
+  at 1.0/4.0 the fleet caps at 251 instances per node and 1,000 per compute
+  is unreachable by construction. Originals saved as
+  `/etc/nova/nova-cpu.conf.pre-scale-baseline`.
+- Admin project quotas raised to 4,000 instances/cores and ports.
+- `/etc/openstack/clouds.yaml` still pointed at the pre-migration
+  `10.224.0.21` identity endpoint and was repaired to `10.32.32.130`;
+  original saved as `clouds.yaml.pre-scale-baseline`.
+- The runner needed two fixes before it could execute at all: it shipped
+  none of its four required evidence helpers, and its Placement provider
+  trait read used the SDK default microversion 1.0, where that route 404s.
+  Both are in `108e0fa`.
+- `--host-*-min-free-bytes` are lowered from the runner defaults for this
+  testbed only: `/var/log/incus` is a 2 GB loop volume that a 4 GiB absolute
+  floor can never satisfy. The percentage floors still apply.
+- `--max-host-skew-percent 40` / `--min-per-compute-percent 70` for a
+  baseline run only. The fleet does not start balanced, so Nova's RAM
+  weigher spends its first few dozen placements correcting the offset before
+  it spreads evenly. The release gate keeps its 20/90 defaults.
+
+### The baseline is blocked: destroy costs ~27 s idle and ~312 s under load
+
+Measured on an idle node, one instance, decomposed:
+
+| step | seconds |
+| --- | --- |
+| graceful stop / `--force` stop | 4.2 / 1.7 |
+| `incusd` DELETE with the exact-identity release token | **19.5** |
+| Nova destroy when the container is already absent | 11 |
+| `rbd trash mv` / `rbd trash rm`, 1 GB image, same pool | 0.19 / 0.19 |
+
+Under the pilot's 16-way concurrency, 23 destroys with no build contention
+gave min 31.05 s, median 312.10 s, max 596.11 s, against 1.3 s to deallocate
+network. So roughly 20 s of fixed cost inside `incusd` is also being
+serialized. Ceph's own image lifecycle accounts for 0.4 s of it, so whatever
+`incusd` spends the remaining ~19 s on, it is not removing the image. A
+krbd unmap or RBD watcher timeout is the leading hypothesis and is **not yet
+verified**; an earlier hypothesis that the 30 s `boot.host_shutdown_timeout`
+was the floor was refuted by the stop measurements above.
+
+At 312 s median, deleting the 3,000 instances a 100/500/1,000 per-compute
+run creates is days of wall clock. The baseline cannot be recorded until
+this is understood.
+
+### One stranded profile per raced delete-during-build
+
+Of 120 pilot instances, 119 released completely: the RBD pool returned to
+exactly its 6 pre-existing container roots, and no release intent was left
+queued. One instance (`4d6ffd8a-a019-4f83-a13b-460b8bb7907c`) left the Incus
+profile `instance-000005e5` on node-02 with no container and no Nova row.
+
+Nothing can reclaim it. The profile carries neither
+`user.openstack.cleanup_required` nor
+`user.openstack.migration_destination_prepared`, so neither profile recovery
+periodic can see it, and the ID-map reconciler correctly refuses to release
+the allocation while a profile of that name exists -- it logs "Incus profile
+instance-000005e5 still exists; retaining idmap release intent" every 60 s.
+The registry therefore holds 7 allocations for 6 servers, permanently.
+
+The fail-closed behaviour is right; the gap is that a delete which races its
+own build can leave a profile that no marker claims. This is the same shape
+as the 2026-08 cleanup defects: the recovery marker only exists on a path
+that did not run. It is narrow -- one in 120, all of them deleted mid-build.
