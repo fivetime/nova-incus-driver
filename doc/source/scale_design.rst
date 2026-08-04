@@ -96,8 +96,11 @@ every cycle on every host:
    count) and the config fingerprint. Cost is O(1) request count and O(1)
    payload per cycle.
 3. **Full audit every K cycles with per-host jitter.** Default one full
-   audit per 15 minutes (config: ``idmap_allocator_full_audit_interval``,
-   minimum 300 s), with a random per-process phase offset so a fleet does
+   audit per 15 minutes, through a new option
+   ``idmap_allocator_full_audit_interval`` (minimum 300 s) introduced by this
+   work; today every cycle is a full audit driven by the existing
+   ``idmap_allocator_audit_interval`` (default 60 s). A random per-process
+   phase offset is added so a fleet does
    not synchronize its full scans. Any drift-probe mismatch, any CAS
    conflict surprise, and any registry mutation error immediately schedules
    an out-of-band full audit before the next mutation is allowed.

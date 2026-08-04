@@ -86,5 +86,5 @@ Tempest 场景测试位于 `nova_incus_tempest_plugin/`;真实环境的端到端
 
 ## 说明
 
-代码模块路径与主类目前仍沿用历史命名 `nova/virt/incus/`(`IncusDriver`),分发包名已更名为
-`nova-incus`;完整的 `incus → incus` 重命名将作为单独的重构进行。
+代码模块路径为 `nova/virt/incus/`,主类为 `IncusDriver`,分发包名为 `nova-incus`,
+计算服务入口点为 `nova-incus-compute`。自 nova-lxd 继承的历史命名已全部改完。

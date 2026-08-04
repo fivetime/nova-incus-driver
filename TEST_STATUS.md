@@ -524,8 +524,9 @@ Test-bed configuration requirement discovered by this run:
 ### Current storage substrate
 
 - The current Noble test nodes do not have `/dev/vdb`; the earlier
-  LINSTOR/DRBD topology was removed when `.21` and `.22` were reinstalled.
-  LINSTOR results later in this file are historical evidence only.
+  LINSTOR/DRBD topology was removed when `incus-node-01` and `incus-node-03`
+  were reinstalled. LINSTOR results later in this file are historical
+  evidence only.
 - The external Rook cluster supplies `glance-images-rbd-pool`,
   `cinder-volumes-rbd-pool`, `nvme-rep3-rbd-pool`,
   `cinder-backups-rbd-pool`, and the Incus rootfs pool. Glance, both Cinder

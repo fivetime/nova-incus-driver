@@ -104,8 +104,11 @@ owned by Nova's destination may converge. Every missing, non-terminal,
 all resources and emit an operator-visible error.
 
 The aggregate gate must also run ``tools/openstack-incus-scale-e2e.py`` with
-``RUN_SCALE=true``. The required cumulative checkpoints are 100, 500, and
-1,000 simultaneously ``ACTIVE`` servers. At every checkpoint the runner
+``RUN_SCALE=true``. The required checkpoints are 100, 500 and 1,000
+simultaneously ``ACTIVE`` servers **per compute**
+(``SCALE_PER_COMPUTE_CHECKPOINTS``); the runner multiplies them by the number
+of mapped hosts, so on the mandated three-node fleet the cumulative figures
+are 300, 1,500 and 3,000. At every checkpoint the runner
 requires every server to be on the explicitly mapped Incus compute subset,
 one active Neutron port bound to a host for every server, and exactly one
 matching Incus instance and instance profile on the same Incus host. It
@@ -132,7 +135,7 @@ compute inventory::
   SCALE_IMAGE=<admitted-image-uuid>
   SCALE_FLAVOR=<scale-flavor-uuid>
   SCALE_NETWORK=<scale-network-uuid>
-  SCALE_INCUS_HOSTS="compute-1=root@10.0.0.11 compute-2=root@10.0.0.12 compute-3=root@10.0.0.13"
+  SCALE_INCUS_HOSTS="compute-1=root@192.0.2.11 compute-2=root@192.0.2.12 compute-3=root@192.0.2.13"
   SCALE_MIN_COMPUTE_HOSTS=3
   SCALE_EXPECTED_ROOT_POOL=ceph-rootfs
   SCALE_EXPECTED_PROCESS_LIMIT=64
@@ -171,9 +174,10 @@ audit uses strict host-key checking and non-interactive authentication.
 delete concurrency, audit concurrency, bounded delete retry attempts/backoff,
 inventory-command timeout, stage and cleanup timeouts, poll interval, Neutron
 query chunk size, cleanup settle time, Incus project, and checkpoint list have
-``SCALE_*`` overrides. An overridden checkpoint list must still include 100,
-500, and 1,000. ``SCALE_MIN_COMPUTE_HOSTS`` must exactly equal the number of
-entries in ``SCALE_INCUS_HOSTS``.
+``SCALE_*`` overrides. The checkpoint list is
+``SCALE_PER_COMPUTE_CHECKPOINTS`` and an override must still include the
+per-compute values 100, 500 and 1,000. ``SCALE_MIN_COMPUTE_HOSTS`` must
+exactly equal the number of entries in ``SCALE_INCUS_HOSTS``.
 Project-scoped administrative credentials are required because Nova host and
 Neutron binding attributes are part of the audit. The runner targets
 OpenStackSDK 4.10 from OpenStack 2026.1.
@@ -281,10 +285,10 @@ The aggregate gate derives all six directed pairs from exactly three explicit
 network, Cinder types, or shares::
 
   RUN_MIGRATION_MATRIX=true
-  MIGRATION_COMPUTE_NODES="compute-1=root@10.0.0.11,compute-2=root@10.0.0.12,compute-3=root@10.0.0.13"
+  MIGRATION_COMPUTE_NODES="compute-1=root@192.0.2.11,compute-2=root@192.0.2.12,compute-3=root@192.0.2.13"
   SSH_IDENTITY=/root/.ssh/incus-release
   SSH_KNOWN_HOSTS_FILE=/root/.ssh/known_hosts
-  CONTROLLER_SSH=root@10.0.0.10
+  CONTROLLER_SSH=root@192.0.2.10
   MIGRATION_LOCAL_IMAGE=<admitted-criu-local-image-uuid>
   MIGRATION_BFV_IMAGE=<admitted-criu-bfv-image-uuid>
   MIGRATION_FLAVOR=<incus-flavor-uuid>
@@ -477,7 +481,8 @@ Archive the output of ``tools/openstack-incus-release-gate.sh`` with:
 * one destructive external-fence evacuation per fencing implementation;
 * ``openstack-incus-bfv-cow-e2e.sh`` proving that Glance-to-Cinder BFV
   provisioning retains an RBD parent and non-zero overlap;
-* the scale JSON proving the 100, 500, and 1,000 checkpoints, complete
+* the scale JSON proving the 100, 500 and 1,000 per-compute checkpoints,
+  complete
   Incus/Neutron ownership audits, and successful exact-ID cleanup;
 * returning-host reconciliation and final three-node fleet audit;
 * known unsupported capabilities from

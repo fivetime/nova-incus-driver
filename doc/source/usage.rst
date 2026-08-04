@@ -1252,11 +1252,11 @@ Install ``tools/openstack-incus-monitoring-audit.sh`` on an independently
 hosted monitoring node and run it with the same immutable identity inputs as
 the fleet preflight::
 
-    COMPUTE_NODES='node-01=root@10.0.0.11,node-02=root@10.0.0.12' \
+    COMPUTE_NODES='node-01=root@192.0.2.11,node-02=root@192.0.2.12' \
     SSH_IDENTITY=/etc/openstack-incus/monitor_ed25519 \
     EXPECTED_INCUS_IMAGE_DIGEST='sha256:...' \
     EXPECTED_INCUS_REVISION='...' \
-    CONTROLLER_SSH=root@10.0.0.10 \
+    CONTROLLER_SSH=root@192.0.2.10 \
     FENCE_EVIDENCE_FILE=/var/lib/openstack-incus/last-fence.log \
       tools/openstack-incus-monitoring-audit.sh
 
@@ -1317,8 +1317,12 @@ Encrypted, read-only, and multiattach volumes remain unsupported.
 Active Manila NFS and CephFS mappings are mounted on the destination before
 the Incus transfer. On success the source staging mount is removed; rollback
 removes the destination staging mount. NFS access must cover every eligible
-compute on an isolated storage network. Configure the same CIDR on all
-computes; a per-host default prevents cross-node migration::
+compute on an isolated storage network. Nova passes this value straight
+through as the ``ip`` access rule Manila grants, and Manila accepts a CIDR
+there, so configure the same CIDR on every compute even though Nova's own
+help text for the option says "IP address": the per-host default grants only
+the source compute and the destination is then refused, which fails
+migration::
 
     [DEFAULT]
     my_shared_fs_storage_ip = 10.32.32.128/27

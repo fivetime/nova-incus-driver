@@ -162,14 +162,20 @@ Incus inventory and storage-proof I/O outside the cross-process instance lock,
 then takes a short lock only to re-read Nova ownership, revalidate the exact
 allocation/host/materialization token, and retire it.
 
-Each generation also has a one-way ``rootfs_materialized`` barrier. It starts
-false. Immediately before the first Incus create request, Nova holds the same
-instance UUID lock used by final deletion, revalidates the exact local claim,
-sets the barrier through etcd CAS, and keeps the lock until Incus accepts or
-rejects the create request. The spawn, cold-migration target, evacuation
-target, and live-migration receive paths all use this transaction. Every start
-or restart requires the barrier to be true, the exact local host claim to
-exist, and both release-intent and release-proof keys to be absent.
+Materialization state is carried by the per-host claim, not by any
+generation-wide flag: a claim moves ``unmaterialized`` to ``possible`` to
+``committed`` to ``cleaned``. Immediately before the first Incus create
+request, Nova holds the same instance UUID lock used by final deletion,
+revalidates that the exact local claim is still ``unmaterialized``, marks it
+``possible`` through etcd CAS, and keeps the lock until Incus accepts or
+rejects the create request. ``possible`` is deliberately ambiguous: it states
+that the rootfs may or may not exist, which is what makes an interrupted
+create recoverable, either by promoting the claim once the server proves the
+materialization committed or by settling it through the materialization
+abort. The spawn, cold-migration target, evacuation target, and
+live-migration receive paths all use this transaction. Every start or restart
+requires the exact local host claim to exist in a materialized state, and
+both release-intent and release-proof keys to be absent.
 
 Final deletion of a materialized generation is a distributed evidence chain.
 Nova first writes the immutable release intent, then sends the Incus instance
