@@ -1642,3 +1642,35 @@ hardening.
 - The focused attach, detach, destroy, and reboot suite passed 26 tests. The
   complete Python 3.12 suite passed all 334 tests, `tox -e pep8` passed, and
   all disposable containers and profiles were removed.
+
+## 2026-08-04 abandoned migration reservation reclamation (defect 15)
+
+- Fork commits `87a638d77` and `60e7c1e8f`, driver commit `1f6101a`. Image
+  `incus-quadlet-candidate:defect15-r11` deployed to all three nodes, and
+  `driver.py`/`manager.py` synced to `/opt/stack/nova/nova/virt/incus` with
+  `devstack@n-cpu` restarted on each. All running instances survived every
+  `incus-podman` restart.
+- Starting state across the fleet was **zero** unfinished attempts, so this
+  was verified by constructing both halves rather than observing wild ones.
+- `incus-node-03`: a registered but never started reservation
+  (`900000000+65536`) reported `idmap_active: true` and rejected an
+  overlapping token with `ErrIDMapOverlap`. After a full `incusd` restart it
+  was still active and still rejected the overlap, which is the required
+  behaviour: the create request it fences carries no deadline and can arrive
+  after a target restart, so Incus must not expire it.
+- Nova released it on the second periodic pass exactly as designed --
+  `Deferring release ... until it is seen unchanged twice` at 06:06:07,
+  `Released the abandoned Incus migration reservation` at 06:07:10 -- after
+  which the same range was immediately claimable by a new token.
+- Regression: a throwaway `m1.tiny` instance live migrated node-01 ->
+  node-02 and cold migrated node-02 -> node-03 with confirm, both ACTIVE.
+  A fleet audit through the new `GET /1.0/migration-attempts` reported
+  `still fencing: 0` on all three nodes before and after.
+- Unit gates: incus `cmd/incusd`, `db`, `migrationattempt`,
+  `idmapreservation`, `storagematerializationattempt`,
+  `storagereleasereceipt`, `instance/drivers`, `storage` and `shared/api` all
+  pass; openstack-incus 806/806 (the tempest-plugin module needs `tempest`,
+  which is absent from the local container) and flake8 clean. Fixing that
+  flake8 run also repaired two continuation lines mangled by an earlier batch
+  edit and a deprecated `LOG.warn`, both of which had been failing
+  `tox -e pep8` since commit `0ad69cd`.
