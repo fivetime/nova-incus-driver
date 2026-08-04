@@ -1,9 +1,11 @@
 Scale hotspot elimination design
 ================================
 
-Status: **approved design, implementation pending**. This chapter records the
-agreed design for removing the remaining super-linear driver and periodic
-audit costs before the 100/500/1,000-instance release gate becomes routine.
+Status: **implemented**; the measured baseline recorded in
+``TEST_STATUS.md`` is what the release SLO limits are derived from.
+This chapter records the design for removing the remaining super-linear
+driver and periodic audit costs before the 100/500/1,000-instance release
+gate becomes routine.
 It complements :doc:`architecture` (which documents behavior that already
 exists) and :doc:`production_readiness` (which defines the release evidence).
 
@@ -32,7 +34,7 @@ Incus write, so a raced periodic read can never publish a stale snapshot.
 This baseline is validated by the cache single-flight unit tests and by the
 idle-soak phase of ``tools/openstack-incus-scale-e2e.py``.
 
-Remaining hotspot 1: all-project absence proofs are O(N²)
+Hotspot 1 (fixed): all-project absence proofs were O(N²)
 ---------------------------------------------------------
 
 ``IncusDriver._all_project_idmap_resources_absent`` and its spawn-attempt
@@ -71,7 +73,16 @@ Amortized cost drops from O(batch × N) per cycle to O(N) per cycle plus
 O(N) per actual retirement. No registry schema, claim state, or proof
 digest changes are required.
 
-Remaining hotspot 2: the full registry audit is O(hosts × N) per minute
+Two implementation notes that the draft did not anticipate. A screening
+fetch that *fails* must leave every candidate to its own exact proof rather
+than resolve either way, so a snapshot outage can neither release nor
+wedge anything. And a release intent that no host has claimed reaches the
+range release without passing through the claimed branch, so that path
+carries its own exact proof; before this work both paths shared one, and
+splitting screen from proof would silently have left the unclaimed path
+with only a screen.
+
+Hotspot 2 (fixed): the full registry audit was O(hosts × N) per minute
 -----------------------------------------------------------------------
 
 ``_audit_incus_idmap_allocator`` reads the entire registry namespace
@@ -89,21 +100,38 @@ every cycle on every host:
 1. **Full audit stays at process start** (``init_host``) and remains the
    fail-closed latch. Unchanged.
 2. **Cheap drift probe every cycle.** Between full audits each cycle runs a
-   count-only probe: one ``keys_only``/count range per key family plus the
-   config-key generation read. The probe checks the family cardinality
-   invariants (``len(instances) == len(slots)``, host-claim count equals
-   the sum of ``host_ids`` lengths, release count bounded by instance
-   count) and the config fingerprint. Cost is O(1) request count and O(1)
-   payload per cycle.
+   count-only probe. All four family counts and the config compare travel
+   in **one** transaction, so every count comes from a single revision.
+   Cost is one request and an O(1) payload per cycle, independent of the
+   registry size.
+
+   The probe checks the cardinality relationships that are *exact* at
+   every revision: ``count(instances) == count(slots)``, because
+   allocation writes both records in one transaction and release deletes
+   both in one transaction; ``count(releases) <= count(instances)``,
+   because an intent cannot outlive its allocation; and no host claims
+   while no allocation exists. The originally drafted "host-claim count
+   equals the sum of ``host_ids`` lengths" invariant is **not**
+   implemented: that sum is only knowable by reading every allocation
+   record, which is the full scan this probe exists to avoid. Claims
+   without their allocation, and every content-level mismatch, therefore
+   remain the full audit's job, which is what item 3 bounds.
 3. **Full audit every K cycles with per-host jitter.** Default one full
-   audit per 15 minutes, through a new option
+   audit per 15 minutes, through the option
    ``idmap_allocator_full_audit_interval`` (minimum 300 s) introduced by this
-   work; today every cycle is a full audit driven by the existing
+   work; previously every cycle was a full audit driven by the existing
    ``idmap_allocator_audit_interval`` (default 60 s). A random per-process
-   phase offset is added so a fleet does
-   not synchronize its full scans. Any drift-probe mismatch, any CAS
-   conflict surprise, and any registry mutation error immediately schedules
-   an out-of-band full audit before the next mutation is allowed.
+   phase offset is applied to the first deadline so a fleet restarted
+   together does not synchronize its scans. A drift-probe mismatch
+   escalates to a full audit immediately, and a scan that could not run
+   because etcd was unavailable retries on the next cycle instead of
+   waiting out the interval.
+
+   Registry *mutations* need no new escalation hook: the allocation and
+   release paths already run ``_audit_with_latch()`` inline on every
+   attempt, on every CAS conflict, and after success. The periodic full
+   audit is therefore the idle-state sweep only, which is exactly the cost
+   this item removes.
 4. **Latch semantics unchanged.** Integrity failure from either the probe
    escalation or the periodic full audit permanently latches the process
    closed exactly as today.
@@ -114,7 +142,7 @@ the integrity guarantee (every corruption class the full audit detects is
 still detected, at worst 15 minutes later, and every local mutation error
 still forces an immediate full audit).
 
-Remaining hotspot 3: duplicate full profile listings per recovery cycle
+Hotspot 3 (fixed): duplicate full profile listings per recovery cycle
 -----------------------------------------------------------------------
 
 ``_recover_incus_cleanup_profiles`` and
@@ -127,7 +155,8 @@ once per recovery interval through the same generation-guarded single-flight
 helper the instance inventory already uses (TTL = half the recovery
 interval). Candidate *action* paths keep their exact per-profile reads; only
 candidate *discovery* shares the snapshot. Cost: one O(N) listing per cycle
-instead of two.
+instead of two. Any instance-inventory invalidation drops this snapshot with
+it, so a mutation cannot be served a pre-mutation profile list.
 
 Performance baseline and regression gate
 ----------------------------------------

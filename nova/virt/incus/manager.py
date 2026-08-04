@@ -14,6 +14,8 @@
 
 import hashlib
 import os
+import random
+import time
 
 import eventlet
 from nova.compute import manager
@@ -256,15 +258,40 @@ class IncusComputeManager(manager.ComputeManager):
                 CONF.instances_path, 'incus-spawn-attempts', instance_uuid),
         )
 
-    def _local_idmap_resources_absent(self, intent):
+    def _all_project_idmap_inventory(self):
+        """Fetch the batch screening snapshot, or None if unavailable.
+
+        Returning None makes every candidate in the cycle fall back to its
+        own exact proof, which is the behaviour that existed before this
+        screen. A screening fetch must never be able to release anything by
+        failing.
+        """
+        try:
+            return incus_driver._all_project_idmap_inventory(
+                self.driver.inventory_client)
+        except Exception:
+            LOG.warning(
+                'Cannot read the all-project Incus inventory for this idmap '
+                'cycle; each candidate falls back to its own exact proof',
+                exc_info=True)
+            return None
+
+    def _local_idmap_resources_absent(self, intent, inventory=None):
         """Prove this host no longer retains resources for an intent."""
         return self._local_idmap_resources_absent_by_name(
             intent.instance_uuid, intent.instance_name,
-            intent.base, intent.size)
+            intent.base, intent.size, inventory=inventory)
 
     def _local_idmap_resources_absent_by_name(
-            self, instance_uuid, instance_name, idmap_base, idmap_size):
-        """Prove one named instance has no resources on this compute."""
+            self, instance_uuid, instance_name, idmap_base, idmap_size,
+            inventory=None):
+        """Prove one named instance has no resources on this compute.
+
+        ``inventory`` only screens the all-project scan against a snapshot
+        this cycle already fetched. The exact per-name Incus reads and the
+        local path checks below are always fresh, and a caller that is about
+        to release must repeat the whole proof with no snapshot.
+        """
         for collection, resource_type in (
                 (self.driver.client.instances, 'instance'),
                 (self.driver.client.profiles, 'profile')):
@@ -298,7 +325,7 @@ class IncusComputeManager(manager.ComputeManager):
         try:
             if not incus_driver._all_project_idmap_resources_absent(
                     self.driver.inventory_client, instance_uuid,
-                    idmap_base, idmap_size):
+                    idmap_base, idmap_size, inventory=inventory):
                 return False
         except Exception:
             LOG.critical(
@@ -382,7 +409,7 @@ class IncusComputeManager(manager.ComputeManager):
 
     def _queue_terminal_failed_build_release(
             self, context, allocator, assignment, claim, host_id,
-            instance=None):
+            instance=None, inventory=None):
         """Create the immutable release fence before a failed host is lost."""
         try:
             if instance is not None:
@@ -414,7 +441,7 @@ class IncusComputeManager(manager.ComputeManager):
                         'the exact idmap generation')
             if not self._local_idmap_resources_absent_by_name(
                     assignment.instance_uuid, instance_name,
-                    assignment.base, assignment.size):
+                    assignment.base, assignment.size, inventory=inventory):
                 return False
             claim = self._resolve_possible_failed_build_claim(
                 current, claim)
@@ -477,7 +504,7 @@ class IncusComputeManager(manager.ComputeManager):
                 return False
 
     def _reconcile_incus_idmap_host_claim(
-            self, context, allocator, claim, host_id):
+            self, context, allocator, claim, host_id, inventory=None):
         """Retire one historical claim after an exact Incus cleanup proof."""
         try:
             assignment = allocator.get(claim.instance_uuid)
@@ -502,7 +529,8 @@ class IncusComputeManager(manager.ComputeManager):
             # still carries the exact instance name, so create the immutable
             # release fence before any retirement can empty host_ids.
             self._queue_terminal_failed_build_release(
-                context, allocator, assignment, exact_claim, host_id)
+                context, allocator, assignment, exact_claim, host_id,
+                inventory=inventory)
             return
         except Exception:
             LOG.exception(
@@ -513,13 +541,13 @@ class IncusComputeManager(manager.ComputeManager):
         if instance.obj_attr_is_set('deleted') and instance.deleted:
             self._queue_terminal_failed_build_release(
                 context, allocator, assignment, exact_claim, host_id,
-                instance=instance)
+                instance=instance, inventory=inventory)
             return
         if (instance.host is None and instance.task_state is None and
                 instance.vm_state == vm_states.ERROR):
             self._queue_terminal_failed_build_release(
                 context, allocator, assignment, exact_claim, host_id,
-                instance=instance)
+                instance=instance, inventory=inventory)
             return
         if instance.task_state is not None or instance.host == self.host:
             return
@@ -550,7 +578,8 @@ class IncusComputeManager(manager.ComputeManager):
         # The exact A/H/T/U claim is revalidated under the short final lock,
         # so a destination that replaces this cleaned token wins safely.
         if not self._local_idmap_resources_absent_by_name(
-                instance.uuid, instance.name, claim.base, claim.size):
+                instance.uuid, instance.name, claim.base, claim.size,
+                inventory=inventory):
             return
         try:
             if exact_claim.state == 'possible':
@@ -676,18 +705,74 @@ class IncusComputeManager(manager.ComputeManager):
         context = (
             context or nova.context.get_admin_context()
         ).elevated(read_deleted='yes')
+        inventory = self._all_project_idmap_inventory()
         for claim in batch:
             self._reconcile_incus_idmap_host_claim(
-                context, allocator, claim, host_id)
+                context, allocator, claim, host_id, inventory=inventory)
 
     @periodic_task.periodic_task(
         spacing=CONF.incus.idmap_allocator_audit_interval,
         run_immediately=False)
     def _audit_incus_idmap_allocator(self, context):
-        """Run the deliberately low-frequency full registry audit."""
+        """Probe the registry every cycle, scan it completely rarely.
+
+        Reading and parsing the whole namespace on every compute every
+        minute is pure steady-state overhead that grows with the fleet and
+        with the instance count. The full scan stays the integrity
+        authority; what changes is how often an *idle* registry pays for
+        it. Every registry mutation already audits inline, and a probe that
+        fails escalates to a scan immediately, so the interval below only
+        bounds how long a corruption invisible to counts can go unnoticed
+        while nothing is happening.
+        """
         allocator = getattr(self.driver, 'idmap_allocator', None)
         if allocator is None:
             return
+
+        if self._incus_full_idmap_audit_due():
+            self._run_incus_full_idmap_audit(allocator)
+            return
+
+        try:
+            counts = allocator.probe()
+        except incus_driver.incus_idmap.IDMapIntegrityError:
+            LOG.error(
+                'Incus idmap registry drift probe failed its cardinality '
+                'invariants; escalating to a complete audit', exc_info=True)
+            self._run_incus_full_idmap_audit(allocator)
+            return
+        except incus_driver.incus_idmap.IDMapBackendError:
+            LOG.warning(
+                'Incus idmap registry drift probe is temporarily '
+                'unavailable', exc_info=True)
+            return
+        except Exception:
+            LOG.exception(
+                'Unexpected Incus idmap registry drift probe failure; '
+                'escalating to a complete audit')
+            self._run_incus_full_idmap_audit(allocator)
+            return
+        LOG.debug('Incus idmap registry drift probe verified %s', counts)
+
+    def _incus_full_idmap_audit_due(self):
+        """Return whether this process owes a complete audit now.
+
+        The first deadline is offset by a random fraction of the interval
+        so that a fleet restarted together does not line up its scans.
+        """
+        deadline = getattr(self, '_incus_full_audit_deadline', None)
+        interval = CONF.incus.idmap_allocator_full_audit_interval
+        now = time.monotonic()
+        if deadline is None:
+            self._incus_full_audit_deadline = now + random.uniform(
+                0, interval)
+            return False
+        return now >= deadline
+
+    def _run_incus_full_idmap_audit(self, allocator):
+        """Run the authoritative scan and reschedule the next one."""
+        interval = CONF.incus.idmap_allocator_full_audit_interval
+        self._incus_full_audit_deadline = time.monotonic() + interval
         try:
             assignments = allocator.audit()
         except incus_driver.incus_idmap.IDMapIntegrityError:
@@ -701,12 +786,15 @@ class IncusComputeManager(manager.ComputeManager):
             return
         except incus_driver.incus_idmap.IDMapBackendError:
             # A transport outage is not evidence of corruption and must not
-            # set the permanent integrity latch.
+            # set the permanent integrity latch. Retry on the next cycle
+            # rather than waiting out the full interval.
+            self._incus_full_audit_deadline = time.monotonic()
             LOG.warning(
                 'Incus idmap registry audit is temporarily unavailable',
                 exc_info=True)
             return
         except Exception:
+            self._incus_full_audit_deadline = time.monotonic()
             LOG.exception('Unexpected Incus idmap registry audit failure')
             return
         LOG.debug(
@@ -901,7 +989,7 @@ class IncusComputeManager(manager.ComputeManager):
             return result
 
     def _replay_incus_idmap_release(self, context, allocator, intent,
-                                    host_id):
+                                    host_id, inventory=None):
         """Retire this host's claim and finish one shared release intent."""
         with lockutils.lock(
                 _idmap_release_lock_name(intent.instance_uuid), external=True,
@@ -934,7 +1022,11 @@ class IncusComputeManager(manager.ComputeManager):
                 # releasable only after this coordinator proves the complete
                 # all-project/local inventory absent. A materialized
                 # generation additionally needs Incus's durable receipt.
-                if not self._local_idmap_resources_absent(intent):
+                # This first pass may screen against the cycle snapshot; the
+                # proof that authorizes the release is repeated exactly
+                # below, on both the claimed and the unclaimed path.
+                if not self._local_idmap_resources_absent(
+                        intent, inventory=inventory):
                     return
 
                 if host_claimed:
@@ -965,6 +1057,11 @@ class IncusComputeManager(manager.ComputeManager):
                         return
                     assignment = self._retire_local_idmap_claim(
                         allocator, assignment, exact_claim, host_id)
+                elif not self._local_idmap_resources_absent(intent):
+                    # An intent with no claims anywhere reaches the range
+                    # release without passing through the claimed branch's
+                    # exact recheck, so it needs its own.
+                    return
 
                 if not self._complete_idmap_release(
                         allocator, intent, assignment):
@@ -1002,9 +1099,10 @@ class IncusComputeManager(manager.ComputeManager):
         context = (
             context or nova.context.get_admin_context()
         ).elevated(read_deleted='yes')
+        inventory = self._all_project_idmap_inventory()
         for intent in batch:
             self._replay_incus_idmap_release(
-                context, allocator, intent, host_id)
+                context, allocator, intent, host_id, inventory=inventory)
 
     def _live_migration_cleanup_flags(self, migrate_data, migr_ctxt=None):
         """Request destination cleanup without deleting shared root storage."""

@@ -271,10 +271,29 @@ incus_opts = [
         default=60,
         min=10,
         help=(
-            "Seconds between complete idmap registry integrity audits. A "
-            "detected integrity violation permanently latches allocation and "
-            "claim operations closed in that nova-compute process; operators "
-            "must repair the registry and restart nova-compute."
+            "Seconds between idmap registry integrity checks. Most cycles "
+            "run a count-only drift probe whose cost does not grow with the "
+            "number of instances; see idmap_allocator_full_audit_interval "
+            "for the complete scan. A detected integrity violation "
+            "permanently latches allocation and claim operations closed in "
+            "that nova-compute process; operators must repair the registry "
+            "and restart nova-compute."
+        ),
+    ),
+    cfg.IntOpt(
+        "idmap_allocator_full_audit_interval",
+        default=900,
+        min=300,
+        help=(
+            "Seconds between complete idmap registry integrity audits, "
+            "which read and validate every record. One always runs at "
+            "process start, and a drift probe that fails its cardinality "
+            "invariants escalates to one immediately, so this only bounds "
+            "how long a corruption that counts cannot see may go unnoticed "
+            "on an otherwise idle compute. Every registry mutation already "
+            "audits inline. Each process offsets its schedule by a random "
+            "fraction of this interval so a fleet does not synchronize its "
+            "scans."
         ),
     ),
     cfg.BoolOpt(

@@ -15,6 +15,7 @@
 import dataclasses
 import os
 import threading
+import time
 from unittest import mock
 
 import fixtures
@@ -531,6 +532,103 @@ class IncusComputeManagerTest(test.NoDBTestCase):
             self.idmap_intent))
         self.compute.driver.idmap_allocator.retire_claim.assert_not_called()
 
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_replay_batch_screens_against_one_shared_listing(
+            self, get_by_uuid):
+        """A batch pays for one all-project listing, not one per candidate."""
+        get_by_uuid.side_effect = manager.exception.InstanceNotFound(
+            instance_id=self.idmap_intent.instance_uuid)
+        intents = [self.idmap_intent] * 4
+        allocator = self.compute.driver.idmap_allocator
+        allocator.list_release_intent_candidates.return_value = intents
+        instances_get = (
+            self.compute.driver.inventory_client.api.instances.get)
+        instances_get.reset_mock()
+
+        self.compute._replay_incus_idmap_releases(
+            context.get_admin_context())
+
+        # One screening listing for the whole batch, plus the exact proof
+        # each candidate repeats immediately before it releases.
+        self.assertEqual(1 + len(intents), instances_get.call_count)
+
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_screening_listing_failure_never_releases(self, get_by_uuid):
+        """A failed screen must fall back to exact proofs, not to yes."""
+        get_by_uuid.side_effect = manager.exception.InstanceNotFound(
+            instance_id=self.idmap_intent.instance_uuid)
+        instances_get = (
+            self.compute.driver.inventory_client.api.instances.get)
+        real_response = instances_get.return_value
+        instances_get.side_effect = [Exception('etcd of incus is down')] + (
+            [real_response] * 8)
+
+        self.compute._replay_incus_idmap_releases(
+            context.get_admin_context())
+
+        # The candidate still released, but only because it proved absence
+        # itself after the screen was unavailable.
+        allocator = self.compute.driver.idmap_allocator
+        allocator.release.assert_called_once_with(self.idmap_intent)
+
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_screened_presence_blocks_without_an_exact_listing(
+            self, get_by_uuid):
+        """A snapshot match is authoritative; it cannot have appeared."""
+        get_by_uuid.side_effect = manager.exception.InstanceNotFound(
+            instance_id=self.idmap_intent.instance_uuid)
+        candidates = (
+            self.compute.driver.idmap_allocator.
+            list_release_intent_candidates)
+        candidates.return_value = [self.idmap_intent] * 4
+        instances_response = (
+            self.compute.driver.inventory_client.api.instances.get.
+            return_value)
+        instances_response.json.return_value = {'metadata': [{
+            'name': 'foreign-instance',
+            'project': 'foreign-project',
+            'config': {
+                'security.idmap.base': str(self.idmap_intent.base),
+                'security.idmap.size': str(self.idmap_intent.size),
+            },
+        }]}
+        instances_get = (
+            self.compute.driver.inventory_client.api.instances.get)
+        instances_get.reset_mock()
+
+        self.compute._replay_incus_idmap_releases(
+            context.get_admin_context())
+
+        allocator = self.compute.driver.idmap_allocator
+        allocator.release.assert_not_called()
+        allocator.retire_claim.assert_not_called()
+        self.assertEqual(1, instances_get.call_count)
+
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_unclaimed_intent_still_proves_absence_exactly(
+            self, get_by_uuid):
+        """An intent with no claims reaches release on its own path."""
+        get_by_uuid.side_effect = manager.exception.InstanceNotFound(
+            instance_id=self.idmap_intent.instance_uuid)
+        allocator = self.compute.driver.idmap_allocator
+        allocator.get.return_value = self._assignment(host_ids=())
+        absent = mock.Mock(return_value=True)
+        with mock.patch.object(
+                self.compute, '_local_idmap_resources_absent', absent):
+            self.compute._replay_incus_idmap_releases(
+                context.get_admin_context())
+
+        allocator.retire_claim.assert_not_called()
+        allocator.release.assert_called_once_with(self.idmap_intent)
+        # Screened once for the batch, then proved exactly before release.
+        self.assertEqual(2, absent.call_count)
+        self.assertIsNotNone(absent.call_args_list[0].kwargs['inventory'])
+        self.assertEqual({}, absent.call_args_list[1].kwargs)
+
+    def _force_full_idmap_audit(self):
+        """Make the next audit cycle owe its complete scan."""
+        self.compute._incus_full_audit_deadline = time.monotonic() - 1
+
     def test_idmap_full_audit_is_skipped_without_allocator(self):
         self.compute.driver.idmap_allocator = None
 
@@ -539,6 +637,7 @@ class IncusComputeManagerTest(test.NoDBTestCase):
     def test_idmap_full_audit_runs_against_allocator(self):
         allocator = self.compute.driver.idmap_allocator
         allocator.audit.return_value = [self.idmap_assignment]
+        self._force_full_idmap_audit()
 
         self.compute._audit_incus_idmap_allocator(mock.sentinel.context)
 
@@ -550,6 +649,7 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         allocator.audit.side_effect = (
             manager.incus_driver.incus_idmap.IDMapIntegrityError(
                 reason='corrupt reverse index'))
+        self._force_full_idmap_audit()
 
         self.compute._audit_incus_idmap_allocator(mock.sentinel.context)
 
@@ -561,10 +661,96 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         allocator.audit.side_effect = (
             manager.incus_driver.incus_idmap.IDMapBackendError(
                 reason='etcd unavailable'))
+        self._force_full_idmap_audit()
 
         self.compute._audit_incus_idmap_allocator(mock.sentinel.context)
 
         warning.assert_called_once()
+
+    def test_idle_audit_cycles_only_probe(self):
+        """The steady-state cost must not grow with the registry."""
+        allocator = self.compute.driver.idmap_allocator
+        allocator.probe.return_value = {
+            'instances': 4, 'slots': 4, 'releases': 1, 'hosts': 4}
+
+        for _ in range(5):
+            self.compute._audit_incus_idmap_allocator(mock.sentinel.context)
+
+        allocator.audit.assert_not_called()
+        self.assertEqual(5, allocator.probe.call_count)
+
+    def test_first_full_audit_deadline_is_jittered(self):
+        """A fleet restarted together must not synchronize its scans."""
+        interval = (
+            manager.CONF.incus.idmap_allocator_full_audit_interval)
+        deadlines = set()
+        for _ in range(20):
+            self.compute._incus_full_audit_deadline = None
+            self.compute._incus_full_idmap_audit_due()
+            deadlines.add(self.compute._incus_full_audit_deadline)
+            self.assertLessEqual(
+                self.compute._incus_full_audit_deadline,
+                time.monotonic() + interval)
+        self.assertGreater(len(deadlines), 1)
+
+    def test_full_audit_runs_once_its_deadline_passes(self):
+        allocator = self.compute.driver.idmap_allocator
+        allocator.probe.return_value = {
+            'instances': 0, 'slots': 0, 'releases': 0, 'hosts': 0}
+        allocator.audit.return_value = []
+
+        self.compute._audit_incus_idmap_allocator(mock.sentinel.context)
+        allocator.audit.assert_not_called()
+
+        self._force_full_idmap_audit()
+        self.compute._audit_incus_idmap_allocator(mock.sentinel.context)
+        allocator.audit.assert_called_once_with()
+
+        # The scan reschedules itself rather than repeating every cycle.
+        self.compute._audit_incus_idmap_allocator(mock.sentinel.context)
+        allocator.audit.assert_called_once_with()
+
+    @mock.patch.object(manager.LOG, 'error')
+    def test_probe_mismatch_escalates_to_a_full_audit(self, error):
+        allocator = self.compute.driver.idmap_allocator
+        allocator.probe.side_effect = (
+            manager.incus_driver.incus_idmap.IDMapIntegrityError(
+                reason='allocation and slot record counts differ'))
+        allocator.audit.side_effect = (
+            manager.incus_driver.incus_idmap.IDMapIntegrityError(
+                reason='instance allocation has no exact slot record'))
+
+        self.compute._audit_incus_idmap_allocator(mock.sentinel.context)
+
+        error.assert_called_once()
+        allocator.audit.assert_called_once_with()
+
+    @mock.patch.object(manager.LOG, 'warning')
+    def test_probe_backend_failure_does_not_escalate(self, warning):
+        """A transport outage is not evidence of corruption."""
+        allocator = self.compute.driver.idmap_allocator
+        allocator.probe.side_effect = (
+            manager.incus_driver.incus_idmap.IDMapBackendError(
+                reason='etcd unavailable'))
+
+        self.compute._audit_incus_idmap_allocator(mock.sentinel.context)
+
+        warning.assert_called_once()
+        allocator.audit.assert_not_called()
+
+    def test_unavailable_full_audit_retries_on_the_next_cycle(self):
+        """A missed scan must not wait out the whole interval."""
+        allocator = self.compute.driver.idmap_allocator
+        allocator.audit.side_effect = (
+            manager.incus_driver.incus_idmap.IDMapBackendError(
+                reason='etcd unavailable'))
+        self._force_full_idmap_audit()
+
+        self.compute._audit_incus_idmap_allocator(mock.sentinel.context)
+        self.compute._audit_incus_idmap_allocator(mock.sentinel.context)
+
+        self.assertEqual(2, allocator.audit.call_count)
+        allocator.probe.assert_not_called()
 
     @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
     def test_idmap_release_replay_retires_local_claim_after_absence(

@@ -1800,6 +1800,7 @@ class IncusDriverTest(test.NoDBTestCase):
         self.CONF.force_config_drive = False
         self.CONF.incus.storage_pool = None
         self.CONF.incus.project = 'nova'
+        self.CONF.incus.migration_recovery_interval = 60
         self.CONF.incus.shared_storage_pool_capacity_gb = None
         self.CONF.incus.root_storage_pools = {}
         self.CONF.incus.root_storage_pool_resource_classes = {}
@@ -5841,6 +5842,44 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'idmap_base': 1065536,
             'idmap_size': 65536,
         }], incus_driver.list_destination_prepared_recovery_candidates())
+
+    def test_both_profile_recovery_periodics_share_one_listing(self):
+        """Discovery is shared; the two periodics run back to back."""
+        response = self.client.api.profiles.get.return_value
+        response.json.return_value = {'metadata': [{
+            'name': 'instance-a',
+            'config': {
+                'environment.product_name': 'OpenStack Nova',
+                'user.openstack.uuid':
+                    '10000000-0000-0000-0000-000000000001',
+                driver.CLEANUP_RECOVERY_KEY: 'true',
+            },
+        }]}
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        self.client.api.profiles.get.reset_mock()
+
+        incus_driver.list_cleanup_recovery_candidates()
+        incus_driver.list_destination_prepared_recovery_candidates()
+
+        self.client.api.profiles.get.assert_called_once_with(
+            params={'recursion': 1})
+
+        # A mutation must drop the shared snapshot, not serve it past a
+        # profile write.
+        incus_driver._invalidate_instance_inventory_cache()
+        incus_driver.list_cleanup_recovery_candidates()
+        self.assertEqual(2, self.client.api.profiles.get.call_count)
+
+    def test_profile_snapshot_rejects_malformed_inventory(self):
+        response = self.client.api.profiles.get.return_value
+        response.json.return_value = {'metadata': 'not-a-list'}
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaises(
+            exception.InvalidConfiguration,
+            incus_driver.list_cleanup_recovery_candidates)
 
     @mock.patch.object(driver.IncusDriver, '_acknowledge_cleanup_profile')
     @mock.patch.object(driver.IncusDriver, '_cleanup')

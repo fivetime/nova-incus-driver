@@ -4862,12 +4862,16 @@ def _loaded_instance_system_metadata(instance):
     return getattr(instance, 'system_metadata', None) or {}
 
 
-def _all_project_idmap_resources_absent(
-        client, instance_uuid, idmap_base, idmap_size,
-        allowed_profile_name=None):
-    """Prove no Incus project retains this UUID or exact idmap range."""
-    expected_range = (str(int(idmap_base)), str(int(idmap_size)))
+def _all_project_idmap_inventory(client):
+    """Return one all-project instance and profile listing.
+
+    A periodic that evaluates a batch of candidates fetches this once and
+    screens every candidate against it, instead of issuing two unscoped
+    recursive listings per candidate. The exact proof that authorizes an
+    actual release still refetches; see the callers.
+    """
     params = {'recursion': 1, 'all-projects': True}
+    inventory = []
     for endpoint, resource_type in (
             ('instances', 'instance'), ('profiles', 'profile')):
         response = getattr(client.api, endpoint).get(params=params)
@@ -4882,12 +4886,31 @@ def _all_project_idmap_resources_absent(
             raise incus_idmap.IDMapIntegrityError(
                 'Incus all-project {} inventory is malformed'.format(
                     resource_type))
-
         for record in records:
             if not isinstance(record, dict):
                 raise incus_idmap.IDMapIntegrityError(
                     'Incus all-project {} inventory contains a malformed '
                     'record'.format(resource_type))
+        inventory.append((resource_type, tuple(records)))
+    return tuple(inventory)
+
+
+def _all_project_idmap_resources_absent(
+        client, instance_uuid, idmap_base, idmap_size,
+        allowed_profile_name=None, inventory=None):
+    """Prove no Incus project retains this UUID or exact idmap range.
+
+    ``inventory`` screens against a snapshot the caller already fetched for
+    a whole batch. A snapshot can only be stale in the direction of listing
+    a resource that has since gone, so a match remains authoritative
+    evidence to retain. Absence from a snapshot is only a screen: the caller
+    must repeat this proof without one immediately before it releases.
+    """
+    expected_range = (str(int(idmap_base)), str(int(idmap_size)))
+    if inventory is None:
+        inventory = _all_project_idmap_inventory(client)
+    for resource_type, records in inventory:
+        for record in records:
             configs = [
                 value for value in (
                     record.get('config'), record.get('expanded_config'))
@@ -4925,29 +4948,17 @@ def _all_project_idmap_resources_absent(
     return True
 
 
-def _all_project_spawn_attempt_resources_absent(client, attempt):
-    """Prove a preflight attempt has no Incus-local resource or token."""
-    params = {'recursion': 1, 'all-projects': True}
-    for endpoint, resource_type in (
-            ('instances', 'instance'), ('profiles', 'profile')):
-        response = getattr(client.api, endpoint).get(params=params)
-        try:
-            body = response.json()
-        except Exception as exc:
-            raise incus_idmap.IDMapIntegrityError(
-                'Incus all-project {} inventory is not JSON'.format(
-                    resource_type)) from exc
-        records = body.get('metadata') if isinstance(body, dict) else None
-        if not isinstance(records, list):
-            raise incus_idmap.IDMapIntegrityError(
-                'Incus all-project {} inventory is malformed'.format(
-                    resource_type))
+def _all_project_spawn_attempt_resources_absent(
+        client, attempt, inventory=None):
+    """Prove a preflight attempt has no Incus-local resource or token.
 
+    ``inventory`` has the same screening semantics as in
+    :func:`_all_project_idmap_resources_absent`.
+    """
+    if inventory is None:
+        inventory = _all_project_idmap_inventory(client)
+    for resource_type, records in inventory:
         for record in records:
-            if not isinstance(record, dict):
-                raise incus_idmap.IDMapIntegrityError(
-                    'Incus all-project {} inventory contains a malformed '
-                    'record'.format(resource_type))
             configs = [
                 value for value in (
                     record.get('config'), record.get('expanded_config'))
@@ -5165,6 +5176,7 @@ class IncusDriver(driver.ComputeDriver):
         self._metric_devices_cache = None
         self._metric_instance_devices_cache = {}
         self._instance_inventory_cache = None
+        self._profile_inventory_cache = None
         # All mutable-inventory caches share one generation and condition.
         # Fetchers claim a generation while holding this condition, perform
         # Incus I/O after releasing it, and publish only if the generation is
@@ -5173,6 +5185,7 @@ class IncusDriver(driver.ComputeDriver):
         self._inventory_cache_condition = threading.Condition()
         self._inventory_cache_generation = 0
         self._instance_inventory_fetch_generation = None
+        self._profile_inventory_fetch_generation = None
         self._disk_metrics_fetch_generation = None
         self._metric_devices_fetch_generation = None
         self._metric_instance_devices_fetch_generations = {}
@@ -6636,17 +6649,44 @@ class IncusDriver(driver.ComputeDriver):
             '_instance_inventory_fetch_generation',
             _INSTANCE_INVENTORY_CACHE_TTL, fetch)
 
+    def _get_profile_inventory_snapshot(self):
+        """Return a short-lived profile inventory for candidate discovery.
+
+        Both profile recovery periodics run back to back in one process and
+        used to issue the same recursive listing each. Only *discovery*
+        shares this snapshot: every action path still reads its exact
+        profile, so a snapshot that has gone stale can at worst offer a
+        candidate whose action path then finds nothing to do, or withhold
+        one until the next cycle.
+        """
+        def fetch():
+            response = self.client.api.profiles.get(params={'recursion': 1})
+            body = response.json()
+            profiles = body.get('metadata') if isinstance(body, dict) else None
+            if not isinstance(profiles, list):
+                raise exception.InvalidConfiguration(
+                    'Incus recursive profile inventory is malformed')
+            return tuple(
+                profile for profile in profiles if isinstance(profile, dict))
+
+        return self._get_generation_cached_snapshot(
+            '_profile_inventory_cache',
+            '_profile_inventory_fetch_generation',
+            max(1, CONF.incus.migration_recovery_interval // 2), fetch)
+
     def _invalidate_instance_inventory_cache(self):
         """Invalidate every cache derived from mutable instance inventory."""
         with self._inventory_cache_condition:
             self._inventory_cache_generation += 1
             self._instance_inventory_cache = None
+            self._profile_inventory_cache = None
             self._metric_devices_cache = None
             self._metric_instance_devices_cache.clear()
             self._disk_metrics_cache = None
             # Old-generation I/O is allowed to finish, but it no longer owns
             # a publication slot.  Invalidation never waits for it.
             self._instance_inventory_fetch_generation = None
+            self._profile_inventory_fetch_generation = None
             self._disk_metrics_fetch_generation = None
             self._metric_devices_fetch_generation = None
             self._metric_instance_devices_fetch_generations.clear()
@@ -8100,18 +8140,11 @@ class IncusDriver(driver.ComputeDriver):
             return False
 
     def list_cleanup_recovery_candidates(self):
-        """Return cleanup-marked profiles using one recursive API request."""
-        response = self.client.api.profiles.get(params={'recursion': 1})
-        body = response.json()
-        profiles = body.get('metadata') if isinstance(body, dict) else None
-        if not isinstance(profiles, list):
-            raise exception.InvalidConfiguration(
-                'Incus recursive profile inventory is malformed')
+        """Return cleanup-marked profiles from the shared profile snapshot."""
+        profiles = self._get_profile_inventory_snapshot()
 
         candidates = []
         for profile in profiles:
-            if not isinstance(profile, dict):
-                continue
             config = profile.get('config')
             name = profile.get('name')
             if (not isinstance(config, dict) or
@@ -8134,17 +8167,10 @@ class IncusDriver(driver.ComputeDriver):
 
     def list_destination_prepared_recovery_candidates(self):
         """Return target profiles that survive without their mount journal."""
-        response = self.client.api.profiles.get(params={'recursion': 1})
-        body = response.json()
-        profiles = body.get('metadata') if isinstance(body, dict) else None
-        if not isinstance(profiles, list):
-            raise exception.InvalidConfiguration(
-                'Incus recursive profile inventory is malformed')
+        profiles = self._get_profile_inventory_snapshot()
 
         candidates = []
         for profile in profiles:
-            if not isinstance(profile, dict):
-                continue
             config = profile.get('config')
             name = profile.get('name')
             if (not isinstance(config, dict) or

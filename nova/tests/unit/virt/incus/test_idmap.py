@@ -120,14 +120,31 @@ class _FakeEtcd:
                 elif "request_range" in request:
                     item = request["request_range"]
                     key = _decode(item["key"])
-                    value = self.values.get(key)
-                    kvs = [] if value is None else [{
-                        "key": base64.b64encode(key).decode("ascii"),
-                        "value": base64.b64encode(value).decode("ascii"),
-                    }]
+                    range_end = item.get("range_end")
+                    if range_end is not None:
+                        end = _decode(range_end)
+                        matched = [
+                            (stored_key, stored)
+                            for stored_key, stored in sorted(
+                                self.values.items())
+                            if key <= stored_key < end
+                        ]
+                    else:
+                        value = self.values.get(key)
+                        matched = (
+                            [] if value is None else [(key, value)])
+                    if item.get("count_only"):
+                        kvs = []
+                    else:
+                        kvs = [{
+                            "key": base64.b64encode(
+                                stored_key).decode("ascii"),
+                            "value": base64.b64encode(
+                                stored).decode("ascii"),
+                        } for stored_key, stored in matched]
                     responses.append({
                         "response_range": {
-                            "count": str(len(kvs)),
+                            "count": str(len(matched)),
                             "kvs": kvs,
                         },
                     })
@@ -1050,6 +1067,105 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
             idmap.IDMapConflict, self.allocator.assert_startable,
             assignment.instance_uuid, host_id, token,
             assignment=assignment)
+
+    def test_probe_counts_every_key_family_at_one_revision(self):
+        first = self.allocator.allocate(self._uuid(60))
+        second = self.allocator.allocate(self._uuid(61))
+        self._claim(first)
+        self.allocator.request_release(
+            second.instance_uuid, "instance-00000061",
+            assignment=self.allocator.get(second.instance_uuid))
+
+        self.etcd.transactions.clear()
+        counts = self.allocator.probe()
+
+        self.assertEqual(
+            {'instances': 2, 'slots': 2, 'releases': 1, 'hosts': 1}, counts)
+        # One transaction, and it transfers counts rather than records.
+        self.assertEqual(1, len(self.etcd.transactions))
+        for request in self.etcd.transactions[0]['success']:
+            self.assertTrue(request['request_range']['count_only'])
+
+    def test_probe_does_not_read_the_namespace(self):
+        """The probe's whole point is not paying for a full scan."""
+        self.allocator.allocate(self._uuid(62))
+        self.etcd.get_prefix_calls.clear()
+
+        self.allocator.probe()
+
+        self.assertEqual([], self.etcd.get_prefix_calls)
+
+    def test_probe_rejects_an_orphan_slot_record(self):
+        assignment = self.allocator.allocate(self._uuid(63))
+        self.etcd.values.pop(
+            self.allocator.instance_key(assignment.instance_uuid).encode())
+
+        self.assertRaisesRegex(
+            idmap.IDMapIntegrityError, "record counts differ",
+            self.allocator.probe)
+
+    def test_probe_rejects_an_orphan_allocation_record(self):
+        assignment = self.allocator.allocate(self._uuid(64))
+        self.etcd.values.pop(
+            self.allocator.slot_key(assignment.slot).encode())
+
+        self.assertRaisesRegex(
+            idmap.IDMapIntegrityError, "record counts differ",
+            self.allocator.probe)
+
+    def test_probe_rejects_more_intents_than_allocations(self):
+        assignment = self.allocator.allocate(self._uuid(65))
+        self.allocator.request_release(
+            assignment.instance_uuid, "instance-00000065",
+            assignment=self.allocator.get(assignment.instance_uuid))
+        intent_raw = self.etcd.values[
+            self.allocator.release_key(assignment.instance_uuid).encode()]
+        self.etcd.values[
+            self.allocator.release_key(self._uuid(66)).encode()] = intent_raw
+
+        self.assertRaisesRegex(
+            idmap.IDMapIntegrityError, "exceeds allocation count",
+            self.allocator.probe)
+
+    def test_probe_rejects_claims_without_any_allocation(self):
+        assignment = self.allocator.allocate(self._uuid(67))
+        assignment, host_id, token = self._claim(assignment)
+        self.etcd.values.pop(
+            self.allocator.instance_key(assignment.instance_uuid).encode())
+        self.etcd.values.pop(
+            self.allocator.slot_key(assignment.slot).encode())
+
+        self.assertRaisesRegex(
+            idmap.IDMapIntegrityError, "without any allocation",
+            self.allocator.probe)
+
+    def test_probe_rejects_a_replaced_configuration_record(self):
+        self.etcd.values[
+            self.allocator.configuration_key.encode()] = b'{"replaced": true}'
+
+        self.assertRaises(idmap.IDMapIntegrityError, self.allocator.probe)
+
+    def test_probe_rejects_a_configuration_replaced_mid_flight(self):
+        """Counts from another namespace generation prove nothing."""
+        def replace(etcd, unused_transaction):
+            etcd.values[
+                self.allocator.configuration_key.encode()] = (
+                    b'{"replaced": true}')
+
+        self.etcd.before_transaction = replace
+
+        self.assertRaisesRegex(
+            idmap.IDMapIntegrityError, "configuration record changed",
+            self.allocator.probe)
+
+    def test_probe_does_not_latch_on_its_own(self):
+        """Counts escalate to the audit; only a scan may latch."""
+        assignment = self.allocator.allocate(self._uuid(68))
+        self.etcd.values.pop(
+            self.allocator.slot_key(assignment.slot).encode())
+
+        self.assertRaises(idmap.IDMapIntegrityError, self.allocator.probe)
+        self.assertIsNone(self.allocator._integrity_latch)
 
     def test_audit_rejects_orphan_and_mismatched_claim(self):
         assignment = self.allocator.allocate(self._uuid(23))

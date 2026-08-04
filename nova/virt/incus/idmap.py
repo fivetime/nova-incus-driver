@@ -643,6 +643,28 @@ class IDMapAllocator:
         return {"request_range": {"key": self._b64(key)}}
 
     @staticmethod
+    def _prefix_range_end(key_prefix):
+        """Return the exclusive end of an etcd prefix range."""
+        raw = bytearray(key_prefix.encode("utf-8"))
+        while raw:
+            if raw[-1] < 0xFF:
+                raw[-1] += 1
+                return bytes(raw)
+            raw.pop()
+        raise IDMapConfigurationError(
+            reason="cannot range over an empty allocator key prefix")
+
+    def _count_range(self, key_prefix):
+        """Return a range request that transfers only the key count."""
+        return {
+            "request_range": {
+                "key": self._b64(key_prefix),
+                "range_end": self._b64(self._prefix_range_end(key_prefix)),
+                "count_only": True,
+            },
+        }
+
+    @staticmethod
     def _decode_b64(value, description):
         if not isinstance(value, str):
             raise IDMapIntegrityError(
@@ -1664,6 +1686,87 @@ class IDMapAllocator:
     def audit_state(self):
         """Return assignments, intents and claims from one revision."""
         return self._audit_with_latch()
+
+    def probe(self):
+        """Return key-family counts and check their exact relationships.
+
+        A full audit reads and parses every record in the namespace, which
+        is the whole steady-state cost of running one on every compute
+        every minute. This reads only counts, so an idle compute can check
+        the invariants that relate family sizes on every cycle and pay for
+        the authoritative scan rarely.
+
+        The relationships checked here are exact, not heuristic: every
+        count comes from one transaction revision, allocation writes its
+        instance and slot records in a single transaction, and release
+        deletes both together with the intent. A probe therefore cannot
+        report a mismatch that a concurrent mutation merely happens to be
+        halfway through.
+
+        It cannot see any record's *content*, so it does not replace the
+        audit: a claim without its allocation, or a generation mismatch
+        inside a record, is visible only to a full scan. Callers escalate a
+        mismatch to one rather than latching from counts alone.
+        """
+        self._ensure_initialized()
+        families = ("instances", "slots", "releases", "hosts")
+        transaction = {
+            "compare": [self._compare_config()],
+            "success": [
+                self._count_range("%s/%s/" % (self._prefix, family))
+                for family in families
+            ],
+            "failure": [self._range(self.configuration_key)],
+        }
+        result = self._transaction_response(transaction)
+        responses = result.get("responses")
+        if not isinstance(responses, list):
+            raise IDMapBackendError(
+                reason="etcd probe omitted range responses")
+        if not result["succeeded"]:
+            # The configuration record is immutable for the lifetime of a
+            # namespace, so a failed compare means the registry was
+            # replaced underneath this process.
+            raise IDMapIntegrityError(
+                reason="allocator configuration record changed")
+        if len(responses) != len(families):
+            raise IDMapBackendError(
+                reason="etcd probe returned the wrong response count")
+
+        counts = {}
+        for family, response in zip(families, responses):
+            if not isinstance(response, dict):
+                raise IDMapBackendError(
+                    reason="etcd probe returned an invalid range response")
+            value = response.get("response_range")
+            if not isinstance(value, dict):
+                raise IDMapBackendError(
+                    reason="etcd probe omitted a range response")
+            try:
+                counts[family] = int(value.get("count", 0))
+            except (TypeError, ValueError):
+                raise IDMapBackendError(
+                    reason="etcd probe returned a non-numeric count for %s"
+                    % family)
+            if counts[family] < 0:
+                raise IDMapBackendError(
+                    reason="etcd probe returned a negative count for %s"
+                    % family)
+
+        if counts["instances"] != counts["slots"]:
+            raise IDMapIntegrityError(
+                reason=("allocation and slot record counts differ (%d vs %d)"
+                        % (counts["instances"], counts["slots"])))
+        if counts["releases"] > counts["instances"]:
+            raise IDMapIntegrityError(
+                reason=("release intent count exceeds allocation count "
+                        "(%d > %d)"
+                        % (counts["releases"], counts["instances"])))
+        if counts["instances"] == 0 and counts["hosts"]:
+            raise IDMapIntegrityError(
+                reason=("host claims exist without any allocation (%d)"
+                        % counts["hosts"]))
+        return counts
 
     def get_release_intent(self, instance_uuid):
         """Return one exact, verified release intent without a prefix scan."""
