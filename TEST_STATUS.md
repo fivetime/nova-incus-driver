@@ -1873,3 +1873,63 @@ N x ~30 s. `reconcileMigrationAttemptsAfterRestart`, added in `87a638d77`,
 sits at the same point with the same serial shape; its work is bounded by
 unfinished migration attempts rather than instance count, so its exposure is
 smaller, but the pattern is identical.
+
+### Step 0 measurements: what the 17.5 s is, and proof that deletes serialize
+
+Run after `40dcbf738` (`rados df`) on an otherwise idle fleet. No code changed
+to obtain any of this.
+
+**1. nova-compute burns almost no CPU.** `py-spy record --idle` over a 40 s
+window containing one delete: 3999 samples, of which 37.17 s sit in
+`eventlet/hubs/epolls.py:31 do_poll`. Every `nova/virt/incus` frame together
+totals under 1.5 s. Note the methodological limit that produced this: eventlet
+green threads are invisible to `py-spy` while blocked, because a blocked
+greenlet is not on any OS thread stack. The conclusion stands and is the useful
+one -- **the delete is round trips, not computation** -- but py-spy cannot
+attribute the waiting, so it is the wrong tool for the rest of this work.
+
+**2. Nova DEBUG logs cannot attribute it either.** Gaps between consecutive log
+lines across one 19.7 s delete: 4.72 s, 3.76 s, 2.24 s, 1.54 s, 1.25 s, 1.04 s,
+each bounded by nothing but unrelated `ovsdbapp` poller wakeups. The driver
+logs nothing while an incusd or etcd call is in flight.
+
+**3. Direct three-way split**, by driving each stage separately against one
+instance:
+
+| stage | now | before `40dcbf738` |
+| --- | --- | --- |
+| `incus stop --force` | 1.79 s | 1.7 s |
+| `incusd` DELETE carrying the release token | **8.07 s** | 19.5 s |
+| Nova destroy with the container already absent | **8.72 s** | 11 s |
+
+The two halves are now within 8 % of each other. Either is worth attacking;
+neither dominates.
+
+**4. Concurrent deletes are ~73 % serialized.** Four instances on one compute,
+deleted simultaneously: **55.76 s**. Fully serial would be 4 x 17.5 = 70 s,
+fully parallel ~20 s. Effective concurrency is 4 / (55.76/17.5) = **1.25x**.
+Solving 17.5 x (1 + 3f) = 55.76 gives **f = 0.73**: about three quarters of
+each delete sits inside a serialized section.
+
+That matches the scope of the lock at `nova/virt/incus/driver.py:7790`, which
+is held across lines 7790-7843 -- stop, delete, receipt settlement, `_cleanup`
+and idmap claim retirement. The call passes `lock_path` positionally into
+`lockutils.lock`'s first parameter, which is `name`, so the in-process
+semaphore is keyed on the constant `/var/lib/nova/instances/locks` and every
+destroy in the nova-compute process shares one mutex. `lock_file_prefix`
+reaches only `external_lock`, so the on-disk flock file stays per instance and
+cross-process exclusion is intact: this is a throughput defect, not a
+correctness defect. The same call shape is at `:4687` (Glance image sync, so
+creates block deletes) and `:10079` (snapshot). Roughly nine other
+`lockutils.lock` sites in the same file pass a per-instance name plus an
+explicit `lock_path=` keyword, so this is a slip rather than a design.
+
+Independent support beyond the 4-way measurement: a FIFO serializer over 16
+predicts median 8.5xS and max 16xS; the scale run's observed 312 s / 596 s
+give S = 36.7 s and 37.25 s, agreeing to 1.5 %.
+
+**Projection, to be confirmed rather than believed:** at C=8 and T=17.5 s,
+3000 deletes take 1.8 h against 14.6 h today. The next ceiling is already
+named and unmeasured -- `cmd/incusd/instances_get.go:399` loads every instance
+inside one cluster transaction on a one-connection pool (`db.go:141`), and the
+delete path issues six such listings.
