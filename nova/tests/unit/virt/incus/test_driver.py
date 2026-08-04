@@ -23,6 +23,7 @@ import hashlib
 import inspect
 import io
 import os
+import re
 import stat
 import tarfile
 import tempfile
@@ -5947,6 +5948,26 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'idmap_base': 1065536,
             'idmap_size': 65536,
         }], incus_driver.list_destination_prepared_recovery_candidates())
+
+    def test_host_wide_locks_are_named_per_instance(self):
+        """The lock NAME keys the in-process semaphore, nothing else.
+
+        lockutils.lock(name, lock_file_prefix=None, external=False,
+        lock_path=None) keys internal_lock on name alone; lock_file_prefix
+        reaches only external_lock. Passing a constant path positionally
+        gave every destroy, image sync and snapshot in one nova-compute
+        process the same mutex, which serialized about three quarters of
+        every delete against every other one on the host.
+        """
+        source = inspect.getsource(driver)
+        for call in re.findall(
+                r'lockutils\.lock\(\s*([^,)]+)', source):
+            name = call.strip()
+            self.assertNotIn(
+                'lock_path', name,
+                'lockutils.lock() was given a path as its lock name; the '
+                'name keys the in-process semaphore, so a shared path '
+                'serializes unrelated instances')
 
     def test_both_profile_recovery_periodics_share_one_listing(self):
         """Discovery is shared; the two periodics run back to back."""

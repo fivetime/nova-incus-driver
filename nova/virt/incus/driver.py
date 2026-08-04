@@ -4683,10 +4683,12 @@ def _sync_glance_image_to_incus(client, context, image_ref):
     The image is stored in the Incus image store with an alias to
     the image_ref. This way, it will only copy over once.
     """
-    lock_path = os.path.join(CONF.instances_path, 'locks')
+    # lockutils.lock's first parameter is the lock NAME, and the name alone
+    # keys the in-process semaphore; lock_file_prefix reaches only the
+    # on-disk lock. Passing a constant path here shared one mutex across
+    # every image sync, container destroy and snapshot in this process.
     with lockutils.lock(
-            lock_path, external=True,
-            lock_file_prefix='incus-image-{}'.format(image_ref)):
+            'incus-image-{}'.format(image_ref), external=True):
 
         # NOTE(jamespage): Re-query by image_ref to ensure
         #                  that another process did not
@@ -7707,7 +7709,6 @@ class IncusDriver(driver.ComputeDriver):
         failed_build_cleanup = (
             getattr(instance, 'vm_state', None) == vm_states.BUILDING and
             getattr(instance, 'task_state', None) == task_states.SPAWNING)
-        lock_path = os.path.join(CONF.instances_path, 'locks')
         unused_release_intent, unused_release_assignment, release_claim = (
             self._idmap_rootfs_release_context(instance))
 
@@ -7787,9 +7788,13 @@ class IncusDriver(driver.ComputeDriver):
                 cleanup_token = profile.config.get(
                     MIGRATION_CLEANUP_TOKEN_KEY)
 
+        # The name is what excludes; see the note in _sync_glance_image.
+        # This lock is held across stop, delete, receipt settlement, cleanup
+        # and idmap claim retirement, so keying it on a constant serialized
+        # roughly three quarters of every destroy on the host against every
+        # other one.
         with lockutils.lock(
-                lock_path, external=True,
-                lock_file_prefix='incus-container-{}'.format(instance.name)):
+                'incus-container-{}'.format(instance.name), external=True):
             if (cleanup_token and destroy_disks and
                     getattr(instance, 'host', None) == self.host):
                 # A successful migration updates Nova's authoritative host
@@ -10074,11 +10079,9 @@ class IncusDriver(driver.ComputeDriver):
                 'The Incus image snapshot path cannot publish a Cinder '
                 'boot volume; use Nova volume-backed snapshot orchestration')
 
-        lock_path = str(os.path.join(CONF.instances_path, 'locks'))
-
+        # The name is what excludes; see the note in _sync_glance_image.
         with lockutils.lock(
-                lock_path, external=True,
-                lock_file_prefix='incus-container-{}'.format(instance.name)):
+                'incus-container-{}'.format(instance.name), external=True):
 
             update_task_state(task_state=task_states.IMAGE_PENDING_UPLOAD)
 
