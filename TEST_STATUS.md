@@ -47,6 +47,55 @@ release intent`` — that barrier was working as designed against a
 genuinely orphaned profile, and the claim released on its own once the
 profile was removed. Unit suite 788/788.
 
+## 2026-08-04 Rollback idempotency and interrupted-detach recovery
+
+Two of the three cases pass on the current candidate:
+
+- **Repeated detach is a clean no-op.** A second detach of an
+  already-detached volume leaves it ``available`` and issues no further
+  connector work (host disconnect count unchanged). This is what makes
+  journal replay safe.
+- **A failed migration rolls back in place.** With the destination's
+  Incus port blocked, the migration fails, the instance stays ACTIVE on
+  its source with an unchanged guest PID, and the destination keeps no
+  instance record.
+
+The third case exposed a gap and, in doing so, corrected the test's own
+premise. Killing nova-compute two seconds into a detach leaves:
+
+* Cinder stuck in ``detaching``;
+* the Nova BDM still present (``deleted=0``);
+* the host RBD mapping still present;
+* **no journal**, because the process died before the driver was entered.
+
+Host and Nova state are therefore *consistent* — the guest still has its
+volume and keeps running. The only wrong thing is Cinder's intermediate
+status, which makes the API refuse a retry (``status must be 'in-use'``)
+and requires ``cinder reset-state``. Vanilla Nova has the same hole; its
+detach failure path calls ``volume_api.roll_detaching`` but a killed
+process never reaches it.
+
+That reframes the correct convergence. Under the project's stated
+migration principle — a failure leaves the workload in place — an
+interrupted detach should be treated as *not having happened*: the
+volume stays attached and usable and Cinder returns to ``in-use`` so the
+operator can retry. The probe originally asserted the opposite (that the
+detach should complete), which is why it reported a failure that was
+partly its own premise.
+
+Fixed in ``0ad69cd``: the volume journal is now consumed. It was already
+written durably before both connect and disconnect, but nothing ever
+read it as work to finish — it was only fail-closed evidence. The new
+periodic completes an interrupted disconnect when, and only when, the
+exact instance is still local, has no in-flight task, and Nova no longer
+maps that volume to it.
+
+Still open: ``init_host`` reconciliation calling ``roll_detaching`` for a
+volume left in ``detaching`` whose BDM and host mapping both still say
+attached. That is the only remaining path for the window before the
+driver is entered, and process start is the only moment it can be
+observed.
+
 ## 2026-08-03 Two abort-path defects reported from the LB provider
 
 Both were reported by the incus-octavia-provider work, which saw its
