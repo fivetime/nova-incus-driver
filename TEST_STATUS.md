@@ -1971,3 +1971,73 @@ host claims), 6 RBD container roots, and the pre-existing instance profiles on
 each node. Concurrency bought throughput without loosening any of the release
 protocol's proofs -- which is the expected result, since the defect was an
 in-process semaphore key and the on-disk exclusion was per instance all along.
+
+### 2026-08-04 first real 100/500/1000 gate attempt: fails at checkpoint 1, on creates
+
+Run `fcdf4f64`, driver `55302b9`, image `radosdf-r12`, flavor `incus.scale`,
+concurrency 32, per-compute checkpoints 100/500/1000.
+
+**Result: FAIL at the first checkpoint** --
+`unexpected server states at checkpoint 300: {'ERROR': 1}`. One instance of
+300. The gate is fail-closed, so the whole run rolled back and neither the
+500 nor the 1000 checkpoint was reached.
+
+**Two preflight checks earned their keep before anything was created.** The
+first attempt was refused with `subnet ... has 252 available addresses, fewer
+than the 3000 scale target` -- the long-used network is a /24. A dedicated
+`incus-scale-net` (10.100.0.0/20, 4081 usable) was created for this. Without
+that check the run would have failed at instance 252 and left hundreds of
+half-built instances to clean up.
+
+**The one failure was a client-side read timeout, not a build error:**
+
+```
+requests.exceptions.ConnectionError: _UnixSocketHTTPConnectionPool: Read timed out.
+  pylxd/models/operation.py:104 -> GET /1.0/operations/<id>/wait
+```
+
+A hypothesis that had to be measured away before acting on it: pylxd hard
+codes `SOCKET_CONNECTION_TIMEOUT = 60` and assigns it to `self.timeout` in
+`_UnixSocketHTTPConnection`, which reads as though the configured
+`[incus] request_timeout = 300` can never reach the unix socket path. **It is
+wrong.** The failing instance began spawning at 13:41:09 and raised at
+13:46:53, so it waited **344 s**, consistent with 300 s plus overhead: the
+hard-coded constant is the *connect* timeout, and urllib3 overrides the read
+timeout per request. The SDK needs no change.
+
+**The real finding is the create side.** Spawn durations across all three
+computes during this run, 142 samples at concurrency 32:
+
+| | seconds |
+| --- | --- |
+| min | 17.8 |
+| p50 | 106.9 |
+| p90 | 208.8 |
+| p99 | 295.6 |
+| max | 300.7 |
+
+The minimum is the uncontended cost and matches a single delete (17.5 s). At
+32 in flight the median is six times that and the tail reaches the 300 s
+client ceiling, which is what produced the single ERROR.
+
+So the gate blocker has moved rather than gone:
+
+| | uncontended | under concurrency |
+| --- | --- | --- |
+| delete | 17.5 s | 9.1x effective at C=16, 1859/hour |
+| create | ~17.8 s | p50 107 s at C=32, tail hits the 300 s timeout |
+
+**Not yet separated:** whether the create queueing is caused by concurrency
+itself or by the ID-map registry growing to 300 instances during the run --
+every allocation runs a full registry audit inline, so both scale together
+here. A C in {1,2,4,8} ladder against a fixed registry size separates them,
+which is the same method that isolated the delete-side lock.
+
+**Host distribution was healthy**, which was the pilot's failure mode: among
+placed instances 29/26/29 across the three computes. The RAM weigher absorbs
+node-01's pre-existing offset once the run is large enough, as predicted.
+
+**Evidence gap:** no `--telemetry-command` was passed, so the incusd and
+nova-compute CPU/RSS/FD ceilings that `scale_design.rst` requires were not
+captured. Any run that is meant to produce the recorded baseline must pass
+telemetry helpers.
