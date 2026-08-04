@@ -2811,3 +2811,120 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         candidates = self.compute.driver.list_migration_recovery_candidates
         candidates.assert_not_called()
         get_by_uuid.assert_not_called()
+
+
+class IncusAbandonedMigrationReservationTest(test.NoDBTestCase):
+    """Only a reservation Nova can no longer consume may be released."""
+
+    def setUp(self):
+        super().setUp()
+        self.flags(migration_auto_recovery=True, group='incus')
+        self.compute = manager.IncusComputeManager.__new__(
+            manager.IncusComputeManager)
+        self.compute.host = 'compute-1'
+        self.compute.driver = mock.Mock()
+        self.compute.driver.get_available_nodes.return_value = ['compute-1']
+        self.candidate = {
+            'token': '40000000-0000-0000-0000-000000000004',
+            'name': 'instance-0000002f',
+            'idmap_base': 500000000,
+            'idmap_size': 65536,
+        }
+        self.listing = (
+            self.compute.driver.
+            list_unstarted_migration_attempt_reservations)
+        self.listing.return_value = [self.candidate]
+        self.release = (
+            self.compute.driver.
+            release_unstarted_migration_attempt_reservation)
+
+    def _run(self, instance_names=(), migration_names=()):
+        instances = []
+        for name in instance_names:
+            instance = mock.Mock()
+            instance.name = name
+            instances.append(instance)
+
+        migrations = []
+        migration_instances = {}
+        for index, name in enumerate(migration_names):
+            uuid = '5000000%d-0000-0000-0000-000000000005' % index
+            migration = mock.Mock()
+            migration.instance_uuid = uuid
+            migrations.append(migration)
+            instance = mock.Mock()
+            instance.name = name
+            migration_instances[uuid] = instance
+
+        with mock.patch.object(
+                manager.objects.InstanceList, 'get_by_host',
+                return_value=instances), \
+            mock.patch.object(
+                manager.objects.MigrationList,
+                'get_in_progress_by_host_and_node',
+                return_value=migrations), \
+            mock.patch.object(
+                manager.objects.Instance, 'get_by_uuid',
+                side_effect=lambda ctx, uuid, **kw: (
+                    migration_instances[uuid])):
+            self.compute._release_abandoned_incus_migration_reservations(
+                context.get_admin_context())
+
+    def test_release_requires_two_unchanged_observations(self):
+        self._run()
+        self.release.assert_not_called()
+
+        self._run()
+        self.release.assert_called_once_with(self.candidate)
+
+    def test_in_progress_migration_protects_the_reservation(self):
+        self._run(migration_names=[self.candidate['name']])
+        self._run(migration_names=[self.candidate['name']])
+        self.release.assert_not_called()
+
+    def test_local_instance_protects_the_reservation(self):
+        self._run(instance_names=[self.candidate['name']])
+        self._run(instance_names=[self.candidate['name']])
+        self.release.assert_not_called()
+
+    def test_a_changed_reservation_restarts_the_observation(self):
+        self._run()
+        started = dict(self.candidate, idmap_base=600000000)
+        self.listing.return_value = [started]
+        self._run()
+        self.release.assert_not_called()
+
+        self._run()
+        self.release.assert_called_once_with(started)
+
+    def test_a_reservation_that_disappears_is_forgotten(self):
+        self._run()
+        self.listing.return_value = []
+        self._run()
+        self.listing.return_value = [self.candidate]
+        self._run()
+        self.release.assert_not_called()
+
+    def test_unknown_nova_state_retains_every_reservation(self):
+        self._run()
+        with mock.patch.object(
+                manager.objects.InstanceList, 'get_by_host',
+                side_effect=Exception('boom')):
+            self.compute._release_abandoned_incus_migration_reservations(
+                context.get_admin_context())
+        self.release.assert_not_called()
+
+    def test_disabled_auto_recovery_does_not_list(self):
+        self.flags(migration_auto_recovery=False, group='incus')
+        self._run()
+        self.listing.assert_not_called()
+
+    def test_a_failed_release_is_retried_next_pass(self):
+        self.release.side_effect = Exception('boom')
+        self._run()
+        self._run()
+        self.release.assert_called_once_with(self.candidate)
+
+        self.release.side_effect = None
+        self._run()
+        self.assertEqual(2, self.release.call_count)

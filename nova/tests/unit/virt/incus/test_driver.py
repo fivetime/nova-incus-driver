@@ -6794,7 +6794,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         connector = mock.Mock()
         with mock.patch.object(driver, 'brick_get_connector',
-                               return_value=connector),                 mock.patch.object(
+                               return_value=connector), \
+                mock.patch.object(
                     driver.objects.BlockDeviceMappingList,
                     'get_by_instance_uuid', return_value=[]):
             incus_driver.recover_volume_journal_candidate(
@@ -6828,7 +6829,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         connector = mock.Mock()
         with mock.patch.object(driver, 'brick_get_connector',
-                               return_value=connector),                 mock.patch.object(
+                               return_value=connector), \
+                mock.patch.object(
                     driver.objects.BlockDeviceMappingList,
                     'get_by_instance_uuid', return_value=[bdm]):
             incus_driver.recover_volume_journal_candidate(
@@ -15529,3 +15531,118 @@ class SaveProfileMarkerTest(test.NoDBTestCase):
         self.assertRaises(
             incuscore_exceptions.LXDAPIException,
             driver._save_profile_marker, profile)
+
+
+class UnstartedMigrationReservationTest(test.NoDBTestCase):
+    """An unstarted target reservation can only be released as a whole."""
+
+    def setUp(self):
+        super().setUp()
+        self.conf_patcher = mock.patch.object(driver, 'CONF')
+        self.conf = self.conf_patcher.start()
+        self.addCleanup(self.conf_patcher.stop)
+        self.conf.incus.project = 'nova'
+        self.token = '10000000-0000-0000-0000-000000000001'
+        self.client = mock.Mock()
+        self.client.host_info = {'api_extensions': [
+            'migration_attempt_fencing',
+            'migration_attempt_reservation_generation',
+        ]}
+        self.client.api = mock.MagicMock()
+        self.collection = self.client.api['migration-attempts']
+        self.endpoint = self.collection[self.token]
+        self.driver = mock.Mock()
+        self.driver.client = self.client
+        self.candidate = {
+            'token': self.token,
+            'name': 'instance-test',
+            'idmap_base': 1065536,
+            'idmap_size': 65536,
+        }
+
+    def _record(self, **overrides):
+        record = {
+            'token': self.token,
+            'project': 'nova',
+            'resource_type': 'instance',
+            'resource_name': 'instance-test',
+            'state': 'active',
+            'started': False,
+            'finished': False,
+            'idmap_base': 1065536,
+            'idmap_size': 65536,
+            'idmap_active': True,
+        }
+        record.update(overrides)
+        return record
+
+    def _response(self, metadata):
+        response = mock.Mock()
+        response.json.return_value = {'metadata': metadata}
+        return response
+
+    def _list(self, records):
+        self.collection.get.return_value = self._response(records)
+        listing = (
+            driver.IncusDriver.list_unstarted_migration_attempt_reservations)
+        return listing(self.driver)
+
+    def test_lists_only_unstarted_active_reservations(self):
+        self.assertEqual([self.candidate], self._list([self._record()]))
+
+    def test_ignores_records_that_cannot_wedge_a_range(self):
+        for record in (
+            self._record(started=True),
+            self._record(finished=True, state='aborted'),
+            self._record(state='committed', finished=True),
+            self._record(idmap_active=False),
+            self._record(idmap_base=None, idmap_size=None),
+            self._record(project='other'),
+            self._record(resource_type='volume'),
+            self._record(token='not-a-uuid'),
+        ):
+            self.assertEqual([], self._list([record]), record)
+
+    def test_listing_needs_the_reservation_generation_extension(self):
+        self.client.host_info = {
+            'api_extensions': ['migration_attempt_fencing']}
+
+        self.assertEqual([], self._list([self._record()]))
+        self.collection.get.assert_not_called()
+
+    def test_release_aborts_and_retires_the_token(self):
+        self.endpoint.get.return_value = self._response(self._record())
+        self.endpoint.put.return_value = self._response(
+            self._record(state='aborted', finished=True))
+
+        driver._release_unstarted_migration_attempt(
+            self.client, self.candidate)
+
+        self.endpoint.put.assert_called_once_with(
+            params={'project': 'nova'}, json={'state': 'aborted'})
+        self.endpoint.delete.assert_called_once_with(
+            params={'project': 'nova'})
+
+    def test_release_refuses_a_reservation_that_changed(self):
+        self.endpoint.get.return_value = self._response(
+            self._record(started=True))
+
+        self.assertRaises(
+            exception.MigrationError,
+            driver._release_unstarted_migration_attempt,
+            self.client, self.candidate)
+        self.endpoint.put.assert_not_called()
+        self.endpoint.delete.assert_not_called()
+
+    def test_release_refuses_to_retire_an_unfinished_abort(self):
+        # A create request that won the race leaves the aborted record
+        # unfinished. Retiring it would discard a live target's fence.
+        self.endpoint.get.return_value = self._response(self._record())
+        self.endpoint.put.return_value = self._response(
+            self._record(state='aborted', started=True))
+
+        self.assertRaises(
+            exception.MigrationError,
+            driver._release_unstarted_migration_attempt,
+            self.client, self.candidate)
+        self.endpoint.delete.assert_not_called()

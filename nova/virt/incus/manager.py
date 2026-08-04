@@ -1990,6 +1990,108 @@ class IncusComputeManager(manager.ComputeManager):
 
     @periodic_task.periodic_task(
         spacing=CONF.incus.migration_recovery_interval)
+    def _release_abandoned_incus_migration_reservations(self, context):
+        """Release target reservations whose migration never started.
+
+        A live migration pre-check reserves a target name and idmap on the
+        destination before anything else exists there. Incus cannot expire
+        that reservation on its own: the create request it fences carries no
+        deadline and can legitimately arrive after a target restart, so an
+        abandoned one would otherwise wedge its idmap range forever. Only
+        Nova knows whether a migration can still consume it.
+
+        Two independent facts must hold before a reservation is released.
+        Nova must have no in-progress migration and no local instance that
+        could still create that target name, and the reservation must have
+        been in exactly the same unstarted state in the previous pass. The
+        second rule keeps a pre-check that is merely slower than one
+        recovery interval from ever being mistaken for an abandoned one.
+        """
+        if not CONF.incus.migration_auto_recovery:
+            return
+
+        context = (context or nova.context.get_admin_context()).elevated()
+        try:
+            candidates = (
+                self.driver.list_unstarted_migration_attempt_reservations())
+        except Exception:
+            LOG.exception(
+                'Failed to list unstarted Incus migration reservations')
+            return
+
+        previous = getattr(self, '_incus_unstarted_reservations', {})
+        current = {
+            candidate['token']: candidate for candidate in candidates}
+        self._incus_unstarted_reservations = current
+        if not candidates:
+            return
+
+        try:
+            claimed = self._incus_claimable_target_names(context)
+        except Exception:
+            LOG.exception(
+                'Failed to determine which Incus target names Nova can '
+                'still create; retaining every unstarted reservation')
+            return
+
+        for token, candidate in sorted(current.items()):
+            if candidate['name'] in claimed:
+                continue
+            if previous.get(token) != candidate:
+                LOG.debug(
+                    'Deferring release of unstarted Incus migration '
+                    'reservation %(token)s for %(name)s until it is seen '
+                    'unchanged twice', candidate)
+                continue
+            try:
+                self.driver.release_unstarted_migration_attempt_reservation(
+                    candidate)
+            except Exception:
+                LOG.exception(
+                    'Failed to release the abandoned Incus migration '
+                    'reservation %(token)s for %(name)s', candidate)
+                continue
+
+            self._incus_unstarted_reservations.pop(token, None)
+            LOG.info(
+                'Released the abandoned Incus migration reservation '
+                '%(token)s for %(name)s (idmap %(idmap_base)s+'
+                '%(idmap_size)s)', candidate)
+
+    def _incus_claimable_target_names(self, context):
+        """Return the target names a Nova migration could still create here.
+
+        An in-progress migration is authoritative regardless of which
+        instance list it appears in, because a live migration target is not
+        yet owned by this host. Local instances are included as well so that
+        a completed migration whose token was never retired is not released
+        while its target exists.
+        """
+        names = set()
+        for instance in objects.InstanceList.get_by_host(
+                context, self.host, expected_attrs=[]):
+            names.add(instance.name)
+
+        # Incus computes are never clustered, so this host has exactly one
+        # node and a per-node migration query covers all of them.
+        nodename = self.driver.get_available_nodes()[0]
+        migrations = objects.MigrationList.get_in_progress_by_host_and_node(
+            context, self.host, nodename)
+        instance_uuids = {
+            migration.instance_uuid for migration in migrations
+            if migration.instance_uuid}
+        for instance_uuid in instance_uuids:
+            try:
+                instance = objects.Instance.get_by_uuid(
+                    context, instance_uuid, expected_attrs=[])
+            except exception.InstanceNotFound:
+                continue
+            names.add(instance.name)
+
+        return names
+
+    @periodic_task.periodic_task(
+        spacing=CONF.incus.migration_recovery_interval)
     def _recover_incus_bfv_migration_targets(self, context):
         if not CONF.incus.migration_auto_recovery:
             return

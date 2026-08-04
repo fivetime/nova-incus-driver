@@ -122,6 +122,8 @@ INCUS_STORAGE_HANDOVER_PROOF_EXTENSION = (
 INCUS_STORAGE_READY_FENCE_EXTENSION = (
     'migration_shared_ceph_storage_ready_fence')
 INCUS_MIGRATION_ATTEMPT_EXTENSION = 'migration_attempt_fencing'
+INCUS_MIGRATION_ATTEMPT_LIST_EXTENSION = (
+    'migration_attempt_reservation_generation')
 INCUS_STORAGE_MATERIALIZATION_ATTEMPT_EXTENSION = (
     incus_storage_protocol.STORAGE_MATERIALIZATION_ATTEMPT_EXTENSION)
 INCUS_STORAGE_RELEASE_RECEIPT_EXTENSION = (
@@ -1150,6 +1152,89 @@ def _get_migration_attempt(
     return _validate_migration_attempt(
         _migration_attempt_metadata(response),
         instance, token, idmap_base, idmap_size)
+
+
+def _migration_attempt_list_metadata(response):
+    try:
+        metadata = response.json()['metadata']
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise exception.MigrationError(
+            reason='Incus migration attempt list returned invalid '
+                   'metadata') from exc
+    if not isinstance(metadata, list):
+        raise exception.MigrationError(
+            reason='Incus migration attempt list returned invalid metadata')
+    return metadata
+
+
+def _unstarted_migration_attempt_reservation(attempt):
+    """Return the binding of an unstarted reservation, or None.
+
+    Only a registration that Incus still counts against new attempts is
+    worth releasing. A record that already started, already finished, or
+    holds no idmap reservation costs the target nothing.
+    """
+    if not isinstance(attempt, dict):
+        return None
+    if (attempt.get('state') != 'active' or
+            attempt.get('started') or
+            attempt.get('finished') or
+            not attempt.get('idmap_active') or
+            attempt.get('project') != CONF.incus.project or
+            attempt.get('resource_type') != 'instance'):
+        return None
+    token = attempt.get('token')
+    name = attempt.get('resource_name')
+    if not uuidutils.is_uuid_like(token) or not name:
+        return None
+    try:
+        idmap_base = int(attempt['idmap_base'])
+        idmap_size = int(attempt['idmap_size'])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if idmap_base < 0 or idmap_size <= 0:
+        return None
+    return {
+        'token': token,
+        'name': name,
+        'idmap_base': idmap_base,
+        'idmap_size': idmap_size,
+    }
+
+
+def _release_unstarted_migration_attempt(client, candidate):
+    """Abort and retire one reservation whose migration never started.
+
+    The re-read before the abort is what makes this safe to run from a
+    periodic task. Incus finishes an abort of an unstarted attempt in the
+    same statement that fences it, so a create request that won the race
+    leaves the record unfinished and this refuses to retire it.
+    """
+    _require_migration_attempt_fencing(client)
+    token = candidate['token']
+    response = client.api['migration-attempts'][token].get(
+        params={'project': CONF.incus.project})
+    current = _unstarted_migration_attempt_reservation(
+        _migration_attempt_metadata(response))
+    if current != candidate:
+        raise exception.MigrationError(
+            reason='Incus migration attempt %s changed before its '
+                   'reservation could be released' % token)
+
+    response = client.api['migration-attempts'][token].put(
+        params={'project': CONF.incus.project},
+        json={'state': 'aborted'})
+    attempt = _migration_attempt_metadata(response)
+    if (attempt.get('token') != token or
+            attempt.get('resource_name') != candidate['name'] or
+            attempt.get('state') not in ('aborted', 'failed') or
+            not attempt.get('finished')):
+        raise exception.MigrationError(
+            reason='Incus migration attempt %s started before its '
+                   'reservation could be released' % token)
+
+    client.api['migration-attempts'][token].delete(
+        params={'project': CONF.incus.project})
 
 
 def _register_migration_attempt(
@@ -6955,6 +7040,36 @@ class IncusDriver(driver.ComputeDriver):
 
         return sorted(candidates, key=lambda candidate: candidate['name'])
 
+    def list_unstarted_migration_attempt_reservations(self):
+        """Return this host's target reservations that never started.
+
+        A live migration pre-check registers a target name and idmap on the
+        destination before anything else exists there. Incus deliberately
+        keeps such a reservation across its own restarts, because the create
+        request it fences can still arrive; only the orchestrator that made
+        the reservation can know that the migration was abandoned instead.
+
+        Nothing here decides that. The caller must prove that no migration
+        can still consume each reservation before releasing it.
+        """
+        extensions = set(self.client.host_info.get('api_extensions', []))
+        if INCUS_MIGRATION_ATTEMPT_LIST_EXTENSION not in extensions:
+            return []
+
+        response = self.client.api['migration-attempts'].get(
+            params={'project': CONF.incus.project, 'recursion': '1'})
+        candidates = []
+        for attempt in _migration_attempt_list_metadata(response):
+            candidate = _unstarted_migration_attempt_reservation(attempt)
+            if candidate is not None:
+                candidates.append(candidate)
+
+        return sorted(candidates, key=lambda candidate: candidate['token'])
+
+    def release_unstarted_migration_attempt_reservation(self, candidate):
+        """Release one reservation the caller proved is abandoned."""
+        _release_unstarted_migration_attempt(self.client, candidate)
+
     def _plug_vifs_for_spawn(
             self, context, instance, network_info, block_device_info):
         timeout = CONF.vif_plugging_timeout
@@ -7276,8 +7391,8 @@ class IncusDriver(driver.ComputeDriver):
             self.cleanup(
                 context, instance, network_info, block_device_info)
         except Exception as e:
-            LOG.warn('The cleanup process failed with: %s. This '
-                     'error may or not may be relevant', e)
+            LOG.warning('The cleanup process failed with: %s. This '
+                        'error may or not may be relevant', e)
 
     def _failed_build_idmap_release_allowed(self, instance, reasons):
         """Return whether idmap ownership permits releasing the failed host.

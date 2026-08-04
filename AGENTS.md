@@ -322,6 +322,23 @@ in `TEST_STATUS.md`; this section keeps only the rules.
   `{"state": "aborted"}`); never delete rows from the node database. Treat an
   attempt that the API cannot show but whose reservation still fences new
   migrations as a defect in reclamation, not as a reason to bypass the fence.
+- Two backstops exist because a failure path can itself be interrupted, and
+  neither replaces the rule above. Incus settles the attempts that *started*
+  under an earlier daemon generation when it restarts, since their target
+  operations died with that process. It cannot expire an attempt that never
+  started, because the create request it fences carries no deadline and may
+  legitimately arrive after a target restart; only Nova knows the migration
+  was abandoned. `_release_abandoned_incus_migration_reservations` closes
+  that half, and it must prove abandonment twice over: no in-progress
+  migration and no local instance can still create that target name, and the
+  reservation was in exactly the same unstarted state one recovery interval
+  earlier. Both facts are required — a pre-check that is merely slower than
+  one interval must never be mistaken for an abandoned one.
+- Auditing reservations belongs to `GET /1.0/migration-attempts`
+  (`migration_attempt_reservation_generation`), which lists every non-retired
+  record with `idmap_active`. Reading the node SQLite database to find them
+  is not a substitute; if the endpoint cannot show a record that still fences
+  migrations, that gap is the defect.
 - Live migration requires `[conductor] workers` to be at least 2. The conductor
   blocks waiting for `check_can_live_migrate_destination` while the destination
   compute's `get_network_info()` lazy load travels back to the conductor over
