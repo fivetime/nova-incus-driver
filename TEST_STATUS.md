@@ -2041,3 +2041,51 @@ node-01's pre-existing offset once the run is large enough, as predicted.
 nova-compute CPU/RSS/FD ceilings that `scale_design.rst` requires were not
 captured. Any run that is meant to produce the recorded baseline must pass
 telemetry helpers.
+
+### The gate run wedged every periodic task on one compute
+
+Found while investigating why four ID-map registry entries would not converge
+after the failed gate run. This is more serious than the create latency it was
+found alongside.
+
+**Symptom.** `incus-node-01` reported `devstack@n-cpu` active, the eventlet hub
+idle in `epoll`, and log lines still flowing at 18-22/minute -- but a live
+100-second window contained **zero** periodic task executions. The last one
+had run 42 minutes earlier, and the last one logged in that final batch was
+`_replay_incus_idmap_releases`.
+
+**Root cause.** A SIGUSR2 guru meditation report (1703 lines) showed exactly
+one live driver green thread, stopped at
+`nova/virt/incus/driver.py:5888` -- the `lockutils.lock(...)` acquiring the
+per-instance claim lock inside `_promote_idmap_claim_if_server_committed`,
+reached from `_replay_incus_idmap_releases` at `manager.py:1104`. Several
+other green threads sat in `eventlet/semaphore.py:107 acquire`. The lock was
+never released.
+
+**Why one stuck lock is fatal.** oslo_service runs every periodic task for a
+service in a *single* green thread, sequentially. One periodic blocking
+forever therefore stops **all** of them on that compute: ID-map release
+replay, host claim reconciliation, Cinder volume journal recovery, profile
+recovery, abandoned migration reservation release, and Nova's own power state
+sync. Nothing converges again until the process is restarted, and nothing
+reports that this has happened -- the service still answers as healthy.
+
+**Confirmation.** Restarting `devstack@n-cpu` on node-01 resumed periodics (19
+executions in the first 70 seconds) and the registry converged from 23 back to
+exactly its 19-entry baseline within one cycle, with no other intervention.
+
+**Method note.** `py-spy dump` was useless here: it showed only the idle hub,
+because a blocked eventlet green thread is not on any OS thread stack. SIGUSR2
+is the tool for this failure mode.
+
+**Correction to an earlier reading.** The single ERROR instance from the gate
+run looked at first like a three-way deadlock between the delete guard at
+`manager.py:920`, the release replay's Nova-state check, and the reconcile
+path. It is not. The guard is transient: it refuses only until the reconcile
+periodic settles a claim still at `possible`, and a manual delete issued later
+succeeded in 45 seconds. What made it look permanent was this wedge -- the
+reconcile periodic that would have cleared it was dead.
+
+**Consequence for the gate.** A compute whose periodic loop dies after ~300
+creates cannot be asked for 1000. This has to be understood before the gate is
+attempted again, and it is independent of the create latency below.
