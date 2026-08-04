@@ -1933,3 +1933,41 @@ give S = 36.7 s and 37.25 s, agreeing to 1.5 %.
 named and unmeasured -- `cmd/incusd/instances_get.go:399` loads every instance
 inside one cluster transaction on a one-connection pool (`db.go:141`), and the
 delete path issues six such listings.
+
+### Concurrency ladder after the lock fix: the gate is unblocked
+
+Driver commit `55302b9`, deployed to all three computes. All deletes on one
+compute, `incus.scale` instances, otherwise idle fleet.
+
+| C | wall | per delete | deletes/hour | effective concurrency |
+| --- | --- | --- | --- | --- |
+| 1 | 17.57 s | 17.57 s | 205 | 1.0x |
+| 2 | 18.06 s | 9.03 s | 399 | 1.9x |
+| 4 | 19.87 s | 4.97 s | 725 | 3.5x |
+| 8 | 22.70 s | 2.84 s | 1269 | 6.2x |
+| 16 | 30.98 s | 1.94 s | 1859 | 9.1x |
+
+The same C=4 point measured **55.76 s** before the fix, at 1.25x effective
+concurrency. It is now 19.87 s at 3.5x -- 2.8x faster on identical hardware
+with no change to what a delete does.
+
+**Gate arithmetic.** 3000 instances is 1000 per compute with all three
+computes working in parallel. At C=8 that is 3807 deletes/hour fleet-wide,
+so 0.79 h; at C=16, 5577/hour, so 0.54 h. Against 14.6 h before this session
+and 27.4 h before the `rados df` change. **Teardown is no longer what makes
+the 100/500/1000 gate impractical.**
+
+Returns start bending after C=8 (6.2x at 8, 9.1x at 16), which is the next
+ceiling appearing. It is already named and still unmeasured:
+`cmd/incusd/instances_get.go:399` loads every instance inside one cluster
+transaction on a one-connection pool (`internal/server/db/db.go:141`), and the
+delete path issues six such listings. Not worth attacking until the gate has
+actually been run at scale.
+
+**No residue.** The ladder created and deleted 31 instances, 16 of them
+simultaneously. Afterwards the fleet returned to exactly its baseline: 6
+servers, 19 ID-map registry entries (1 config + 6 allocations + 6 slots + 6
+host claims), 6 RBD container roots, and the pre-existing instance profiles on
+each node. Concurrency bought throughput without loosening any of the release
+protocol's proofs -- which is the expected result, since the defect was an
+in-process semaphore key and the on-disk exclusion was per instance all along.
