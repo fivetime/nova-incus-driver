@@ -4862,6 +4862,40 @@ def _loaded_instance_system_metadata(instance):
     return getattr(instance, 'system_metadata', None) or {}
 
 
+def _profile_instance_users(profile):
+    """Return the instance names an Incus profile reports as users."""
+    names = set()
+    for reference in getattr(profile, 'used_by', None) or ():
+        if not isinstance(reference, str):
+            # An unreadable reference is not proof that this instance owns
+            # it, so surface it as a distinct user and let the caller treat
+            # the profile as in use by something else.
+            names.add(reference)
+            continue
+        path = parse.urlparse(reference).path.rstrip('/')
+        marker = '/instances/'
+        index = path.rfind(marker)
+        if index < 0:
+            marker = '/containers/'
+            index = path.rfind(marker)
+        names.add(
+            path[index + len(marker):] if index >= 0 else path)
+    return names
+
+
+def _profile_users_other_than(profile, instance):
+    """Return profile users that are not this instance's own containers.
+
+    A cleanup that could not finish leaves this instance's own container
+    behind, which is exactly why the profile is retained. Reading that as
+    "the profile is in use" would refuse to mark the profile for recovery
+    at the one moment the marker is needed, so only another instance's
+    usage makes the profile foreign here.
+    """
+    own = {instance.name, '{}-rescue'.format(instance.name)}
+    return sorted(_profile_instance_users(profile) - own)
+
+
 def _all_project_idmap_inventory(client):
     """Return one all-project instance and profile listing.
 
@@ -7960,10 +7994,11 @@ class IncusDriver(driver.ComputeDriver):
                     profile.config if isinstance(profile.config, dict)
                     else {})
                 profile_uuid = profile_config.get('user.openstack.uuid')
+                foreign_users = _profile_users_other_than(profile, instance)
                 if (profile_config.get('environment.product_name') !=
                         'OpenStack Nova' or
                         profile_uuid not in (None, instance.uuid) or
-                        profile.used_by):
+                        foreign_users):
                     raise exception.InvalidConfiguration(
                         'Refusing to mark a foreign or in-use Incus profile '
                         'for automatic cleanup')

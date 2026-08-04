@@ -5388,6 +5388,111 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         cleanup_shares.assert_called_once_with(profile, instance)
         cleanup_journals.assert_called_once_with(instance)
 
+    @mock.patch.object(driver, '_cleanup_share_journal_mounts')
+    @mock.patch.object(
+        driver, '_cleanup_profile_share_mounts',
+        side_effect=exception.ShareUmountError(
+            share_id='10000000-0000-0000-0000-000000000001',
+            server_id='20000000-0000-0000-0000-000000000002',
+            reason='busy'))
+    @mock.patch.object(driver.storage, 'detach_ephemeral')
+    @mock.patch.object(driver, '_remove_instance_directory')
+    def test_cleanup_marks_profile_its_own_container_still_uses(
+            self, remove_instance_directory, detach_ephemeral,
+            cleanup_shares, cleanup_journals):
+        """The retained container is why the profile is retained.
+
+        A cleanup that could not finish leaves this instance's own
+        container behind. Reading that as "in use" refused to write the
+        recovery marker at exactly the moment it was needed, which
+        stranded the profile and pinned its idmap allocation forever.
+        """
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        profile = self.client.profiles.get.return_value
+        profile.devices = {}
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+        }
+        profile.used_by = [
+            '/1.0/instances/{}?project=nova'.format(instance.name),
+            '/1.0/instances/{}-rescue'.format(instance.name),
+        ]
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver._disconnect_profile_volume_connections = mock.Mock(
+            return_value=[])
+
+        self.assertRaises(
+            exception.MigrationError, incus_driver._cleanup,
+            ctx, instance, [], block_device_info=None,
+            destroy_vifs=False, delete_profile=True)
+
+        self.assertEqual(
+            'true', profile.config[driver.CLEANUP_RECOVERY_KEY])
+        profile.save.assert_called_once_with(wait=True)
+
+    @mock.patch.object(driver, '_cleanup_share_journal_mounts')
+    @mock.patch.object(
+        driver, '_cleanup_profile_share_mounts',
+        side_effect=exception.ShareUmountError(
+            share_id='10000000-0000-0000-0000-000000000001',
+            server_id='20000000-0000-0000-0000-000000000002',
+            reason='busy'))
+    @mock.patch.object(driver.storage, 'detach_ephemeral')
+    @mock.patch.object(driver, '_remove_instance_directory')
+    def test_cleanup_refuses_to_mark_a_profile_another_instance_uses(
+            self, remove_instance_directory, detach_ephemeral,
+            cleanup_shares, cleanup_journals):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        profile = self.client.profiles.get.return_value
+        profile.devices = {}
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+        }
+        profile.used_by = ['/1.0/instances/instance-0000dead?project=nova']
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver._disconnect_profile_volume_connections = mock.Mock(
+            return_value=[])
+
+        self.assertRaises(
+            exception.MigrationError, incus_driver._cleanup,
+            ctx, instance, [], block_device_info=None,
+            destroy_vifs=False, delete_profile=True)
+
+        self.assertNotIn(driver.CLEANUP_RECOVERY_KEY, profile.config)
+        profile.save.assert_not_called()
+
+    def test_profile_users_other_than_reads_every_reference_form(self):
+        instance = mock.Mock()
+        instance.name = 'instance-00000001'
+        profile = mock.Mock(used_by=[
+            '/1.0/instances/instance-00000001?project=nova',
+            '/1.0/containers/instance-00000001',
+            '/1.0/instances/instance-00000001-rescue',
+            '/1.0/instances/instance-00000002?project=other',
+        ])
+
+        self.assertEqual(
+            ['instance-00000002'],
+            driver._profile_users_other_than(profile, instance))
+
+    def test_profile_users_other_than_treats_junk_as_foreign(self):
+        """An unreadable reference is not proof of self-ownership."""
+        instance = mock.Mock()
+        instance.name = 'instance-00000001'
+
+        self.assertEqual(
+            [], driver._profile_users_other_than(
+                mock.Mock(used_by=None), instance))
+        self.assertEqual(
+            [12345], driver._profile_users_other_than(
+                mock.Mock(used_by=[12345]), instance))
+
     @mock.patch.object(driver.storage, 'detach_ephemeral')
     @mock.patch.object(driver.IncusDriver, 'unplug_vifs')
     @mock.patch.object(driver.os.path, 'exists', return_value=False)
