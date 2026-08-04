@@ -6771,6 +6771,73 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         disconnect_mock = incus_driver._disconnect_profile_volume_connection
         disconnect_mock.assert_called_once_with(ctx, instance, volume_id)
 
+    def test_volume_journal_recovery_replays_only_terminal_disconnects(self):
+        """A disconnect journal is replayed once Nova drops the mapping."""
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-journal-recovery', memory_mb=0)
+        volume_id = '00000000-0000-0000-0000-0000000000aa'
+        connection_info = {
+            'driver_volume_type': 'rbd',
+            'serial': volume_id,
+            'data': {'name': 'volumes/volume-recover'},
+        }
+        driver._write_volume_journal(
+            instance, volume_id, connection_info, {'path': '/dev/rbd7'},
+            '/dev/vdb', phase='disconnecting')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        candidates = incus_driver.list_volume_journal_recovery_candidates()
+        candidate = next(
+            c for c in candidates if c['uuid'] == instance.uuid)
+        self.assertEqual([volume_id], candidate['volume_ids'])
+
+        connector = mock.Mock()
+        with mock.patch.object(driver, 'brick_get_connector',
+                               return_value=connector),                 mock.patch.object(
+                    driver.objects.BlockDeviceMappingList,
+                    'get_by_instance_uuid', return_value=[]):
+            incus_driver.recover_volume_journal_candidate(
+                ctx, instance, candidate)
+
+        connector.disconnect_volume.assert_called_once_with(
+            mock.ANY, {'path': '/dev/rbd7'})
+        self.assertEqual(
+            'volumes/volume-recover',
+            connector.disconnect_volume.call_args[0][0]['name'])
+        self.assertEqual({}, driver._volume_journal_records(instance))
+
+    def test_volume_journal_recovery_retains_a_still_mapped_volume(self):
+        """Nova still mapping the volume means the work is not terminal."""
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-journal-retained', memory_mb=0)
+        volume_id = '00000000-0000-0000-0000-0000000000bb'
+        connection_info = {
+            'driver_volume_type': 'rbd',
+            'serial': volume_id,
+            'data': {'name': 'volumes/volume-retained'},
+        }
+        driver._write_volume_journal(
+            instance, volume_id, connection_info, {'path': '/dev/rbd8'},
+            '/dev/vdb', phase='disconnecting')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        candidate = {'uuid': instance.uuid, 'volume_ids': [volume_id]}
+        bdm = mock.Mock(volume_id=volume_id, deleted=False)
+
+        connector = mock.Mock()
+        with mock.patch.object(driver, 'brick_get_connector',
+                               return_value=connector),                 mock.patch.object(
+                    driver.objects.BlockDeviceMappingList,
+                    'get_by_instance_uuid', return_value=[bdm]):
+            incus_driver.recover_volume_journal_candidate(
+                ctx, instance, candidate)
+
+        connector.disconnect_volume.assert_not_called()
+        self.assertIn(
+            volume_id, driver._volume_journal_records(instance))
+
     def test_power_on_cleans_proven_stale_volume_journal(self):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(

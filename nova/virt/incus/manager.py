@@ -1862,6 +1862,65 @@ class IncusComputeManager(manager.ComputeManager):
 
     @periodic_task.periodic_task(
         spacing=CONF.incus.migration_recovery_interval)
+    def _recover_incus_volume_journals(self, context):
+        """Finish volume work this compute started but did not complete.
+
+        The driver's journal is durable before both connect and disconnect,
+        so a process that dies inside either leaves one behind and the
+        operation can be replayed. Replay is safe because os-brick connect
+        and disconnect are idempotent for an exact volume identity.
+
+        A journal is only evidence that *this* compute began the work. It is
+        never sufficient on its own: the exact Nova instance must still exist
+        here, be free of an in-flight task, and no longer carry that volume
+        as an attached block device mapping. Anything ambiguous keeps the
+        journal and reports it, because acting on a volume whose ownership
+        moved would disconnect storage another host is using.
+        """
+        if not CONF.incus.migration_auto_recovery:
+            return
+
+        context = context or nova.context.get_admin_context()
+        try:
+            candidates = (
+                self.driver.list_volume_journal_recovery_candidates())
+        except Exception:
+            LOG.exception('Failed to list Incus Cinder journal recovery work')
+            return
+
+        for candidate in candidates:
+            instance_uuid = candidate['uuid']
+            with lockutils.lock(
+                    _share_recovery_lock_name(instance_uuid),
+                    external=True, lock_path=CONF.state_path):
+                try:
+                    instance = objects.Instance.get_by_uuid(
+                        context, instance_uuid)
+                except exception.InstanceNotFound:
+                    LOG.error(
+                        'Cinder journal for %s references a deleted Nova '
+                        'instance; retaining it', instance_uuid)
+                    continue
+                except Exception:
+                    LOG.exception(
+                        'Failed to verify Nova ownership for a Cinder '
+                        'journal; retaining it')
+                    continue
+                if instance.host != self.host or instance.task_state:
+                    LOG.debug(
+                        'Retaining Cinder journal while Nova ownership is '
+                        'unresolved', instance=instance)
+                    continue
+                try:
+                    self.driver.recover_volume_journal_candidate(
+                        context, instance, candidate)
+                except Exception:
+                    LOG.exception(
+                        'Automatic Incus Cinder journal recovery failed',
+                        instance=instance)
+
+    @periodic_task.periodic_task(
+        spacing=CONF.incus.migration_recovery_interval)
     def _recover_incus_bfv_migration_targets(self, context):
         if not CONF.incus.migration_auto_recovery:
             return

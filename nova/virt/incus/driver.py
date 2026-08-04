@@ -2638,6 +2638,46 @@ def _volume_journal_records(instance):
     return records
 
 
+def _volume_journal_records_by_uuid(instance_uuid):
+    """Read journals for an instance whose Nova object may not be loadable.
+
+    Recovery enumerates the journal tree before it knows which instances
+    still exist, so it cannot build the instance object the ownership check
+    in _volume_journal_records() needs. Every record still has to name this
+    exact instance UUID and hash to its own filename; anything else is
+    reported so the caller keeps the journal instead of acting on it.
+    """
+    journal_dir = os.path.join(
+        CONF.instances_path, 'incus-volume-journal', instance_uuid)
+    try:
+        names = os.listdir(journal_dir)
+    except FileNotFoundError:
+        return {}
+    records = {}
+    for name in names:
+        if not name.endswith('.json'):
+            continue
+        try:
+            with open(os.path.join(journal_dir, name), encoding='utf-8') as f:
+                payload = json.load(f)
+        except (OSError, ValueError) as exc:
+            raise exception.InvalidVolume(
+                reason='Host Cinder cleanup journal is unreadable: %s' % exc)
+        volume_id = payload.get('volume_id') if isinstance(
+            payload, dict) else None
+        if (not isinstance(payload, dict) or
+                payload.get('version') != _VOLUME_JOURNAL_VERSION or
+                payload.get('instance_uuid') != instance_uuid or
+                not isinstance(volume_id, str) or
+                not isinstance(payload.get('attachment'), dict) or
+                hashlib.sha256(
+                    volume_id.encode('utf-8')).hexdigest() + '.json' != name):
+            raise exception.InvalidVolume(
+                reason='Host Cinder cleanup journal ownership is invalid')
+        records[volume_id] = payload['attachment']
+    return records
+
+
 def _remove_volume_journal(instance, volume_id):
     journal_dir = _volume_journal_directory(instance)
     try:
@@ -8118,6 +8158,72 @@ class IncusDriver(driver.ComputeDriver):
     def list_share_journal_recovery_candidates(self):
         """Return migration journal owners for manager-side validation."""
         return _share_journal_recovery_candidates()
+
+    def recover_volume_journal_candidate(self, context, instance, candidate):
+        """Replay an unfinished disconnect the manager has proven terminal."""
+        if candidate.get('uuid') != instance.uuid:
+            raise exception.InvalidVolume(
+                reason='Cinder journal candidate is not this instance')
+        records = _volume_journal_records(instance)
+        for volume_id in candidate.get('volume_ids', ()):
+            attachment = records.get(volume_id)
+            if attachment is None:
+                continue
+            if attachment.get('phase') != 'disconnecting':
+                # A 'connecting' journal belongs to the attach path, which
+                # replays it under the caller's own topology lock.
+                continue
+            bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
+                context, instance.uuid)
+            if any(bdm.volume_id == volume_id and not bdm.deleted
+                   for bdm in bdms):
+                LOG.debug(
+                    'Retaining the Cinder journal for %s while Nova still '
+                    'maps it to this instance', volume_id, instance=instance)
+                continue
+            connection_data = attachment.get('connection_data') or {}
+            if not connection_data:
+                raise exception.InvalidVolume(
+                    reason='Cinder journal has no connector data')
+            protocol = attachment.get('driver_volume_type')
+            if not protocol:
+                raise exception.InvalidVolume(
+                    reason='Cinder journal has no connector protocol')
+            LOG.warning(
+                'Replaying the unfinished Cinder disconnect for volume %s',
+                volume_id, instance=instance)
+            brick_get_connector(protocol).disconnect_volume(
+                connection_data, attachment.get('device_info') or {})
+            _remove_volume_journal(instance, volume_id)
+
+    def list_volume_journal_recovery_candidates(self):
+        """Return unfinished volume journals for manager-side validation.
+
+        The journal is durable before both connect and disconnect, so a
+        process that dies inside either leaves one behind. Nova's compute
+        manager can also die before this driver is entered at all, in which
+        case there is no journal and only the mapping reconciler can see the
+        divergence; these two mechanisms answer different questions and are
+        both needed.
+        """
+        candidates = []
+        journal_root = os.path.join(
+            CONF.instances_path, 'incus-volume-journal')
+        try:
+            instance_uuids = sorted(os.listdir(journal_root))
+        except FileNotFoundError:
+            return candidates
+        for instance_uuid in instance_uuids:
+            if not uuidutils.is_uuid_like(instance_uuid):
+                continue
+            records = _volume_journal_records_by_uuid(instance_uuid)
+            if not records:
+                continue
+            candidates.append({
+                'uuid': instance_uuid,
+                'volume_ids': sorted(records),
+            })
+        return candidates
 
     def recover_share_journal_candidate(self, instance, candidate):
         """Clean one terminal migration journal after rechecking runtime."""
