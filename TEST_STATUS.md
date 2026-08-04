@@ -1769,3 +1769,44 @@ allocations + 6 slots + 6 host claims for 6 servers), the RBD pool to its 6
 container roots, and all three nodes to zero fencing migration attempts.
 Everything downstream of the marker already worked; the marker was the only
 broken link.
+
+### Where the ~20 s inside `incusd` goes: 38 Python `ceph` spawns per delete
+
+Sampling every process `incusd` forks during one Nova delete on an idle
+node (32.9 s wall, repeated twice with the same result):
+
+| invocations | command |
+| --- | --- |
+| **38** | `ceph --name client.incus osd map <pool> rbd_directory --format json` |
+| 8 | `rbd trash ls` |
+| 8 | `rbd info incus_identity_release_<digest>` |
+| 5 | `rbd info incus_identity_quarantine_<digest>` |
+| 5 + 5 | `rbd info container_nova_<instance>` (json and plain) |
+| 1 each | `rbd unmap`, `rbd mv`, `rbd snap ls`, `rbd trash mv`, `rbd trash rm` |
+
+Cumulative sampled runtime attributes 9.8 s of the delete to that one
+`ceph` command and 0.2-0.4 s to each `rbd` command. The difference is the
+binary: `rbd` is C++, while `ceph` is `/usr/bin/python3 /usr/bin/ceph`, so
+each invocation pays interpreter startup plus a mon round-trip.
+
+The arithmetic is exact. `getRBDVolumeIdentity`
+(`driver_ceph_identity_release.go:171`) brackets its `rbd info` with two
+`getRBDPoolIdentity()` calls, an ABA guard proving the pool was not deleted
+and recreated under the read. Eighteen identity lookups per delete times two
+pool reads each is thirty-six, plus two more, which is the thirty-eight
+observed. The same three images are re-identified five to eight times within
+a single delete.
+
+Two independent levers, and they differ in risk:
+
+1. **Redundant lookups.** Re-identifying the same image five to eight times
+   inside one locked delete is repeated work, not a guarantee. Collapsing
+   that is safety-neutral and is the larger share.
+2. **Cost per pool read.** The value needed is only the pool's numeric ID.
+   Obtaining it through the Python CLI costs roughly 0.25 s against a few
+   milliseconds of real work.
+
+Lever 2 touches the ABA guard's semantics and must not be weakened
+unilaterally: caching the pool identity would still catch pool recreation
+between operations but no longer within one. Lever 1 requires no such
+trade-off. Not yet implemented.
