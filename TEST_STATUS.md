@@ -90,11 +90,22 @@ periodic completes an interrupted disconnect when, and only when, the
 exact instance is still local, has no in-flight task, and Nova no longer
 maps that volume to it.
 
-Still open: ``init_host`` reconciliation calling ``roll_detaching`` for a
-volume left in ``detaching`` whose BDM and host mapping both still say
-attached. That is the only remaining path for the window before the
-driver is entered, and process start is the only moment it can be
-observed.
+Closed by ``da84d47``: ``init_host`` now calls ``roll_detaching`` for a
+volume left in ``detaching`` whose block device mapping and host mapping
+both still say attached. It runs at startup rather than periodically
+because that residue can only be produced by process death, and polling
+Cinder per instance every cycle is the kind of hotspot the scale work is
+meant to remove. ``holds_volume_attachment()`` keeps the two recovery
+mechanisms from fighting over one volume: a journal means the driver
+reached the disconnect and journal recovery owns the outcome; a profile
+device with no journal means nothing was released.
+
+All three cases now pass through
+``tools/openstack-incus-rollback-idempotency-e2e.sh``: the repeated
+detach is a no-op, the interrupted detach rolls back to ``in-use`` with
+the guest still holding the volume and then retries cleanly to no host
+mapping and no journal, and the failed migration leaves the instance
+ACTIVE on its source with an unchanged guest PID.
 
 ## 2026-08-03 Two abort-path defects reported from the LB provider
 
