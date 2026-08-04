@@ -289,6 +289,29 @@ in `TEST_STATUS.md`; this section keeps only the rules.
   Never claim automatic BFV recovery when a compute still starts the stock
   `nova-compute` binary.
 
+### Live migration safety model
+
+- Live migration is CRIU checkpoint/restore: the source is frozen, dumped,
+  transferred, and only then restored on the destination. The destination
+  cannot run until it holds the complete image set, so the failure semantics
+  are those of libvirt's pre-copy mode — an interrupted or failed migration
+  leaves the workload intact on its source and is safely rolled back. This is
+  proven by the `INJECT_RESTORE_FAILURE=1` case: the source resumes from its
+  checkpoint with the same guest PID and a continuing counter, the
+  destination keeps nothing, and the same instance migrates successfully
+  immediately afterwards.
+- **Never introduce post-copy semantics.** There is deliberately no
+  `live_migration_force_complete` implementation, so the API that switches a
+  libvirt migration to post-copy cannot do anything here. Post-copy resumes
+  the guest on the destination before its memory has arrived and faults the
+  remainder across the network; a failure after that switch leaves memory
+  split across two hosts and destroys the workload. That trade is not
+  available to this driver, whatever the convergence pressure.
+- Iterative pre-copy (CRIU pre-dump) is currently not enabled, so downtime
+  grows with the guest's memory rather than with its write rate. Enabling
+  pre-dump later to shorten downtime is acceptable because it stays within
+  the pre-copy family; switching to demand paging is not.
+
 ### Migration attempt fencing and conductor concurrency
 
 - A migration attempt reserves its isolated ID-map range for as long as it is
