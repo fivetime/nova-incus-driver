@@ -1745,7 +1745,27 @@ the allocation while a profile of that name exists -- it logs "Incus profile
 instance-000005e5 still exists; retaining idmap release intent" every 60 s.
 The registry therefore holds 7 allocations for 6 servers, permanently.
 
-The fail-closed behaviour is right; the gap is that a delete which races its
-own build can leave a profile that no marker claims. This is the same shape
-as the 2026-08 cleanup defects: the recovery marker only exists on a path
-that did not run. It is narrow -- one in 120, all of them deleted mid-build.
+The fail-closed behaviour is right. The gap was in the retention path
+itself: it refuses to write the recovery marker when `profile.used_by` is
+non-empty, to avoid claiming a profile another instance uses -- but the
+usual reason a cleanup could not finish is that this instance's own
+container is still there, which is exactly what makes `used_by` non-empty.
+The compute logged both halves in the same second: "Refusing to mark a
+foreign or in-use Incus profile for automatic cleanup" and "Incus instance
+nova/instance-000005e5 still matches Nova instance 4d6ffd8a-...". Same shape
+as the 2026-08 cleanup defects: the marker is withheld at the one moment it
+is needed.
+
+Fixed in `aa9c197`: only another instance's usage makes the profile foreign,
+so `used_by` is compared against this instance's own container and its
+rescue container, and an unparseable reference still counts as foreign.
+
+Verified on the stranded profile itself. Writing the marker that the fix now
+writes automatically let `_recover_incus_cleanup_profiles` reclaim the
+profile on its next cycle, after which the ID-map reconciler released the
+allocation on its own next cycle with no further intervention. The registry
+returned from 22 entries to exactly its 19-entry baseline (1 config + 6
+allocations + 6 slots + 6 host claims for 6 servers), the RBD pool to its 6
+container roots, and all three nodes to zero fencing migration attempts.
+Everything downstream of the marker already worked; the marker was the only
+broken link.
