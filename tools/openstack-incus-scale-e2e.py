@@ -47,6 +47,9 @@ RUN_METADATA_KEY = 'openstack_incus_scale_run'
 CLEANUP_METADATA_KEY = 'openstack_incus_scale_cleanup'
 ORDINAL_METADATA_KEY = 'openstack_incus_scale_ordinal'
 INCUS_SYSTEM_CONTAINER_TRAIT = 'CUSTOM_INCUS_SYSTEM_CONTAINER'
+# Resource-provider traits are placement 1.6; everything else this runner
+# reads from Placement is available at or below it.
+PLACEMENT_MICROVERSION = 'placement 1.6'
 INCUS_STORAGE_POOL_TRAIT_PREFIX = 'CUSTOM_INCUS_STORAGE_POOL_'
 ALLOWED_BUILD_STATES = {'ACTIVE', 'BUILD'}
 ABSENCE_CONFIRMATIONS = 2
@@ -1430,7 +1433,13 @@ class ScaleRun:
             raise ScaleFailure(
                 'OpenStackSDK connection does not expose Placement REST')
         try:
-            response = placement.get(path, params=params)
+            # Provider traits arrived in placement 1.6 and the SDK
+            # negotiates 1.0 by default, where that route 404s. Ask for the
+            # exact microversion this validation needs instead of whatever
+            # the client happens to default to.
+            response = placement.get(
+                path, params=params,
+                headers={'OpenStack-API-Version': PLACEMENT_MICROVERSION})
         except Exception as exc:
             raise ScaleFailure(
                 '{} failed: {}: {}'.format(

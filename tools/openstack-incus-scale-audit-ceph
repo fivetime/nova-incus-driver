@@ -1,0 +1,54 @@
+#!/bin/bash
+# Copyright 2026 OpenStack Incus Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
+# not use this file except in compliance with the License. You may obtain
+# a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations
+# under the License.
+#
+# Emit read-only Ceph identity, health and root-pool capacity evidence for
+# tools/openstack-incus-scale-e2e.py --ceph-status-command.
+#
+# pool_max_bytes is the pool quota. Zero means no quota, which the runner
+# reads as "capacity is bounded by the cluster, not by this pool".
+#
+# Environment:
+#   INCUS_RBD_POOL  root pool name (default incus-rootfs-rbd-pool)
+#   INCUS_RBD_ID    Ceph client id  (default incus)
+set -euo pipefail
+
+pool=${INCUS_RBD_POOL:-incus-rootfs-rbd-pool}
+ceph_id=${INCUS_RBD_ID:-incus}
+
+status=$(ceph --id "$ceph_id" -s --format json)
+df=$(ceph --id "$ceph_id" df --format json)
+quota=$(ceph --id "$ceph_id" osd pool get-quota "$pool" --format json)
+nearfull=$(ceph --id "$ceph_id" osd dump --format json)
+
+jq -nc \
+    --argjson status "$status" \
+    --argjson df "$df" \
+    --argjson quota "$quota" \
+    --argjson osd "$nearfull" \
+    --arg pool "$pool" '
+    ($df.pools[] | select(.name == $pool)) as $p |
+    {
+        fsid: $status.fsid,
+        health: $status.health.status,
+        pool: $pool,
+        available_bytes: ($df.stats.total_avail_bytes | floor),
+        pool_stored_bytes: (($p.stats.stored // 0) | floor),
+        pool_max_bytes: (($quota.quota_max_bytes // 0) | floor),
+        raw_used_bytes: ($df.stats.total_used_raw_bytes | floor),
+        raw_used_ratio: ($df.stats.total_used_raw_ratio),
+        nearfull_ratio: ($osd.nearfull_ratio),
+        full_ratio: ($osd.full_ratio),
+        pool_available_bytes: (($p.stats.max_avail // 0) | floor)
+    }'

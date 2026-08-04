@@ -1,0 +1,33 @@
+#!/bin/bash
+# Copyright 2026 OpenStack Incus Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
+# not use this file except in compliance with the License. You may obtain
+# a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations
+# under the License.
+#
+# Emit every Incus container root image in the audited RBD pool as a JSON
+# list, for tools/openstack-incus-scale-e2e.py --rbd-inventory-command.
+#
+# Only container roots are reported. The image cache (image_*, carrying the
+# per-node ceph.rbd.image_prefix) and the pool's own marker objects are not
+# instance state and the scale runner rejects them by design.
+#
+# Environment:
+#   INCUS_RBD_POOL  root pool name (default incus-rootfs-rbd-pool)
+#   INCUS_RBD_ID    Ceph client id  (default incus)
+set -euo pipefail
+
+pool=${INCUS_RBD_POOL:-incus-rootfs-rbd-pool}
+ceph_id=${INCUS_RBD_ID:-incus}
+
+rbd --id "$ceph_id" -p "$pool" ls --format json |
+    jq -c '[.[] | select(startswith("container_") or
+                         startswith("zombie_container_"))]'

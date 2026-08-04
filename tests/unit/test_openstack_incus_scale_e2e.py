@@ -1397,7 +1397,7 @@ class ScaleRunnerTest(unittest.TestCase):
         server_id = str(uuid.uuid4())
         provider_id = str(uuid.uuid4())
 
-        def placement_get(path, params=None):
+        def placement_get(path, params=None, headers=None):
             if path == '/allocations/{}'.format(server_id):
                 return FakeResponse({
                     'allocations': {
@@ -1659,6 +1659,36 @@ class ScaleRunnerTest(unittest.TestCase):
         with self.assertRaisesRegex(
                 scale.ScaleFailure, 'runtime_errors'):
             run.audit_incus({server_id: server})
+
+
+class PlacementMicroversionTest(unittest.TestCase):
+    """Provider traits are placement 1.6; the SDK negotiates 1.0."""
+
+    def _run(self, response):
+        run = scale.ScaleRun.__new__(scale.ScaleRun)
+        calls = []
+
+        class _Placement:
+            def get(self, path, params=None, headers=None):
+                calls.append((path, params, headers))
+                return response
+
+        run.connection = types.SimpleNamespace(placement=_Placement())
+        return run, calls
+
+    def test_every_placement_read_pins_the_microversion(self):
+        response = types.SimpleNamespace(
+            status_code=200, headers={},
+            json=lambda: {'traits': ['CUSTOM_INCUS_SYSTEM_CONTAINER']})
+        run, calls = self._run(response)
+
+        run._placement_get('/resource_providers/x/traits', 'traits')
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual(
+            {'OpenStack-API-Version': scale.PLACEMENT_MICROVERSION},
+            calls[0][2])
+        self.assertEqual('placement 1.6', scale.PLACEMENT_MICROVERSION)
 
 
 if __name__ == '__main__':

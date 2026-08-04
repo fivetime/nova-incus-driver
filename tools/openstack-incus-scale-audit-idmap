@@ -1,0 +1,79 @@
+#!/bin/bash
+# Copyright 2026 OpenStack Incus Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
+# not use this file except in compliance with the License. You may obtain
+# a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations
+# under the License.
+#
+# Emit the complete ID-map etcd namespace as
+# {"revision": "<n>", "entries": [{"key": ..., "value": ...}]} for
+# tools/openstack-incus-scale-e2e.py --idmap-inventory-command.
+#
+# Values stay schema opaque on purpose: the runner only needs to associate
+# records with instance UUIDs and detect residue, so allocation, claim and
+# any later record type audit through the same interface. One range request
+# returns them all at one revision.
+#
+# Environment:
+#   IDMAP_ETCD_ENDPOINT   default https://127.0.0.1:12379
+#   IDMAP_ETCD_NAMESPACE  default region-one-cell1
+#   IDMAP_ETCD_CREDS_DIR  default /etc/nova/idmap-etcd
+#   IDMAP_ETCD_USER       default nova-incus
+set -euo pipefail
+
+endpoint=${IDMAP_ETCD_ENDPOINT:-https://127.0.0.1:12379}
+namespace=${IDMAP_ETCD_NAMESPACE:-region-one-cell1}
+creds=${IDMAP_ETCD_CREDS_DIR:-/etc/nova/idmap-etcd}
+user=${IDMAP_ETCD_USER:-nova-incus}
+prefix="/openstack-incus/idmaps/v3/${namespace}/"
+
+curl_etcd() {
+    curl -fsS \
+        --cacert "$creds/ca.crt" \
+        --cert "$creds/nova-incus-idmap.crt" \
+        --key "$creds/nova-incus-idmap.key" \
+        -H 'Content-Type: application/json' "$@"
+}
+
+token=$(jq -nc --arg name "$user" \
+        --arg password "$(cat "$creds/password")" \
+        '{name: $name, password: $password}' |
+    curl_etcd --data @- "$endpoint/v3/auth/authenticate" | jq -er .token)
+
+range=$(python3 - "$prefix" <<'PY'
+import base64
+import sys
+
+raw = bytearray(sys.argv[1].encode())
+key = base64.b64encode(bytes(raw)).decode()
+while raw and raw[-1] == 0xFF:
+    raw.pop()
+if not raw:
+    raise SystemExit('cannot range over an empty prefix')
+raw[-1] += 1
+print(key)
+print(base64.b64encode(bytes(raw)).decode())
+PY
+)
+key=$(printf '%s' "$range" | sed -n 1p)
+range_end=$(printf '%s' "$range" | sed -n 2p)
+
+jq -nc --arg key "$key" --arg range_end "$range_end" \
+        '{key: $key, range_end: $range_end}' |
+    curl_etcd -H "Authorization: $token" \
+        --data @- "$endpoint/v3/kv/range" |
+    jq -c '{
+        revision: .header.revision,
+        entries: [(.kvs // [])[] | {
+            key: (.key | @base64d),
+            value: (.value | @base64d)
+        }]
+    }'
