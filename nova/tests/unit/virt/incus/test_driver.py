@@ -15763,6 +15763,29 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertIn('mapping is uncertain', ' '.join(assessment.reasons))
 
 
+class TimedPhaseTest(test.NoDBTestCase):
+    def test_timed_phase_logs_success(self):
+        instance = mock.Mock(uuid='00000000-0000-0000-0000-0000000000aa')
+        with self.assertLogs('nova.virt.incus.driver', level='INFO') as logs:
+            with driver.IncusDriver._timed_phase(instance, 'spawn', 'x'):
+                pass
+        line = logs.output[-1]
+        self.assertIn('timing operation=spawn phase=x outcome=ok', line)
+        self.assertIn('duration_ms=', line)
+
+    def test_timed_phase_logs_failure_and_reraises(self):
+        instance = mock.Mock(uuid='00000000-0000-0000-0000-0000000000ab')
+
+        def run():
+            with driver.IncusDriver._timed_phase(instance, 'spawn', 'y'):
+                raise ValueError('phase failure')
+
+        with self.assertLogs('nova.virt.incus.driver', level='INFO') as logs:
+            self.assertRaises(ValueError, run)
+        self.assertIn(
+            'timing operation=spawn phase=y outcome=error', logs.output[-1])
+
+
 class SaveProfileMarkerTest(test.NoDBTestCase):
     """The durable-marker save tolerates backup.yaml resync failures only."""
 

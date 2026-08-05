@@ -17,6 +17,7 @@ from __future__ import absolute_import
 
 import base64
 import copy
+import contextlib
 from contextlib import closing
 import dataclasses
 from dataclasses import dataclass
@@ -5310,6 +5311,33 @@ class IncusDriver(driver.ComputeDriver):
         raise exception.BuildAbortException(
             instance_uuid=instance.uuid, reason=reason) from exc
 
+    @staticmethod
+    @contextlib.contextmanager
+    def _timed_phase(instance, operation, phase):
+        """Log one structured duration line for an operation phase.
+
+        The line is emitted on success and on failure alike, so an aborted
+        operation still records where its time went. Fields are structured
+        (operation=, phase=, outcome=, duration_ms=) for direct aggregation
+        from journal output.
+        """
+        watch = timeutils.StopWatch()
+        watch.start()
+        outcome = 'ok'
+        try:
+            yield
+        except BaseException:
+            outcome = 'error'
+            raise
+        finally:
+            LOG.info(
+                'timing operation=%(operation)s phase=%(phase)s '
+                'outcome=%(outcome)s duration_ms=%(ms)d',
+                {'operation': operation, 'phase': phase,
+                 'outcome': outcome,
+                 'ms': int(watch.elapsed() * 1000)},
+                instance=instance)
+
     def init_host(self, host):
         """Initialize the driver on the host.
 
@@ -7305,38 +7333,42 @@ class IncusDriver(driver.ComputeDriver):
         See `nova.virt.driver.ComputeDriver.spawn` for more
         information.
         """
+        spawn_watch = timeutils.StopWatch()
+        spawn_watch.start()
         root_volume = None
         root_device = None
         materialization = None
         materialization_id = uuidutils.generate_uuid()
-        spawn_attempt = self._create_spawn_preflight_attempt(
-            instance, materialization_id)
-        try:
-            root_volume, root_device, data_volume_bdms = (
-                self._spawn_root_device_preflight(
-                    context, instance, image_meta, network_info,
-                    block_device_info))
-        except (exception.Invalid,
-                exception.MultiattachNotSupportedByVirtDriver) as exc:
-            self._spawn_build_abort(instance, exc)
+        with self._timed_phase(instance, 'spawn', 'preflight'):
+            spawn_attempt = self._create_spawn_preflight_attempt(
+                instance, materialization_id)
+            try:
+                root_volume, root_device, data_volume_bdms = (
+                    self._spawn_root_device_preflight(
+                        context, instance, image_meta, network_info,
+                        block_device_info))
+            except (exception.Invalid,
+                    exception.MultiattachNotSupportedByVirtDriver) as exc:
+                self._spawn_build_abort(instance, exc)
 
-        try:
-            self.client.instances.get(instance.name)
-            raise exception.InstanceExists(name=instance.name)
-        except incus_exceptions.LXDAPIException as e:
-            if not _is_incus_not_found(e):
-                raise  # Re-raise the exception if it wasn't NotFound
+            try:
+                self.client.instances.get(instance.name)
+                raise exception.InstanceExists(name=instance.name)
+            except incus_exceptions.LXDAPIException as e:
+                if not _is_incus_not_found(e):
+                    raise  # Re-raise the exception if it wasn't NotFound
 
-        spawn_attempt = self._open_spawn_attempt(instance, spawn_attempt)
-        try:
-            materialization = self._begin_idmap_materialization(
-                instance, materialization_id, root_device)
-        except incus_idmap.IDMapError as exc:
-            raise exception.InvalidConfiguration(
-                'Cannot register a deployment-wide Incus root '
-                'materialization: {}'.format(
-                    exc)) from exc
-        self._finish_spawn_attempt_open(instance, spawn_attempt)
+        with self._timed_phase(instance, 'spawn', 'idmap_materialization'):
+            spawn_attempt = self._open_spawn_attempt(instance, spawn_attempt)
+            try:
+                materialization = self._begin_idmap_materialization(
+                    instance, materialization_id, root_device)
+            except incus_idmap.IDMapError as exc:
+                raise exception.InvalidConfiguration(
+                    'Cannot register a deployment-wide Incus root '
+                    'materialization: {}'.format(
+                        exc)) from exc
+            self._finish_spawn_attempt_open(instance, spawn_attempt)
 
         instance_dir = common.InstanceAttributes(instance).instance_dir
         if not os.path.exists(instance_dir):
@@ -7344,14 +7376,29 @@ class IncusDriver(driver.ComputeDriver):
 
         if not root_volume:
             # A Cinder root volume already contains the prepared rootfs.
-            try:
-                self.client.images.get_by_alias(instance.image_ref)
-            except incus_exceptions.LXDAPIException as e:
-                if not _is_incus_not_found(e):
-                    raise
+            with self._timed_phase(instance, 'spawn', 'image_sync'):
                 try:
-                    _sync_glance_image_to_incus(
-                        self.client, context, instance.image_ref)
+                    self.client.images.get_by_alias(instance.image_ref)
+                except incus_exceptions.LXDAPIException as e:
+                    if not _is_incus_not_found(e):
+                        raise
+                    try:
+                        _sync_glance_image_to_incus(
+                            self.client, context, instance.image_ref)
+                    except Exception:
+                        with excutils.save_and_reraise_exception():
+                            self._abort_idmap_materialization(
+                                materialization)
+                            self.cleanup(
+                                context, instance, network_info,
+                                block_device_info)
+
+        # Plug in the network
+        if network_info:
+            with self._timed_phase(instance, 'spawn', 'vif_plug'):
+                try:
+                    self._plug_vifs_for_spawn(
+                        context, instance, network_info, block_device_info)
                 except Exception:
                     with excutils.save_and_reraise_exception():
                         self._abort_idmap_materialization(materialization)
@@ -7359,29 +7406,19 @@ class IncusDriver(driver.ComputeDriver):
                             context, instance, network_info,
                             block_device_info)
 
-        # Plug in the network
-        if network_info:
+        # Create the profile
+        with self._timed_phase(instance, 'spawn', 'profile'):
             try:
-                self._plug_vifs_for_spawn(
-                    context, instance, network_info, block_device_info)
-            except Exception:
+                profile = flavor.to_profile(
+                    self.client, instance, network_info, block_device_info)
+                if root_volume:
+                    profile.devices['root'] = root_device
+                    profile.save()
+            except incus_exceptions.LXDAPIException:
                 with excutils.save_and_reraise_exception():
                     self._abort_idmap_materialization(materialization)
                     self.cleanup(
                         context, instance, network_info, block_device_info)
-
-        # Create the profile
-        try:
-            profile = flavor.to_profile(
-                self.client, instance, network_info, block_device_info)
-            if root_volume:
-                profile.devices['root'] = root_device
-                profile.save()
-        except incus_exceptions.LXDAPIException:
-            with excutils.save_and_reraise_exception():
-                self._abort_idmap_materialization(materialization)
-                self.cleanup(
-                    context, instance, network_info, block_device_info)
 
         # Create the container
         container_config = {
@@ -7401,50 +7438,53 @@ class IncusDriver(driver.ComputeDriver):
             'source': ({'type': 'none'} if root_volume else {
                 'type': 'image', 'alias': instance.image_ref}),
         }
-        try:
-            container = self._with_rootfs_materialization_barrier(
-                materialization, container_config['config'],
-                lambda: self.client.instances.create(
-                    container_config, wait=True),
-                recover_action=lambda: self.client.instances.get(
-                    instance.name))
-        except Exception:
-            with excutils.save_and_reraise_exception():
-                self.cleanup(
-                    context, instance, network_info, block_device_info)
+        with self._timed_phase(instance, 'spawn', 'incus_create'):
+            try:
+                container = self._with_rootfs_materialization_barrier(
+                    materialization, container_config['config'],
+                    lambda: self.client.instances.create(
+                        container_config, wait=True),
+                    recover_action=lambda: self.client.instances.get(
+                        instance.name))
+            except Exception:
+                with excutils.save_and_reraise_exception():
+                    self.cleanup(
+                        context, instance, network_info, block_device_info)
 
         attached_data_volumes = []
         try:
-            incus_config = self.client.host_info
-            storage.attach_ephemeral(
-                self.client, block_device_info, incus_config, instance)
-            # Nova's initial BDM preparation creates and completes the Cinder
-            # attachments with do_driver_attach=False. The virt driver's
-            # spawn transaction must therefore connect every non-root volume
-            # before the guest is first started.
-            for bdm in data_volume_bdms:
-                self.attach_volume(
-                    context, bdm['connection_info'], instance,
-                    bdm['mount_device'], encryption=bdm.get('encrypted'))
-                attached_data_volumes.append(bdm)
+            with self._timed_phase(instance, 'spawn', 'volumes'):
+                incus_config = self.client.host_info
+                storage.attach_ephemeral(
+                    self.client, block_device_info, incus_config, instance)
+                # Nova's initial BDM preparation creates and completes the
+                # Cinder attachments with do_driver_attach=False. The virt
+                # driver's spawn transaction must therefore connect every
+                # non-root volume before the guest is first started.
+                for bdm in data_volume_bdms:
+                    self.attach_volume(
+                        context, bdm['connection_info'], instance,
+                        bdm['mount_device'], encryption=bdm.get('encrypted'))
+                    attached_data_volumes.append(bdm)
 
             if configdrive.required_by(instance):
-                configdrive_path = self._add_configdrive(
-                    context, instance,
-                    injected_files, admin_password,
-                    network_info)
+                with self._timed_phase(instance, 'spawn', 'configdrive'):
+                    configdrive_path = self._add_configdrive(
+                        context, instance,
+                        injected_files, admin_password,
+                        network_info)
 
-                profile = self.client.profiles.get(instance.name)
-                config_drive = {
-                    'configdrive': {
-                        'path': '/config-drive',
-                        'source': configdrive_path,
-                        'type': 'disk',
-                        'readonly': 'true',
+                    profile = self.client.profiles.get(instance.name)
+                    config_drive = {
+                        'configdrive': {
+                            'path': '/config-drive',
+                            'source': configdrive_path,
+                            'type': 'disk',
+                            'readonly': 'true',
+                        }
                     }
-                }
-                profile.devices.update(config_drive)
-                profile.save()
+                    profile.devices.update(config_drive)
+                    profile.save()
 
             self.firewall_driver.setup_basic_filtering(
                 instance, network_info)
@@ -7452,7 +7492,8 @@ class IncusDriver(driver.ComputeDriver):
                 instance, network_info)
 
             if power_on:
-                self._start_instance_with_idmap(instance, container)
+                with self._timed_phase(instance, 'spawn', 'start'):
+                    self._start_instance_with_idmap(instance, container)
 
             self.firewall_driver.apply_instance_filter(
                 instance, network_info)
@@ -7461,6 +7502,10 @@ class IncusDriver(driver.ComputeDriver):
                 self._fence_failed_spawn(
                     context, instance, network_info, block_device_info,
                     materialization, attached_data_volumes)
+        LOG.info(
+            'timing operation=spawn phase=total outcome=ok '
+            'duration_ms=%(ms)d',
+            {'ms': int(spawn_watch.elapsed() * 1000)}, instance=instance)
 
     def _fence_failed_spawn(self, context, instance, network_info,
                             block_device_info, materialization,
