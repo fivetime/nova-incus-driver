@@ -5733,8 +5733,11 @@ class IncusDriver(driver.ComputeDriver):
             raise incus_idmap.IDMapConflict(
                 reason='Another materialization owns the Incus host claim')
         if instance is not None:
+            # An absent stamp is a build that died before Nova cached the
+            # assignment; the registry pair above is the authority. Only a
+            # present-but-different stamp is evidence of another generation.
             stored = _instance_idmap_metadata(instance)
-            if (stored is None or
+            if (stored is not None and
                     not _idmap_generation_matches_metadata(
                         assignment, stored)):
                 raise incus_idmap.IDMapIntegrityError(
@@ -5987,19 +5990,41 @@ class IncusDriver(driver.ComputeDriver):
         if self.idmap_allocator is None:
             return None, None, None
         assignment = self.idmap_allocator.get(instance.uuid)
+        # Raises on a partial or invalid stamp; absence returns None.
         stored = _instance_idmap_metadata(instance)
-        if (assignment is None or stored is None or
-                not _idmap_generation_matches_metadata(
-                    assignment, stored)):
-            raise incus_idmap.IDMapIntegrityError(
-                'Incus allocator generation does not match the Nova '
-                'instance metadata')
         host_id = virt_node.read_local_node_uuid()
         if not host_id:
             raise incus_idmap.IDMapConfigurationError(
                 'Nova has no persistent compute-node UUID')
+        if assignment is None:
+            claim = self.idmap_allocator.get_host_claim(
+                instance.uuid, host_id)
+            if claim is not None:
+                raise incus_idmap.IDMapIntegrityError(
+                    'A local Incus host claim exists without its allocation '
+                    'generation')
+            # No allocation and no local claim: the build never reached the
+            # allocator (a delete racing a queued build), or a delete retry
+            # arrived after the release already completed. Stale Nova
+            # metadata alone is not a resource; deletion must not demand
+            # evidence that only a successful build produces.
+            return None, None, None
+        if stored is not None and not _idmap_generation_matches_metadata(
+                assignment, stored):
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus allocator generation does not match the Nova '
+                'instance metadata')
+        # stored is None with a live assignment: the build died between the
+        # durable allocation and the Nova metadata stamp. The registry pair
+        # (assignment plus this host's exact claim) is the authority the
+        # release path verifies against; the stamp is Nova's cache of it.
         claim = self.idmap_allocator.get_host_claim(instance.uuid, host_id)
-        if claim is None or not _same_idmap_generation(claim, assignment):
+        if claim is None:
+            # The build never claimed this host. Local release work needs a
+            # claim; disposal of the bare allocation belongs to the terminal
+            # failed-build reconciler, which fences it by proving absence.
+            return None, None, None
+        if not _same_idmap_generation(claim, assignment):
             raise incus_idmap.IDMapIntegrityError(
                 'Local Incus root has no exact materialization claim')
         if claim.state == 'possible':
@@ -6018,7 +6043,13 @@ class IncusDriver(driver.ComputeDriver):
 
     def _settle_idmap_host_claim(
             self, instance, claim, final_delete=False, client=None):
-        """Persist then ACK exact Incus proof; never retire the claim."""
+        """Persist then ACK exact Incus proof; never retire the claim.
+
+        The one exception is a claim still ``unmaterialized`` whose
+        materialization attempt was never registered with Incus: it has no
+        proof to persist or acknowledge, so it is abandoned whole and
+        ``None`` is returned.
+        """
         if self.idmap_allocator is None:
             raise incus_idmap.IDMapIntegrityError(
                 'Cannot settle an idmap claim without the shared allocator')
@@ -6087,7 +6118,29 @@ class IncusDriver(driver.ComputeDriver):
                     raise
             return current
 
-        attempt = protocol.discover_materialization(identity)
+        try:
+            attempt = protocol.discover_materialization(identity)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+            if current.state != 'unmaterialized':
+                # The 'possible' transition happens only after the attempt
+                # is registered, and a registered attempt is only deleted
+                # after its proof made the claim 'cleaned'. A claim beyond
+                # 'unmaterialized' without a server attempt is therefore
+                # registry corruption, not a recoverable absence.
+                raise incus_idmap.IDMapIntegrityError(
+                    'Incus has no materialization attempt for a local claim '
+                    'that already issued its create request') from exc
+            # A claim still 'unmaterialized' proves the create request was
+            # never issued; with no server attempt registered there is
+            # nothing to abort, settle or prove. Abandon the never-
+            # registered claim in one CAS instead of demanding evidence
+            # that only a registered materialization produces.
+            self.idmap_allocator.abandon_unregistered_claim(
+                current.instance_uuid, current.host_id,
+                current.materialization_id, assignment=assignment)
+            return None
         if attempt.state == 'committed':
             raise incus_idmap.IDMapConflict(
                 reason='Committed materialization requires a release receipt')

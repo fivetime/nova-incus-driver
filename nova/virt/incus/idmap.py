@@ -2659,6 +2659,92 @@ class IDMapAllocator:
             instance_uuid, host_id, materialization_id, proof,
             assignment=assignment)
 
+    def abandon_unregistered_claim(self, instance_uuid, host_id,
+                                   materialization_id, assignment=None):
+        """Remove one ``unmaterialized`` claim whose attempt never existed.
+
+        The ``possible`` transition happens only after the materialization
+        attempt is registered with Incus, and a registered attempt is only
+        deleted after its cleanup proof made the claim ``cleaned``. A claim
+        still ``unmaterialized`` while Incus holds no attempt record
+        therefore proves the create request was never issued: there is no
+        rootfs, no proof, and nothing for the ordinary settle path to
+        consume. This is the single sanctioned proof-free removal; every
+        other disposal still goes through ``retire_claim`` with a durable
+        exact cleanup proof.
+        """
+        self._ensure_initialized()
+        instance_uuid = self._instance_uuid(instance_uuid)
+        host_id = self._host_id(host_id)
+        materialization_id = self._materialization_id(materialization_id)
+
+        for unused_attempt in range(64):
+            current, current_raw, unused_intent, unused_intent_raw, claims, \
+                claim_raws = self._read_assignment_state(instance_uuid)
+            if current is None:
+                return None
+            self._require_generation(current, assignment)
+            claim = claims.get(host_id)
+            if claim is None:
+                return current
+            if claim.materialization_id != materialization_id:
+                raise IDMapConflict(
+                    reason="another materialization owns the host claim")
+            if claim.state != "unmaterialized":
+                raise IDMapConflict(
+                    reason="only a never-registered unmaterialized claim "
+                           "may be abandoned without proof")
+            desired = IDMapAssignment(
+                instance_uuid=current.instance_uuid,
+                base=current.base,
+                size=current.size,
+                slot=current.slot,
+                allocation_id=current.allocation_id,
+                fingerprint=current.fingerprint,
+                host_ids=tuple(
+                    value for value in current.host_ids if value != host_id),
+            )
+            desired_raw = self._assignment_raw(
+                desired.instance_uuid, desired.slot,
+                desired.allocation_id, desired.host_ids)
+            host_key = self.host_claim_key(host_id, instance_uuid)
+            transaction = {
+                "compare": [
+                    self._compare_config(),
+                    self._compare_value(
+                        self.instance_key(instance_uuid), current_raw),
+                    self._compare_value(
+                        self.slot_key(current.slot), current_raw),
+                    self._compare_value(host_key, claim_raws[host_id]),
+                ],
+                "success": [
+                    self._put(self.instance_key(instance_uuid), desired_raw),
+                    self._put(self.slot_key(current.slot), desired_raw),
+                    self._delete(host_key),
+                ],
+                "failure": [],
+            }
+            try:
+                succeeded = self._transaction(transaction)
+            except IDMapBackendError:
+                observed, unused_raw, unused_intent, unused_intent_raw, \
+                    observed_claims, unused_claim_raws = (
+                        self._read_assignment_state(instance_uuid))
+                if observed is None or host_id not in observed_claims:
+                    return observed
+                raise
+            if not succeeded:
+                continue
+            observed, unused_raw, unused_intent, unused_intent_raw, \
+                observed_claims, unused_claim_raws = (
+                    self._read_assignment_state(instance_uuid))
+            if observed is None or host_id not in observed_claims:
+                return observed
+            raise IDMapIntegrityError(
+                reason="abandoned host claim still exists")
+        raise IDMapConflict(
+            reason="host claim abandonment could not win CAS")
+
     def retire_claim(self, instance_uuid, host_id, materialization_id,
                      assignment=None):
         """Retire a claim only after an exact cleanup proof is durable."""

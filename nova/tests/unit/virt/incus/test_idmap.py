@@ -765,6 +765,64 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
             assignment.instance_uuid, host_id, token,
             assignment=assignment)
 
+    def test_abandon_removes_unmaterialized_claim_without_proof(self):
+        assignment = self.allocator.allocate(self._uuid(210))
+        assignment, host_id, token = self._claim(
+            assignment, host_number=210, token_number=210)
+        current = self.allocator.abandon_unregistered_claim(
+            assignment.instance_uuid, host_id, token,
+            assignment=assignment)
+        self.assertNotIn(host_id, current.host_ids)
+        self.assertIsNone(self.allocator.get_host_claim(
+            assignment.instance_uuid, host_id))
+
+    def test_abandon_rejects_possible_claim(self):
+        assignment = self.allocator.allocate(self._uuid(211))
+        assignment, host_id, token = self._claim(
+            assignment, host_number=211, token_number=211)
+        self.allocator.mark_materialization_possible(
+            assignment.instance_uuid, host_id, token,
+            assignment=assignment)
+        self.assertRaisesRegex(
+            idmap.IDMapConflict, "unmaterialized",
+            self.allocator.abandon_unregistered_claim,
+            assignment.instance_uuid, host_id, token,
+            assignment=assignment)
+
+    def test_abandon_rejects_another_materialization_token(self):
+        assignment = self.allocator.allocate(self._uuid(212))
+        assignment, host_id, token = self._claim(
+            assignment, host_number=212, token_number=212)
+        self.assertRaisesRegex(
+            idmap.IDMapConflict, "another materialization",
+            self.allocator.abandon_unregistered_claim,
+            assignment.instance_uuid, host_id,
+            self._materialization(213),
+            assignment=assignment)
+
+    def test_abandon_is_idempotent_when_claim_is_gone(self):
+        assignment = self.allocator.allocate(self._uuid(214))
+        assignment, host_id, token = self._claim(
+            assignment, host_number=214, token_number=214)
+        self.allocator.abandon_unregistered_claim(
+            assignment.instance_uuid, host_id, token,
+            assignment=assignment)
+        current = self.allocator.abandon_unregistered_claim(
+            assignment.instance_uuid, host_id, token)
+        self.assertNotIn(host_id, current.host_ids)
+
+    def test_abandoned_generation_can_release(self):
+        assignment = self.allocator.allocate(self._uuid(215))
+        assignment, host_id, token = self._claim(
+            assignment, host_number=215, token_number=215)
+        self.allocator.abandon_unregistered_claim(
+            assignment.instance_uuid, host_id, token,
+            assignment=assignment)
+        intent = self.allocator.request_release(
+            assignment.instance_uuid, 'instance-abandon215')
+        self.assertTrue(self.allocator.release(intent))
+        self.assertIsNone(self.allocator.get(assignment.instance_uuid))
+
     def test_exact_not_materialized_proof_cleans_unmaterialized_claim(self):
         assignment = self.allocator.allocate(self._uuid(11))
         assignment, host_id, token = self._claim(assignment)

@@ -177,6 +177,19 @@ live-migration receive paths all use this transaction. Every start or restart
 requires the exact local host claim to exist in a materialized state, and
 both release-intent and release-proof keys to be absent.
 
+Deletion racing an unfinished build must not demand evidence that only a
+successful build produces. A claim still ``unmaterialized`` while Incus holds
+no materialization attempt record proves the create request was never issued:
+registration precedes the ``possible`` transition, and a registered attempt is
+only deleted after its cleanup proof made the claim ``cleaned``. That exact
+state pair is the single sanctioned proof-free disposal — the allocator
+abandons the never-registered claim in one compare-and-swap. A claim beyond
+``unmaterialized`` without a server attempt record is registry corruption and
+stays fail-closed. Likewise, a delete that finds neither an allocation nor a
+local host claim treats stale Nova metadata as a cache, not a resource, and
+proceeds; a bare allocation without a local claim is left to the terminal
+failed-build reconciler, which fences it by proving absence.
+
 Final deletion of a materialized generation is a distributed evidence chain.
 Nova first writes the immutable release intent, then sends the Incus instance
 DELETE with the allocation UUID as release token and the Nova instance UUID as

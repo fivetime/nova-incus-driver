@@ -896,6 +896,101 @@ class IncusIDMapDriverTest(test.NoDBTestCase):
         self.assertIsNotNone(
             driver._read_spawn_attempt_journal(self.instance))
 
+    def test_release_context_absent_everywhere_is_noop(self):
+        # A delete racing a queued build, or a retry after the release
+        # completed: no allocation, no claim, no metadata. Deletion must
+        # proceed without demanding build-only evidence.
+        self.driver.idmap_allocator.get.return_value = None
+        self.driver.idmap_allocator.get_host_claim.return_value = None
+
+        self.assertEqual(
+            (None, None, None),
+            self.driver._idmap_rootfs_release_context(self.instance))
+
+    def test_release_context_stale_metadata_alone_is_noop(self):
+        self.driver.idmap_allocator.get.return_value = None
+        self.driver.idmap_allocator.get_host_claim.return_value = None
+        self._set_instance_idmap_metadata()
+
+        self.assertEqual(
+            (None, None, None),
+            self.driver._idmap_rootfs_release_context(self.instance))
+
+    def test_release_context_claim_without_allocation_fails_closed(self):
+        self.driver.idmap_allocator.get.return_value = None
+        self.driver.idmap_allocator.get_host_claim.return_value = (
+            self._claim(state='unmaterialized'))
+
+        self.assertRaisesRegex(
+            driver.incus_idmap.IDMapIntegrityError,
+            'without its allocation',
+            self.driver._idmap_rootfs_release_context, self.instance)
+
+    def test_release_context_unstamped_build_uses_registry_authority(self):
+        # The build died between the durable allocation and the Nova
+        # metadata stamp: the registry pair is the release authority.
+        self.instance.system_metadata = {}
+
+        intent, assignment, claim = (
+            self.driver._idmap_rootfs_release_context(self.instance))
+
+        self.assertIsNone(intent)
+        self.assertEqual(self.assignment, assignment)
+        self.assertEqual(self.claim, claim)
+
+    def test_release_context_metadata_mismatch_still_fails_closed(self):
+        self._set_instance_idmap_metadata()
+        self.instance.system_metadata[
+            driver.IDMAP_ALLOCATION_METADATA_KEY] = (
+                '10000000-0000-0000-0000-00000000000f')
+
+        self.assertRaisesRegex(
+            driver.incus_idmap.IDMapIntegrityError,
+            'does not match the Nova',
+            self.driver._idmap_rootfs_release_context, self.instance)
+
+    def test_release_context_allocation_without_local_claim_is_noop(self):
+        # The build never claimed this host; the bare allocation belongs to
+        # the terminal failed-build reconciler, not this delete.
+        self._set_instance_idmap_metadata()
+        self.driver.idmap_allocator.get_host_claim.return_value = None
+
+        self.assertEqual(
+            (None, None, None),
+            self.driver._idmap_rootfs_release_context(self.instance))
+
+    def test_settle_abandons_never_registered_unmaterialized_claim(self):
+        unmaterialized = self._claim(state='unmaterialized')
+        self.driver.idmap_allocator.get_host_claim.return_value = (
+            unmaterialized)
+        self.driver.storage_ownership.discover_materialization.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+
+        settled = self.driver._settle_idmap_host_claim(
+            self.instance, unmaterialized)
+
+        self.assertIsNone(settled)
+        (self.driver.idmap_allocator.abandon_unregistered_claim
+            .assert_called_once_with(
+                unmaterialized.instance_uuid, unmaterialized.host_id,
+                unmaterialized.materialization_id,
+                assignment=self.assignment))
+        self.driver.idmap_allocator.record_materialization_proof \
+            .assert_not_called()
+
+    def test_settle_missing_attempt_beyond_unmaterialized_fails_closed(self):
+        possible = self._claim(state='possible')
+        self.driver.idmap_allocator.get_host_claim.return_value = possible
+        self.driver.storage_ownership.discover_materialization.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+
+        self.assertRaisesRegex(
+            driver.incus_idmap.IDMapIntegrityError,
+            'already issued its create request',
+            self.driver._settle_idmap_host_claim, self.instance, possible)
+        self.driver.idmap_allocator.abandon_unregistered_claim \
+            .assert_not_called()
+
     def test_failed_build_destroy_reacks_cleaned_claim_without_retiring(self):
         cleaned = self._claim(
             state='cleaned', proof=mock.sentinel.cleanup_proof)
