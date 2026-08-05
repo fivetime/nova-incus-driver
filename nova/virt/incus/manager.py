@@ -1788,7 +1788,13 @@ class IncusComputeManager(manager.ComputeManager):
                     'Nova instance %(uuid)s name %(instance_name)s',
                     {**candidate, 'instance_name': instance.name})
                 continue
-            if instance.task_state is not None:
+            deleted = (
+                instance.obj_attr_is_set('deleted') and instance.deleted)
+            if not deleted and instance.task_state is not None:
+                # A live in-flight operation owns its own cleanup. A deleted
+                # row's task state is frozen history (this context reads
+                # deleted rows, so InstanceNotFound never fires for them) and
+                # must not retain the profile forever.
                 LOG.debug(
                     'Skipping cleanup profile while the Nova instance has '
                     'task state %(task_state)s',

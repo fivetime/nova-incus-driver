@@ -2717,6 +2717,52 @@ class IncusComputeManagerTest(test.NoDBTestCase):
             mock.ANY, candidate, network_info)
 
     @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_cleanup_recovery_ignores_frozen_task_state_of_deleted_row(
+            self, get_by_uuid):
+        # The periodic reads deleted rows (read_deleted=yes), so a deletion
+        # that raced an unfinished build leaves deleted=<id> with the frozen
+        # task_state 'deleting'. That history must not retain the profile.
+        network_info = mock.sentinel.network_info
+        candidate = mock.Mock(
+            task_state='deleting', deleted=2304,
+            uuid='10000000-0000-0000-0000-000000000001',
+            host='compute-2',
+            info_cache=mock.Mock(network_info=network_info))
+        candidate.name = 'instance-candidate'
+        candidate.obj_attr_is_set.return_value = True
+        get_by_uuid.return_value = candidate
+        self.compute.driver.list_cleanup_recovery_candidates.return_value = [{
+            'name': candidate.name,
+            'uuid': candidate.uuid,
+        }]
+
+        self.compute._recover_incus_cleanup_profiles(
+            context.get_admin_context())
+
+        self.compute.driver.recover_cleanup_profile.assert_called_once_with(
+            mock.ANY, candidate, network_info)
+
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_cleanup_recovery_still_defers_to_live_task_state(
+            self, get_by_uuid):
+        candidate = mock.Mock(
+            task_state='deleting', deleted=0,
+            uuid='10000000-0000-0000-0000-000000000001',
+            host='compute-2', info_cache=None)
+        candidate.name = 'instance-candidate'
+        candidate.obj_attr_is_set.return_value = True
+        get_by_uuid.return_value = candidate
+        self.compute.driver.list_cleanup_recovery_candidates.return_value = [{
+            'name': candidate.name,
+            'uuid': candidate.uuid,
+        }]
+
+        self.compute._recover_incus_cleanup_profiles(
+            context.get_admin_context())
+
+        self.compute.driver.recover_cleanup_profile.assert_not_called()
+
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
     def test_cleanup_recovery_uses_deleted_instance_network_cache(
             self, get_by_uuid):
         network_info = mock.sentinel.network_info
