@@ -1379,6 +1379,47 @@ class IncusComputeManagerTest(test.NoDBTestCase):
             instance.uuid, instance.name, assignment=self.idmap_assignment)
 
     @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_failed_build_abandons_an_unregistered_unmaterialized_claim(
+            self, get_by_uuid):
+        """A build that died before registering takes the non-final path."""
+        unmaterialized = self._host_claim(state='unmaterialized', proof=None)
+        empty_assignment = self._assignment(host_ids=())
+        instance = self._idmap_instance()
+        instance.host = None
+        instance.task_state = None
+        instance.vm_state = manager.vm_states.ERROR
+        instance.deleted = False
+        get_by_uuid.return_value = instance
+        allocator = self.compute.driver.idmap_allocator
+        allocator.request_release.return_value = self.idmap_intent
+        abandoned = []
+        allocator.get.side_effect = (
+            lambda *a, **kw: (
+                empty_assignment if abandoned else self.idmap_assignment))
+        allocator.get_host_claim.side_effect = (
+            lambda *a, **kw: None if abandoned else unmaterialized)
+
+        def settle(*args, **kwargs):
+            abandoned.append(True)
+            return None
+
+        self.compute.driver._settle_idmap_host_claim.side_effect = settle
+
+        self.compute._reconcile_incus_idmap_host_claim(
+            context.get_admin_context(), allocator, unmaterialized,
+            self.host_id)
+
+        # The local-delete leftover journal is consumed the way destroy
+        # would have, before the absence proof runs.
+        (self.compute.driver._remove_spawn_attempt_for_claim
+            .assert_called_once_with(instance, unmaterialized))
+        # Never registered: non-final settle, whose 404 branch abandons.
+        self.compute.driver._settle_idmap_host_claim.assert_called_once_with(
+            instance, unmaterialized, final_delete=False)
+        allocator.request_release.assert_called_once_with(
+            instance.uuid, instance.name, assignment=empty_assignment)
+
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
     def test_failed_build_promoted_by_server_uses_the_release_receipt(
             self, get_by_uuid):
         """A create that did commit still owns storage to release."""

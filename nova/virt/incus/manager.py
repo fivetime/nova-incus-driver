@@ -206,6 +206,21 @@ class IncusComputeManager(manager.ComputeManager):
         settled = self.driver._settle_idmap_host_claim(
             instance, claim, final_delete=final_delete)
         if settled is None:
+            if claim.state == 'unmaterialized':
+                # The driver abandons a never-registered claim whole; it has
+                # no proof to demand. Verify the abandonment instead: the
+                # claim must be gone and the host de-indexed.
+                allocator = self.driver.idmap_allocator
+                remaining = allocator.get_host_claim(
+                    claim.instance_uuid, claim.host_id)
+                current = allocator.get(claim.instance_uuid)
+                if remaining is None and (
+                        current is None or
+                        claim.host_id not in current.host_ids):
+                    return None
+                raise incus_driver.incus_idmap.IDMapIntegrityError(
+                    'Incus idmap claim abandonment left its exact host '
+                    'claim behind')
             raise incus_driver.incus_idmap.IDMapConflict(
                 reason='the exact Incus idmap host claim disappeared')
         if not self._idmap_claim_identity_matches(settled, claim):
@@ -439,6 +454,15 @@ class IncusComputeManager(manager.ComputeManager):
                     raise incus_driver.incus_idmap.IDMapIntegrityError(
                         'Terminal failed-build Nova metadata does not match '
                         'the exact idmap generation')
+                # A local delete (compute unreachable) skips driver.destroy,
+                # leaving the spawn attempt journal destroy would have
+                # consumed, and the absence proof below would retain the
+                # claim forever on that journal. Consume it exactly the way
+                # destroy does: only against the exact live claim it names;
+                # any mismatch raises and keeps the claim retained. A purged
+                # Nova row (current is None) keeps its journal and stays
+                # retained and visible.
+                self.driver._remove_spawn_attempt_for_claim(current, claim)
             if not self._local_idmap_resources_absent_by_name(
                     assignment.instance_uuid, instance_name,
                     assignment.base, assignment.size, inventory=inventory):
@@ -449,8 +473,13 @@ class IncusComputeManager(manager.ComputeManager):
             # materialized rootfs to release, so it settles through the
             # materialization abort instead of a release receipt. Demanding
             # the receipt path here is what left these claims unreleased.
+            # An 'unmaterialized' claim never issued its create request at
+            # all: it takes the same non-final path, where a registered
+            # attempt aborts and a never-registered one is abandoned whole.
             settled = self._settle_idmap_host_claim(
-                current, claim, final_delete=claim.state != 'possible')
+                current, claim,
+                final_delete=claim.state not in (
+                    'possible', 'unmaterialized'))
         except Exception:
             LOG.exception(
                 'Cannot prove terminal failed-build idmap ownership for %s; '
@@ -589,6 +618,10 @@ class IncusComputeManager(manager.ComputeManager):
             settled = self._settle_idmap_host_claim(
                 instance, exact_claim,
                 final_delete=(exact_claim.state == 'committed'))
+            if settled is None:
+                # A verified abandonment removed the claim whole; there is
+                # nothing left to retire on this host.
+                return
             assignment = allocator.get(claim.instance_uuid)
             if (assignment is None or
                     not self._idmap_generation_matches(
