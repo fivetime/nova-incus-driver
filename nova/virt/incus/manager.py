@@ -947,11 +947,28 @@ class IncusComputeManager(manager.ComputeManager):
             assignment, local_claim = (
                 self.driver._promote_idmap_claim_if_server_committed(
                     instance, local_claim))
-            if (local_claim is None or
-                    local_claim.state == 'possible'):
+            if local_claim is None:
                 raise incus_driver.incus_idmap.IDMapConflict(
                     reason='Final Nova deletion cannot prove whether the '
                            'local Incus rootfs materialized')
+            if local_claim.state == 'possible':
+                # A crash between the create request and its outcome leaves
+                # the claim at 'possible' with no committed container to
+                # promote from - the only evidence this gate used to accept,
+                # which made such an instance permanently undeletable. The
+                # materialization attempt is the remaining authority:
+                # settling it (abort for a registered attempt, whole-claim
+                # abandonment for one that was never registered) proves
+                # non-materialization. A genuinely committed rootfs cannot
+                # reach this branch, because the promotion above would have
+                # lifted the claim.
+                try:
+                    local_claim = self._settle_idmap_host_claim(
+                        instance, local_claim, final_delete=False)
+                except incus_driver.incus_idmap.IDMapError as exc:
+                    raise incus_driver.incus_idmap.IDMapConflict(
+                        reason='Final Nova deletion cannot prove whether '
+                               'the local Incus rootfs materialized') from exc
 
         # Nova's delete drives driver.destroy, whose rootfs release receipt
         # path takes the same per-instance claim lock. Holding the release

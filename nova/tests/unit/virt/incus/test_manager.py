@@ -180,6 +180,60 @@ class IncusComputeManagerTest(test.NoDBTestCase):
 
     @mock.patch.object(manager.manager.ComputeManager, '_delete_instance',
                        return_value=mock.sentinel.result)
+    def test_final_delete_settles_a_possible_claim_that_never_committed(
+            self, base_delete):
+        """A crash mid-create leaves 'possible' with no container to promote.
+
+        The gate used to accept only a committed container as evidence,
+        making such an instance permanently undeletable. The materialization
+        attempt settlement is the remaining authority and must unblock the
+        delete once it proves non-materialization.
+        """
+        instance = self._idmap_instance()
+        possible = self._host_claim(state='possible', proof=None)
+        cleaned = self._host_claim(
+            proof=mock.Mock(instance_name=instance.name))
+        allocator = self.compute.driver.idmap_allocator
+        allocator.get_host_claim.return_value = possible
+        allocator.request_release.return_value = self.idmap_intent
+        promote = self.compute.driver._promote_idmap_claim_if_server_committed
+        # Incus has no committed container for this claim.
+        promote.return_value = (self.idmap_assignment, possible)
+        self.compute.driver._settle_idmap_host_claim.return_value = cleaned
+
+        result = self.compute._delete_instance(
+            mock.sentinel.context, instance, mock.sentinel.bdms)
+
+        self.assertIs(mock.sentinel.result, result)
+        self.compute.driver._settle_idmap_host_claim.assert_any_call(
+            instance, possible, final_delete=False)
+        base_delete.assert_called_once_with(
+            mock.sentinel.context, instance, mock.sentinel.bdms)
+
+    @mock.patch.object(manager.manager.ComputeManager, '_delete_instance',
+                       return_value=mock.sentinel.result)
+    def test_final_delete_still_refuses_an_unsettleable_possible_claim(
+            self, base_delete):
+        instance = self._idmap_instance()
+        possible = self._host_claim(state='possible', proof=None)
+        allocator = self.compute.driver.idmap_allocator
+        allocator.get_host_claim.return_value = possible
+        allocator.request_release.return_value = self.idmap_intent
+        promote = self.compute.driver._promote_idmap_claim_if_server_committed
+        promote.return_value = (self.idmap_assignment, possible)
+        # Settlement cannot produce a cleaned claim either: the manager
+        # wrapper surfaces that as an IDMapError, which the gate converts
+        # back into its fail-closed conflict.
+        self.compute.driver._settle_idmap_host_claim.return_value = possible
+
+        self.assertRaises(
+            manager.incus_driver.incus_idmap.IDMapConflict,
+            self.compute._delete_instance,
+            mock.sentinel.context, instance, mock.sentinel.bdms)
+        base_delete.assert_not_called()
+
+    @mock.patch.object(manager.manager.ComputeManager, '_delete_instance',
+                       return_value=mock.sentinel.result)
     def test_final_delete_tolerates_claim_retired_elsewhere(
             self, base_delete):
         """A migration that moved ownership already retired this claim.
@@ -297,12 +351,21 @@ class IncusComputeManagerTest(test.NoDBTestCase):
     @mock.patch.object(manager.manager.ComputeManager, '_delete_instance')
     def test_final_delete_retains_unresolved_possible_claim(
             self, base_delete):
+        """The unknown-materialization invariant survives the settle path.
+
+        A 'possible' claim the server cannot promote is now handed to the
+        attempt settlement; only when THAT cannot prove non-materialization
+        either does the delete stay refused. The claim is retained.
+        """
         possible = self._host_claim(state='possible', proof=None)
         allocator = self.compute.driver.idmap_allocator
         allocator.get_host_claim.return_value = possible
         promote = (
             self.compute.driver._promote_idmap_claim_if_server_committed)
         promote.return_value = self.idmap_assignment, possible
+        settle = self.compute.driver._settle_idmap_host_claim
+        settle.side_effect = manager.incus_driver.incus_idmap.IDMapConflict(
+            reason='attempt is still active on the server')
 
         self.assertRaises(
             manager.incus_driver.incus_idmap.IDMapConflict,
@@ -311,7 +374,8 @@ class IncusComputeManagerTest(test.NoDBTestCase):
             mock.sentinel.bdms)
 
         base_delete.assert_not_called()
-        self.compute.driver._settle_idmap_host_claim.assert_not_called()
+        settle.assert_called_once_with(
+            mock.ANY, possible, final_delete=False)
         allocator.retire_claim.assert_not_called()
         allocator.release.assert_not_called()
 
