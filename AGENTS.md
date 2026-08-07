@@ -311,6 +311,13 @@ in `TEST_STATUS.md`; this section keeps only the rules.
   grows with the guest's memory rather than with its write rate. Enabling
   pre-dump later to shorten downtime is acceptable because it stays within
   the pre-copy family; switching to demand paging is not.
+- **Live migratability is universal, not a flavor feature.** Every instance
+  is created with `migration.stateful=true` (and therefore a shifted
+  on-disk rootfs) because hardware retirement makes every instance migrate
+  eventually, migration is an operator duty rather than a tenant purchase,
+  and live migration must not require tenant notification (cold migration
+  does). The per-instance shift cost is that duty's price; do not
+  reintroduce per-flavor stateful opt-in to save it.
 
 ### Migration attempt fencing and conductor concurrency
 

@@ -5195,7 +5195,7 @@ class IncusDriver(driver.ComputeDriver):
 
     capabilities = dict(
         driver.ComputeDriver.capabilities,
-        has_imagecache=False,
+        has_imagecache=True,
         supports_attach_interface=True,
         supports_device_tagging=False,
         supports_tagged_attach_interface=False,
@@ -9044,6 +9044,75 @@ class IncusDriver(driver.ComputeDriver):
                     for key, value in expected.items()):
                 raise exception.InterfaceAttachFailed(
                     instance_uuid=instance.uuid)
+
+    def manage_image_cache(self, context, all_instances):
+        """Age out unused Glance images synced into the local Incus store.
+
+        _sync_glance_image_to_incus imports every booted Glance image into
+        this node's Incus image store under an alias equal to the Glance
+        UUID, and nothing ever removed them: a long-lived node accumulated
+        every historical image until the store filled, the reported DISK_GB
+        shrank and scheduling starved.
+
+        Removal is deliberately narrow, per node and fail-safe:
+
+        - only images whose aliases are exclusively canonical UUIDs are
+          candidates (operator-published images carry named aliases);
+        - an image referenced by any instance on this host is kept;
+        - a candidate must have been unused for at least
+          [image_cache]remove_unused_original_minimum_age_seconds;
+        - the per-node ceph.rbd.image_prefix keeps cached image volumes
+          node-scoped, so deletion cannot affect another compute, and the
+          server-side image-use lock keeps a concurrent clone safe.
+        """
+        referenced = {
+            getattr(inst, 'image_ref', None) for inst in all_instances}
+        referenced.discard(None)
+        referenced.discard('')
+        min_age = CONF.image_cache.remove_unused_original_minimum_age_seconds
+        now = timeutils.utcnow(with_timezone=True)
+        try:
+            images = self.client.images.all()
+        except Exception:
+            LOG.warning(
+                'Cannot list the Incus image store for cache aging',
+                exc_info=True)
+            return
+        for image in images:
+            try:
+                aliases = [
+                    alias.get('name', '')
+                    for alias in (image.aliases or [])]
+                if not aliases or not all(
+                        uuidutils.is_uuid_like(alias) for alias in aliases):
+                    continue
+                if any(alias in referenced for alias in aliases):
+                    continue
+                last_used = None
+                for stamp in (getattr(image, 'last_used_at', None),
+                              getattr(image, 'uploaded_at', None)):
+                    if not stamp:
+                        continue
+                    parsed = timeutils.parse_isotime(stamp)
+                    # Incus reports never-used as the zero time.
+                    if parsed.year <= 1970:
+                        continue
+                    if last_used is None or parsed > last_used:
+                        last_used = parsed
+                if last_used is None:
+                    continue
+                if (now - last_used).total_seconds() < min_age:
+                    continue
+                LOG.info(
+                    'Removing unused cached Incus image %(fingerprint).12s '
+                    'aliased %(aliases)s (unused since %(last_used)s)',
+                    {'fingerprint': image.fingerprint,
+                     'aliases': aliases, 'last_used': last_used})
+                image.delete(wait=True)
+            except Exception:
+                LOG.warning(
+                    'Failed to age cached Incus image; leaving it in place',
+                    exc_info=True)
 
     def get_console_output(self, context, instance):
         """Get the output of the container console.

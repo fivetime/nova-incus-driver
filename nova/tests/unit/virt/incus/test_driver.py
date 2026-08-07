@@ -15836,6 +15836,95 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertIn('mapping is uncertain', ' '.join(assessment.reasons))
 
 
+class ManageImageCacheTest(test.NoDBTestCase):
+    def setUp(self):
+        super().setUp()
+        self.flags(
+            remove_unused_original_minimum_age_seconds=3600,
+            group='image_cache')
+        self.driver = driver.IncusDriver(None)
+        self.driver.client = mock.Mock()
+
+    @staticmethod
+    def _image(aliases, last_used_at, uploaded_at='2020-01-01T00:00:00Z'):
+        image = mock.Mock(
+            aliases=[{'name': alias} for alias in aliases],
+            last_used_at=last_used_at,
+            uploaded_at=uploaded_at)
+        image.fingerprint = 'f' * 64
+        return image
+
+    def test_removes_old_unreferenced_uuid_alias_image(self):
+        stale = self._image(
+            ['10000000-0000-0000-0000-000000000001'],
+            '2020-01-02T00:00:00Z')
+        self.driver.client.images.all.return_value = [stale]
+
+        self.driver.manage_image_cache(mock.sentinel.ctx, [])
+
+        stale.delete.assert_called_once_with(wait=True)
+
+    def test_keeps_image_referenced_by_an_instance(self):
+        ref = '10000000-0000-0000-0000-000000000001'
+        used = self._image([ref], '2020-01-02T00:00:00Z')
+        self.driver.client.images.all.return_value = [used]
+        instance = mock.Mock(image_ref=ref)
+
+        self.driver.manage_image_cache(mock.sentinel.ctx, [instance])
+
+        used.delete.assert_not_called()
+
+    def test_keeps_operator_published_named_alias_image(self):
+        named = self._image(
+            ['10000000-0000-0000-0000-000000000001', 'release-2026'],
+            '2020-01-02T00:00:00Z')
+        self.driver.client.images.all.return_value = [named]
+
+        self.driver.manage_image_cache(mock.sentinel.ctx, [])
+
+        named.delete.assert_not_called()
+
+    def test_keeps_recently_used_image(self):
+        fresh = self._image(
+            ['10000000-0000-0000-0000-000000000001'],
+            timeutils.utcnow(with_timezone=True).isoformat())
+        self.driver.client.images.all.return_value = [fresh]
+
+        self.driver.manage_image_cache(mock.sentinel.ctx, [])
+
+        fresh.delete.assert_not_called()
+
+    def test_never_used_image_falls_back_to_upload_age(self):
+        # Incus reports never-used as the zero time; the upload timestamp
+        # still ages the image out.
+        stale = self._image(
+            ['10000000-0000-0000-0000-000000000001'],
+            '1970-01-01T00:00:00Z')
+        self.driver.client.images.all.return_value = [stale]
+
+        self.driver.manage_image_cache(mock.sentinel.ctx, [])
+
+        stale.delete.assert_called_once_with(wait=True)
+
+    def test_survives_listing_and_deletion_failures(self):
+        self.driver.client.images.all.side_effect = RuntimeError('down')
+        self.driver.manage_image_cache(mock.sentinel.ctx, [])
+
+        broken = self._image(
+            ['10000000-0000-0000-0000-000000000001'],
+            '2020-01-02T00:00:00Z')
+        broken.delete.side_effect = RuntimeError('busy')
+        second = self._image(
+            ['10000000-0000-0000-0000-000000000002'],
+            '2020-01-02T00:00:00Z')
+        self.driver.client.images.all.side_effect = None
+        self.driver.client.images.all.return_value = [broken, second]
+
+        self.driver.manage_image_cache(mock.sentinel.ctx, [])
+
+        second.delete.assert_called_once_with(wait=True)
+
+
 class TimedPhaseTest(test.NoDBTestCase):
     def test_timed_phase_logs_success(self):
         instance = mock.Mock(uuid='00000000-0000-0000-0000-0000000000aa')
