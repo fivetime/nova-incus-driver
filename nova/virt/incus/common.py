@@ -60,9 +60,13 @@ def InstanceAttributes(instance):
 def is_snap_incus():
     """Determine whether Incus is installed as a snap or a package.
 
-    This is easily done by checking if the bin file is /snap/bin/lxc
+    The snap publishes its client as /snap/bin/incus. This used to look
+    for /snap/bin/lxc, inherited from the LXD lineage, which a genuine
+    Incus snap does not provide - so a snap install was misread as a
+    package one and its console log was looked for under the wrong
+    prefix.
 
     :returns: True if snap installed, otherwise False
     :rtype: bool
     """
-    return os.path.isfile('/snap/bin/lxc')
+    return os.path.isfile('/snap/bin/incus')

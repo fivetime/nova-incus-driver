@@ -17,6 +17,7 @@ from dataclasses import dataclass
 import hashlib
 import os
 import re
+import stat
 import threading
 import time
 from urllib import parse as urlparse
@@ -356,14 +357,36 @@ class IDMapAllocator:
                 reason="cannot create etcd client: %s" % exc)
 
     def _read_password(self):
+        # This credential authorizes every mutation of the registry that
+        # keeps two hosts from ever sharing an ID-map range, so a file any
+        # local account can read is a real exposure and not merely untidy.
+        # Group access is deliberately allowed: nova-compute does not run
+        # as root and reads this through its group, so requiring 0600 here
+        # would reject the supported deployment rather than protect it.
+        # World access has no such justification. Checked on the open file
+        # descriptor, not the path, so the answer describes what was
+        # actually read.
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
         try:
             path = os.path.abspath(self.password_file)
-            if not os.path.isfile(path):
-                raise ValueError("path is not a regular file")
-            if os.path.getsize(path) > 4096:
-                raise ValueError("file exceeds 4096 bytes")
-            with open(path, "rb") as password_stream:
-                password = password_stream.read()
+            descriptor = os.open(path, flags)
+            try:
+                info = os.fstat(descriptor)
+                if not stat.S_ISREG(info.st_mode):
+                    raise ValueError("path is not a regular file")
+                if stat.S_IMODE(info.st_mode) & 0o007:
+                    raise ValueError(
+                        "file is accessible by other")
+                if info.st_size > 4096:
+                    raise ValueError("file exceeds 4096 bytes")
+                with os.fdopen(descriptor, "rb") as password_stream:
+                    descriptor = None
+                    password = password_stream.read()
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
         except (OSError, ValueError) as exc:
             raise IDMapBackendError(
                 reason="cannot read etcd password file: %s" % exc)

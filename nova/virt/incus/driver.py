@@ -176,8 +176,6 @@ _VOLUME_JOURNAL_VERSION = 1
 _SHARE_JOURNAL_VERSION = 1
 _SPAWN_ATTEMPT_JOURNAL_VERSION = 1
 _SPAWN_ATTEMPT_PHASES = frozenset({'preflight', 'opening'})
-BASE_DIR = os.path.join(
-    CONF.instances_path, CONF.image_cache.subdirectory_name)
 _HOST_RESOURCE_CACHE_TTL = 60
 _INSTANCE_INVENTORY_CACHE_TTL = 10
 
@@ -11419,6 +11417,9 @@ class IncusDriver(driver.ComputeDriver):
             'local_gb': resources['local_gb'],
             'local_gb_used': resources['local_gb_used'],
             'vcpus_used': self._get_vcpus_used(),
+            # Nova's HVType enum has no incus value, so this reports the
+            # closest one it accepts. Changing it needs an enum addition
+            # upstream, not a change here.
             'hypervisor_type': obj_fields.HVType.LXD,
             'hypervisor_version': resources['hypervisor_version'],
             'cpu_info': jsonutils.dumps(resources['cpu_info']),

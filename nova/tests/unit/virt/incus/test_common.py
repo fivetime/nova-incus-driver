@@ -38,11 +38,16 @@ class InstanceAttributesTest(test.NoDBTestCase):
         self.CONF_patcher.stop()
 
     def test_is_snap_incus(self):
+        # The path matters: a global isfile stub would pass whichever
+        # binary name the code happened to look for, which is how this
+        # kept checking LXD's client long after the driver moved to Incus.
         with mock.patch('os.path.isfile') as isfile:
             isfile.return_value = False
             self.assertFalse(common.is_snap_incus())
+            isfile.assert_called_with('/snap/bin/incus')
             isfile.return_value = True
             self.assertTrue(common.is_snap_incus())
+            isfile.assert_called_with('/snap/bin/incus')
 
     @mock.patch.object(common, 'is_snap_incus')
     def test_instance_dir(self, is_snap_incus):

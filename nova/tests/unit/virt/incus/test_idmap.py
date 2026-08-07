@@ -239,11 +239,47 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
             client=self.etcd,
         )
 
+    def _password_allocator(self, mode):
+        directory = self.useFixture(fixtures.TempDir()).path
+        password_file = os.path.join(directory, "etcd-password")
+        with open(password_file, "w", encoding="utf-8") as stream:
+            stream.write("correct horse battery staple\n")
+        os.chmod(password_file, mode)
+        return idmap.IDMapAllocator(
+            endpoint="https://etcd.example:2379",
+            namespace="cell1", base=500000000, size=65536, count=8,
+            ca_cert="ca.crt", cert_cert="client.crt", cert_key="client.key",
+            username="nova-incus", password_file=password_file,
+            client=_AuthenticatedFakeEtcd())
+
+    def test_a_world_readable_password_file_is_refused(self):
+        """The credential that guards every ID-map mutation.
+
+        It authorizes the writes that keep two hosts from ever sharing a
+        range, so a file any local account can read is an exposure, not
+        an untidiness.
+        """
+        allocator = self._password_allocator(0o644)
+
+        self.assertRaisesRegex(
+            idmap.IDMapBackendError, "accessible by other",
+            allocator._read_password)
+
+    def test_a_group_readable_password_file_is_accepted(self):
+        # nova-compute does not run as root and reads this through its
+        # group, so demanding 0600 would reject the supported deployment
+        # rather than protect it.
+        allocator = self._password_allocator(0o640)
+
+        self.assertEqual(
+            "correct horse battery staple", allocator._read_password())
+
     def test_authenticates_once_before_registry_access(self):
         directory = self.useFixture(fixtures.TempDir()).path
         password_file = os.path.join(directory, "etcd-password")
         with open(password_file, "w", encoding="utf-8") as stream:
             stream.write("correct horse battery staple\n")
+        os.chmod(password_file, 0o600)
         etcd = _AuthenticatedFakeEtcd()
         allocator = idmap.IDMapAllocator(
             endpoint="https://etcd.example:2379",
@@ -277,6 +313,7 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
         password_file = os.path.join(directory, "etcd-password")
         with open(password_file, "w", encoding="utf-8") as stream:
             stream.write("first-password\n")
+        os.chmod(password_file, 0o600)
         etcd = _AuthenticatedFakeEtcd()
         allocator = idmap.IDMapAllocator(
             endpoint="https://etcd.example:2379",
@@ -294,6 +331,7 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
         allocator.bootstrap()
         with open(password_file, "w", encoding="utf-8") as stream:
             stream.write("rotated-password\n")
+        os.chmod(password_file, 0o600)
         etcd.next_get_error = jsonutils.dumps({
             "code": 16,
             "message": "etcdserver: invalid auth token",
@@ -313,6 +351,7 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
         password_file = os.path.join(directory, "etcd-password")
         with open(password_file, "w", encoding="utf-8") as stream:
             stream.write("password\n")
+        os.chmod(password_file, 0o600)
         etcd = _AuthenticatedFakeEtcd()
         allocator = idmap.IDMapAllocator(
             endpoint="https://etcd.example:2379",
@@ -348,6 +387,7 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
         password_file = os.path.join(directory, "etcd-password")
         with open(password_file, "w", encoding="utf-8") as stream:
             stream.write("password\n")
+        os.chmod(password_file, 0o600)
         etcd = _AuthenticatedFakeEtcd()
         allocator = idmap.IDMapAllocator(
             endpoint="https://etcd.example:2379",
