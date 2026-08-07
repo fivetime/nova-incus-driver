@@ -394,7 +394,7 @@ _DEVICE_FILTER_MAP = [
 
 
 def to_profile(
-        client, instance, network_info, block_info, update=False,
+        client, instance, network_info, block_info,
         config_overrides=None, device_overrides=None):
     """Convert a nova flavor to a incus profile.
 
@@ -426,11 +426,9 @@ def to_profile(
     if device_overrides:
         devices.update(device_overrides)
 
-    if update is True:
-        profile = client.profiles.get(name)
-        profile.devices = devices
-        profile.config = config
-        profile.save()
-        return profile
-    else:
-        return client.profiles.create(name, config, devices)
+    # The former update=True branch wholesale-replaced profile.config and
+    # profile.devices, which would have erased volume records, share devices
+    # and migration tokens had anything ever called it. Removed as an armed
+    # landmine: incremental profile mutation goes through the callers'
+    # locked read-modify-save paths instead.
+    return client.profiles.create(name, config, devices)

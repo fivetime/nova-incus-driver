@@ -4710,9 +4710,15 @@ def _sync_glance_image_to_incus(client, context, image_ref):
             if not _is_incus_not_found(e):
                 raise
 
+        # GB-scale images must not land on /tmp (commonly tmpfs backed by
+        # RAM); stage them next to the instances the download serves.
+        staging_dir = os.path.join(CONF.instances_path, 'image-staging')
+        os.makedirs(staging_dir, exist_ok=True)
+        ifd = mfd = None
+        image_file = manifest_file = None
         try:
-            ifd, image_file = tempfile.mkstemp()
-            mfd, manifest_file = tempfile.mkstemp()
+            ifd, image_file = tempfile.mkstemp(dir=staging_dir)
+            mfd, manifest_file = tempfile.mkstemp(dir=staging_dir)
 
             image = IMAGE_API.get(context, image_ref)
             if image.get('disk_format') not in ACCEPTABLE_IMAGE_FORMATS:
@@ -4810,10 +4816,21 @@ def _sync_glance_image_to_incus(client, context, image_ref):
             image.add_alias(image_ref, '')
 
         finally:
-            os.close(ifd)
-            os.close(mfd)
-            os.unlink(image_file)
-            os.unlink(manifest_file)
+            # Guard each teardown step: referencing a descriptor the failed
+            # mkstemp never returned raised NameError here and masked the
+            # original download or import error.
+            for fd in (ifd, mfd):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            for path in (image_file, manifest_file):
+                if path is not None:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
 
 
 def brick_get_connector_properties(multipath=None, enforce_multipath=None):
@@ -5364,6 +5381,18 @@ class IncusDriver(driver.ComputeDriver):
             raise exception.InvalidConfiguration(
                 '[incus] volume_enforce_multipath requires '
                 'volume_use_multipath')
+        # Fail fast on static root-storage capacity misconfiguration; the
+        # resource-tracker path only degrades at runtime.
+        for selector, resource_class in (
+                CONF.incus.root_storage_pool_resource_classes.items()):
+            if not CONF.incus.root_storage_pools.get(selector):
+                raise exception.InvalidConfiguration(
+                    'Capacity-tracked Incus root storage selector {} is not '
+                    'present in root_storage_pools'.format(selector))
+            if not resource_class.startswith('CUSTOM_'):
+                raise exception.InvalidConfiguration(
+                    'Incus root storage resource class {} must start with '
+                    'CUSTOM_'.format(resource_class))
         if CONF.incus.enable_manila_shares:
             try:
                 incus_privsep.validate_gnu_timeout()
@@ -7928,29 +7957,32 @@ class IncusDriver(driver.ComputeDriver):
 
             # TODO(sahid): Each time we get a container we should
             # protect it by using a mutex.
-            destroy_container(instance.name)
-            if instance.vm_state == vm_states.RESCUED:
-                destroy_container('{}-rescue'.format(instance.name))
+            with self._timed_phase(instance, 'destroy', 'container'):
+                destroy_container(instance.name)
+                if instance.vm_state == vm_states.RESCUED:
+                    destroy_container('{}-rescue'.format(instance.name))
 
-            if cleanup_token:
-                self._cleanup(
-                    context, instance, network_info,
-                    block_device_info=block_device_info,
-                    destroy_disks=destroy_disks,
-                    destroy_secrets=destroy_secrets,
-                    delete_profile=False)
-                self._acknowledge_cleanup_profile(
-                    instance, cleanup_token)
-            else:
-                self.cleanup(
-                    context, instance, network_info, block_device_info,
-                    destroy_disks=destroy_disks,
-                    destroy_secrets=destroy_secrets)
-            if release_claim is not None:
-                self._remove_spawn_attempt_for_claim(
-                    instance, release_claim)
-            if not failed_build_cleanup:
-                self._retire_instance_idmap_claim_if_clean(instance)
+            with self._timed_phase(instance, 'destroy', 'cleanup'):
+                if cleanup_token:
+                    self._cleanup(
+                        context, instance, network_info,
+                        block_device_info=block_device_info,
+                        destroy_disks=destroy_disks,
+                        destroy_secrets=destroy_secrets,
+                        delete_profile=False)
+                    self._acknowledge_cleanup_profile(
+                        instance, cleanup_token)
+                else:
+                    self.cleanup(
+                        context, instance, network_info, block_device_info,
+                        destroy_disks=destroy_disks,
+                        destroy_secrets=destroy_secrets)
+            with self._timed_phase(instance, 'destroy', 'claim_settlement'):
+                if release_claim is not None:
+                    self._remove_spawn_attempt_for_claim(
+                        instance, release_claim)
+                if not failed_build_cleanup:
+                    self._retire_instance_idmap_claim_if_clean(instance)
 
     def cleanup(self, context, instance, network_info, block_device_info=None,
                 destroy_disks=True, migrate_data=None, destroy_vifs=True,
@@ -9961,6 +9993,7 @@ class IncusDriver(driver.ComputeDriver):
         if not CONF.incus.allow_cold_migration:
             raise exception.MigrationError(
                 reason='Incus cold migration is disabled by configuration')
+        self._release_serial_console_broker(instance)
 
         root_bdm = _boot_from_volume(block_device_info)
         if (root_bdm is None and
@@ -10285,6 +10318,24 @@ class IncusDriver(driver.ComputeDriver):
         raise NotImplementedError(
             'Incus container rescue is not implemented')
 
+    def _release_serial_console_broker(self, instance):
+        """Close and drop any serial console broker for a stopping guest.
+
+        Brokers used to be reclaimed only by destroy; power-off, resize and
+        migration left them holding proxy ports for a dead console until
+        the pool drained.
+        """
+        with self._serial_consoles_lock:
+            broker = self._serial_consoles.pop(instance.uuid, None)
+        if broker is None:
+            return
+        try:
+            broker.close()
+        except Exception:
+            LOG.exception(
+                'Failed to close the Incus serial console broker for a '
+                'stopping instance', instance=instance)
+
     @_invalidates_instance_inventory
     def power_off(self, instance, timeout=0, retry_interval=0):
         """Power off an instance
@@ -10292,6 +10343,8 @@ class IncusDriver(driver.ComputeDriver):
         See 'nova.virt.drvier.ComputeDriver.power_off` for more
         information.
         """
+        self._release_serial_console_broker(instance)
+
         def force_stop():
             container = self.client.instances.get(instance.name)
             if container.status != 'Stopped':
@@ -11124,14 +11177,15 @@ class IncusDriver(driver.ComputeDriver):
         for selector, resource_class in (
                 CONF.incus.root_storage_pool_resource_classes.items()):
             pool_name = CONF.incus.root_storage_pools.get(selector)
-            if not pool_name:
-                raise exception.InvalidConfiguration(
-                    'Capacity-tracked Incus root storage selector {} is not '
-                    'present in root_storage_pools'.format(selector))
-            if not resource_class.startswith('CUSTOM_'):
-                raise exception.InvalidConfiguration(
-                    'Incus root storage resource class {} must start with '
-                    'CUSTOM_'.format(resource_class))
+            if not pool_name or not resource_class.startswith('CUSTOM_'):
+                # Static misconfiguration is rejected at init_host; raising
+                # here on every resource-tracker cycle would freeze the
+                # Placement inventory while the service still reported up.
+                LOG.error(
+                    'Invalid Incus root storage capacity configuration for '
+                    'selector %(selector)s; skipping its resource class',
+                    {'selector': selector})
+                continue
             pool = root_pools.get(selector)
             if pool is None or common.root_storage_pool_trait(
                     selector) not in available_root_pool_traits:

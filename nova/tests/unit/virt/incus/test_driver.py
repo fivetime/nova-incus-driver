@@ -2050,7 +2050,12 @@ class IncusDriverTest(test.NoDBTestCase):
 
         # NOTE: mock out fileutils to ensure that unit tests don't try
         #       to manipulate the filesystem (breaks in package builds).
-        driver.fileutils = mock.Mock()
+        # This used to be a bare module attribute assignment that was never
+        # restored, leaking the mock into every later test class in the
+        # same process.
+        fileutils_patcher = mock.patch.object(driver, 'fileutils')
+        self.patchers.append(fileutils_patcher)
+        fileutils_patcher.start()
 
     def tearDown(self):
         super(IncusDriverTest, self).tearDown()
@@ -4725,7 +4730,6 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         })
         profile.save.assert_called_once_with()
 
-    @mock.patch('nova.virt.incus.driver.fileutils.ensure_tree')
     @mock.patch('nova.virt.incus.driver.os.listdir', return_value=[])
     @mock.patch.object(driver.incus_privsep, 'configdrive_umount')
     @mock.patch.object(driver.incus_privsep, 'chown_tree_to_host_id')
@@ -4734,7 +4738,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     @mock.patch('nova.virt.incus.driver.instance_metadata.InstanceMetadata')
     def test_add_configdrive_uses_modern_instance_metadata_signature(
             self, instance_metadata_mock, builder_mock, mount_mock,
-            chown_mock, umount_mock, listdir_mock, ensure_tree_mock):
+            chown_mock, umount_mock, listdir_mock):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0, root_gb=1)
