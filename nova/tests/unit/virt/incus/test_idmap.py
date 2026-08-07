@@ -851,6 +851,31 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
             idmap.IDMapIntegrityError, "the live host claim it disposed of",
             self.allocator.audit_state)
 
+    def test_audit_accepts_a_ledger_entry_written_before_tokens(self):
+        """A schema addition must not latch an existing registry.
+
+        Entries written before the disposed token was recorded cannot
+        answer the coexistence question, so they stay out of it rather
+        than failing every allocator operation on every compute.
+        """
+        assignment = self.allocator.allocate(self._uuid(308))
+        assignment, host_id, token = self._claim(
+            assignment, host_number=308, token_number=308)
+        proof = self._fence_proof(assignment, host_id)
+        legacy = jsonutils.loads(
+            self.allocator._fence_proof_raw(proof, token).decode("utf-8"))
+        del legacy["materialization_id"]
+        key = self.allocator.fence_key(host_id, assignment.instance_uuid)
+        self.etcd.values[key.encode("utf-8")] = jsonutils.dumps(
+            legacy, sort_keys=True).encode("utf-8")
+
+        assignments, unused_intents, unused_claims = (
+            self.allocator.audit_state())
+
+        self.assertIn(
+            assignment.instance_uuid,
+            [a.instance_uuid for a in assignments])
+
     def test_instance_may_return_to_a_host_it_was_fenced_off(self):
         """A repaired host must be able to host the instance again.
 

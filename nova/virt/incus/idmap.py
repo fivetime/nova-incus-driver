@@ -1692,8 +1692,15 @@ class IDMapAllocator:
                         operator=value["operator"],
                         evidence=value["evidence"])
                     validate_fence_proof(proof)
-                    fenced_token = self._materialization_id(
-                        value["materialization_id"])
+                    # Ledger entries written before the token was recorded
+                    # cannot say which claim they disposed of. They simply
+                    # do not participate in the coexistence check below;
+                    # refusing to parse them would latch every allocator
+                    # operation fleet-wide over a missing audit hint.
+                    legacy_token = value.get("materialization_id")
+                    fenced_token = (
+                        self._materialization_id(legacy_token)
+                        if legacy_token else None)
                 except (ValueError, KeyError, TypeError,
                         IDMapConfigurationError) as exc:
                     raise IDMapIntegrityError(
@@ -1717,6 +1724,8 @@ class IDMapAllocator:
         # ledger keeps that disposal permanently auditable and must never
         # latch the registry against the reclaim.
         for fence_pair, fenced_token in fenced_tokens.items():
+            if fenced_token is None:
+                continue
             claim = host_claims.get(fence_pair)
             if claim is not None and claim.materialization_id == fenced_token:
                 raise IDMapIntegrityError(
