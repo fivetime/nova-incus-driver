@@ -11414,9 +11414,25 @@ class IncusDriver(driver.ComputeDriver):
                 continue
             total_gb = pool_info['total'] // units.Gi
             if total_gb < 1:
-                raise exception.InvalidConfiguration(
-                    'Incus root storage pool {} has no reportable '
-                    'capacity'.format(pool_name))
+                # Runtime data, not static misconfiguration: a pool can
+                # report nothing while it is being resized or while its
+                # backend is degraded. Raising here would freeze the whole
+                # Placement inventory at its previous values while the
+                # service still reported up, which is the failure this
+                # method exists to avoid. Degrade exactly like the
+                # unreachable-pool path above.
+                available_root_pool_traits.discard(
+                    common.root_storage_pool_trait(selector))
+                quiesced = _quiesced_inventory(
+                    current.inventory, resource_class)
+                if quiesced is not None:
+                    inventory[resource_class] = quiesced
+                LOG.error(
+                    'Incus root storage pool %(pool)s reports no usable '
+                    'capacity for selector %(selector)s; preserving its '
+                    'existing inventory and suppressing its Placement trait',
+                    {'pool': pool_name, 'selector': selector})
+                continue
             inventory[resource_class] = {
                 'total': total_gb,
                 'min_unit': 1,

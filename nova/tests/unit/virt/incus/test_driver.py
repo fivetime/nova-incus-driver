@@ -7716,6 +7716,56 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             self.client, 'local-zfs',
             pool=self.client.storage_pools.get.return_value)
 
+    @mock.patch('nova.virt.incus.driver._get_storage_pool_info')
+    @mock.patch('nova.virt.incus.driver._host_has_swap', return_value=False)
+    def test_unreportable_pool_capacity_degrades_instead_of_freezing(
+            self, _host_has_swap, get_pool_info):
+        """A pool reporting nothing must not freeze the whole inventory.
+
+        Raising here would leave every resource class stuck at its last
+        value while the service kept reporting up - the failure mode this
+        method exists to avoid. The selector's own inventory is preserved
+        and its trait suppressed, exactly like an unreachable pool.
+        """
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+        incus_driver._get_host_resource_snapshot = mock.Mock(return_value={
+            'vcpus': 8, 'memory_mb': 16384, 'local_gb': 100})
+        incus_driver._get_allocation_ratios = mock.Mock(return_value={
+            'VCPU': 4.0, 'MEMORY_MB': 1.5, 'DISK_GB': 1.0})
+        incus_driver._get_reserved_host_disk_gb_from_config = mock.Mock(
+            return_value=2)
+        get_pool_info.return_value = {'total': 0, 'used': 0}
+        previous = {
+            'total': 80, 'min_unit': 1, 'max_unit': 80, 'step_size': 1,
+            'allocation_ratio': 1.0, 'reserved': 0,
+        }
+        provider_tree = mock.Mock()
+        provider_tree.data.return_value = mock.Mock(
+            inventory={
+                'CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME_DISK_GB': previous},
+            traits=set())
+        self.CONF.incus.root_storage_pools = {'local-nvme': 'local-zfs'}
+        self.client.storage_pools.get.return_value.status = 'Created'
+        self.CONF.incus.root_storage_pool_resource_classes = {
+            'local-nvme': 'CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME_DISK_GB',
+        }
+        self.CONF.reserved_host_cpus = 0
+        self.CONF.reserved_host_memory_mb = 0
+
+        incus_driver.update_provider_tree(provider_tree, 'compute-1')
+
+        inventory = provider_tree.update_inventory.call_args.args[1]
+        quiesced = inventory['CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME_DISK_GB']
+        # Existing allocations keep their capacity; new ones are blocked
+        # by reserving all of it.
+        self.assertEqual(previous['total'], quiesced['total'])
+        self.assertEqual(previous['total'], quiesced['reserved'])
+        # The live resource classes are still refreshed this cycle.
+        self.assertIn('VCPU', inventory)
+        traits = provider_tree.update_traits.call_args.args[1]
+        self.assertNotIn('CUSTOM_INCUS_STORAGE_POOL_LOCAL_NVME', traits)
+
     @mock.patch('nova.virt.incus.driver._host_has_swap', return_value=False)
     def test_update_provider_tree_slices_shared_pool_capacity(
             self, _host_has_swap):

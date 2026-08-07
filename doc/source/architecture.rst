@@ -738,9 +738,25 @@ explicitly::
     openstack-incus-idmap-registry ... \
         --fence-retire-host-claim <instance-uuid> \
         --host-id <dead-compute-uuid> \
+        --fence-plug <dead-compute-fence-id> \
         --fence-agent fence_ipmilan --fenced-at 2026-08-07T00:00:00Z \
         --operator ops@example.com \
         --fence-evidence "fence_ipmilan --action=off rc=0"
+
+``--fence-plug`` names the same host to the fence provider, whose reported
+power state must be ``off`` before anything is written. This is the check
+that survives the one operator error the command cannot otherwise detect: a
+mistyped ``--host-id``. The dead host's and the evacuation destination's
+UUIDs usually sit side by side in one ticket, and naming the destination
+would delete a healthy running instance's claim and leave fence evidence
+pointing at a live host -- after which every destroy there would find that
+evidence and take the detached local-only path, skipping shared volume
+deletion. Power state is checked rather than the Nova service state because
+a service reported down may only be partitioned, while the premise of this
+disposal is that the host lost power. Where no fence provider can be
+consulted, ``--unverified-power-state <why>`` is mandatory instead, and the
+stated reason is written into the ledger entry: a disposal nobody could
+verify stays visible for the life of the record.
 
 The allocator writes that evidence to a per-host fence ledger and removes
 the claim and its host index entry in one compare-and-swap, so the

@@ -17,6 +17,7 @@
 import argparse
 import json
 from pathlib import Path
+import subprocess
 import sys
 import uuid
 
@@ -379,6 +380,41 @@ def retire_host_claim(allocator, document, instance_uuid, host_id):
     return assignments, intents
 
 
+def verify_host_is_powered_off(provider, fence_plug, config_dir):
+    """Confirm with the fence provider that the target really is off.
+
+    The one operator error this command cannot survive is a mistyped
+    --host-id: two compute UUIDs usually sit side by side in the same
+    ticket, and naming the *destination* would delete a healthy running
+    instance's claim and write a fence ledger entry against it. Every
+    later destroy on that host would then find the forged evidence and
+    take the detached local-only path, skipping shared volume deletion.
+
+    Power state is the right check rather than the Nova service state:
+    a service reported down may only be partitioned, while the whole
+    premise of this disposal is that the host lost power.
+    """
+    command = [str(provider), "status", fence_plug]
+    if config_dir:
+        command += ["--config-dir", str(config_dir)]
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError(
+            "cannot confirm the target is powered off: %s" % exc)
+    state = result.stdout.strip().splitlines()[-1].strip().lower()         if result.stdout.strip() else ""
+    if result.returncode not in (0, 2) or state not in ("on", "off"):
+        raise ValueError(
+            "fence provider did not report a usable power state for %s: %s"
+            % (fence_plug, (result.stderr or result.stdout).strip()))
+    if state != "off":
+        raise ValueError(
+            "refusing to retire a claim of %s: the fence provider reports "
+            "it powered %s" % (fence_plug, state))
+    return "fence provider reported %s powered off" % fence_plug
+
+
 def fence_retire_host_claim(allocator, instance_uuid, host_id, fence_agent,
                             fenced_at, operator, evidence):
     """Dispose of a fenced host's claim so evacuation can proceed.
@@ -454,6 +490,21 @@ def _parser():
     parser.add_argument("--fenced-at", metavar="ISO8601")
     parser.add_argument("--operator", metavar="WHO")
     parser.add_argument("--fence-evidence", metavar="TEXT")
+    parser.add_argument(
+        "--fence-plug", metavar="NAME",
+        help=("Fence-provider plug name of the host named by --host-id. "
+              "Its power state is confirmed to be off before the claim is "
+              "retired, which is what catches a mistyped --host-id."))
+    parser.add_argument(
+        "--fence-provider", metavar="PATH",
+        default="/usr/local/sbin/openstack-incus-fence-agent-provider")
+    parser.add_argument("--fence-config-dir", metavar="PATH")
+    parser.add_argument(
+        "--unverified-power-state", metavar="WHY",
+        help=("Retire without confirming the power state, stating why. "
+              "The reason is written into the permanent fence ledger "
+              "entry, because a disposal nobody could verify must stay "
+              "visible during audit."))
     return parser
 
 
@@ -480,6 +531,11 @@ def main(argv=None, allocator_factory=idmap.IDMapAllocator,
         if missing:
             parser.error(
                 "fence-based retirement requires %s" % ", ".join(missing))
+        if bool(args.fence_plug) == bool(args.unverified_power_state):
+            parser.error(
+                "fence-based retirement requires either --fence-plug, to "
+                "confirm the target is powered off, or "
+                "--unverified-power-state stating why that is impossible")
         if args.restore_file is not None or args.retire_host_claim is not None:
             parser.error(
                 "--fence-retire-host-claim cannot be combined with frozen "
@@ -528,10 +584,18 @@ def main(argv=None, allocator_factory=idmap.IDMapAllocator,
             allow_insecure=args.allow_insecure,
         )
         if fence_requested:
+            if args.fence_plug:
+                confirmation = verify_host_is_powered_off(
+                    args.fence_provider, args.fence_plug,
+                    args.fence_config_dir)
+            else:
+                confirmation = (
+                    "power state unverified: %s"
+                    % args.unverified_power_state)
             assignments, release_intents = fence_retire_host_claim(
                 allocator, args.fence_retire_host_claim, args.host_id,
                 args.fence_agent, args.fenced_at, args.operator,
-                args.fence_evidence)
+                "%s; %s" % (args.fence_evidence, confirmation))
         elif args.restore_file is None:
             if args.bootstrap_empty:
                 allocator.bootstrap()
