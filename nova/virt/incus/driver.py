@@ -297,28 +297,17 @@ def _invalidates_instance_inventory(action):
     return wrapped
 
 
-def _guards_serial_console_destroy(action):
-    """Prevent console listeners from racing with instance destruction."""
+def _guards_serial_console(action):
+    """Refuse new console brokers for the whole of a guest-ending action.
+
+    Applied to operations after which the guest no longer runs here, so a
+    console request arriving mid-flight cannot build a broker the action
+    is about to strand.
+    """
     @functools.wraps(action)
     def wrapped(self, context, instance, *args, **kwargs):
-        with self._serial_consoles_lock:
-            self._serial_console_destroying.add(instance.uuid)
-            broker = self._serial_consoles.pop(instance.uuid, None)
-        if broker is not None:
-            try:
-                broker.close()
-            except Exception:
-                LOG.exception(
-                    'Failed to close the Incus serial console broker before '
-                    'destroying the instance',
-                    instance=instance)
-        try:
+        with self._quiesced_serial_console(instance):
             return action(self, context, instance, *args, **kwargs)
-        finally:
-            # A failed destroy must not permanently block a later console
-            # request. That request re-reads the authoritative Incus state.
-            with self._serial_consoles_lock:
-                self._serial_console_destroying.discard(instance.uuid)
 
     return wrapped
 
@@ -7985,7 +7974,7 @@ class IncusDriver(driver.ComputeDriver):
             reasons=tuple(sorted(reasons)))
 
     @_invalidates_instance_inventory
-    @_guards_serial_console_destroy
+    @_guards_serial_console
     def destroy(self, context, instance, network_info, block_device_info=None,
                 destroy_disks=True, destroy_secrets=True):
         """Destroy a running instance.
@@ -10224,6 +10213,7 @@ class IncusDriver(driver.ComputeDriver):
         self.vif_driver.unplug(instance, vif)
 
     @_invalidates_instance_inventory
+    @_guards_serial_console
     def migrate_disk_and_power_off(
             self, context, instance, dest, flavor, network_info,
             block_device_info=None, timeout=0, retry_interval=0):
@@ -10234,7 +10224,6 @@ class IncusDriver(driver.ComputeDriver):
         if not CONF.incus.allow_cold_migration:
             raise exception.MigrationError(
                 reason='Incus cold migration is disabled by configuration')
-        self._release_serial_console_broker(instance)
 
         root_bdm = _boot_from_volume(block_device_info)
         if (root_bdm is None and
@@ -10560,11 +10549,16 @@ class IncusDriver(driver.ComputeDriver):
             'Incus container rescue is not implemented')
 
     def _release_serial_console_broker(self, instance):
-        """Close and drop any serial console broker for a stopping guest.
+        """Close and drop any serial console broker for a departed guest.
 
         Brokers used to be reclaimed only by destroy; power-off, resize and
         migration left them holding proxy ports for a dead console until
         the pool drained.
+
+        Use this only where the guest is already gone from this host. While
+        it is still running here, releasing without holding the console
+        closed lets a concurrent request build a replacement that the
+        imminent stop will strand - use ``_quiesced_serial_console``.
         """
         with self._serial_consoles_lock:
             broker = self._serial_consoles.pop(instance.uuid, None)
@@ -10577,6 +10571,37 @@ class IncusDriver(driver.ComputeDriver):
                 'Failed to close the Incus serial console broker for a '
                 'stopping instance', instance=instance)
 
+    @contextlib.contextmanager
+    def _quiesced_serial_console(self, instance):
+        """Hold the console closed across an operation that stops a guest.
+
+        Closing the broker first and stopping the container afterwards
+        leaves a window in which the container is still Running and no
+        broker is registered, so a concurrent get_serial_console builds a
+        new one - which the stop then strands, holding a proxy port for a
+        console that can never produce output. Refusing new brokers for the
+        whole operation is what actually closes the leak.
+
+        The refusal is always lifted, including when the operation fails,
+        because a later console request re-reads the authoritative Incus
+        state and must not be blocked by a stop that did not happen.
+        """
+        with self._serial_consoles_lock:
+            self._serial_console_destroying.add(instance.uuid)
+            broker = self._serial_consoles.pop(instance.uuid, None)
+        if broker is not None:
+            try:
+                broker.close()
+            except Exception:
+                LOG.exception(
+                    'Failed to close the Incus serial console broker before '
+                    'stopping the instance', instance=instance)
+        try:
+            yield
+        finally:
+            with self._serial_consoles_lock:
+                self._serial_console_destroying.discard(instance.uuid)
+
     @_invalidates_instance_inventory
     def power_off(self, instance, timeout=0, retry_interval=0):
         """Power off an instance
@@ -10584,13 +10609,18 @@ class IncusDriver(driver.ComputeDriver):
         See 'nova.virt.drvier.ComputeDriver.power_off` for more
         information.
         """
-        self._release_serial_console_broker(instance)
-
         def force_stop():
             container = self.client.instances.get(instance.name)
             if container.status != 'Stopped':
                 container.stop(timeout=0, force=True, wait=True)
 
+        with self._quiesced_serial_console(instance):
+            self._power_off_locked(instance, timeout, retry_interval,
+                                   force_stop)
+
+    def _power_off_locked(self, instance, timeout, retry_interval,
+                          force_stop):
+        """Stop the guest while new console brokers are refused."""
         if timeout:
             def clean_stop():
                 container = self.client.instances.get(instance.name)
@@ -12964,6 +12994,11 @@ class IncusDriver(driver.ComputeDriver):
 
     @_invalidates_instance_inventory
     def post_live_migration_at_source(self, context, instance, network_info):
+        # The guest now runs on the destination, so any broker left here is
+        # bound to a container this host is about to delete. Keeping it
+        # would hold a proxy port, and would hand a dead console to the
+        # next request if the instance ever migrated back.
+        self._release_serial_console_broker(instance)
         failures = []
         try:
             profile = self.client.profiles.get(instance.name)

@@ -11692,6 +11692,83 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'secret')
 
     @mock.patch.object(driver.incus_console, 'SerialConsoleBroker')
+    def test_power_off_refuses_a_console_until_the_guest_is_stopped(
+            self, broker_factory):
+        """The window between releasing and stopping is the whole leak.
+
+        Closing the broker first and stopping afterwards left the guest
+        Running with no broker registered, so a console request built a
+        replacement that the imminent stop stranded on a proxy port.
+        """
+        self.CONF.serial_console.enabled = True
+        self.CONF.serial_console.proxyclient_address = '192.0.2.10'
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-console')
+        container = self.client.instances.get.return_value
+        container.status = 'Running'
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+        existing = mock.Mock()
+        incus_driver._serial_consoles[instance.uuid] = existing
+        raced = []
+
+        def stop(*args, **kwargs):
+            # A console request arriving while the stop is in flight.
+            raced.append(self.assertRaises(
+                exception.InstanceNotRunning,
+                incus_driver.get_serial_console, None, instance))
+            container.status = 'Stopped'
+
+        container.stop.side_effect = stop
+
+        incus_driver.power_off(instance)
+
+        self.assertEqual(1, len(raced))
+        existing.close.assert_called_once_with()
+        broker_factory.assert_not_called()
+        self.assertNotIn(instance.uuid, incus_driver._serial_consoles)
+        # The refusal is lifted once the guest is actually stopped.
+        self.assertNotIn(
+            instance.uuid, incus_driver._serial_console_destroying)
+
+    def test_power_off_lifts_the_console_refusal_after_failing(self):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-console')
+        container = self.client.instances.get.return_value
+        container.status = 'Running'
+        container.stop.side_effect = RuntimeError('stop failed')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        self.assertRaises(
+            RuntimeError, incus_driver.power_off, instance)
+
+        # A stop that did not happen must not block later consoles.
+        self.assertNotIn(
+            instance.uuid, incus_driver._serial_console_destroying)
+
+    def test_live_migration_source_releases_its_console_broker(self):
+        """The guest now runs elsewhere; this host's broker is dead.
+
+        Keeping it held a proxy port, and handed a stale console to the
+        next request if the instance ever migrated back.
+        """
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+        incus_driver.cleanup = mock.Mock()
+        broker = mock.Mock()
+        incus_driver._serial_consoles[instance.uuid] = broker
+
+        incus_driver.post_live_migration_at_source(ctx, instance, [_VIF])
+
+        broker.close.assert_called_once_with()
+        self.assertNotIn(instance.uuid, incus_driver._serial_consoles)
+
+    @mock.patch.object(driver.incus_console, 'SerialConsoleBroker')
     def test_get_serial_console_reuses_instance_broker(self, broker_factory):
         self.CONF.serial_console.enabled = True
         self.CONF.serial_console.proxyclient_address = '192.0.2.10'
