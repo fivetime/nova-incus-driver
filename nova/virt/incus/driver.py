@@ -13530,7 +13530,14 @@ class IncusDriver(driver.ComputeDriver):
         if not os.path.exists(configdrive_dir):
             fileutils.ensure_tree(configdrive_dir)
 
-        with utils.tempdir() as tmpdir:
+        # The mountpoint lives under instances_path, not the system temp
+        # directory: the privileged mount and umount entrypoints constrain
+        # both of their paths there, which is what keeps a compromised nova
+        # user from mounting a self-made image over a system directory.
+        mount_parent = os.path.join(
+            nova.conf.CONF.instances_path, instance.name)
+        os.makedirs(mount_parent, exist_ok=True)
+        with utils.tempdir(dir=mount_parent) as tmpdir:
             mounted = False
             try:
                 # Dedicated privsep entrypoints replace the three

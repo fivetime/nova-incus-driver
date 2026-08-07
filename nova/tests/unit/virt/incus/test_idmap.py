@@ -835,21 +835,51 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
             assignment.instance_uuid,
             [a.instance_uuid for a in assignments])
 
-    def test_audit_rejects_fence_entry_beside_a_live_claim(self):
+    def test_audit_rejects_fence_entry_beside_the_claim_it_disposed(self):
         # fence_retire_claim deletes the claim in the same transaction
-        # that writes the ledger, so both records for one pair can only
-        # mean outside mutation.
+        # that writes the ledger, so both records for one generation can
+        # only mean outside mutation.
         assignment = self.allocator.allocate(self._uuid(306))
         assignment, host_id, token = self._claim(
             assignment, host_number=306, token_number=306)
         proof = self._fence_proof(assignment, host_id)
-        raw = self.allocator._fence_proof_raw(proof)
+        raw = self.allocator._fence_proof_raw(proof, token)
         key = self.allocator.fence_key(host_id, assignment.instance_uuid)
         self.etcd.values[key.encode("utf-8")] = raw
 
         self.assertRaisesRegex(
-            idmap.IDMapIntegrityError, "coexists with a live host claim",
+            idmap.IDMapIntegrityError, "the live host claim it disposed of",
             self.allocator.audit_state)
+
+    def test_instance_may_return_to_a_host_it_was_fenced_off(self):
+        """A repaired host must be able to host the instance again.
+
+        The ledger entry is permanent audit evidence, so a later
+        generation's claim necessarily sits beside it. Treating that as
+        corruption would latch every allocator operation fleet-wide the
+        first time an instance came home.
+        """
+        assignment = self.allocator.allocate(self._uuid(307))
+        assignment, host_id, token = self._claim(
+            assignment, host_number=307, token_number=307)
+        assignment = self.allocator.fence_retire_claim(
+            assignment.instance_uuid, host_id,
+            self._fence_proof(assignment, host_id), assignment=assignment)
+
+        # A new materialization on the same host is a new generation.
+        current = self.allocator.claim(
+            assignment.instance_uuid, host_id, self._materialization(317),
+            assignment=assignment)
+
+        self.assertIn(host_id, current.host_ids)
+        assignments, unused_intents, unused_claims = (
+            self.allocator.audit_state())
+        self.assertIn(
+            assignment.instance_uuid,
+            [a.instance_uuid for a in assignments])
+        # The disposal stays auditable after the reclaim.
+        self.assertIsNotNone(self.allocator.get_fence_proof(
+            assignment.instance_uuid, host_id))
 
     def test_fence_retirement_refuses_a_cleaned_claim(self):
         # A claim with its own cleanup proof must retire through the

@@ -2086,7 +2086,9 @@ class IncusDriverTest(test.NoDBTestCase):
         self.CONF2 = CONF2_patcher.start()
         self.CONF2.incus.root_dir = '/incus'
         self.CONF2.incus.storage_pool = None
-        self.CONF2.instances_path = '/i'
+        # Real path: the config-drive mountpoint is created under
+        # instances_path, so it must not be a fictional directory here.
+        self.CONF2.instances_path = self.instances_dir.name
 
         bdige_patcher = mock.patch(
             'nova.virt.incus.driver.driver.block_device_info_get_ephemerals')

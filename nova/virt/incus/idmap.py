@@ -568,13 +568,21 @@ class IDMapAllocator:
             self._prefix, self._host_id(host_id),
             self._instance_uuid(instance_uuid))
 
-    def _fence_proof_raw(self, proof):
+    def _fence_proof_raw(self, proof, materialization_id):
+        # The materialization token of the disposed claim is recorded
+        # alongside the operator's evidence, not asked of the operator: it
+        # is what lets a later audit tell "the claim we deleted reappeared"
+        # (outside mutation) from "the instance was rebuilt on this host
+        # after it was repaired" (ordinary, and it must not latch the
+        # registry).
         return self._json_bytes({
             "schema": _SCHEMA_VERSION,
             "kind": "fence-retirement",
             "instance_uuid": self._instance_uuid(proof.instance_uuid),
             "host_id": self._host_id(proof.host_id),
             "allocation_id": self._materialization_id(proof.allocation_id),
+            "materialization_id": self._materialization_id(
+                materialization_id),
             "fence_agent": proof.fence_agent,
             "fenced_at": proof.fenced_at,
             "operator": proof.operator,
@@ -1574,7 +1582,7 @@ class IDMapAllocator:
         slots = {}
         intents = {}
         host_claims = {}
-        fences = {}
+        fenced_tokens = {}
         instance_raw = {}
         slot_raw = {}
         for key, raw in records.items():
@@ -1684,6 +1692,8 @@ class IDMapAllocator:
                         operator=value["operator"],
                         evidence=value["evidence"])
                     validate_fence_proof(proof)
+                    fenced_token = self._materialization_id(
+                        value["materialization_id"])
                 except (ValueError, KeyError, TypeError,
                         IDMapConfigurationError) as exc:
                     raise IDMapIntegrityError(
@@ -1693,19 +1703,25 @@ class IDMapAllocator:
                         proof.instance_uuid != normalized_uuid):
                     raise IDMapIntegrityError(
                         reason="fence ledger record contradicts its key")
-                fences[(normalized_host_id, normalized_uuid)] = proof
+                fenced_tokens[(normalized_host_id, normalized_uuid)] = (
+                    fenced_token)
             else:
                 raise IDMapIntegrityError(
                     reason="unexpected allocator key %s" % key)
 
-        # fence_retire_claim removes the claim in the same transaction that
-        # writes the ledger entry, so a pair holding both records means the
-        # registry was mutated outside the allocator.
-        for fence_pair in fences:
-            if fence_pair in host_claims:
+        # fence_retire_claim writes the ledger entry and deletes that exact
+        # claim in one transaction, so seeing the *same* materialization
+        # token alive again means the registry was mutated outside the
+        # allocator. A different token is the ordinary case of an instance
+        # returning to a host that was repaired after being fenced: the
+        # ledger keeps that disposal permanently auditable and must never
+        # latch the registry against the reclaim.
+        for fence_pair, fenced_token in fenced_tokens.items():
+            claim = host_claims.get(fence_pair)
+            if claim is not None and claim.materialization_id == fenced_token:
                 raise IDMapIntegrityError(
-                    reason="fence ledger entry coexists with a live host "
-                           "claim for the same host and instance")
+                    reason="fence ledger entry coexists with the live host "
+                           "claim it disposed of")
 
         claimed_slots = {}
         for instance_uuid, assignment in instances.items():
@@ -2845,7 +2861,8 @@ class IDMapAllocator:
                     self._compare_value(host_key, claim_raws[host_id]),
                 ],
                 "success": [
-                    self._put(fence_key, self._fence_proof_raw(fence_proof)),
+                    self._put(fence_key, self._fence_proof_raw(
+                        fence_proof, claim.materialization_id)),
                     self._put(self.instance_key(instance_uuid), desired_raw),
                     self._put(self.slot_key(current.slot), desired_raw),
                     self._delete(host_key),

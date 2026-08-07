@@ -229,28 +229,42 @@ def _validate_instances_subpath(path, description):
 
 @nova.privsep.sys_admin_pctxt.entrypoint
 def configdrive_mount_iso(iso_path, mountpoint, uid, gid, timeout):
-    """Loop-mount a config-drive ISO read-only under instances_path."""
+    """Loop-mount a config-drive ISO read-only under instances_path.
+
+    The mountpoint is constrained exactly like the source. Mounting over a
+    system directory is a host takeover even read-only: the mount hides the
+    real directory while the caller controls the image contents. The
+    filesystem type is pinned so a crafted image cannot reach an arbitrary
+    kernel filesystem driver through type autodetection.
+    """
     iso_path = _validate_instances_subpath(iso_path, 'config drive ISO')
     if not os.path.isfile(iso_path):
         raise ValueError(_('config drive ISO is not a regular file'))
-    if not isinstance(mountpoint, str) or not os.path.isdir(mountpoint):
+    mountpoint = _validate_instances_subpath(
+        mountpoint, 'config drive mountpoint')
+    if not os.path.isdir(mountpoint):
         raise ValueError(_('config drive mountpoint is not a directory'))
     options = 'loop,ro,nosuid,nodev,noexec,uid=%d,gid=%d' % (
         int(uid), int(gid))
     command = _timeout_prefix(timeout) + [
-        _MOUNT_PATH, '-o', options, '--', iso_path, mountpoint]
+        _MOUNT_PATH, '-t', 'iso9660', '-o', options, '--',
+        iso_path, mountpoint]
     return processutils.execute(
         *command, timeout=int(timeout) + _KILL_GRACE_SECONDS + 5)
 
 
 @nova.privsep.sys_admin_pctxt.entrypoint
 def configdrive_umount(mountpoint, timeout):
-    """Unmount a config-drive ISO mounted by configdrive_mount_iso."""
-    if not isinstance(mountpoint, str) or not mountpoint or (
-            '\x00' in mountpoint):
-        raise ValueError(_('config drive mountpoint is invalid'))
+    """Unmount a config-drive ISO mounted by configdrive_mount_iso.
+
+    Unmounting is as privileged as mounting: releasing an arbitrary
+    mountpoint would make later writes land on whatever directory sits
+    underneath it, so the target is constrained to instances_path too.
+    """
+    mountpoint = _validate_instances_subpath(
+        mountpoint, 'config drive mountpoint')
     command = _timeout_prefix(timeout) + [
-        _UMOUNT_PATH, '--', os.path.realpath(mountpoint)]
+        _UMOUNT_PATH, '--', mountpoint]
     return processutils.execute(
         *command, timeout=int(timeout) + _KILL_GRACE_SECONDS + 5)
 
