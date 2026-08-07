@@ -41,6 +41,7 @@ import time
 import types
 from urllib import parse
 import uuid
+import zlib
 
 import eventlet
 import nova.conf
@@ -4452,6 +4453,34 @@ def _incus_network_config(network_info):
         default_flow_style=False, sort_keys=False)
 
 
+def _decompress_bounded_user_data(raw):
+    """Expand gzipped user-data without letting it expand without bound.
+
+    Nova caps user-data at 64 KiB, but gzip expands by up to about a
+    thousand times, so decompressing whole turns that cap into tens of
+    megabytes. The result is not transient either: it is stored in the
+    Incus instance configuration and returned by every read of that
+    instance, so each inventory scan pays for it again.
+
+    Reading one byte past the ceiling is what makes the limit real. A
+    length check applied after ``gzip.decompress`` would already have
+    built the oversized value it was meant to prevent.
+    """
+    limit = CONF.incus.maximum_user_data_kb * units.Ki
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(raw)) as expanded:
+            decompressed = expanded.read(limit + 1)
+    except (OSError, EOFError, zlib.error) as exc:
+        raise exception.Invalid(
+            'Instance user_data is not valid gzip data') from exc
+    if len(decompressed) > limit:
+        raise exception.Invalid(
+            'Instance user_data expands beyond the %d KiB limit set by '
+            '[incus] maximum_user_data_kb'
+            % CONF.incus.maximum_user_data_kb)
+    return decompressed
+
+
 def _incus_cloud_init_config(instance, network_info=None):
     """Translate Nova bootstrap data to the Incus NoCloud template keys."""
     config = {'user.openstack.uuid': instance.uuid}
@@ -4465,7 +4494,7 @@ def _incus_cloud_init_config(instance, network_info=None):
             # Users gzip user-data to fit Nova's 64K API limit. Incus
             # config values must be text, so carry the decompressed form,
             # which cloud-init treats identically.
-            raw = gzip.decompress(raw)
+            raw = _decompress_bounded_user_data(raw)
         try:
             config['cloud-init.user-data'] = raw.decode('utf-8')
         except UnicodeDecodeError as exc:

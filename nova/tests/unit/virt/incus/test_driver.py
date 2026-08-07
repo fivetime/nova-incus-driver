@@ -2007,6 +2007,7 @@ class IncusDriverTest(test.NoDBTestCase):
         self.CONF.incus.root_storage_pools = {}
         self.CONF.incus.root_storage_pool_resource_classes = {}
         self.CONF.incus.boot_from_volume_storage_pools = {}
+        self.CONF.incus.maximum_user_data_kb = 1024
         self.CONF.incus.shared_root_storage_pool_capacities_gb = {}
         self.CONF.incus.allow_cold_migration = False
         self.CONF.incus.allow_live_migration = False
@@ -3603,6 +3604,60 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         self.assertEqual(
             payload.decode('utf-8'), config['cloud-init.user-data'])
+
+    def test_incus_cloud_init_config_rejects_a_decompression_bomb(self):
+        """A 64 KiB upload must not become tens of megabytes.
+
+        The expanded value is stored in the Incus instance configuration
+        and returned by every read of that instance, so the cost would be
+        paid again on each inventory scan rather than once at boot.
+        """
+        self.CONF.incus.maximum_user_data_kb = 1
+        # Well inside Nova's own 64 KiB API limit once base64-encoded.
+        bomb = gzip.compress(b'\0' * (4 * units.Mi))
+        self.assertLess(len(base64.b64encode(bomb)), 64 * units.Ki)
+        instance = mock.Mock(
+            uuid='instance-uuid',
+            user_data=base64.b64encode(bomb),
+            key_name=None, key_data=None)
+
+        self.assertRaisesRegex(
+            Exception, 'maximum_user_data_kb',
+            driver._incus_cloud_init_config, instance)
+
+    def test_incus_cloud_init_config_reads_only_up_to_the_ceiling(self):
+        # The limit has to be enforced during expansion; checking the
+        # length afterwards would already have built the oversized value.
+        self.CONF.incus.maximum_user_data_kb = 1
+        reads = []
+        real_gzipfile = driver.gzip.GzipFile
+
+        class RecordingGzipFile(real_gzipfile):
+            def read(self, size=-1):
+                reads.append(size)
+                return super().read(size)
+
+        instance = mock.Mock(
+            uuid='instance-uuid',
+            user_data=base64.b64encode(gzip.compress(b'\0' * (4 * units.Mi))),
+            key_name=None, key_data=None)
+
+        with mock.patch.object(driver.gzip, 'GzipFile', RecordingGzipFile):
+            self.assertRaises(
+                Exception, driver._incus_cloud_init_config, instance)
+
+        # Bounded at the ceiling rather than reading the whole stream.
+        self.assertEqual(units.Ki + 1, reads[0])
+
+    def test_incus_cloud_init_config_rejects_corrupt_gzip_user_data(self):
+        instance = mock.Mock(
+            uuid='instance-uuid',
+            user_data=base64.b64encode(b'\x1f\x8btruncated'),
+            key_name=None, key_data=None)
+
+        self.assertRaisesRegex(
+            Exception, 'not valid gzip data',
+            driver._incus_cloud_init_config, instance)
 
     def test_incus_cloud_init_config_rejects_binary_user_data(self):
         instance = mock.Mock(

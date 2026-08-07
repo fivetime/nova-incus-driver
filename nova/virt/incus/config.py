@@ -118,6 +118,22 @@ incus_opts = [
             "spec. The default process limit must not exceed this value."
         ),
     ),
+    cfg.IntOpt(
+        "maximum_user_data_kb",
+        default=1024,
+        min=1,
+        help=(
+            "Ceiling on decompressed instance user-data, in kibibytes. "
+            "Tenants gzip user-data to fit Nova's 64 KiB API limit, and "
+            "gzip expands by up to about a thousand times, so an "
+            "unbounded decompression turns that limit into tens of "
+            "megabytes. The result is stored in the Incus instance "
+            "configuration and returned by every instance read, so the "
+            "cost is paid again on each inventory scan rather than once "
+            "at boot. Raise this only if a deployment genuinely ships "
+            "cloud-config larger than the default."
+        ),
+    ),
     cfg.BoolOpt(
         "allow_instance_swap",
         default=False,
