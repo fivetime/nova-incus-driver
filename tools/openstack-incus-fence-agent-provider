@@ -61,6 +61,7 @@ AGENTS = {
         "binary": "fence_virsh",
         "keys": {
             "agent",
+            "compute_id",
             "identity_file",
             "ip",
             "ipport",

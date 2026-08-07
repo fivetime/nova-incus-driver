@@ -12,6 +12,7 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 import contextlib
+import json
 import importlib.machinery
 import importlib.util
 import io
@@ -237,3 +238,48 @@ class FenceAgentProviderTest(test.NoDBTestCase):
             )
         self.assertNotIn("secret-value", str(error))
         self.assertIn("[REDACTED]", str(error))
+
+
+class FenceComputeBindingTest(test.NoDBTestCase):
+    """compute_id ties a fence entry to the compute it powers.
+
+    A powered-off host cannot be asked for its own UUID, so the binding
+    has to be declared here in advance for tools acting on a fenced host
+    to verify it.
+    """
+
+    def test_every_agent_accepts_the_binding_key(self):
+        # virsh defines its own key set rather than extending the common
+        # one, and was missed the first time.
+        for name, agent in provider.AGENTS.items():
+            self.assertIn(
+                'compute_id', agent['keys'],
+                '%s must accept compute_id' % name)
+
+    def test_the_binding_is_never_passed_to_the_fence_agent(self):
+        # It is metadata for the caller, not a fence agent parameter;
+        # forwarding it would make every fence action fail.
+        with tempfile.TemporaryDirectory() as config_dir:
+            identity = os.path.join(config_dir, 'id')
+            with open(identity, 'w', encoding='utf-8') as handle:
+                handle.write('key')
+            os.chmod(identity, 0o600)
+            config = {
+                'agent': 'virsh',
+                'ip': '192.0.2.9',
+                'username': 'root',
+                'identity_file': identity,
+                'plug': 'compute-1',
+                'compute_id': '00000000-0000-0000-0000-000000000002',
+            }
+            path = os.path.join(config_dir, 'compute-1.json')
+            with open(path, 'w', encoding='utf-8') as handle:
+                json.dump(config, handle)
+            os.chmod(path, 0o600)
+            with mock.patch.object(
+                    provider.os, 'stat', return_value=secure_stat()):
+                unused_binary, parameters = provider.load_config(
+                    provider.Path(config_dir), 'compute-1')
+
+        self.assertNotIn('compute_id', parameters)
+        self.assertEqual('compute-1', parameters['plug'])
