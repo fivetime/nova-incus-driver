@@ -18,6 +18,7 @@ import hashlib
 import os
 import re
 import threading
+import time
 from urllib import parse as urlparse
 import uuid
 
@@ -858,18 +859,29 @@ class IDMapAllocator:
                         "registry and restart this compute: %s" %
                         self._integrity_latch))
 
+    # How long a successful configuration validation may be reused before
+    # the next allocator operation re-reads it. Every ownership-changing
+    # transaction still carries its own _compare_config() compare-and-swap,
+    # which is the actual authority against an outage or operator edit; this
+    # bound only limits how stale the read-side belt-and-suspenders check
+    # may be, and removes an etcd round trip from every hot-path operation
+    # (previously ~a quarter of all allocator etcd traffic).
+    _INITIALIZE_REVALIDATE_SECONDS = 5.0
+
     def _ensure_initialized(self):
-        # Validate the registry on every allocator operation. A compute may
-        # remain alive while etcd is unavailable, but no ownership-changing
-        # operation may rely on a configuration cached before an outage or an
-        # operator edit.
         self._raise_if_integrity_latched()
+        now = time.monotonic()
+        checked = getattr(self, '_initialized_checked_at', None)
+        if (self._initialized and checked is not None and
+                now - checked < self._INITIALIZE_REVALIDATE_SECONDS):
+            return
         try:
             self.initialize()
         except IDMapIntegrityError as exc:
             if self._integrity_latch is None:
                 self._integrity_latch = str(exc)
             raise
+        self._initialized_checked_at = time.monotonic()
 
     def _assignment_raw(self, instance_uuid, slot, allocation_id,
                         host_ids=()):

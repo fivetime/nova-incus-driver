@@ -15,6 +15,7 @@
 
 import collections
 import base64
+import gzip
 import copy
 from contextlib import closing
 import dataclasses
@@ -24,6 +25,7 @@ import inspect
 import io
 import os
 import re
+import shutil
 import stat
 import tarfile
 import tempfile
@@ -3382,6 +3384,54 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                 '  "tenant-key": "ssh-ed25519 AAAATEST tenant"\n'),
         }, driver._incus_cloud_init_config(instance))
 
+    def test_get_vcpus_used_raises_when_inventory_unavailable(self):
+        # Reporting zero would make a failing host look empty and attract
+        # the scheduler exactly when Incus is unreachable.
+        drv = driver.IncusDriver(None)
+        with mock.patch.object(
+                drv, '_get_instance_inventory_snapshot',
+                side_effect=RuntimeError('incus unreachable')):
+            self.assertRaises(RuntimeError, drv._get_vcpus_used)
+
+    def test_unplug_vifs_attempts_every_vif_and_reraises_first(self):
+        drv = driver.IncusDriver(None)
+        drv.vif_driver = mock.Mock()
+        boom = RuntimeError('vif 1 unplug failed')
+        drv.vif_driver.unplug.side_effect = [boom, None, None]
+        instance = mock.Mock()
+        instance.name = 'instance-00000001'
+        vifs = [{'id': 'vif-1'}, {'id': 'vif-2'}, {'id': 'vif-3'}]
+
+        raised = self.assertRaises(
+            RuntimeError, drv.unplug_vifs, instance, vifs)
+
+        self.assertIs(boom, raised)
+        self.assertEqual(3, drv.vif_driver.unplug.call_count)
+
+    def test_incus_cloud_init_config_gzip_user_data(self):
+        # Users gzip user-data to fit Nova's 64K API limit; it must arrive
+        # at cloud-init as the equivalent decompressed text.
+        payload = b'#cloud-config\nruncmd: []\n'
+        instance = mock.Mock(
+            uuid='instance-uuid',
+            user_data=base64.b64encode(gzip.compress(payload)),
+            key_name=None, key_data=None)
+
+        config = driver._incus_cloud_init_config(instance)
+
+        self.assertEqual(
+            payload.decode('utf-8'), config['cloud-init.user-data'])
+
+    def test_incus_cloud_init_config_rejects_binary_user_data(self):
+        instance = mock.Mock(
+            uuid='instance-uuid',
+            user_data=base64.b64encode(b'\xff\xfe\x00binary'),
+            key_name=None, key_data=None)
+
+        self.assertRaisesRegex(
+            Exception, 'neither UTF-8 text nor',
+            driver._incus_cloud_init_config, instance)
+
     def test_incus_cloud_init_network_config(self):
         network_info = [{
             'id': '01234567-89ab-cdef-0123-456789abcdef',
@@ -6404,6 +6454,30 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         self.assertEqual(b'x' * driver.MAX_CONSOLE_BYTES, contents)
         self.client.instances.get.assert_called_once_with(instance.name)
+
+    @mock.patch('nova.virt.incus.driver.neutron')
+    def test_get_console_output_tail_reads_host_file(self, _):
+        # The host-side log file is read with _last_bytes so a huge console
+        # log cannot balloon nova-compute memory; the API is not consulted.
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        log_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, log_dir, ignore_errors=True)
+        console_path = os.path.join(log_dir, 'console.log')
+        with open(console_path, 'wb') as f:
+            f.write(b'y' * 100 + b'x' * driver.MAX_CONSOLE_BYTES)
+        attributes = mock.Mock(console_path=console_path)
+
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        with mock.patch.object(
+                driver.common, 'InstanceAttributes',
+                return_value=attributes):
+            contents = incus_driver.get_console_output(context, instance)
+
+        self.assertEqual(b'x' * driver.MAX_CONSOLE_BYTES, contents)
+        self.client.instances.get.assert_not_called()
 
     def test_reboot_starts_stopped_migration_target(self):
         ctx = context.get_admin_context()

@@ -43,7 +43,13 @@ def InstanceAttributes(instance):
     else:
         prefix = '/var/log/incus'
     instance_dir = os.path.join(conf.CONF.instances_path, instance.name)
-    console_path = os.path.join(prefix, instance.name, 'console.log')
+    # Incus places non-default-project instance logs under
+    # "<project>_<instance>".
+    project = conf.CONF.incus.project
+    log_dir = (
+        instance.name if project == 'default'
+        else '{}_{}'.format(project, instance.name))
+    console_path = os.path.join(prefix, log_dir, 'console.log')
     storage_path = os.path.join(instance_dir, 'storage')
     container_path = os.path.join(
         conf.CONF.incus.root_dir, 'containers', instance.name)

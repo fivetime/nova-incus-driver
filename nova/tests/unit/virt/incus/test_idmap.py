@@ -17,6 +17,7 @@ from concurrent import futures
 import dataclasses
 import os
 import threading
+from unittest import mock
 import uuid
 
 import fixtures
@@ -756,6 +757,30 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
         # If the claim linearized first, both calls succeed and the release
         # barrier preserves that existing claim. If release won, claim fails.
         self.assertEqual(results[0] is not None, bool(current.host_ids))
+
+    def test_ensure_initialized_caches_config_validation_briefly(self):
+        # Every ownership-changing transaction still carries its own
+        # _compare_config() CAS; the per-operation config re-read is a
+        # read-side check whose 5s reuse removes a hot-path etcd round trip.
+        calls = []
+        orig = self.allocator._get_raw
+
+        def spy(key):
+            calls.append(key)
+            return orig(key)
+
+        with mock.patch.object(self.allocator, '_get_raw', side_effect=spy):
+            self.allocator._ensure_initialized()
+            self.allocator._ensure_initialized()
+            config_reads = [
+                k for k in calls if k == self.allocator.configuration_key]
+            self.assertEqual(1, len(config_reads))
+            # An expired window revalidates.
+            self.allocator._initialized_checked_at -= 60
+            self.allocator._ensure_initialized()
+            config_reads = [
+                k for k in calls if k == self.allocator.configuration_key]
+            self.assertEqual(2, len(config_reads))
 
     def test_unproven_claim_cannot_retire(self):
         assignment = self.allocator.allocate(self._uuid(10))

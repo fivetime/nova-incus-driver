@@ -24,6 +24,7 @@ from dataclasses import dataclass
 import errno
 import functools
 import glob
+import gzip
 import hashlib
 import io
 import ipaddress
@@ -4427,8 +4428,18 @@ def _incus_cloud_init_config(instance, network_info=None):
     if user_data:
         if isinstance(user_data, str):
             user_data = user_data.encode('ascii')
-        config['cloud-init.user-data'] = base64.b64decode(user_data).decode(
-            'utf-8')
+        raw = base64.b64decode(user_data)
+        if raw[:2] == b'\x1f\x8b':
+            # Users gzip user-data to fit Nova's 64K API limit. Incus
+            # config values must be text, so carry the decompressed form,
+            # which cloud-init treats identically.
+            raw = gzip.decompress(raw)
+        try:
+            config['cloud-init.user-data'] = raw.decode('utf-8')
+        except UnicodeDecodeError as exc:
+            raise exception.Invalid(
+                'Instance user_data is neither UTF-8 text nor '
+                'gzip-compressed UTF-8 text') from exc
 
     key_data = getattr(instance, 'key_data', None)
     if key_data:
@@ -9018,6 +9029,17 @@ class IncusDriver(driver.ComputeDriver):
         See `nova.virt.driver.ComputeDriver.get_console_output` for more
         information.
         """
+        # Read the tail of the host-side log file so a tenant hammering a
+        # huge console log cannot balloon nova-compute memory; the API
+        # fetch below has no ranged read and loads the whole log.
+        console_path = common.InstanceAttributes(instance).console_path
+        try:
+            with open(console_path, 'rb') as console_file:
+                data, unused_remaining = _last_bytes(
+                    console_file, MAX_CONSOLE_BYTES)
+                return data
+        except OSError:
+            pass
         container = self.client.instances.get(instance.name)
         return container.console_log()[-MAX_CONSOLE_BYTES:]
 
@@ -10986,8 +11008,12 @@ class IncusDriver(driver.ComputeDriver):
         try:
             containers = self._get_instance_inventory_snapshot().values()
         except Exception:
+            # Reporting zero here would make a failing host look empty and
+            # attract the scheduler exactly when Incus is unreachable.
+            # Raising keeps the resource tracker on its last known view,
+            # matching the fail-closed storage-pool availability handling.
             LOG.exception('Failed to audit Incus vCPU usage')
-            return 0
+            raise
 
         for container in containers:
             config = getattr(container, 'expanded_config', None)
@@ -11250,8 +11276,21 @@ class IncusDriver(driver.ComputeDriver):
         return failures
 
     def unplug_vifs(self, instance, network_info):
+        # Attempt every VIF: aborting on the first failure leaked every
+        # remaining interface of a multi-NIC instance. The first error is
+        # re-raised afterwards so callers still see the failure.
+        first_error = None
         for vif in network_info:
-            self.vif_driver.unplug(instance, vif)
+            try:
+                self.vif_driver.unplug(instance, vif)
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+                LOG.exception(
+                    'Failed to unplug VIF %s; continuing with the rest',
+                    vif.get('id', 'unknown'), instance=instance)
+        if first_error is not None:
+            raise first_error
 
     def get_host_cpu_stats(self):
         return {

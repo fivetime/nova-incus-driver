@@ -31,6 +31,7 @@ class InstanceAttributesTest(test.NoDBTestCase):
         self.CONF = self.CONF_patcher.start()
         self.CONF.instances_path = '/i'
         self.CONF.incus.root_dir = '/c'
+        self.CONF.incus.project = 'nova'
 
     def tearDown(self):
         super(InstanceAttributesTest, self).tearDown()
@@ -62,6 +63,13 @@ class InstanceAttributesTest(test.NoDBTestCase):
             ctx, name='test', memory_mb=0)
         is_snap_incus.return_value = False
 
+        # Incus prefixes non-default-project log directories.
+        attributes = common.InstanceAttributes(instance)
+        self.assertEqual(
+            '/var/log/incus/nova_instance-00000001/console.log',
+            attributes.console_path)
+
+        self.CONF.incus.project = 'default'
         attributes = common.InstanceAttributes(instance)
         self.assertEqual(
             '/var/log/incus/instance-00000001/console.log',
