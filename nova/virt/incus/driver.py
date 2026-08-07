@@ -102,6 +102,10 @@ LOG = logging.getLogger(__name__)
 IMAGE_API = glance.API()
 
 MAX_CONSOLE_BYTES = 100 * units.Ki
+# Cached-image deletions are serial and each waits on the server, so a
+# pass is bounded to keep the periodic task's greenthread available. What
+# it defers is taken by the next pass, not dropped.
+_IMAGE_CACHE_DELETE_BATCH = 25
 NOVA_CONF = nova.conf.CONF
 
 ACCEPTABLE_IMAGE_FORMATS = {'raw', 'root-tar', 'squashfs'}
@@ -7656,12 +7660,35 @@ class IncusDriver(driver.ComputeDriver):
             'source': ({'type': 'none'} if root_volume else {
                 'type': 'image', 'alias': instance.image_ref}),
         }
+        def create_container():
+            try:
+                return self.client.instances.create(
+                    container_config, wait=True)
+            except incus_exceptions.LXDAPIException as exc:
+                if root_volume or not _is_incus_not_found(exc):
+                    raise
+                # The image was present when this spawn checked for it,
+                # but cache aging holds no lock over the interval before
+                # the create and only sees the instances that existed when
+                # its pass began - so a build that started after that
+                # snapshot can have its image removed underneath it. Sync
+                # it back and create once more rather than failing a spawn
+                # over a cache decision. The retry stays inside this
+                # callable so the materialization barrier sees one attempt.
+                LOG.info(
+                    'Cached Incus image %s disappeared before the container '
+                    'was created; syncing it again', instance.image_ref,
+                    instance=instance)
+                _sync_glance_image_to_incus(
+                    self.client, context, instance.image_ref)
+                return self.client.instances.create(
+                    container_config, wait=True)
+
         with self._timed_phase(instance, 'spawn', 'incus_create'):
             try:
                 container = self._with_rootfs_materialization_barrier(
                     materialization, container_config['config'],
-                    lambda: self.client.instances.create(
-                        container_config, wait=True),
+                    create_container,
                     recover_action=lambda: self.client.instances.get(
                         instance.name))
             except Exception:
@@ -9262,43 +9289,77 @@ class IncusDriver(driver.ComputeDriver):
         min_age = CONF.image_cache.remove_unused_original_minimum_age_seconds
         now = timeutils.utcnow(with_timezone=True)
         try:
-            images = self.client.images.all()
+            # One recursive listing rather than pylxd's plain index, whose
+            # objects carry only a fingerprint and fetch every attribute
+            # below on first access - a request per image, on a periodic
+            # task, for a store that is mostly not candidates.
+            response = self.client.api.images.get(params={'recursion': 1})
+            body = response.json()
+            images = body.get('metadata') if isinstance(body, dict) else None
+            if not isinstance(images, list):
+                raise exception.InvalidConfiguration(
+                    'Incus recursive image inventory is malformed')
         except Exception:
             LOG.warning(
                 'Cannot list the Incus image store for cache aging',
                 exc_info=True)
             return
+
+        candidates = []
         for image in images:
-            try:
-                aliases = [
-                    alias.get('name', '')
-                    for alias in (image.aliases or [])]
-                if not aliases or not all(
-                        uuidutils.is_uuid_like(alias) for alias in aliases):
+            if not isinstance(image, dict):
+                continue
+            aliases = [
+                alias.get('name', '')
+                for alias in (image.get('aliases') or [])
+                if isinstance(alias, dict)]
+            if not aliases or not all(
+                    uuidutils.is_uuid_like(alias) for alias in aliases):
+                continue
+            if any(alias in referenced for alias in aliases):
+                continue
+            last_used = None
+            for stamp in (image.get('last_used_at'),
+                          image.get('uploaded_at')):
+                if not stamp:
                     continue
-                if any(alias in referenced for alias in aliases):
-                    continue
-                last_used = None
-                for stamp in (getattr(image, 'last_used_at', None),
-                              getattr(image, 'uploaded_at', None)):
-                    if not stamp:
-                        continue
+                try:
                     parsed = timeutils.parse_isotime(stamp)
-                    # Incus reports never-used as the zero time.
-                    if parsed.year <= 1970:
-                        continue
-                    if last_used is None or parsed > last_used:
-                        last_used = parsed
-                if last_used is None:
+                except ValueError:
                     continue
-                if (now - last_used).total_seconds() < min_age:
+                # Incus reports never-used as the zero time.
+                if parsed.year <= 1970:
                     continue
+                if last_used is None or parsed > last_used:
+                    last_used = parsed
+            if last_used is None:
+                continue
+            if (now - last_used).total_seconds() < min_age:
+                continue
+            fingerprint = image.get('fingerprint')
+            if fingerprint:
+                candidates.append((fingerprint, aliases, last_used))
+
+        # Deletions are serial and each waits on the server, so the first
+        # pass on a node that has been running for months would otherwise
+        # hold this periodic task for minutes. The remainder is not
+        # dropped, it is taken by the following passes - and it is logged,
+        # because a bounded pass that looked complete would misreport the
+        # store as fully aged.
+        batch = candidates[:_IMAGE_CACHE_DELETE_BATCH]
+        if len(candidates) > len(batch):
+            LOG.info(
+                'Aging %(batch)d of %(total)d unused cached Incus images '
+                'this pass; the rest follow on later passes',
+                {'batch': len(batch), 'total': len(candidates)})
+        for fingerprint, aliases, last_used in batch:
+            try:
                 LOG.info(
                     'Removing unused cached Incus image %(fingerprint).12s '
                     'aliased %(aliases)s (unused since %(last_used)s)',
-                    {'fingerprint': image.fingerprint,
+                    {'fingerprint': fingerprint,
                      'aliases': aliases, 'last_used': last_used})
-                image.delete(wait=True)
+                self.client.images.get(fingerprint).delete(wait=True)
             except Exception:
                 LOG.warning(
                     'Failed to age cached Incus image; leaving it in place',
@@ -9319,8 +9380,22 @@ class IncusDriver(driver.ComputeDriver):
                 data, unused_remaining = _last_bytes(
                     console_file, MAX_CONSOLE_BYTES)
                 return data
-        except OSError:
+        except FileNotFoundError:
+            # A guest that has not written to its console yet. The API
+            # below returns the same emptiness, so this is not worth a
+            # log line on every request.
             pass
+        except OSError as exc:
+            # Anything else - most often the log directory being
+            # unreadable by the compute service user - is a standing
+            # condition that silently defeats the bounded read on every
+            # request. Swallowing it left no trace of why memory use
+            # tracked console size.
+            LOG.warning(
+                'Cannot read the host-side Incus console log %(path)s '
+                '(%(error)s); falling back to the unbounded API read, '
+                'which loads the whole log into memory',
+                {'path': console_path, 'error': exc}, instance=instance)
         container = self.client.instances.get(instance.name)
         return container.console_log()[-MAX_CONSOLE_BYTES:]
 

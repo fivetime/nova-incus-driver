@@ -3795,6 +3795,76 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         IMAGE_API.download = download_unified
         self.test_spawn()
 
+    @mock.patch('nova.virt.incus.driver._sync_glance_image_to_incus')
+    @mock.patch('nova.virt.configdrive.required_by')
+    def test_spawn_resyncs_an_image_aged_out_before_the_create(
+            self, configdrive, sync):
+        """Cache aging can remove the image this spawn just verified.
+
+        The aging pass holds no lock over the interval and only sees the
+        instances that existed when its pass began, so a build starting
+        after that snapshot can lose its image. Losing a build to a cache
+        decision is not acceptable when the image can simply be fetched
+        again.
+        """
+        def container_get(*args, **kwargs):
+            raise incuscore_exceptions.LXDAPIException(MockResponse(404))
+
+        self.client.instances.get.side_effect = container_get
+        configdrive.return_value = False
+        container = mock.Mock()
+        self.client.instances.create.side_effect = [
+            incuscore_exceptions.LXDAPIException(MockResponse(404)),
+            container,
+        ]
+
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0, root_gb=1)
+        virtapi = manager.ComputeVirtAPI(mock.MagicMock())
+        incus_driver = driver.IncusDriver(virtapi)
+        incus_driver.init_host(None)
+        incus_driver.firewall_driver = mock.Mock()
+
+        incus_driver.spawn(
+            ctx, instance, mock.Mock(), mock.Mock(), mock.Mock(),
+            mock.Mock(), [_VIF], {'block_device_mapping': []})
+
+        # Synced again for the create, and the spawn completed.
+        sync.assert_called_once_with(
+            incus_driver.client, ctx, instance.image_ref)
+        self.assertEqual(2, self.client.instances.create.call_count)
+        container.start.assert_called_once_with(wait=True)
+
+    @mock.patch('nova.virt.configdrive.required_by')
+    def test_spawn_does_not_retry_a_create_that_failed_for_another_reason(
+            self, configdrive):
+        # Only a missing image earns a second create; anything else must
+        # surface as it always did.
+        def container_get(*args, **kwargs):
+            raise incuscore_exceptions.LXDAPIException(MockResponse(404))
+
+        self.client.instances.get.side_effect = container_get
+        configdrive.return_value = False
+        self.client.instances.create.side_effect = (
+            incuscore_exceptions.LXDAPIException(MockResponse(500)))
+
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0, root_gb=1)
+        virtapi = manager.ComputeVirtAPI(mock.MagicMock())
+        incus_driver = driver.IncusDriver(virtapi)
+        incus_driver.init_host(None)
+        incus_driver.firewall_driver = mock.Mock()
+
+        self.assertRaises(
+            incuscore_exceptions.LXDAPIException,
+            incus_driver.spawn,
+            ctx, instance, mock.Mock(), mock.Mock(), mock.Mock(),
+            mock.Mock(), [_VIF], {'block_device_mapping': []})
+
+        self.assertEqual(1, self.client.instances.create.call_count)
+
     @mock.patch('nova.virt.configdrive.required_by')
     def test_spawn(self, configdrive, neutron_failure=None):
         def container_get(*args, **kwargs):
@@ -6708,6 +6778,61 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         self.assertEqual(b'x' * driver.MAX_CONSOLE_BYTES, contents)
         self.client.instances.get.assert_not_called()
+
+    @mock.patch('nova.virt.incus.driver.neutron')
+    def test_get_console_output_reports_an_unreadable_host_log(self, _):
+        """An unreadable log defeats the bounded read on every request.
+
+        The log directory is usually root-owned, so a non-root compute
+        service falls back to the unbounded API read forever. Swallowing
+        the error left no trace of why memory tracked console size.
+        """
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        attributes = mock.Mock(console_path='/var/log/incus/console.log')
+        self.client.instances.get.return_value.console_log.return_value = (
+            b'x' * driver.MAX_CONSOLE_BYTES)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        with mock.patch.object(
+                driver.common, 'InstanceAttributes',
+                return_value=attributes), \
+                mock.patch(
+                    'builtins.open',
+                    side_effect=PermissionError(13, 'Permission denied')), \
+                mock.patch.object(driver.LOG, 'warning') as warning:
+            contents = incus_driver.get_console_output(context, instance)
+
+        # Still serves the console, but says why the bound was lost.
+        self.assertEqual(b'x' * driver.MAX_CONSOLE_BYTES, contents)
+        warning.assert_called_once()
+        self.assertIn('unbounded', warning.call_args[0][0])
+
+    @mock.patch('nova.virt.incus.driver.neutron')
+    def test_get_console_output_is_quiet_before_the_guest_writes(self, _):
+        # A guest that has not written to its console yet is ordinary and
+        # must not produce a warning on every request.
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        attributes = mock.Mock(console_path='/var/log/incus/console.log')
+        self.client.instances.get.return_value.console_log.return_value = b''
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        with mock.patch.object(
+                driver.common, 'InstanceAttributes',
+                return_value=attributes), \
+                mock.patch(
+                    'builtins.open',
+                    side_effect=FileNotFoundError(2, 'No such file')), \
+                mock.patch.object(driver.LOG, 'warning') as warning:
+            contents = incus_driver.get_console_output(context, instance)
+
+        self.assertEqual(b'', contents)
+        warning.assert_not_called()
 
     def test_reboot_starts_stopped_migration_target(self):
         ctx = context.get_admin_context()
@@ -16219,54 +16344,78 @@ class ManageImageCacheTest(test.NoDBTestCase):
         self.driver = driver.IncusDriver(None)
         self.driver.client = mock.Mock()
 
-    @staticmethod
-    def _image(aliases, last_used_at, uploaded_at='2020-01-01T00:00:00Z'):
-        image = mock.Mock(
-            aliases=[{'name': alias} for alias in aliases],
-            last_used_at=last_used_at,
-            uploaded_at=uploaded_at)
-        image.fingerprint = 'f' * 64
-        return image
+    _NEXT_FINGERPRINT = 0
+
+    @classmethod
+    def _image(cls, aliases, last_used_at,
+               uploaded_at='2020-01-01T00:00:00Z'):
+        """One entry as the recursive image listing really returns it."""
+        cls._NEXT_FINGERPRINT += 1
+        return {
+            'fingerprint': '%064x' % cls._NEXT_FINGERPRINT,
+            'aliases': [{'name': alias} for alias in aliases],
+            'last_used_at': last_used_at,
+            'uploaded_at': uploaded_at,
+        }
+
+    def _listing(self, *images):
+        """Serve those entries from the recursive listing endpoint."""
+        response = mock.Mock()
+        response.json.return_value = {'metadata': list(images)}
+        self.driver.client.api.images.get.return_value = response
+        deleters = {}
+        for image in images:
+            deleters[image['fingerprint']] = mock.Mock()
+        self.driver.client.images.get.side_effect = (
+            lambda fingerprint: deleters[fingerprint])
+        return deleters
+
+    def _deleter(self, deleters, image):
+        return deleters[image['fingerprint']]
 
     def test_removes_old_unreferenced_uuid_alias_image(self):
         stale = self._image(
             ['10000000-0000-0000-0000-000000000001'],
             '2020-01-02T00:00:00Z')
-        self.driver.client.images.all.return_value = [stale]
+        deleters = self._listing(stale)
 
         self.driver.manage_image_cache(mock.sentinel.ctx, [])
 
-        stale.delete.assert_called_once_with(wait=True)
+        self._deleter(deleters, stale).delete.assert_called_once_with(
+            wait=True)
+        # One recursive listing, not a request per image.
+        self.driver.client.api.images.get.assert_called_once_with(
+            params={'recursion': 1})
 
     def test_keeps_image_referenced_by_an_instance(self):
         ref = '10000000-0000-0000-0000-000000000001'
         used = self._image([ref], '2020-01-02T00:00:00Z')
-        self.driver.client.images.all.return_value = [used]
+        deleters = self._listing(used)
         instance = mock.Mock(image_ref=ref)
 
         self.driver.manage_image_cache(mock.sentinel.ctx, [instance])
 
-        used.delete.assert_not_called()
+        self._deleter(deleters, used).delete.assert_not_called()
 
     def test_keeps_operator_published_named_alias_image(self):
         named = self._image(
             ['10000000-0000-0000-0000-000000000001', 'release-2026'],
             '2020-01-02T00:00:00Z')
-        self.driver.client.images.all.return_value = [named]
+        deleters = self._listing(named)
 
         self.driver.manage_image_cache(mock.sentinel.ctx, [])
 
-        named.delete.assert_not_called()
+        self._deleter(deleters, named).delete.assert_not_called()
 
     def test_keeps_recently_used_image(self):
         fresh = self._image(
             ['10000000-0000-0000-0000-000000000001'],
             timeutils.utcnow(with_timezone=True).isoformat())
-        self.driver.client.images.all.return_value = [fresh]
+        deleters = self._listing(fresh)
 
         self.driver.manage_image_cache(mock.sentinel.ctx, [])
 
-        fresh.delete.assert_not_called()
+        self._deleter(deleters, fresh).delete.assert_not_called()
 
     def test_never_used_image_falls_back_to_upload_age(self):
         # Incus reports never-used as the zero time; the upload timestamp
@@ -16274,29 +16423,57 @@ class ManageImageCacheTest(test.NoDBTestCase):
         stale = self._image(
             ['10000000-0000-0000-0000-000000000001'],
             '1970-01-01T00:00:00Z')
-        self.driver.client.images.all.return_value = [stale]
+        deleters = self._listing(stale)
 
         self.driver.manage_image_cache(mock.sentinel.ctx, [])
 
-        stale.delete.assert_called_once_with(wait=True)
+        self._deleter(deleters, stale).delete.assert_called_once_with(
+            wait=True)
 
     def test_survives_listing_and_deletion_failures(self):
-        self.driver.client.images.all.side_effect = RuntimeError('down')
+        self.driver.client.api.images.get.side_effect = RuntimeError('down')
         self.driver.manage_image_cache(mock.sentinel.ctx, [])
 
         broken = self._image(
             ['10000000-0000-0000-0000-000000000001'],
             '2020-01-02T00:00:00Z')
-        broken.delete.side_effect = RuntimeError('busy')
         second = self._image(
             ['10000000-0000-0000-0000-000000000002'],
             '2020-01-02T00:00:00Z')
-        self.driver.client.images.all.side_effect = None
-        self.driver.client.images.all.return_value = [broken, second]
+        self.driver.client.api.images.get.side_effect = None
+        deleters = self._listing(broken, second)
+        self._deleter(deleters, broken).delete.side_effect = RuntimeError(
+            'busy')
 
         self.driver.manage_image_cache(mock.sentinel.ctx, [])
 
-        second.delete.assert_called_once_with(wait=True)
+        self._deleter(deleters, second).delete.assert_called_once_with(
+            wait=True)
+
+    def test_a_long_backlog_is_bounded_and_reported(self):
+        """A first pass on an old node must not hold the greenthread.
+
+        Deletions are serial and each waits on the server, so the pass is
+        bounded - and what it defers is logged, because a bounded pass
+        that looked complete would misreport the store as fully aged.
+        """
+        backlog = [
+            self._image(
+                ['10000000-0000-0000-0000-%012d' % index],
+                '2020-01-02T00:00:00Z')
+            for index in range(driver._IMAGE_CACHE_DELETE_BATCH + 5)]
+        deleters = self._listing(*backlog)
+
+        with mock.patch.object(driver.LOG, 'info') as info:
+            self.driver.manage_image_cache(mock.sentinel.ctx, [])
+
+        deleted = [
+            fingerprint for fingerprint, deleter in deleters.items()
+            if deleter.delete.called]
+        self.assertEqual(driver._IMAGE_CACHE_DELETE_BATCH, len(deleted))
+        self.assertTrue(any(
+            'the rest follow on later passes' in call[0][0]
+            for call in info.call_args_list))
 
 
 class TimedPhaseTest(test.NoDBTestCase):
