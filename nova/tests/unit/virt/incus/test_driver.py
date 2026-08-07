@@ -220,19 +220,36 @@ class GetPowerStateTest(test.NoDBTestCase):
             power_state.CRASHED, driver._get_power_state(112))
 
     def test_freeze_transitions_have_no_stable_state(self):
+        # Freezing and Ready are mid-transition; Nova has no value for
+        # that, so NOSTATE is the honest answer.
         self.assertEqual(
             power_state.NOSTATE, driver._get_power_state(109))
         self.assertEqual(
-            power_state.NOSTATE, driver._get_power_state(111))
-        self.assertEqual(
             power_state.NOSTATE, driver._get_power_state(113))
+
+    def test_thawed_is_running_again(self):
+        """Thawed is a settled state, not a transition.
+
+        The guest resumed after a freeze. Calling it NOSTATE made every
+        unpause look to Nova's power-state sync like an instance whose
+        state had been lost.
+        """
+        self.assertEqual(
+            power_state.RUNNING, driver._get_power_state(111))
 
     def test_frozen_is_paused(self):
         self.assertEqual(
             power_state.PAUSED, driver._get_power_state(110))
 
-    def test_unknown(self):
-        self.assertRaises(ValueError, driver._get_power_state, 69)
+    def test_unknown_code_is_reported_not_raised(self):
+        # This feeds get_info and so Nova's periodic power-state sync; a
+        # code from a newer Incus must not break that instance until the
+        # driver catches up.
+        with mock.patch.object(driver.LOG, 'warning') as warning:
+            self.assertEqual(
+                power_state.NOSTATE, driver._get_power_state(69))
+
+        warning.assert_called_once()
 
 
 class MigrationAttemptProtocolTest(test.NoDBTestCase):

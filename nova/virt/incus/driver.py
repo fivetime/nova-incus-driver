@@ -4744,18 +4744,36 @@ def _incus_hypervisor_version(host_info):
 
 
 def _get_power_state(incus_state):
-    """Take a incus state code and translate it to nova power state."""
+    """Take a incus state code and translate it to nova power state.
+
+    The codes are Incus' own, from shared/api/status_code.go. Nova has
+    no value for "in transition", so codes that genuinely describe one
+    become NOSTATE - but a code describing a settled state has to map to
+    that state.
+    """
     state_map = [
-        (power_state.RUNNING, {100, 101, 103, 200}),
+        # 111 is Thawed: the guest resumed after a freeze and is running
+        # again. Reporting NOSTATE for it made every unpause look to
+        # Nova's power-state sync like an instance whose state was lost.
+        (power_state.RUNNING, {100, 101, 103, 111, 200}),
         (power_state.SHUTDOWN, {102, 104, 107}),
-        (power_state.NOSTATE, {105, 106, 109, 111, 113, 401}),
+        # Pending, Starting, Freezing, Ready, Cancelled: mid-transition,
+        # or an operation outcome rather than a guest state.
+        (power_state.NOSTATE, {105, 106, 109, 113, 401}),
         (power_state.CRASHED, {108, 112, 400}),
         (power_state.PAUSED, {110}),
     ]
     for nova_state, incus_states in state_map:
         if incus_state in incus_states:
             return nova_state
-    raise ValueError('Unknown Incus power state: {}'.format(incus_state))
+    # A code this driver has not seen is no reason to fail the caller:
+    # this feeds get_info, and so Nova's periodic power-state sync, which
+    # would then keep breaking for that instance until the driver caught
+    # up with a newer Incus. NOSTATE is Nova's own value for "unknown".
+    LOG.warning(
+        'Unknown Incus power state %r; reporting it as NOSTATE',
+        incus_state)
+    return power_state.NOSTATE
 
 
 def _sync_glance_image_to_incus(client, context, image_ref):
