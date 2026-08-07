@@ -142,8 +142,10 @@ class GetConfigTest(test.NoDBTestCase):
         self.assertEqual(expected, config)
 
     def test_get_config_ovs_hybrid(self):
+        # Hybrid plug is rejected at plug(); the config helper no longer
+        # fabricates a qbr bridge for it.
         expected = {
-            'bridge': 'qbrda5cc4bf-f1', 'mac_address': 'ca:fe:de:ad:be:ef'}
+            'bridge': 'br0', 'mac_address': 'ca:fe:de:ad:be:ef'}
         an_vif = network_model.VIF(
             id='da5cc4bf-f16c-4807-a0b6-911c7c67c3f8',
             address='ca:fe:de:ad:be:ef',
@@ -189,6 +191,18 @@ class IncusGenericVifDriverTest(test.NoDBTestCase):
         self.assertEqual(
             'instance-00000001', os_vif.plug.call_args[0][1].name)
         _post_plug_wiring.assert_called_with(INSTANCE, OVS_VIF)
+
+    @mock.patch.object(vif, '_post_plug_wiring')
+    @mock.patch('nova.virt.incus.vif.os_vif')
+    def test_plug_rejects_ovs_hybrid(self, os_vif, _post_plug_wiring):
+        # The firewall driver is a deliberate no-op for OVN security
+        # groups; silently accepting hybrid plug would run the guest with
+        # no security groups at all.
+        self.assertRaisesRegex(
+            Exception, 'hybrid plug',
+            self.vif_driver.plug, INSTANCE, OVS_HYBRID_VIF)
+        os_vif.plug.assert_not_called()
+        _post_plug_wiring.assert_not_called()
 
     @mock.patch.object(vif, '_delete_ovs_vif_port')
     @mock.patch.object(vif.IncusGenericVifDriver, 'plug')
@@ -266,11 +280,9 @@ class PostPlugTest(test.NoDBTestCase):
         delete_net_dev.assert_called_once_with('tapda5cc4bf-f1')
 
     @mock.patch('nova.virt.incus.vif._create_veth_pair')
-    @mock.patch('nova.virt.incus.vif._add_bridge_port')
     @mock.patch('nova.virt.incus.vif.linux_net')
     def test_post_plug_ovs_hybrid(self,
                                   linux_net,
-                                  add_bridge_port,
                                   create_veth_pair):
         linux_net.device_exists.return_value = False
 
@@ -280,16 +292,13 @@ class PostPlugTest(test.NoDBTestCase):
         create_veth_pair.assert_called_with('tapda5cc4bf-f1',
                                             'tinda5cc4bf-f1',
                                             1000)
-        add_bridge_port.assert_not_called()
 
     @mock.patch('nova.virt.incus.vif._create_veth_pair')
-    @mock.patch('nova.virt.incus.vif._add_bridge_port')
     @mock.patch.object(vif, '_create_ovs_vif_port')
     @mock.patch('nova.virt.incus.vif.linux_net')
     def test_post_plug_ovs(self,
                            linux_net,
                            create_ovs_vif_port,
-                           add_bridge_port,
                            create_veth_pair):
 
         linux_net.device_exists.return_value = False
@@ -300,15 +309,12 @@ class PostPlugTest(test.NoDBTestCase):
         create_veth_pair.assert_called_with('tapda5cc4bf-f1',
                                             'tinda5cc4bf-f1',
                                             1000)
-        add_bridge_port.assert_not_called()
         create_ovs_vif_port.assert_not_called()
 
     @mock.patch('nova.virt.incus.vif._create_veth_pair')
-    @mock.patch('nova.virt.incus.vif._add_bridge_port')
     @mock.patch('nova.virt.incus.vif.linux_net')
     def test_post_plug_bridge(self,
                               linux_net,
-                              add_bridge_port,
                               create_veth_pair):
         linux_net.device_exists.return_value = False
 
@@ -318,14 +324,11 @@ class PostPlugTest(test.NoDBTestCase):
         create_veth_pair.assert_called_with('tapda5cc4bf-f1',
                                             'tinda5cc4bf-f1',
                                             1000)
-        add_bridge_port.assert_not_called()
 
     @mock.patch('nova.virt.incus.vif._create_veth_pair')
-    @mock.patch('nova.virt.incus.vif._add_bridge_port')
     @mock.patch('nova.virt.incus.vif.linux_net')
     def test_post_plug_tap(self,
                            linux_net,
-                           add_bridge_port,
                            create_veth_pair):
         linux_net.device_exists.return_value = False
 
@@ -366,8 +369,3 @@ class MiscHelpersTest(test.NoDBTestCase):
         self.assertFalse(vif._is_ovs_vif_port(OVS_HYBRID_VIF))
         self.assertFalse(vif._is_ovs_vif_port(TAP_VIF))
 
-    @mock.patch.object(vif, 'processutils')
-    def test_add_bridge_port(self, processutils):
-        vif._add_bridge_port('br-int', 'tapXYZ')
-        processutils.execute.assert_called_with(
-            'brctl', 'addif', 'br-int', 'tapXYZ', run_as_root=True)

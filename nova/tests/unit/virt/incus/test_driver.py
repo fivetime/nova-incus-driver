@@ -4727,15 +4727,14 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
     @mock.patch('nova.virt.incus.driver.fileutils.ensure_tree')
     @mock.patch('nova.virt.incus.driver.os.listdir', return_value=[])
-    @mock.patch('nova.virt.incus.driver.processutils.execute',
-                return_value=('', ''))
-    @mock.patch('nova.virt.incus.driver.utils.get_root_helper',
-                return_value='sudo nova-rootwrap')
+    @mock.patch.object(driver.incus_privsep, 'configdrive_umount')
+    @mock.patch.object(driver.incus_privsep, 'chown_tree_to_host_id')
+    @mock.patch.object(driver.incus_privsep, 'configdrive_mount_iso')
     @mock.patch('nova.virt.incus.driver.configdrive.ConfigDriveBuilder')
     @mock.patch('nova.virt.incus.driver.instance_metadata.InstanceMetadata')
     def test_add_configdrive_uses_modern_instance_metadata_signature(
-            self, instance_metadata_mock, builder_mock, root_helper_mock,
-            execute_mock, listdir_mock, ensure_tree_mock):
+            self, instance_metadata_mock, builder_mock, mount_mock,
+            chown_mock, umount_mock, listdir_mock, ensure_tree_mock):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0, root_gb=1)
@@ -4759,10 +4758,11 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             extra_md={'admin_pass': 'secret'}, network_info=network_info)
         builder_mock.assert_called_once_with(
             instance_md=instance_metadata_mock.return_value)
-        self.assertTrue(execute_mock.call_args_list)
-        for call in execute_mock.call_args_list:
-            self.assertEqual('sudo nova-rootwrap',
-                             call.kwargs['root_helper'])
+        # The three former rootwrap invocations now run through dedicated
+        # privsep entrypoints.
+        mount_mock.assert_called_once()
+        chown_mock.assert_called_once_with(mock.ANY, 100000)
+        umount_mock.assert_called_once()
 
     @mock.patch('nova.virt.configdrive.required_by')
     def test_spawn_profile_fail(self, configdrive, neutron_failure=None):
@@ -5473,11 +5473,10 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         mock_profile.delete.assert_called_once_with()
 
     @mock.patch.object(driver.LOG, 'debug')
-    @mock.patch.object(driver.storage, 'detach_ephemeral')
     @mock.patch.object(driver.IncusDriver, 'unplug_vifs')
     @mock.patch.object(driver, '_remove_instance_directory')
     def test_cleanup_missing_profile_is_idempotent(
-            self, remove_instance_directory, unplug_vifs, detach_ephemeral,
+            self, remove_instance_directory, unplug_vifs,
             debug):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
@@ -5503,10 +5502,9 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             share_id='10000000-0000-0000-0000-000000000001',
             server_id='20000000-0000-0000-0000-000000000002',
             reason='busy'))
-    @mock.patch.object(driver.storage, 'detach_ephemeral')
     @mock.patch.object(driver, '_remove_instance_directory')
     def test_cleanup_manila_failure_marks_and_retains_profile(
-            self, remove_instance_directory, detach_ephemeral,
+            self, remove_instance_directory,
             cleanup_shares, cleanup_journals):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
@@ -5541,10 +5539,9 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             share_id='10000000-0000-0000-0000-000000000001',
             server_id='20000000-0000-0000-0000-000000000002',
             reason='busy'))
-    @mock.patch.object(driver.storage, 'detach_ephemeral')
     @mock.patch.object(driver, '_remove_instance_directory')
     def test_cleanup_marks_profile_its_own_container_still_uses(
-            self, remove_instance_directory, detach_ephemeral,
+            self, remove_instance_directory,
             cleanup_shares, cleanup_journals):
         """The retained container is why the profile is retained.
 
@@ -5586,10 +5583,9 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             share_id='10000000-0000-0000-0000-000000000001',
             server_id='20000000-0000-0000-0000-000000000002',
             reason='busy'))
-    @mock.patch.object(driver.storage, 'detach_ephemeral')
     @mock.patch.object(driver, '_remove_instance_directory')
     def test_cleanup_refuses_to_mark_a_profile_another_instance_uses(
-            self, remove_instance_directory, detach_ephemeral,
+            self, remove_instance_directory,
             cleanup_shares, cleanup_journals):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
@@ -5639,11 +5635,10 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             [12345], driver._profile_users_other_than(
                 mock.Mock(used_by=[12345]), instance))
 
-    @mock.patch.object(driver.storage, 'detach_ephemeral')
     @mock.patch.object(driver.IncusDriver, 'unplug_vifs')
     @mock.patch.object(driver.os.path, 'exists', return_value=False)
     def test_cleanup_disconnects_data_volume_before_profile_delete(
-            self, _exists, _unplug_vifs, _detach_ephemeral):
+            self, _exists, _unplug_vifs):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         connection_info = {
@@ -5688,10 +5683,9 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             ctx, connection_info, instance, '/dev/sdb')
         profile.delete.assert_called_once_with()
 
-    @mock.patch.object(driver.storage, 'detach_ephemeral')
     @mock.patch.object(driver.os.path, 'exists', return_value=False)
     def test_cleanup_does_not_reread_profile_per_data_volume(
-            self, _exists, _detach_ephemeral):
+            self, _exists):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         volume_ids = ('data-volume-1', 'data-volume-2')
@@ -5737,11 +5731,10 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertEqual(2, self.client.profiles.get.call_count)
         profile.delete.assert_called_once_with()
 
-    @mock.patch.object(driver.storage, 'detach_ephemeral')
     @mock.patch.object(driver.IncusDriver, 'unplug_vifs')
     @mock.patch.object(driver.os.path, 'exists', return_value=False)
     def test_cleanup_retains_profile_when_data_disconnect_fails(
-            self, _exists, _unplug_vifs, _detach_ephemeral):
+            self, _exists, _unplug_vifs):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         connection_info = {
@@ -10444,7 +10437,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                 staging = driver._stage_configdrive_from_migration(
                     instance, payload)
                 with mock.patch.object(
-                        driver.processutils, 'execute') as execute:
+                        driver.incus_privsep,
+                        'chown_tree_to_host_id') as chown_tree:
                     destination = driver._commit_staged_configdrive(
                         instance, container, staging)
 
@@ -10458,7 +10452,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                 stat.S_IMODE(os.stat(os.path.join(
                     destination, 'openstack', 'latest',
                     'meta_data.json')).st_mode))
-            execute.assert_called_once()
+            chown_tree.assert_called_once_with(
+                mock.ANY, 100000)
 
     def test_container_root_host_id_prefers_next_mapping(self):
         container = mock.Mock()

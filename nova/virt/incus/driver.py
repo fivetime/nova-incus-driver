@@ -76,7 +76,6 @@ from nova.virt.incus import flavor
 from nova.virt.incus import idmap as incus_idmap
 from nova.virt.incus import migrate_data as incus_migrate_data
 from nova.virt.incus import privsep as incus_privsep
-from nova.virt.incus import storage
 from nova.virt.incus import storage_protocol as incus_storage_protocol
 
 from nova.api.metadata import base as instance_metadata
@@ -4059,9 +4058,7 @@ def _commit_staged_configdrive(instance, container, staging):
         raise exception.MigrationError(
             reason='Target config-drive directory already exists')
     storage_id = _container_root_host_id(container)
-    processutils.execute(
-        'chown', '-R', '%s:%s' % (storage_id, storage_id), staging,
-        run_as_root=True, root_helper=utils.get_root_helper())
+    incus_privsep.chown_tree_to_host_id(staging, storage_id)
     os.replace(staging, destination)
     return destination
 
@@ -7465,13 +7462,12 @@ class IncusDriver(driver.ComputeDriver):
         attached_data_volumes = []
         try:
             with self._timed_phase(instance, 'spawn', 'volumes'):
-                incus_config = self.client.host_info
-                storage.attach_ephemeral(
-                    self.client, block_device_info, incus_config, instance)
                 # Nova's initial BDM preparation creates and completes the
                 # Cinder attachments with do_driver_attach=False. The virt
                 # driver's spawn transaction must therefore connect every
                 # non-root volume before the guest is first started.
+                # (Ephemeral disks are rejected in the preflight; the dead
+                # LVM/ZFS ephemeral module has been removed.)
                 for bdm in data_volume_bdms:
                     self.attach_volume(
                         context, bdm['connection_info'], instance,
@@ -7999,12 +7995,6 @@ class IncusDriver(driver.ComputeDriver):
                     'remove firewall filter for VIF %s' % vif_id,
                     lambda vif=vif: self.firewall_driver.unfilter_instance(
                         instance, [vif]))
-
-        attempt(
-            'detach ephemeral storage',
-            lambda: storage.detach_ephemeral(
-                self.client, block_device_info, self.client.host_info,
-                instance))
 
         profile = None
         try:
@@ -13292,16 +13282,14 @@ class IncusDriver(driver.ComputeDriver):
 
         with utils.tempdir() as tmpdir:
             mounted = False
-            root_helper = utils.get_root_helper()
             try:
-                _, err = processutils.execute('mount',
-                                       '-o',
-                                       ('loop,ro,nosuid,nodev,noexec,'
-                                        'uid=%d,gid=%d') % (
-                                            os.getuid(), os.getgid()),
-                                       iso_path, tmpdir,
-                                       run_as_root=True,
-                                       root_helper=root_helper)
+                # Dedicated privsep entrypoints replace the three
+                # nova-rootwrap invocations here, which each cold-started a
+                # Python interpreter and required unconstrained
+                # mount/umount/chown CommandFilters that undid privsep's
+                # path validation at the deployment layer.
+                incus_privsep.configdrive_mount_iso(
+                    iso_path, tmpdir, os.getuid(), os.getgid(), 60)
                 mounted = True
 
                 # Copy and adjust the files from the ISO so that we
@@ -13319,14 +13307,10 @@ class IncusDriver(driver.ComputeDriver):
                     for name in dirs:
                         os.chmod(os.path.join(root, name), 0o500)
                     os.chmod(root, 0o500)
-                processutils.execute('chown', '-R',
-                              '%s:%s' % (storage_id, storage_id),
-                              configdrive_dir, run_as_root=True,
-                              root_helper=root_helper)
+                incus_privsep.chown_tree_to_host_id(
+                    configdrive_dir, storage_id)
             finally:
                 if mounted:
-                    processutils.execute(
-                        'umount', tmpdir, run_as_root=True,
-                        root_helper=root_helper)
+                    incus_privsep.configdrive_umount(tmpdir, 60)
 
         return configdrive_dir

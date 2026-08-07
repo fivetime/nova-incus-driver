@@ -212,3 +212,60 @@ def umount(mountpoint, timeout):
         _UMOUNT_PATH, '--', mountpoint]
     return processutils.execute(
         *command, timeout=int(timeout) + _KILL_GRACE_SECONDS + 5)
+
+
+def _validate_instances_subpath(path, description):
+    """Return a canonical path under instances_path or fail closed."""
+    if not isinstance(path, str) or not path or '\x00' in path:
+        raise ValueError(_('%s is invalid') % description)
+    instances_path = os.path.realpath(nova.conf.CONF.instances_path)
+    requested = os.path.realpath(path)
+    if requested != instances_path and not requested.startswith(
+            instances_path + os.sep):
+        raise ValueError(
+            _('%s is outside instances_path') % description)
+    return requested
+
+
+@nova.privsep.sys_admin_pctxt.entrypoint
+def configdrive_mount_iso(iso_path, mountpoint, uid, gid, timeout):
+    """Loop-mount a config-drive ISO read-only under instances_path."""
+    iso_path = _validate_instances_subpath(iso_path, 'config drive ISO')
+    if not os.path.isfile(iso_path):
+        raise ValueError(_('config drive ISO is not a regular file'))
+    if not isinstance(mountpoint, str) or not os.path.isdir(mountpoint):
+        raise ValueError(_('config drive mountpoint is not a directory'))
+    options = 'loop,ro,nosuid,nodev,noexec,uid=%d,gid=%d' % (
+        int(uid), int(gid))
+    command = _timeout_prefix(timeout) + [
+        _MOUNT_PATH, '-o', options, '--', iso_path, mountpoint]
+    return processutils.execute(
+        *command, timeout=int(timeout) + _KILL_GRACE_SECONDS + 5)
+
+
+@nova.privsep.sys_admin_pctxt.entrypoint
+def configdrive_umount(mountpoint, timeout):
+    """Unmount a config-drive ISO mounted by configdrive_mount_iso."""
+    if not isinstance(mountpoint, str) or not mountpoint or (
+            '\x00' in mountpoint):
+        raise ValueError(_('config drive mountpoint is invalid'))
+    command = _timeout_prefix(timeout) + [
+        _UMOUNT_PATH, '--', os.path.realpath(mountpoint)]
+    return processutils.execute(
+        *command, timeout=int(timeout) + _KILL_GRACE_SECONDS + 5)
+
+
+@nova.privsep.sys_admin_pctxt.entrypoint
+def chown_tree_to_host_id(path, host_id):
+    """Recursively chown one instances_path subtree to a shifted host ID.
+
+    Replaces the unconstrained rootwrap 'chown -R' CommandFilter: the target
+    is validated to stay inside instances_path and the ownership value must
+    be a plain integer, so no privileged caller can retarget system paths.
+    """
+    root = _validate_instances_subpath(path, 'ownership target')
+    owner = int(host_id)
+    os.chown(root, owner, owner)
+    for parent, dirs, files in os.walk(root):
+        for name in dirs + files:
+            os.lchown(os.path.join(parent, name), owner, owner)

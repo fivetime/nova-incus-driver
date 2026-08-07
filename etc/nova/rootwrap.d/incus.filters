@@ -1,11 +1,11 @@
 # nova-rootwrap filters for compute nodes running nova-incus
 # This file should be owned by (and only-writable by) the root user
+#
+# Mount/umount/chown moved to dedicated privsep entrypoints
+# (nova/virt/incus/privsep.py) with path validation; only the read-only
+# storage reporting binaries remain here.
 
 [Filters]
 zfs: CommandFilter, zfs, root
 zpool: CommandFilter, zpool, root
 btrfs: CommandFilter, btrfs, root
-chown: CommandFilter, chown, root
-chmod: CommandFilter, chmod, root
-mount: CommandFilter, mount, root
-umount: CommandFilter, umount, root

@@ -56,10 +56,6 @@ def _create_veth_pair(dev1_name, dev2_name, mtu=None):
     ovs_linux_net.create_veth_pair(dev1_name, dev2_name, mtu)
 
 
-def _add_bridge_port(bridge, dev):
-    processutils.execute('brctl', 'addif', bridge, dev, run_as_root=True)
-
-
 def _is_ovs_vif_port(vif):
     return vif['type'] == 'ovs' and not vif.is_hybrid_plug_enabled()
 
@@ -71,15 +67,9 @@ def _get_bridge_config(vif):
 
 
 def _get_ovs_config(vif):
-    is_hybrid = getattr(vif, 'is_hybrid_plug_enabled', lambda: False)
-    if is_hybrid():
-        return {
-            'bridge': ('qbr{}'.format(vif['id']))[:network_model.NIC_NAME_LEN],
-            'mac_address': vif['address']}
-    else:
-        return {
-            'bridge': vif['network']['bridge'],
-            'mac_address': vif['address']}
+    return {
+        'bridge': vif['network']['bridge'],
+        'mac_address': vif['address']}
 
 
 def _get_tap_config(vif):
@@ -242,6 +232,16 @@ class IncusGenericVifDriver(object):
 
     def plug(self, instance, vif):
         vif_type = vif['type']
+        # Hybrid plug expects an iptables firewall on a qbr bridge; this
+        # driver's firewall is a deliberate no-op for OVN-enforced security
+        # groups, so accepting hybrid plug would silently run the guest
+        # with no security groups at all.
+        is_hybrid = getattr(vif, 'is_hybrid_plug_enabled', lambda: False)
+        if vif_type == network_model.VIF_TYPE_OVS and is_hybrid():
+            raise exception.InternalError(
+                'ovs hybrid plug requires an iptables firewall this driver '
+                'does not provide; configure Neutron for OVN security '
+                'groups (ovs_hybrid_plug=false) on Incus computes')
         instance_info = os_vif_util.nova_to_osvif_instance(instance)
 
         # The device must exist before os-vif can attach it to an OVS or
