@@ -1346,6 +1346,55 @@ class IncusIDMapDriverTest(test.NoDBTestCase):
         self.assertEqual('keep-me', instance.system_metadata['unrelated-key'])
         self.assertNotIn('stale-key', instance.system_metadata)
 
+    def test_an_already_stamped_instance_costs_no_database_round_trip(self):
+        """Every caller reaches here on the common path.
+
+        Several do so per spawn, so confirming from the database what the
+        object already says would be paid on every instance of a run.
+        """
+        instance = objects.Instance(
+            uuid=self.assignment.instance_uuid,
+            system_metadata={
+                driver.IDMAP_BASE_METADATA_KEY: str(self.assignment.base),
+                driver.IDMAP_SIZE_METADATA_KEY: str(self.assignment.size),
+                driver.IDMAP_ALLOCATION_METADATA_KEY:
+                    self.assignment.allocation_id,
+                driver.IDMAP_FINGERPRINT_METADATA_KEY:
+                    self.assignment.fingerprint,
+            })
+        self.driver.idmap_allocator.get.return_value = self.assignment
+
+        with mock.patch.object(instance, 'refresh') as refresh:
+            with mock.patch.object(instance, 'save') as save:
+                result = self.driver._ensure_instance_idmap(instance)
+
+        self.assertEqual(self.assignment, result)
+        refresh.assert_not_called()
+        save.assert_not_called()
+
+    def test_a_concurrent_stamp_found_by_refresh_is_not_rewritten(self):
+        # The refresh exists to avoid clobbering another writer; if it
+        # shows the stamp already applied there is nothing left to write.
+        instance = objects.Instance(
+            uuid=self.assignment.instance_uuid, system_metadata={})
+        self.driver.idmap_allocator.allocate.return_value = self.assignment
+
+        def refreshed():
+            instance.system_metadata = {
+                driver.IDMAP_BASE_METADATA_KEY: str(self.assignment.base),
+                driver.IDMAP_SIZE_METADATA_KEY: str(self.assignment.size),
+                driver.IDMAP_ALLOCATION_METADATA_KEY:
+                    self.assignment.allocation_id,
+                driver.IDMAP_FINGERPRINT_METADATA_KEY:
+                    self.assignment.fingerprint,
+            }
+
+        with mock.patch.object(instance, 'refresh', side_effect=refreshed):
+            with mock.patch.object(instance, 'save') as save:
+                self.driver._ensure_instance_idmap(instance)
+
+        save.assert_not_called()
+
     def test_existing_metadata_requires_exact_allocator_generation(self):
         self.instance.system_metadata = {
             driver.IDMAP_BASE_METADATA_KEY: '500000000',

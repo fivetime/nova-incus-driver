@@ -6559,19 +6559,35 @@ class IncusDriver(driver.ComputeDriver):
             IDMAP_ALLOCATION_METADATA_KEY: assignment.allocation_id,
             IDMAP_FINGERPRINT_METADATA_KEY: assignment.fingerprint,
         }
-        if isinstance(instance, objects.Instance):
-            # Instance.save() replaces the complete system_metadata mapping.
-            # Refresh under Nova's per-instance operation lock immediately
-            # before merging so we do not delete unrelated keys from a stale
-            # object received earlier in a long spawn or migration workflow.
-            instance.refresh()
         metadata = dict(_loaded_instance_system_metadata(instance))
-        if any(metadata.get(key) != value for key, value in expected.items()):
-            metadata.update(expected)
-            instance.system_metadata = metadata
-            # If this save fails the durable allocator record is retained.
-            # A Nova retry obtains the same assignment and repairs metadata.
-            instance.save()
+        if not any(
+                metadata.get(key) != value
+                for key, value in expected.items()):
+            # Already stamped with this generation. Every caller reaches
+            # here on the common path, several of them per spawn, so
+            # taking a database round trip to confirm what the object
+            # already says would be paid on every instance of a run.
+            return assignment
+
+        if isinstance(instance, objects.Instance):
+            # Instance.save() replaces the complete system_metadata
+            # mapping. Refresh under Nova's per-instance operation lock
+            # immediately before merging, so a stale object received
+            # earlier in a long spawn or migration workflow cannot delete
+            # keys someone else added meanwhile. Re-read afterwards: the
+            # refresh may itself show the stamp already present.
+            instance.refresh()
+            metadata = dict(_loaded_instance_system_metadata(instance))
+            if not any(
+                    metadata.get(key) != value
+                    for key, value in expected.items()):
+                return assignment
+
+        metadata.update(expected)
+        instance.system_metadata = metadata
+        # If this save fails the durable allocator record is retained.
+        # A Nova retry obtains the same assignment and repairs metadata.
+        instance.save()
         return assignment
 
     def _idmap_claim_from_local_config(self, instance, config):
