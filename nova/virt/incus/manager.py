@@ -833,6 +833,96 @@ class IncusComputeManager(manager.ComputeManager):
         LOG.debug(
             'Incus idmap registry integrity audit verified %d allocation(s)',
             len(assignments))
+        self._adopt_unclaimed_incus_idmap_allocations(allocator, assignments)
+
+    def _adopt_unclaimed_incus_idmap_allocations(self, allocator,
+                                                 assignments):
+        """Give an allocation nobody claims the release intent it lacks.
+
+        An allocation whose last claim went away without leaving an intent
+        is invisible to both periodic reclaimers: the host-claim pass only
+        walks this compute's claims, and the replay pass only walks
+        existing intents. It happens when Nova deletes an instance whose
+        compute is unreachable, because a local delete never reaches the
+        driver, and after a fence retirement that removes the last claim
+        before the destination establishes its own. Nothing would ever
+        free the slot.
+
+        Only the intent is created here, never the deletion. The existing
+        replay path then applies the full barrier it always has: Nova's
+        row proven deleted, the complete inventory proven absent, and an
+        exact-generation compare-and-swap. Writing an intent for an
+        allocation that turns out to be live is therefore recoverable,
+        while deleting one would not be.
+
+        The audit is the only caller because it is the one place that
+        already holds a complete, single-revision view of every
+        allocation. Asking for one just to look for a rare orphan would
+        reintroduce the fleet-wide per-cycle scan the audit interval
+        exists to avoid.
+        """
+        adopted = 0
+        for assignment in assignments:
+            if assignment.host_ids:
+                continue
+            try:
+                if allocator.get_release_intent(
+                        assignment.instance_uuid) is not None:
+                    continue
+                instance_name = self._unclaimed_idmap_instance_name(
+                    assignment)
+                if instance_name is None:
+                    continue
+                allocator.request_release(
+                    assignment.instance_uuid, instance_name,
+                    assignment=assignment)
+            except Exception:
+                # One unreadable allocation must not stop the others, and
+                # the next audit retries this one.
+                LOG.exception(
+                    'Cannot adopt unclaimed Incus idmap allocation %s',
+                    assignment.instance_uuid)
+                continue
+            adopted += 1
+            LOG.warning(
+                'Adopted unclaimed Incus idmap allocation %(uuid)s (slot '
+                '%(slot)s) for release; no host claimed it and no release '
+                'intent existed',
+                {'uuid': assignment.instance_uuid, 'slot': assignment.slot})
+        if adopted:
+            LOG.info(
+                'Adopted %d unclaimed Incus idmap allocation(s) for release',
+                adopted)
+
+    def _unclaimed_idmap_instance_name(self, assignment):
+        """Return the Nova name an orphaned allocation must be released as.
+
+        The intent binds to an exact instance name and the replay path
+        refuses any mismatch, so Nova's row is the only authority for it.
+        An allocation whose row is gone entirely cannot be adopted: it is
+        reported for the operator recovery procedure instead, because
+        inventing a name would make the release fence check the wrong
+        thing.
+        """
+        context = nova.context.get_admin_context().elevated(
+            read_deleted='yes')
+        try:
+            instance = objects.Instance.get_by_uuid(
+                context, assignment.instance_uuid,
+                expected_attrs=['system_metadata'])
+        except exception.InstanceNotFound:
+            LOG.error(
+                'Unclaimed Incus idmap allocation %(uuid)s (slot %(slot)s) '
+                'has no Nova instance row, so its exact name cannot be '
+                'established; it needs the operator registry recovery '
+                'procedure',
+                {'uuid': assignment.instance_uuid, 'slot': assignment.slot})
+            return None
+        if not instance.obj_attr_is_set('deleted') or not instance.deleted:
+            # A live row means this is an in-flight build between allocate
+            # and its first claim, not an orphan.
+            return None
+        return instance.name
 
     def _nova_idmap_retirement_state(self, context, intent):
         """Return whether Nova permits retirement and its deleted row."""

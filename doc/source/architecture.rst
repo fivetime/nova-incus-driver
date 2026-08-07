@@ -151,6 +151,24 @@ visible capacity leak instead of host UID/GID reuse. Retiring such a claim
 requires explicit STONITH evidence; a hostname or elapsed timeout is never
 sufficient authority.
 
+Two situations leave an allocation that no host claims and that no release
+intent names: Nova deleting an instance whose compute is unreachable, which
+never reaches the driver that would write the intent, and a fence retirement
+that removes the last claim before the destination establishes its own. Both
+periodic reclaimers would miss it, because one walks a compute's own claims
+and the other walks existing intents, so the slot would never come back. The
+complete registry audit therefore also adopts such an allocation by writing
+the release intent it lacks, using the exact instance name from Nova's own
+deleted row. It never deletes anything: the ordinary replay path then applies
+its usual barrier, so an adoption that turns out to have been premature is
+recoverable, while a deletion would not be. An allocation whose Nova row is
+gone entirely is reported rather than adopted, because its exact name can no
+longer be established and the release fence would check the wrong thing.
+Adoption runs only from the full audit, which is the one place that already
+holds a complete single-revision view; looking for a rare orphan on every
+cycle would reintroduce the fleet-wide scan the audit interval exists to
+avoid.
+
 A compute may later receive the same allocation generation after its previous
 host materialization has an acknowledged ``cleaned`` proof. The allocator
 replaces that old host claim with the new materialization token in one etcd

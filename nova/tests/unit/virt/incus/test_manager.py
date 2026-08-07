@@ -118,6 +118,99 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         instance.obj_attr_is_set.return_value = True
         return instance
 
+    def _adoption_deleted_row(self, name='instance-00000001'):
+        instance = mock.Mock()
+        instance.name = name
+        instance.deleted = True
+        instance.obj_attr_is_set.return_value = True
+        return instance
+
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_orphan_is_given_the_intent_it_lacks(self, get_by_uuid):
+        allocator = self.compute.driver.idmap_allocator
+        allocator.get_release_intent.return_value = None
+        get_by_uuid.return_value = self._adoption_deleted_row()
+        orphan = self._assignment(host_ids=())
+
+        self.compute._adopt_unclaimed_incus_idmap_allocations(
+            allocator, [orphan])
+
+        allocator.request_release.assert_called_once_with(
+            orphan.instance_uuid, 'instance-00000001', assignment=orphan)
+
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_claimed_allocation_is_left_alone(self, get_by_uuid):
+        allocator = self.compute.driver.idmap_allocator
+        allocator.get_release_intent.return_value = None
+
+        self.compute._adopt_unclaimed_incus_idmap_allocations(
+            allocator, [self._assignment()])
+
+        allocator.request_release.assert_not_called()
+        get_by_uuid.assert_not_called()
+
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_allocation_that_already_has_an_intent_is_left_alone(
+            self, get_by_uuid):
+        allocator = self.compute.driver.idmap_allocator
+        allocator.get_release_intent.return_value = self.idmap_intent
+
+        self.compute._adopt_unclaimed_incus_idmap_allocations(
+            allocator, [self._assignment(host_ids=())])
+
+        allocator.request_release.assert_not_called()
+
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_in_flight_build_is_not_mistaken_for_an_orphan(self, get_by_uuid):
+        """Between allocate() and the first claim, host_ids is empty.
+
+        A live Nova row is what tells the two apart; adopting one would
+        aim a release barrier at a build that is still running.
+        """
+        allocator = self.compute.driver.idmap_allocator
+        allocator.get_release_intent.return_value = None
+        live = mock.Mock()
+        live.deleted = False
+        live.obj_attr_is_set.return_value = True
+        get_by_uuid.return_value = live
+
+        self.compute._adopt_unclaimed_incus_idmap_allocations(
+            allocator, [self._assignment(host_ids=())])
+
+        allocator.request_release.assert_not_called()
+
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_missing_nova_row_is_reported_not_guessed(self, get_by_uuid):
+        # The intent binds an exact instance name and the replay path
+        # refuses any mismatch, so a name that cannot be established from
+        # Nova must not be invented.
+        allocator = self.compute.driver.idmap_allocator
+        allocator.get_release_intent.return_value = None
+        get_by_uuid.side_effect = manager.exception.InstanceNotFound(
+            instance_id='00000000-0000-0000-0000-000000000001')
+
+        self.compute._adopt_unclaimed_incus_idmap_allocations(
+            allocator, [self._assignment(host_ids=())])
+
+        allocator.request_release.assert_not_called()
+
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_one_failure_does_not_stop_the_remaining_orphans(
+            self, get_by_uuid):
+        allocator = self.compute.driver.idmap_allocator
+        allocator.get_release_intent.side_effect = [
+            RuntimeError('etcd read failed'), None]
+        get_by_uuid.return_value = self._adoption_deleted_row('instance-00000002')
+        second = self._assignment(
+            host_ids=(),
+            instance_uuid='00000000-0000-0000-0000-000000000002', slot=1)
+
+        self.compute._adopt_unclaimed_incus_idmap_allocations(
+            allocator, [self._assignment(host_ids=()), second])
+
+        allocator.request_release.assert_called_once_with(
+            second.instance_uuid, 'instance-00000002', assignment=second)
+
     def _assignment(self, host_ids=None, **overrides):
         values = {
             'instance_uuid': '00000000-0000-0000-0000-000000000001',
