@@ -1461,6 +1461,50 @@ def _placement_pool_identity(pool, pool_name):
     )
 
 
+def _validate_boot_from_volume_storage_pools(client):
+    """Make this compute prove at startup what its BFV mapping claims.
+
+    Nothing else reads the mapping until a boot-from-volume instance is
+    already being built here, so a pool that was named but never created,
+    or created against the wrong Cinder pool, produced a compute that
+    started, reported up, accepted scheduling, and only failed once an
+    instance landed on it. Root storage pools already fail startup for
+    the same class of mistake.
+
+    This is a node-local invariant: it asks whether this host can honour
+    its own configuration, never what other computes offer.
+    """
+    for cinder_pool, pool_name in sorted(
+            CONF.incus.boot_from_volume_storage_pools.items()):
+        try:
+            pool = client.storage_pools.get(pool_name)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+            raise exception.InvalidConfiguration(
+                'boot_from_volume_storage_pools maps Cinder RBD pool {} to '
+                'Incus storage pool {}, which does not exist on this '
+                'compute'.format(cinder_pool, pool_name))
+        # Only configuration invariants are checked here. A pool's status
+        # is runtime state that can resolve itself, and refusing to start
+        # over it would be the same mistake as freezing the Placement
+        # inventory when a pool momentarily reports no capacity.
+        pool_config = pool.config or {}
+        if pool.driver != 'cephext':
+            raise exception.InvalidConfiguration(
+                'Incus boot-from-volume storage pool {} uses driver {}; '
+                'boot-from-volume roots require cephext'.format(
+                    pool_name, pool.driver))
+        if pool_config.get('source') != cinder_pool:
+            # A pool pointing at the wrong Cinder RBD pool is worse than a
+            # missing one: it would resolve and then operate on another
+            # backend's images.
+            raise exception.InvalidConfiguration(
+                'Incus boot-from-volume storage pool {} is backed by {} but '
+                'is mapped to Cinder RBD pool {}'.format(
+                    pool_name, pool_config.get('source'), cinder_pool))
+
+
 def _validate_root_storage_pool_accounting(client):
     """Reject Placement mappings that can duplicate physical capacity."""
     selectors = CONF.incus.root_storage_pools
@@ -5413,6 +5457,7 @@ class IncusDriver(driver.ComputeDriver):
         self.storage_ownership = (
             incus_storage_protocol.StorageOwnershipClient(self.client))
         _validate_root_storage_pool_accounting(self.client)
+        _validate_boot_from_volume_storage_pools(self.client)
 
         migration_enabled = any((
             CONF.incus.allow_cold_migration,

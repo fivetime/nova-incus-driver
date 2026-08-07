@@ -2006,6 +2006,7 @@ class IncusDriverTest(test.NoDBTestCase):
         self.CONF.incus.shared_storage_pool_capacity_gb = None
         self.CONF.incus.root_storage_pools = {}
         self.CONF.incus.root_storage_pool_resource_classes = {}
+        self.CONF.incus.boot_from_volume_storage_pools = {}
         self.CONF.incus.shared_root_storage_pool_capacities_gb = {}
         self.CONF.incus.allow_cold_migration = False
         self.CONF.incus.allow_live_migration = False
@@ -2501,6 +2502,76 @@ class IncusDriverTest(test.NoDBTestCase):
 
         validate.assert_called_once_with()
         self.Client.assert_not_called()
+
+    def _configure_bfv_pool(self, cinder_pool='cinder-volumes',
+                            pool_name='cinder'):
+        """Declare the BFV mapping a test depends on.
+
+        init_host verifies that every mapped pool exists on this compute
+        and is a cephext pool backed by the named Cinder RBD pool, so a
+        test exercising boot-from-volume has to say which mapping it
+        assumes instead of leaning on a permissive mock.
+        """
+        self.CONF.incus.boot_from_volume_storage_pools = {
+            cinder_pool: pool_name}
+        pool = self.client.storage_pools.get.return_value
+        pool.driver = 'cephext'
+        pool.config = {'source': cinder_pool}
+        return pool
+
+    def _bfv_pool(self, source='cinder-volumes', pool_driver='cephext'):
+        return mock.Mock(driver=pool_driver, config={'source': source})
+
+    def test_init_host_accepts_a_correctly_backed_bfv_pool(self):
+        self.CONF.incus.boot_from_volume_storage_pools = {
+            'cinder-volumes': 'cinder-bfv'}
+        self.client.storage_pools.get.return_value = self._bfv_pool()
+        incus_driver = driver.IncusDriver(None)
+
+        incus_driver.init_host(None)
+
+        self.client.storage_pools.get.assert_any_call('cinder-bfv')
+
+    def test_init_host_rejects_a_bfv_pool_that_does_not_exist(self):
+        """Configuration that names a pool must prove it at startup.
+
+        Nothing else reads the mapping until an instance is already being
+        built here, so without this the compute reports up and accepts
+        scheduling it cannot honour.
+        """
+        self.CONF.incus.boot_from_volume_storage_pools = {
+            'cinder-volumes': 'never-created'}
+        self.client.storage_pools.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+        incus_driver = driver.IncusDriver(None)
+
+        self.assertRaisesRegex(
+            exception.InvalidConfiguration, 'does not exist on this compute',
+            incus_driver.init_host, None)
+
+    def test_init_host_rejects_a_bfv_pool_backed_by_another_cinder_pool(self):
+        # Worse than a missing pool: it resolves, then operates on another
+        # backend's images.
+        self.CONF.incus.boot_from_volume_storage_pools = {
+            'nvme-rep3': 'cinder-nvme-bfv'}
+        self.client.storage_pools.get.return_value = self._bfv_pool(
+            source='cinder-volumes')
+        incus_driver = driver.IncusDriver(None)
+
+        self.assertRaisesRegex(
+            exception.InvalidConfiguration, 'is backed by',
+            incus_driver.init_host, None)
+
+    def test_init_host_rejects_a_bfv_pool_with_the_wrong_driver(self):
+        self.CONF.incus.boot_from_volume_storage_pools = {
+            'cinder-volumes': 'cinder-bfv'}
+        self.client.storage_pools.get.return_value = self._bfv_pool(
+            pool_driver='ceph')
+        incus_driver = driver.IncusDriver(None)
+
+        self.assertRaisesRegex(
+            exception.InvalidConfiguration, 'require cephext',
+            incus_driver.init_host, None)
 
     def test_init_host_rejects_duplicate_root_pool_resource_class(self):
         self.CONF.incus.root_storage_pools = {
@@ -3896,6 +3967,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     @mock.patch('nova.virt.configdrive.required_by', return_value=False)
     def test_spawn_root_and_initial_data_volume_cardinality_matrix(
             self, configdrive, to_profile, attach_volume):
+        self._configure_bfv_pool()
         self.client.host_info['api_extensions'].append(
             'storage_driver_cephext')
         self.CONF.incus.boot_from_volume_storage_pools = {
@@ -13475,6 +13547,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     @mock.patch.object(driver.flavor, 'to_profile')
     def test_finish_migration_retains_claimed_bfv_target_on_start_failure(
             self, to_profile, get_mapping, boot_from_volume, require_bfv):
+        self._configure_bfv_pool()
+        require_bfv.return_value = ('cinder-volumes', 'volume-root')
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         migration = mock.Mock(
@@ -13519,6 +13593,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     @mock.patch.object(driver.flavor, 'to_profile')
     def test_finish_migration_retries_transient_marker_failure(
             self, to_profile, get_mapping, boot_from_volume, require_bfv):
+        self._configure_bfv_pool()
+        require_bfv.return_value = ('cinder-volumes', 'volume-root')
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         boot_from_volume.return_value = {'boot_index': 0}
@@ -13561,6 +13637,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     @mock.patch.object(driver.flavor, 'to_profile')
     def test_finish_migration_marker_failure_reraises_start_failure(
             self, to_profile, get_mapping, boot_from_volume, require_bfv):
+        self._configure_bfv_pool()
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         root_bdm = {'boot_index': 0}
@@ -13611,6 +13688,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     @mock.patch.object(driver.flavor, 'to_profile')
     def test_finish_migration_retries_transient_target_start_failure(
             self, to_profile, get_mapping, boot_from_volume, require_bfv):
+        self._configure_bfv_pool()
+        require_bfv.return_value = ('cinder-volumes', 'volume-root')
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         migration = mock.Mock(
@@ -13652,6 +13731,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     @mock.patch.object(driver.flavor, 'to_profile')
     def test_finish_migration_recovers_bfv_target_after_create_timeout(
             self, to_profile, boot_from_volume, require_bfv):
+        self._configure_bfv_pool()
+        require_bfv.return_value = ('cinder-volumes', 'volume-root')
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         migration = mock.Mock(
@@ -13696,6 +13777,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     @mock.patch.object(driver.flavor, 'to_profile')
     def test_finish_migration_rolls_back_incomplete_timeout_target(
             self, to_profile, boot_from_volume, require_bfv):
+        self._configure_bfv_pool()
+        require_bfv.return_value = ('cinder-volumes', 'volume-root')
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         root_bdm = {'boot_index': 0}
@@ -13762,6 +13845,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     @mock.patch.object(driver.flavor, 'to_profile')
     def test_finish_migration_attaches_only_data_volumes(
             self, to_profile, get_mapping, boot_from_volume, require_bfv):
+        self._configure_bfv_pool()
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         migration = mock.Mock(
@@ -14440,6 +14524,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     @mock.patch.object(driver, '_remove_stale_live_migration_profile')
     def test_pre_live_migration_leaves_bfv_root_to_cephext(
             self, remove_stale_profile, stage_volume, require_bfv):
+        self._configure_bfv_pool()
+        require_bfv.return_value = ('cinder-volumes', 'volume-root')
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         cleanup_token = '10000000-0000-0000-0000-000000000001'
