@@ -761,20 +761,35 @@ explicitly::
         --operator ops@example.com \
         --fence-evidence "fence_ipmilan --action=off rc=0"
 
-``--fence-plug`` names the same host to the fence provider, whose reported
-power state must be ``off`` before anything is written. This is the check
-that survives the one operator error the command cannot otherwise detect: a
-mistyped ``--host-id``. The dead host's and the evacuation destination's
-UUIDs usually sit side by side in one ticket, and naming the destination
+``--fence-plug`` names the host to the fence provider, whose reported power
+state must be ``off`` before anything is written. Power state is checked
+rather than the Nova service state because a service reported down may only
+be partitioned, while the premise of this disposal is that the host lost
+power. Where no fence provider can be consulted,
+``--unverified-power-state <why>`` is mandatory instead, and the stated
+reason is written into the ledger entry: a disposal nobody could verify
+stays visible for the life of the record. That flag is an audit record,
+not a barrier -- any non-empty text passes it.
+
+The power check answers a question about ``--fence-plug`` while the
+retirement acts on ``--host-id``, so the two must be tied together or a
+correct-looking check can accompany the wrong compute. The dead host's UUID
+and the evacuation destination's usually sit side by side in one ticket, and
+naming the destination while a genuinely dead machine passes the power check
 would delete a healthy running instance's claim and leave fence evidence
 pointing at a live host -- after which every destroy there would find that
-evidence and take the detached local-only path, skipping shared volume
-deletion. Power state is checked rather than the Nova service state because
-a service reported down may only be partitioned, while the premise of this
-disposal is that the host lost power. Where no fence provider can be
-consulted, ``--unverified-power-state <why>`` is mandatory instead, and the
-stated reason is written into the ledger entry: a disposal nobody could
-verify stays visible for the life of the record.
+evidence, take the detached local-only path and skip shared volume deletion.
+The reachable form of that mistake is a partially failed batch evacuation
+being re-run, where the destination already holds a committed claim for the
+instance; a destination that holds no claim is refused earlier and harmlessly.
+
+A powered-off host cannot be asked for its own compute UUID, so the binding
+is declared in advance: each ``fence.d`` entry may carry ``compute_id``. The
+tool refuses the retirement when that value names a different compute than
+``--host-id``. The key is optional so that existing deployments keep
+working, but where it is absent the ledger entry records that the binding
+was never proven -- the same treatment as an unverified power state. Adding
+it to every fence entry is recommended.
 
 The allocator writes that evidence to a per-host fence ledger and removes
 the claim and its host index entry in one compare-and-swap, so the

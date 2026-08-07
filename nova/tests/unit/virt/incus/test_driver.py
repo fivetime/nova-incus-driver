@@ -5071,6 +5071,79 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         chown_mock.assert_called_once_with(mock.ANY, 100000)
         umount_mock.assert_called_once()
 
+    @mock.patch('nova.virt.incus.driver.os.listdir', return_value=[])
+    @mock.patch.object(driver.incus_privsep, 'configdrive_umount')
+    @mock.patch.object(driver.incus_privsep, 'chown_tree_to_host_id')
+    @mock.patch.object(driver.incus_privsep, 'configdrive_mount_iso')
+    @mock.patch('nova.virt.incus.driver.configdrive.ConfigDriveBuilder')
+    @mock.patch('nova.virt.incus.driver.instance_metadata.InstanceMetadata')
+    def test_add_configdrive_mounts_outside_the_instance_directory(
+            self, instance_metadata_mock, builder_mock, mount_mock,
+            chown_mock, umount_mock, listdir_mock):
+        """A leaked mount must not make the instance undeletable.
+
+        Instance removal chowns, walks and rmtree's the instance
+        directory, and each of those fails on a live read-only mount. The
+        mountpoint therefore stays under instances_path - which is what
+        the privileged entrypoints require - but outside any instance
+        directory.
+        """
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0, root_gb=1)
+        container = self.client.instances.get.return_value
+        container.config = {
+            'volatile.last_state.idmap': jsonutils.dumps([
+                {'Isuid': True, 'Hostid': 100000},
+                {'Isgid': True, 'Hostid': 100000},
+            ])
+        }
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver._add_configdrive(
+            ctx, instance, [], 'secret', [_VIF])
+
+        mountpoint = mount_mock.call_args[0][1]
+        instances_path = self.CONF2.instances_path
+        instance_dir = os.path.join(instances_path, instance.name)
+        self.assertTrue(
+            mountpoint.startswith(instances_path + os.sep),
+            '%s must stay under instances_path' % mountpoint)
+        self.assertFalse(
+            mountpoint.startswith(instance_dir + os.sep),
+            '%s must not sit inside the instance directory' % mountpoint)
+        self.assertIn(driver._CONFIGDRIVE_MOUNT_DIR, mountpoint)
+
+    @mock.patch.object(driver.eventlet, 'sleep')
+    @mock.patch.object(driver.incus_privsep, 'configdrive_umount')
+    def test_configdrive_umount_retries_a_busy_unmount(self, umount, sleep):
+        instance = mock.Mock(uuid='00000000-0000-0000-0000-000000000001')
+        umount.side_effect = [
+            driver.processutils.ProcessExecutionError('target is busy'), None]
+
+        driver.IncusDriver._umount_configdrive_iso('/mnt/cd', instance)
+
+        self.assertEqual(2, umount.call_count)
+
+    @mock.patch.object(driver.eventlet, 'sleep')
+    @mock.patch.object(driver.incus_privsep, 'configdrive_umount')
+    def test_configdrive_umount_reports_a_leak_without_failing_the_build(
+            self, umount, sleep):
+        # The guest is fine and the config drive is already copied, so a
+        # stuck unmount must be loud rather than fatal.
+        instance = mock.Mock(uuid='00000000-0000-0000-0000-000000000001')
+        umount.side_effect = (
+            driver.processutils.ProcessExecutionError('busy'))
+
+        with mock.patch.object(driver.LOG, 'error') as error:
+            driver.IncusDriver._umount_configdrive_iso('/mnt/cd', instance)
+
+        self.assertEqual(
+            driver._CONFIGDRIVE_UMOUNT_ATTEMPTS, umount.call_count)
+        error.assert_called_once()
+        self.assertIn('operator umount', error.call_args[0][0])
+
     @mock.patch('nova.virt.configdrive.required_by')
     def test_spawn_profile_fail(self, configdrive, neutron_failure=None):
         """Cleanup is called when profile creation fails."""

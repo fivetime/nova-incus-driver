@@ -415,6 +415,47 @@ def verify_host_is_powered_off(provider, fence_plug, config_dir):
     return "fence provider reported %s powered off" % fence_plug
 
 
+def verify_fence_plug_names_the_host(fence_plug, host_id, config_dir):
+    """Check that the plug just proved off is the compute being retired.
+
+    The power check answers a question about --fence-plug; the retirement
+    acts on --host-id. Nothing connected the two, so naming the wrong
+    compute passed verification against a genuinely dead machine. That
+    matters when the misnamed compute holds a live claim for this
+    instance - a partially failed batch evacuation, re-run - because the
+    retirement then deletes a healthy claim and leaves fence evidence
+    pointing at a running host, after which every destroy there takes the
+    detached path and skips shared volume deletion.
+
+    A powered-off host cannot be asked for its own UUID, so the binding
+    has to be declared in advance in the fence entry. Where it is
+    declared it is enforced; where it is not, the disposal is recorded as
+    unverified rather than refused, so existing deployments keep working
+    and the gap stays visible in the ledger.
+    """
+    path = Path(
+        config_dir or "/etc/openstack-incus/fence.d") / ("%s.json" % fence_plug)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            config = json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            "cannot read the fence entry for %s to confirm it names the "
+            "compute being retired: %s" % (fence_plug, exc))
+    if not isinstance(config, dict):
+        raise ValueError("fence entry for %s is not a JSON object"
+                         % fence_plug)
+    declared = config.get("compute_id")
+    if not declared:
+        return ("fence entry %s declares no compute_id, so the plug/host "
+                "binding is unverified" % fence_plug)
+    if _canonical_uuid_argument(str(declared)) != host_id:
+        raise ValueError(
+            "fence entry %s names compute %s, not the --host-id %s being "
+            "retired" % (fence_plug, declared, host_id))
+    return "fence entry %s confirms compute %s" % (fence_plug, host_id)
+
+
 def fence_retire_host_claim(allocator, instance_uuid, host_id, fence_agent,
                             fenced_at, operator, evidence):
     """Dispose of a fenced host's claim so evacuation can proceed.
@@ -588,6 +629,11 @@ def main(argv=None, allocator_factory=idmap.IDMapAllocator,
                 confirmation = verify_host_is_powered_off(
                     args.fence_provider, args.fence_plug,
                     args.fence_config_dir)
+                confirmation = "%s; %s" % (
+                    confirmation,
+                    verify_fence_plug_names_the_host(
+                        args.fence_plug, args.host_id,
+                        args.fence_config_dir))
             else:
                 confirmation = (
                     "power state unverified: %s"

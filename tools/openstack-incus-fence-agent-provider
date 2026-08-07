@@ -29,6 +29,13 @@ STATUS_RE = re.compile(r"(?:status\s*:\s*)?\b(on|off)\b", re.IGNORECASE)
 MAX_SECURE_FILE_SIZE = 64 * 1024
 COMMON_KEYS = {
     "agent",
+    # Optional: the Nova compute node UUID of the machine this entry
+    # fences. It is never passed to the fence agent; it exists so that
+    # tools acting on a fenced host can prove the compute they are about
+    # to act on is the one whose power they just checked. A powered-off
+    # host cannot be asked for its own UUID, so it has to be recorded
+    # here in advance.
+    "compute_id",
     "ip",
     "ipport",
     "username",
@@ -158,7 +165,7 @@ def load_config(config_dir, fence_id):
 
     parameters = dict(AGENTS[agent_name]["defaults"])
     for key, value in config.items():
-        if key not in {"agent", "password_file"}:
+        if key not in {"agent", "password_file", "compute_id"}:
             parameters[key] = value
 
     if "password_file" in config:

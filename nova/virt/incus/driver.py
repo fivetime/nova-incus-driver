@@ -102,6 +102,15 @@ LOG = logging.getLogger(__name__)
 IMAGE_API = glance.API()
 
 MAX_CONSOLE_BYTES = 100 * units.Ki
+# Config-drive ISOs are mounted under instances_path, because that is what
+# the privileged mount and umount entrypoints will accept - but in a
+# directory of their own, never inside an instance directory. Instance
+# removal chowns, walks and rmtree's that directory, and every one of those
+# steps fails on a live read-only mount, so a mount left behind there would
+# make the instance undeletable rather than merely untidy.
+_CONFIGDRIVE_MOUNT_DIR = 'incus-configdrive-mnt'
+_CONFIGDRIVE_UMOUNT_ATTEMPTS = 3
+_CONFIGDRIVE_UMOUNT_RETRY_SECONDS = 2
 # Cached-image deletions are serial and each waits on the server, so a
 # pass is bounded to keep the periodic task's greenthread available. What
 # it defers is taken by the next pass, not dropped.
@@ -13695,6 +13704,38 @@ class IncusDriver(driver.ComputeDriver):
     # have not been through the cleanup process. We know the cleanup process
     # is complete when there is no more code below this comment, and the
     # comment can be removed.
+    @staticmethod
+    def _umount_configdrive_iso(mountpoint, instance):
+        """Release the config-drive ISO, retrying a transient busy unmount.
+
+        A leaked mount holds a loop device and keeps its own directory
+        undeletable. It can no longer block instance deletion - the
+        mountpoint sits outside the instance directory - so failing the
+        spawn over it would be the worse trade: the config drive has
+        already been copied and the guest is fine. Retry the cases that
+        pass on their own, then say so loudly and continue.
+        """
+        for attempt in range(1, _CONFIGDRIVE_UMOUNT_ATTEMPTS + 1):
+            try:
+                incus_privsep.configdrive_umount(mountpoint, 60)
+                return
+            except Exception as exc:
+                if attempt == _CONFIGDRIVE_UMOUNT_ATTEMPTS:
+                    LOG.error(
+                        'Could not unmount the config drive ISO at '
+                        '%(path)s after %(attempts)d attempts (%(error)s); '
+                        'a loop mount is left behind and needs an operator '
+                        'umount',
+                        {'path': mountpoint,
+                         'attempts': _CONFIGDRIVE_UMOUNT_ATTEMPTS,
+                         'error': exc}, instance=instance)
+                    return
+                LOG.warning(
+                    'Unmounting the config drive ISO at %(path)s failed '
+                    '(%(error)s); retrying',
+                    {'path': mountpoint, 'error': exc}, instance=instance)
+                eventlet.sleep(_CONFIGDRIVE_UMOUNT_RETRY_SECONDS)
+
     def _add_configdrive(self, context, instance,
                          injected_files, admin_password, network_info):
         """Create configdrive for the instance."""
@@ -13731,13 +13772,18 @@ class IncusDriver(driver.ComputeDriver):
             fileutils.ensure_tree(configdrive_dir)
 
         # The mountpoint lives under instances_path, not the system temp
-        # directory: the privileged mount and umount entrypoints constrain
-        # both of their paths there, which is what keeps a compromised nova
-        # user from mounting a self-made image over a system directory.
-        mount_parent = os.path.join(
-            nova.conf.CONF.instances_path, instance.name)
-        os.makedirs(mount_parent, exist_ok=True)
-        with utils.tempdir(dir=mount_parent) as tmpdir:
+        # directory, because the privileged mount and umount entrypoints
+        # constrain both of their paths there - that is what keeps a
+        # compromised nova user from mounting a self-made image over a
+        # system directory. It deliberately does not live inside the
+        # instance directory: a mount that outlives this block would make
+        # that instance permanently undeletable, since its removal path
+        # chowns, walks and rmtree's the tree and each of those fails on a
+        # live read-only mount.
+        mount_root = os.path.join(
+            nova.conf.CONF.instances_path, _CONFIGDRIVE_MOUNT_DIR)
+        os.makedirs(mount_root, exist_ok=True)
+        with utils.tempdir(dir=mount_root) as tmpdir:
             mounted = False
             try:
                 # Dedicated privsep entrypoints replace the three
@@ -13768,6 +13814,6 @@ class IncusDriver(driver.ComputeDriver):
                     configdrive_dir, storage_id)
             finally:
                 if mounted:
-                    incus_privsep.configdrive_umount(tmpdir, 60)
+                    self._umount_configdrive_iso(tmpdir, instance)
 
         return configdrive_dir

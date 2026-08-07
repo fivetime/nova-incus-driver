@@ -302,7 +302,14 @@ source_host_id=$(openstack resource provider list --name "$SOURCE_HOST"     -f v
     echo "Cannot resolve the source compute node UUID" >&2
     exit 1
 }
-remote "$CONTROLLER_SSH" "$IDMAP_REGISTRY_TOOL     --fence-retire-host-claim '$SERVER_ID'     --host-id '$source_host_id'     --fence-plug '$SOURCE_FENCE_ID'     --fence-provider '$FENCE_PROVIDER'     --fence-agent '$FENCE_PROVIDER' --fenced-at '$fenced_at'     --operator '$FENCE_OPERATOR'     --fence-evidence 'BFV root watcher count 0'"     >/dev/null || {
+remote "$CONTROLLER_SSH" "$IDMAP_REGISTRY_TOOL \
+    --fence-retire-host-claim '$SERVER_ID' \
+    --host-id '$source_host_id' \
+    --fence-plug '$SOURCE_FENCE_ID' \
+    --fence-provider '$FENCE_PROVIDER' \
+    --fence-agent '$FENCE_PROVIDER' --fenced-at '$fenced_at' \
+    --operator '$FENCE_OPERATOR' \
+    --fence-evidence 'BFV root watcher count 0'" >/dev/null || {
     echo "Fence-based claim retirement failed" >&2
     exit 1
 }

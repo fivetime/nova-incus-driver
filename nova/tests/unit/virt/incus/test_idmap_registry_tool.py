@@ -13,8 +13,12 @@
 # under the License.
 import importlib.machinery
 import importlib.util
+import json
+import os
 from pathlib import Path
 from unittest import mock
+
+import fixtures
 
 from nova import test
 
@@ -126,3 +130,141 @@ class FenceArgumentContractTest(test.NoDBTestCase):
             SystemExit, self._run,
             ['--fence-plug', 'incus-node-02',
              '--unverified-power-state', 'no BMC access'])
+
+
+class FenceRetirementWiringTest(test.NoDBTestCase):
+    """The order and the record, not just the helpers.
+
+    The helper tests below prove the power check refuses correctly; they
+    would all still pass if a regression moved the check after the
+    retirement, or dropped the confirmation instead of writing it into
+    the permanent ledger. These exercise main() end to end.
+    """
+
+    INSTANCE = '00000000-0000-0000-0000-000000000001'
+    HOST = '00000000-0000-0000-0000-000000000002'
+
+    def setUp(self):
+        super().setUp()
+        self.fence_dir = self.useFixture(fixtures.TempDir()).path
+        self.calls = []
+        self.allocator = mock.Mock()
+        self.allocator.get.return_value = mock.Mock(
+            allocation_id='10000000-0000-0000-0000-000000000003')
+        self.allocator.fence_retire_claim.side_effect = (
+            lambda *a, **kw: self.calls.append('retire'))
+        self.allocator.audit_state.return_value = ([], [], [])
+        # registry_document serialises these straight into the report.
+        self.allocator.base = 1000000
+        self.allocator.count = 10000
+        self.allocator.size = 65536
+        self.allocator.namespace = 'region-one-cell1'
+        self.allocator.endpoint = 'https://127.0.0.1:2379'
+        self.allocator.fingerprint = 'a' * 64
+
+    def _fence_entry(self, compute_id=None):
+        entry = {
+            'agent': 'virsh', 'ip': '192.0.2.9', 'username': 'root',
+            'identity_file': '/root/.ssh/id', 'plug': 'compute-1',
+        }
+        if compute_id:
+            entry['compute_id'] = compute_id
+        path = os.path.join(self.fence_dir, 'compute-1.json')
+        with open(path, 'w', encoding='utf-8') as handle:
+            json.dump(entry, handle)
+        return path
+
+    def _argv(self, *extra):
+        return [
+            '--endpoint', 'https://127.0.0.1:2379',
+            '--namespace', 'region-one-cell1',
+            '--base', '1000000', '--count', '10000',
+            '--fence-retire-host-claim', self.INSTANCE,
+            '--host-id', self.HOST,
+            '--fence-agent', 'fence_virsh',
+            '--fenced-at', '2026-08-07T00:00:00Z',
+            '--operator', 'ops@example.com',
+            '--fence-evidence', 'rc=0',
+            '--fence-config-dir', self.fence_dir,
+        ] + list(extra)
+
+    def _run(self, *extra, power='off'):
+        self._fence_entry(compute_id=self.HOST)
+
+        def fake_run(command, **kwargs):
+            self.calls.append('power-check')
+            return mock.Mock(stdout=power + '\n', stderr='',
+                             returncode=2 if power == 'off' else 0)
+
+        with mock.patch.object(registry.subprocess, 'run', fake_run):
+            return registry.main(
+                self._argv('--fence-plug', 'compute-1', *extra),
+                allocator_factory=lambda **kwargs: self.allocator,
+                stdout=mock.Mock(), stderr=mock.Mock())
+
+    def test_power_is_checked_before_anything_is_retired(self):
+        self.assertEqual(0, self._run())
+
+        self.assertEqual(['power-check', 'retire'], self.calls)
+
+    def test_a_live_host_is_never_retired(self):
+        self._run(power='on')
+
+        self.assertEqual(['power-check'], self.calls)
+        self.allocator.fence_retire_claim.assert_not_called()
+
+    def test_the_confirmation_reaches_the_permanent_ledger(self):
+        self._run()
+
+        proof = self.allocator.fence_retire_claim.call_args[0][2]
+        self.assertIn('rc=0', proof.evidence)
+        self.assertIn('powered off', proof.evidence)
+        self.assertIn('confirms compute', proof.evidence)
+
+    def test_a_fence_entry_naming_another_compute_stops_the_retirement(self):
+        # The power check answers a question about --fence-plug; without
+        # this the retirement could act on an unrelated, live --host-id.
+        self._fence_entry(compute_id='00000000-0000-0000-0000-0000000000ff')
+
+        with mock.patch.object(
+                registry.subprocess, 'run',
+                return_value=mock.Mock(
+                    stdout='off\n', stderr='', returncode=2)):
+            rc = registry.main(
+                self._argv('--fence-plug', 'compute-1'),
+                allocator_factory=lambda **kwargs: self.allocator,
+                stdout=mock.Mock(), stderr=mock.Mock())
+
+        self.assertEqual(2, rc)
+        self.allocator.fence_retire_claim.assert_not_called()
+
+    def test_an_undeclared_binding_is_recorded_rather_than_refused(self):
+        # Existing deployments have no compute_id; they keep working, but
+        # the ledger says the binding was never proven.
+        self._fence_entry()
+
+        with mock.patch.object(
+                registry.subprocess, 'run',
+                return_value=mock.Mock(
+                    stdout='off\n', stderr='', returncode=2)):
+            rc = registry.main(
+                self._argv('--fence-plug', 'compute-1'),
+                allocator_factory=lambda **kwargs: self.allocator,
+                stdout=mock.Mock(), stderr=mock.Mock())
+
+        self.assertEqual(0, rc)
+        proof = self.allocator.fence_retire_claim.call_args[0][2]
+        self.assertIn('binding is unverified', proof.evidence)
+
+    def test_a_waived_power_state_is_recorded_and_nothing_is_probed(self):
+        with mock.patch.object(registry.subprocess, 'run') as run:
+            rc = registry.main(
+                self._argv(
+                    '--unverified-power-state', 'BMC unreachable'),
+                allocator_factory=lambda **kwargs: self.allocator,
+                stdout=mock.Mock(), stderr=mock.Mock())
+
+        self.assertEqual(0, rc)
+        run.assert_not_called()
+        proof = self.allocator.fence_retire_claim.call_args[0][2]
+        self.assertIn('BMC unreachable', proof.evidence)
