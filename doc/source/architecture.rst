@@ -721,6 +721,33 @@ when the source host is down. Cold migration requires a reachable, healthy
 source Incus daemon so the destination can negotiate the transfer. Cinder BFV
 roots use shared Ceph without copying rootfs data.
 
+Fence-based claim disposal
+---------------------------
+
+A running instance's ID-map claim is ``committed`` with no cleanup proof,
+and the only way a claim becomes released is the holding host producing a
+storage release receipt. A host that external STONITH powered off can never
+produce one, so without a second authority every failed-host evacuation
+would deadlock: the destination's rescheduled spawn refuses while any claim
+of the allocation generation is unreleased.
+
+External power fencing is that second authority, and the deployment already
+requires it to complete before evacuation starts. The operator records it
+explicitly::
+
+    openstack-incus-idmap-registry ...         --fence-retire-host-claim <instance-uuid>         --host-id <dead-compute-uuid>         --fence-agent fence_ipmilan --fenced-at 2026-08-07T00:00:00Z         --operator ops@example.com         --fence-evidence "fence_ipmilan --action=off rc=0"
+
+The allocator writes that evidence to a per-host fence ledger and removes
+the claim and its host index entry in one compare-and-swap, so the
+destination pre-check no longer sees the dead host. The ledger entry keeps
+a fence-based disposal permanently distinguishable from a normal cleanup
+during audit. The primitive refuses a claim that is already ``cleaned`` --
+a host that can produce its own proof must retire through the ordinary
+path -- and refuses evidence naming another instance, host or allocation
+generation. Never use it for a host that is merely unreachable: the fence
+must have actually removed the host's power, because the evidence replaces
+the proof that its storage access ended.
+
 Returning-host quarantine
 --------------------------
 

@@ -379,6 +379,34 @@ def retire_host_claim(allocator, document, instance_uuid, host_id):
     return assignments, intents
 
 
+def fence_retire_host_claim(allocator, instance_uuid, host_id, fence_agent,
+                            fenced_at, operator, evidence):
+    """Dispose of a fenced host's claim so evacuation can proceed.
+
+    Unlike --retire-host-claim this does not consult a frozen document,
+    because the point is that the holding host is powered off and can
+    never produce the cleanup proof such a document would carry. The
+    operator's fence evidence is the authority and is recorded in the
+    registry's fence ledger.
+    """
+    current = allocator.get(instance_uuid)
+    if current is None:
+        raise idmap.IDMapIntegrityError(
+            reason="no allocation for the requested instance")
+    proof = idmap.IDMapFenceProof(
+        instance_uuid=instance_uuid,
+        host_id=host_id,
+        allocation_id=current.allocation_id,
+        fence_agent=fence_agent,
+        fenced_at=fenced_at,
+        operator=operator,
+        evidence=evidence)
+    allocator.fence_retire_claim(
+        instance_uuid, host_id, proof, assignment=current)
+    assignments, intents, unused_claims = allocator.audit_state()
+    return assignments, intents
+
+
 def _canonical_uuid_argument(value):
     try:
         normalized = str(uuid.UUID(value))
@@ -416,6 +444,16 @@ def _parser():
         help="Retire an exact cleaned claim from --restore-file.")
     parser.add_argument(
         "--host-id", metavar="COMPUTE_UUID", type=_canonical_uuid_argument)
+    parser.add_argument(
+        "--fence-retire-host-claim", metavar="INSTANCE_UUID",
+        type=_canonical_uuid_argument,
+        help=("Dispose of the --host-id claim for this instance using "
+              "external fence evidence, so evacuation can proceed. Requires "
+              "--fence-agent, --fenced-at, --operator and --fence-evidence."))
+    parser.add_argument("--fence-agent", metavar="AGENT")
+    parser.add_argument("--fenced-at", metavar="ISO8601")
+    parser.add_argument("--operator", metavar="WHO")
+    parser.add_argument("--fence-evidence", metavar="TEXT")
     return parser
 
 
@@ -425,8 +463,27 @@ def main(argv=None, allocator_factory=idmap.IDMapAllocator,
     args = parser.parse_args(argv)
     stdout = stdout or sys.stdout
     stderr = stderr or sys.stderr
+    fence_requested = args.fence_retire_host_claim is not None
     retire_requested = (
-        args.retire_host_claim is not None or args.host_id is not None)
+        not fence_requested and
+        (args.retire_host_claim is not None or args.host_id is not None))
+    if fence_requested:
+        required = {
+            "--host-id": args.host_id is not None,
+            "--fence-agent": bool(args.fence_agent),
+            "--fenced-at": bool(args.fenced_at),
+            "--operator": bool(args.operator),
+            "--fence-evidence": bool(args.fence_evidence),
+        }
+        missing = sorted(
+            option for option, supplied in required.items() if not supplied)
+        if missing:
+            parser.error(
+                "fence-based retirement requires %s" % ", ".join(missing))
+        if args.restore_file is not None or args.retire_host_claim is not None:
+            parser.error(
+                "--fence-retire-host-claim cannot be combined with frozen "
+                "document retirement")
     if args.bootstrap_empty and args.restore_file is not None:
         parser.error(
             "--bootstrap-empty cannot be combined with --restore-file")
@@ -470,7 +527,12 @@ def main(argv=None, allocator_factory=idmap.IDMapAllocator,
             password_file=args.password_file,
             allow_insecure=args.allow_insecure,
         )
-        if args.restore_file is None:
+        if fence_requested:
+            assignments, release_intents = fence_retire_host_claim(
+                allocator, args.fence_retire_host_claim, args.host_id,
+                args.fence_agent, args.fenced_at, args.operator,
+                args.fence_evidence)
+        elif args.restore_file is None:
             if args.bootstrap_empty:
                 allocator.bootstrap()
             assignments, release_intents, unused_claims = (
