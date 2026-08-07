@@ -11403,6 +11403,7 @@ class IncusDriver(driver.ComputeDriver):
             'hypervisor_version': _incus_hypervisor_version(incus_config),
             'local_gb': local_disk_info['total'] // units.Gi,
             'local_gb_used': local_disk_info['used'] // units.Gi,
+            'disk_available_least': local_disk_info['available'] // units.Gi,
             'memory_mb': local_memory_info['total'] // units.Mi,
             'memory_mb_used': local_memory_info['used'] // units.Mi,
             'vcpus': vcpus,
@@ -11434,6 +11435,14 @@ class IncusDriver(driver.ComputeDriver):
             'memory_mb_used': resources['memory_mb_used'],
             'local_gb': resources['local_gb'],
             'local_gb_used': resources['local_gb_used'],
+            # Left unset, this reads as zero free space in
+            # "hypervisor show", which is the one place an operator looks
+            # for it. The pool already measures what is actually free.
+            'disk_available_least': resources['disk_available_least'],
+            # vcpus_used counts what instances were promised, while the
+            # two used figures above are what the host is really
+            # consuming. The asymmetry is Nova's own field semantics -
+            # libvirt reports the same way - not an accounting mistake.
             'vcpus_used': self._get_vcpus_used(),
             # Nova's HVType enum has no incus value, so this reports the
             # closest one it accepts. Changing it needs an enum addition
