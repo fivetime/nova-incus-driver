@@ -118,6 +118,8 @@ INCUS_LIVE_BFV_MIGRATION_EXTENSION = (
 INCUS_LIVE_CEPH_MIGRATION_EXTENSION = (
     'migration_live_shared_ceph_storage')
 INCUS_STORAGE_HANDOVER_EXTENSION = 'instance_storage_handover'
+INCUS_STORAGE_HANDOVER_DETACHED_EXTENSION = (
+    'instance_storage_handover_detached')
 INCUS_STORAGE_HANDOVER_PROOF_EXTENSION = (
     'instance_storage_handover_proof')
 INCUS_STORAGE_READY_FENCE_EXTENSION = (
@@ -6278,6 +6280,122 @@ class IncusDriver(driver.ComputeDriver):
                 raise receipt_error from delete_error
             raise
 
+    @staticmethod
+    def _instance_has_materialization_binding(container):
+        """True when the local record carries a complete A/H/T/U binding."""
+        config = container.config if isinstance(container.config, dict) \
+            else {}
+        return all(config.get(key) for key in (
+            'user.openstack.uuid', IDMAP_ALLOCATION_CONFIG_KEY,
+            IDMAP_COMPUTE_CONFIG_KEY, IDMAP_MATERIALIZATION_CONFIG_KEY))
+
+    def _delete_fence_retired_instance(self, container, instance,
+                                       client=None):
+        """Dispose of a local record whose host claim was fence-retired.
+
+        The registry no longer holds this host's claim, so there is
+        nothing to settle - but the local Incus record still carries its
+        materialization binding and Incus correctly refuses an unproven
+        delete. Only recorded fence evidence may authorize the disposal:
+        it is the operator's confirmation of how this host's storage
+        access ended. The receipt the delete produces is acknowledged
+        without a registry write because the fence ledger already is the
+        durable audit record of this disposal.
+        """
+        client = client or self.client
+        config = container.config if isinstance(container.config, dict) \
+            else {}
+        token = config.get(IDMAP_MATERIALIZATION_CONFIG_KEY)
+        allocation_id = config.get(IDMAP_ALLOCATION_CONFIG_KEY)
+        host_id = config.get(IDMAP_COMPUTE_CONFIG_KEY)
+        owner = config.get('user.openstack.uuid')
+        if not all((token, allocation_id, host_id, owner)):
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus instance carries a partial materialization binding')
+        if owner != instance.uuid:
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus instance materialization binding names another '
+                'owner')
+        local_host = virt_node.read_local_node_uuid()
+        if host_id != local_host:
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus instance materialization binding names another '
+                'compute')
+        if self.idmap_allocator is None:
+            raise incus_idmap.IDMapIntegrityError(
+                'Cannot dispose of a bound Incus root without the shared '
+                'allocator')
+        proof = self.idmap_allocator.get_fence_proof(instance.uuid, host_id)
+        if proof is None:
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus root keeps its materialization binding but the '
+                'registry has neither this host claim nor a fence disposal '
+                'for it; refusing to guess')
+        if proof.allocation_id != allocation_id:
+            raise incus_idmap.IDMapIntegrityError(
+                'Fence disposal names another allocation generation than '
+                'the local Incus root binding')
+        try:
+            idmap_base = int(config.get('security.idmap.base'))
+            idmap_size = int(config.get('security.idmap.size'))
+        except (TypeError, ValueError):
+            raise incus_idmap.IDMapIntegrityError(
+                'Bound Incus root has no explicit idmap base and size')
+        LOG.warning(
+            'Disposing of the local record of %(name)s under fence '
+            'evidence recorded by %(operator)s at %(fenced_at)s',
+            {'name': instance.name, 'operator': proof.operator,
+             'fenced_at': proof.fenced_at}, instance=instance)
+        # The volume's authoritative owner is wherever the instance was
+        # evacuated to; this host only disposes of its record. The detached
+        # state makes Incus skip rootfs normalization and shared volume
+        # deletion - both would need to mount a volume this host no longer
+        # owns - and release only local state, recording the outcome in
+        # the release receipt.
+        extensions = set(client.host_info.get('api_extensions', []))
+        if INCUS_STORAGE_HANDOVER_DETACHED_EXTENSION not in extensions:
+            raise incus_idmap.IDMapIntegrityError(
+                'Fence-based local disposal requires the Incus %s API '
+                'extension' % INCUS_STORAGE_HANDOVER_DETACHED_EXTENSION)
+        client.api.instances[instance.name]['storage-handover'].put(
+            params={'project': CONF.incus.project},
+            json={'state': 'detached'})
+        current = client.instances.get(instance.name)
+        current_config = (
+            current.config if isinstance(current.config, dict) else {})
+        if str(current_config.get(
+                'volatile.migration.storage_delete_protection', '')
+               ).lower() not in ('1', 'true', 'yes', 'on'):
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus did not persist the detached shared-storage '
+                'protection')
+        params = {
+            'project': CONF.incus.project,
+            'rootfs-idmap-release-token': token,
+            'rootfs-idmap-release-owner': owner,
+            'rootfs-idmap-allocation-id': allocation_id,
+            'rootfs-idmap-compute-id': host_id,
+        }
+        response = client.api.instances[instance.name].delete(params=params)
+        operation_id = _migration_operation_id(
+            response.json().get('operation'))
+        if operation_id is None:
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus rootfs release delete returned no operation UUID')
+        client.operations.wait_for_operation(operation_id)
+        identity = incus_storage_protocol.StorageMaterializationIdentity(
+            token=token, allocation_id=allocation_id, compute_id=host_id,
+            owner=owner, project=CONF.incus.project,
+            instance_name=instance.name, idmap_base=idmap_base,
+            idmap_size=idmap_size)
+        protocol = self._storage_ownership_client(client)
+        try:
+            binding, receipt = protocol.discover_release_receipt(identity)
+            protocol.acknowledge_release_receipt(binding, receipt)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+
     def _ensure_instance_idmap(
             self, instance, observed_base=None, observed_size=None):
         """Allocate or verify one deployment-wide fixed idmap."""
@@ -7908,6 +8026,15 @@ class IncusDriver(driver.ComputeDriver):
             if name == instance.name and release_claim is not None:
                 self._delete_instance_with_rootfs_release_receipt(
                     container, instance, release_claim)
+            elif (name == instance.name and
+                    self._instance_has_materialization_binding(container)):
+                # No registry claim, yet the local record is still bound:
+                # the claim was disposed of externally. Fence evidence is
+                # the only authority this path accepts (an evacuated-stale
+                # record on a returning host is the normal case); anything
+                # else stays fail-closed rather than guessing at incusd's
+                # receipt requirement.
+                self._delete_fence_retired_instance(container, instance)
             else:
                 container.delete(wait=True)
 

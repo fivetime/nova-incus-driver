@@ -1569,10 +1569,12 @@ class IDMapAllocator:
         slot_prefix = "%s/slots/" % self._prefix
         release_prefix = "%s/releases/" % self._prefix
         host_prefix = "%s/hosts/" % self._prefix
+        fence_prefix = "%s/fences/" % self._prefix
         instances = {}
         slots = {}
         intents = {}
         host_claims = {}
+        fences = {}
         instance_raw = {}
         slot_raw = {}
         for key, raw in records.items():
@@ -1653,9 +1655,57 @@ class IDMapAllocator:
                     raise IDMapIntegrityError(
                         reason="duplicate host claim index")
                 host_claims[claim_key] = claim
+            elif key.startswith(fence_prefix):
+                suffix = key[len(fence_prefix):]
+                parts = suffix.split("/")
+                if len(parts) != 2:
+                    raise IDMapIntegrityError(
+                        reason="fence ledger key is not canonical")
+                key_host_id, key_uuid = parts
+                try:
+                    normalized_host_id = self._host_id(key_host_id)
+                    normalized_uuid = self._instance_uuid(key_uuid)
+                except IDMapConfigurationError as exc:
+                    raise IDMapIntegrityError(
+                        reason="invalid fence ledger key %s: %s" % (
+                            key, exc))
+                if (key_host_id != normalized_host_id or
+                        key_uuid != normalized_uuid):
+                    raise IDMapIntegrityError(
+                        reason="fence ledger key is not canonical")
+                try:
+                    value = jsonutils.loads(raw.decode("utf-8"))
+                    proof = IDMapFenceProof(
+                        instance_uuid=value["instance_uuid"],
+                        host_id=value["host_id"],
+                        allocation_id=value["allocation_id"],
+                        fence_agent=value["fence_agent"],
+                        fenced_at=value["fenced_at"],
+                        operator=value["operator"],
+                        evidence=value["evidence"])
+                    validate_fence_proof(proof)
+                except (ValueError, KeyError, TypeError,
+                        IDMapConfigurationError) as exc:
+                    raise IDMapIntegrityError(
+                        reason="invalid fence ledger record %s: %s" % (
+                            key, exc))
+                if (proof.host_id != normalized_host_id or
+                        proof.instance_uuid != normalized_uuid):
+                    raise IDMapIntegrityError(
+                        reason="fence ledger record contradicts its key")
+                fences[(normalized_host_id, normalized_uuid)] = proof
             else:
                 raise IDMapIntegrityError(
                     reason="unexpected allocator key %s" % key)
+
+        # fence_retire_claim removes the claim in the same transaction that
+        # writes the ledger entry, so a pair holding both records means the
+        # registry was mutated outside the allocator.
+        for fence_pair in fences:
+            if fence_pair in host_claims:
+                raise IDMapIntegrityError(
+                    reason="fence ledger entry coexists with a live host "
+                           "claim for the same host and instance")
 
         claimed_slots = {}
         for instance_uuid, assignment in instances.items():

@@ -828,6 +828,28 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
         recorded = self.allocator.get_fence_proof(
             assignment.instance_uuid, host_id)
         self.assertEqual(proof, recorded)
+        # The ledger entry is a first-class allocator record: the full
+        # audit scan must accept it, not report an unexpected key.
+        assignments, intents, unused_claims = self.allocator.audit_state()
+        self.assertIn(
+            assignment.instance_uuid,
+            [a.instance_uuid for a in assignments])
+
+    def test_audit_rejects_fence_entry_beside_a_live_claim(self):
+        # fence_retire_claim deletes the claim in the same transaction
+        # that writes the ledger, so both records for one pair can only
+        # mean outside mutation.
+        assignment = self.allocator.allocate(self._uuid(306))
+        assignment, host_id, token = self._claim(
+            assignment, host_number=306, token_number=306)
+        proof = self._fence_proof(assignment, host_id)
+        raw = self.allocator._fence_proof_raw(proof)
+        key = self.allocator.fence_key(host_id, assignment.instance_uuid)
+        self.etcd.values[key.encode("utf-8")] = raw
+
+        self.assertRaisesRegex(
+            idmap.IDMapIntegrityError, "coexists with a live host claim",
+            self.allocator.audit_state)
 
     def test_fence_retirement_refuses_a_cleaned_claim(self):
         # A claim with its own cleanup proof must retire through the

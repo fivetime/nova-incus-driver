@@ -281,12 +281,29 @@ if [[ "$original_status" == ACTIVE ]]; then
 fi
 
 "$FENCE_PROVIDER" off "$SOURCE_FENCE_ID"
+fenced_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 wait_for "source power fencing" source_fenced
 openstack compute service set --disable "$SOURCE_HOST" nova-compute
 wait_for "Nova source service down" source_service_down
 
 [[ "$(watcher_count)" == 0 ]] || {
     echo "Source is fenced but the BFV root still has a watcher" >&2
+    exit 1
+}
+
+# The dead source's committed claim structurally blocks every rescheduled
+# spawn of this allocation generation; only recorded fence evidence may
+# dispose of it. Without this step the evacuation below fails its idmap
+# pre-check by design.
+IDMAP_REGISTRY_TOOL=${IDMAP_REGISTRY_TOOL:?Set IDMAP_REGISTRY_TOOL to the openstack-incus-idmap-registry.py invocation prefix (interpreter, script and connection arguments)}
+FENCE_OPERATOR=${FENCE_OPERATOR:?Set FENCE_OPERATOR to the operator identity recorded in the fence ledger}
+source_host_id=$(openstack resource provider list --name "$SOURCE_HOST"     -f value -c uuid)
+[[ "$source_host_id" =~ ^[0-9a-f-]{36}$ ]] || {
+    echo "Cannot resolve the source compute node UUID" >&2
+    exit 1
+}
+remote "$CONTROLLER_SSH" "$IDMAP_REGISTRY_TOOL     --fence-retire-host-claim '$SERVER_ID'     --host-id '$source_host_id'     --fence-agent '$FENCE_PROVIDER' --fenced-at '$fenced_at'     --operator '$FENCE_OPERATOR'     --fence-evidence 'fence provider reported status=off; BFV root watcher count 0'"     >/dev/null || {
+    echo "Fence-based claim retirement failed" >&2
     exit 1
 }
 

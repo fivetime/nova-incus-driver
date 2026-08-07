@@ -735,7 +735,12 @@ External power fencing is that second authority, and the deployment already
 requires it to complete before evacuation starts. The operator records it
 explicitly::
 
-    openstack-incus-idmap-registry ...         --fence-retire-host-claim <instance-uuid>         --host-id <dead-compute-uuid>         --fence-agent fence_ipmilan --fenced-at 2026-08-07T00:00:00Z         --operator ops@example.com         --fence-evidence "fence_ipmilan --action=off rc=0"
+    openstack-incus-idmap-registry ... \
+        --fence-retire-host-claim <instance-uuid> \
+        --host-id <dead-compute-uuid> \
+        --fence-agent fence_ipmilan --fenced-at 2026-08-07T00:00:00Z \
+        --operator ops@example.com \
+        --fence-evidence "fence_ipmilan --action=off rc=0"
 
 The allocator writes that evidence to a per-host fence ledger and removes
 the claim and its host index entry in one compare-and-swap, so the
@@ -747,6 +752,19 @@ path -- and refuses evidence naming another instance, host or allocation
 generation. Never use it for a host that is merely unreachable: the fence
 must have actually removed the host's power, because the evidence replaces
 the proof that its storage access ended.
+
+When the fenced host later returns, its stale record still carries the
+materialization binding and Incus still refuses an unproven delete. The
+driver's evacuated-stale cleanup recognizes the recorded fence disposal:
+it marks the record ``detached`` -- an Incus storage-handover state that
+requires server-administrator authorization and is refused for any record
+carrying negotiated handover state -- so the local delete releases only
+local state, with no rootfs ID map normalization and no shared volume
+deletion, and the release receipt records the ``detached`` outcome. The
+receipt is acknowledged without a registry write; the fence ledger remains
+the durable audit record of the disposal. A pending ``normalized`` receipt
+left behind by a delete that failed before the record was protected is
+superseded to ``detached``; the reverse rewrite is never allowed.
 
 Returning-host quarantine
 --------------------------

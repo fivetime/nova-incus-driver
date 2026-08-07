@@ -1208,6 +1208,110 @@ class IncusIDMapDriverTest(test.NoDBTestCase):
         self.driver.client.api.instances[
             self.instance.name].delete.assert_not_called()
 
+    def _fence_bound_container(self):
+        return mock.Mock(config={
+            'user.openstack.uuid': self.assignment.instance_uuid,
+            driver.IDMAP_ALLOCATION_CONFIG_KEY:
+                self.assignment.allocation_id,
+            driver.IDMAP_COMPUTE_CONFIG_KEY: self.host_id,
+            driver.IDMAP_MATERIALIZATION_CONFIG_KEY:
+                self.materialization_id,
+            'security.idmap.base': str(self.assignment.base),
+            'security.idmap.size': str(self.assignment.size)})
+
+    def test_fence_retired_record_disposal_needs_no_registry_write(self):
+        """A returning host disposes of its evacuated-stale record.
+
+        The claim was fence-retired, so the local delete supplies the
+        four-tuple from the container's own binding and the produced
+        receipt is acknowledged without touching the registry.
+        """
+        self.driver.idmap_allocator.get_fence_proof.return_value = (
+            driver.incus_idmap.IDMapFenceProof(
+                instance_uuid=self.assignment.instance_uuid,
+                host_id=self.host_id,
+                allocation_id=self.assignment.allocation_id,
+                fence_agent='virsh', fenced_at='2026-08-07T00:00:00Z',
+                operator='ops@example.com', evidence='status=off'))
+        container = self._fence_bound_container()
+        endpoint = self.driver.client.api.instances[self.instance.name]
+        response = mock.Mock()
+        response.json.return_value = {
+            'operation': '/1.0/operations/'
+                         '30000000-0000-0000-0000-000000000003'}
+        endpoint.delete.return_value = response
+        ownership = self.driver.storage_ownership
+        ownership.discover_release_receipt.return_value = (
+            mock.sentinel.binding, mock.sentinel.receipt)
+
+        self.driver.client.host_info = {
+            'api_extensions': ['instance_storage_handover',
+                               'instance_storage_handover_detached']}
+        protected = mock.Mock(config={
+            'volatile.migration.storage_delete_protection': 'true'})
+        self.driver.client.instances.get.return_value = protected
+
+        self.driver._delete_fence_retired_instance(container, self.instance)
+
+        handover = self.driver.client.api.instances[
+            self.instance.name]['storage-handover']
+        handover.put.assert_called_once_with(
+            params={'project': 'nova'}, json={'state': 'detached'})
+        endpoint.delete.assert_called_once_with(params={
+            'project': 'nova',
+            'rootfs-idmap-release-token': self.materialization_id,
+            'rootfs-idmap-release-owner': self.assignment.instance_uuid,
+            'rootfs-idmap-allocation-id': self.assignment.allocation_id,
+            'rootfs-idmap-compute-id': self.host_id,
+        })
+        ownership.acknowledge_release_receipt.assert_called_once_with(
+            mock.sentinel.binding, mock.sentinel.receipt)
+        record = self.driver.idmap_allocator.record_rootfs_release_proof
+        record.assert_not_called()
+        self.driver.idmap_allocator.retire_claim.assert_not_called()
+
+    def test_fence_disposal_refused_without_ledger_entry(self):
+        # A bound record with neither a claim nor fence evidence stays
+        # fail-closed: no guessing at incusd's receipt requirement.
+        self.driver.idmap_allocator.get_fence_proof.return_value = None
+        container = self._fence_bound_container()
+
+        self.assertRaisesRegex(
+            driver.incus_idmap.IDMapIntegrityError, 'fence disposal',
+            self.driver._delete_fence_retired_instance,
+            container, self.instance)
+
+        self.driver.client.api.instances[
+            self.instance.name].delete.assert_not_called()
+
+    def test_fence_disposal_refuses_foreign_generation_evidence(self):
+        self.driver.idmap_allocator.get_fence_proof.return_value = (
+            driver.incus_idmap.IDMapFenceProof(
+                instance_uuid=self.assignment.instance_uuid,
+                host_id=self.host_id,
+                allocation_id='10000000-0000-0000-0000-00000000009f',
+                fence_agent='virsh', fenced_at='2026-08-07T00:00:00Z',
+                operator='ops@example.com', evidence='status=off'))
+        container = self._fence_bound_container()
+
+        self.assertRaisesRegex(
+            driver.incus_idmap.IDMapIntegrityError,
+            'another allocation generation',
+            self.driver._delete_fence_retired_instance,
+            container, self.instance)
+
+        self.driver.client.api.instances[
+            self.instance.name].delete.assert_not_called()
+
+    def test_binding_predicate_requires_every_key(self):
+        self.assertTrue(
+            self.driver._instance_has_materialization_binding(
+                self._fence_bound_container()))
+        partial = self._fence_bound_container()
+        del partial.config[driver.IDMAP_MATERIALIZATION_CONFIG_KEY]
+        self.assertFalse(
+            self.driver._instance_has_materialization_binding(partial))
+
     def test_allocate_refreshes_and_preserves_unrelated_system_metadata(self):
         instance = objects.Instance(
             uuid=self.assignment.instance_uuid,
