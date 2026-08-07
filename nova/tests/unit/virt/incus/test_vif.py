@@ -253,16 +253,23 @@ class IncusGenericVifDriverTest(test.NoDBTestCase):
         linux_net.delete_net_dev.assert_called_with('tapda5cc4bf-f1')
         _post_unplug_wiring.assert_called_with(INSTANCE, TAP_VIF)
 
-    @mock.patch.object(vif, '_post_unplug_wiring')
+    @mock.patch.object(vif, '_post_unplug_wiring_delete_veth')
     @mock.patch('nova.virt.incus.vif.os_vif')
-    def test_unplug_binding_failed_is_idempotent(
-            self, os_vif, _post_unplug_wiring):
+    def test_unplug_binding_failed_still_removes_our_veth(
+            self, os_vif, delete_veth):
+        """Neutron's binding state does not own this driver's device.
+
+        plug() creates the host veth before anything is bound and names
+        it from the port ID, so it outlives a port that later reports
+        binding-failed. Skipping its removal stranded one host device per
+        failed binding, permanently. os-vif still has nothing to undo.
+        """
         failed_vif = {'id': 'failed-port', 'type': 'binding_failed'}
 
         self.vif_driver.unplug(INSTANCE, failed_vif)
 
         os_vif.unplug.assert_not_called()
-        _post_unplug_wiring.assert_not_called()
+        delete_veth.assert_called_once_with(INSTANCE, failed_vif)
 
 
 class PostPlugTest(test.NoDBTestCase):
@@ -271,13 +278,26 @@ class PostPlugTest(test.NoDBTestCase):
     def setUp(self):
         super(PostPlugTest, self).setUp()
 
+    @mock.patch.object(vif.linux_net, 'device_exists', return_value=True)
     @mock.patch.object(vif.linux_net, 'delete_net_dev')
-    def test_post_unplug_logs_veth_delete_failure(self, delete_net_dev):
+    def test_post_unplug_logs_veth_delete_failure(
+            self, delete_net_dev, device_exists):
         delete_net_dev.side_effect = processutils.ProcessExecutionError()
 
         vif._post_unplug_wiring_delete_veth(INSTANCE, OVS_VIF)
 
         delete_net_dev.assert_called_once_with('tapda5cc4bf-f1')
+
+    @mock.patch.object(vif.linux_net, 'device_exists', return_value=False)
+    @mock.patch.object(vif.linux_net, 'delete_net_dev')
+    def test_post_unplug_is_quiet_when_there_was_never_a_veth(
+            self, delete_net_dev, device_exists):
+        # Removal is now attempted for ports that may never have been
+        # wired, so an absent device must not produce a failure trace on
+        # every unplug.
+        vif._post_unplug_wiring_delete_veth(INSTANCE, OVS_VIF)
+
+        delete_net_dev.assert_not_called()
 
     @mock.patch('nova.virt.incus.vif._create_veth_pair')
     @mock.patch('nova.virt.incus.vif.linux_net')

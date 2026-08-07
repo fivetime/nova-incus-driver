@@ -176,8 +176,11 @@ def _post_plug_wiring(instance, vif):
 # VIF_TYPE_OVS = 'ovs'
 # VIF_TYPE_BRIDGE = 'bridge'
 def _post_unplug_wiring_delete_veth(instance, vif):
-    """Wire/plug the virtual interface for the instance into the bridge that
-    incus is using.
+    """Remove the host-side veth this driver created for one VIF.
+
+    Safe to call for a VIF that never had one: checking for the device
+    first keeps a port that was never wired from logging a failure trace
+    on every unplug.
 
     :param instance: the instance to plug into the bridge
     :type instance: ???
@@ -185,6 +188,8 @@ def _post_unplug_wiring_delete_veth(instance, vif):
     :type vif: :class:`nova.network.model.VIF`
     """
     v1_name = get_vif_devname(vif)
+    if not linux_net.device_exists(v1_name):
+        return
     try:
         linux_net.delete_net_dev(v1_name)
     except processutils.ProcessExecutionError:
@@ -274,9 +279,18 @@ class IncusGenericVifDriver(object):
     def unplug(self, instance, vif):
         vif_type = vif['type']
         if vif_type == network_model.VIF_TYPE_BINDING_FAILED:
+            # os-vif has nothing to undo for a port Neutron never bound,
+            # and asking it would fail. This driver's own veth is a
+            # different matter: it was created by plug() before anything
+            # was bound, its name derives from the port ID rather than
+            # the VIF type, and it therefore survives a port that later
+            # reports binding-failed. Leaving it stranded a host device
+            # per failed binding, forever.
             LOG.warning(
-                'Skipping unplug for Neutron binding-failed VIF %(vif)s',
+                'Skipping os-vif unplug for Neutron binding-failed VIF '
+                '%(vif)s; removing the veth this driver created',
                 {'vif': vif.get('id')}, instance=instance)
+            _post_unplug_wiring_delete_veth(instance, vif)
             return
         instance_info = os_vif_util.nova_to_osvif_instance(instance)
 

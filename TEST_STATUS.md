@@ -11,6 +11,78 @@ Entries are append-mostly and are release evidence, not permanent
 configuration. Each release must re-validate against its own approved
 digest/revision pair.
 
+## 2026-08-07 Evacuation unblocked, and the fixes that took
+
+**Evacuation was structurally impossible, now proven working.** A running
+instance holds a `committed` ID-map claim with no cleanup proof, and the only
+way a claim becomes released is the holding host producing a storage release
+receipt -- which a STONITH-powered-off host can never do. Every failed-host
+evacuation therefore deadlocked at the destination's pre-check. Confirmed live
+before fixing: `IDMapConflict: Rescheduled Incus spawn has an uncleared idmap
+host claim`.
+
+The fix is `fence_retire_claim`: external power-fencing evidence substitutes
+for the receipt, written to a per-host fence ledger in the same
+compare-and-swap that removes the claim and its host index entry. The
+destination pre-check needs no change -- the dead host simply leaves
+`host_ids`.
+
+Verified end to end on the testbed with a real STONITH of incus-node-02:
+BFV instance -> `virsh` power off -> service down -> RBD watcher count 0 ->
+evacuation refused (expected) -> `--fence-retire-host-claim` -> evacuation
+succeeds, ACTIVE on incus-node-03 -> root marker file intact -> watcher count
+1 -> registry holds only the destination's claim -> returning host quarantined
+(no admission token, nova-compute refuses to start, containers stopped) ->
+returning-host audit 9/9 PASS -> admitted -> stale record disposed of ->
+re-enabled.
+
+**Three defects that only the live run could show.**
+
+- The registry audit did not recognise the new fence ledger keys, so the
+  first retirement permanently broke every full audit. The per-minute count
+  probe was unaffected, which is why the suite stayed green.
+- A returning host could not rejoin: `init_host` destroys evacuated-stale
+  records, but the claim had been fence-retired, so the plain delete hit the
+  fork's release-receipt requirement and nova-compute died on every start.
+  Fixed by a new Incus storage-handover state, `detached`, plus a driver path
+  that disposes of such a record under recorded fence evidence.
+- Adding the disposed materialization token to the ledger changed the shape
+  of an already-persisted record, and the parser demanded the new field.
+  Deploying it took every compute down at `init_host` -- the same fleet-wide
+  latch the token was added to prevent, arriving by a different door.
+
+**Bare ID-map allocations are now reclaimed.** An allocation whose last claim
+went away without leaving a release intent -- a local delete against an
+unreachable compute, or a fence retirement before the destination claims --
+was invisible to both periodic reclaimers, so the slot never came back. The
+full audit now adopts it by writing the missing intent and lets the ordinary
+replay path apply its usual barrier. Verified by producing one the real way
+(stop the compute, local delete, fence-retire the last claim) and watching a
+compute audit adopt and release it.
+
+**Fork-side create-path fix, still the performance ceiling.** The
+per-fingerprint `ImageOperation` lock recorded above was made read/write in
+the fork (`24fa16c6b`, writer-priority, ctx-aware): creates take it shared,
+downloads and deletions exclusively, with a second `UseImage_<pool>_<fp>`
+lock in the storage layer. Measured on incus-node-01 against the Ceph pool:
+**C=1 8 s, C=8 wall 17 s**, against >=64 s before, so the serialized fraction
+fell from 0.48 to 0.16. `EnsureImage` itself was never the problem -- it costs
+1-2 s and was exonerated by the incusd debug log after I had wrongly accused
+it.
+
+**Fleet.** incus-node-01 is control-plane only (no compute service, no
+resource provider). Compute is incus-node-02, incus-node-03 and the new
+incus-node-07, all 64C/125G. incus-node-04 and the `-kvm` services on 02/03/07
+are libvirt computes belonging to separate testing; `m1.tiny` carries no trait
+requirement and can schedule there, so Incus test instances must pin their
+host or use a flavor with `trait:CUSTOM_INCUS_SYSTEM_CONTAINER=required`.
+
+**Still open.** The formal performance baseline has not been recorded. The
+physical virsh host has 278 GiB against 608 GiB allocated across seven VMs and
+only ~52 GiB free, with incus-node-03 alone holding 99 GiB resident while
+nearly idle; the previous attempt died of host OOM at ~2600 instances under
+less pressure than this.
+
 ## 2026-08-03 Failed-build idmap claims were never released
 
 Third defect of the same family, also reported from the LB provider:
