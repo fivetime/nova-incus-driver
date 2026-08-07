@@ -782,6 +782,125 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
                 k for k in calls if k == self.allocator.configuration_key]
             self.assertEqual(2, len(config_reads))
 
+    @staticmethod
+    def _fence_proof(assignment, host_id):
+        return idmap.IDMapFenceProof(
+            instance_uuid=assignment.instance_uuid,
+            host_id=host_id,
+            allocation_id=assignment.allocation_id,
+            fence_agent="fence_virsh",
+            fenced_at="2026-08-07T00:00:00Z",
+            operator="ops@example.com",
+            evidence="virsh destroy incus-node-02 rc=0")
+
+    def test_fence_retires_a_committed_claim_of_a_dead_host(self):
+        """Evacuation's unblocking primitive.
+
+        A host that STONITH powered off can never produce a release
+        receipt, so its committed claim blocked every rescheduled spawn of
+        the generation. External fence evidence disposes of it.
+        """
+        assignment = self.allocator.allocate(self._uuid(300))
+        assignment, host_id, token = self._claim(
+            assignment, host_number=300, token_number=300)
+        self.allocator.mark_materialization_possible(
+            assignment.instance_uuid, host_id, token, assignment=assignment)
+        self.allocator.mark_materialization_committed(
+            assignment.instance_uuid, host_id, token, assignment=assignment)
+
+        current = self.allocator.fence_retire_claim(
+            assignment.instance_uuid, host_id,
+            self._fence_proof(assignment, host_id), assignment=assignment)
+
+        self.assertNotIn(host_id, current.host_ids)
+        self.assertIsNone(self.allocator.get_host_claim(
+            assignment.instance_uuid, host_id))
+
+    def test_fence_retirement_is_recorded_in_the_audit_ledger(self):
+        assignment = self.allocator.allocate(self._uuid(301))
+        assignment, host_id, token = self._claim(
+            assignment, host_number=301, token_number=301)
+        proof = self._fence_proof(assignment, host_id)
+
+        self.allocator.fence_retire_claim(
+            assignment.instance_uuid, host_id, proof, assignment=assignment)
+
+        recorded = self.allocator.get_fence_proof(
+            assignment.instance_uuid, host_id)
+        self.assertEqual(proof, recorded)
+
+    def test_fence_retirement_refuses_a_cleaned_claim(self):
+        # A claim with its own cleanup proof must retire through the
+        # ordinary path; fence evidence is only for hosts that cannot
+        # produce one.
+        assignment = self.allocator.allocate(self._uuid(302))
+        assignment, host_id, token = self._claim(
+            assignment, host_number=302, token_number=302)
+        self.allocator.mark_materialization_possible(
+            assignment.instance_uuid, host_id, token, assignment=assignment)
+        proof = self._materialization_proof(assignment, host_id, token)
+        self.allocator.record_materialization_proof(
+            assignment.instance_uuid, host_id, token, proof,
+            assignment=assignment)
+
+        self.assertRaisesRegex(
+            idmap.IDMapConflict, "cleanup proof",
+            self.allocator.fence_retire_claim,
+            assignment.instance_uuid, host_id,
+            self._fence_proof(assignment, host_id), assignment=assignment)
+
+    def test_fence_retirement_rejects_mismatched_evidence(self):
+        assignment = self.allocator.allocate(self._uuid(303))
+        assignment, host_id, token = self._claim(
+            assignment, host_number=303, token_number=303)
+
+        for overrides, expected in (
+                ({"host_id": self._host(399)}, "another host"),
+                ({"instance_uuid": self._uuid(399)}, "another instance"),
+                ({"allocation_id": self._uuid(398)},
+                 "another allocation generation"),
+                ({"evidence": "  "}, "field evidence is missing")):
+            values = dict(
+                instance_uuid=assignment.instance_uuid,
+                host_id=host_id,
+                allocation_id=assignment.allocation_id,
+                fence_agent="fence_virsh",
+                fenced_at="2026-08-07T00:00:00Z",
+                operator="ops@example.com",
+                evidence="virsh destroy rc=0")
+            values.update(overrides)
+            self.assertRaises(
+                idmap.IDMapError,
+                self.allocator.fence_retire_claim,
+                assignment.instance_uuid, host_id,
+                idmap.IDMapFenceProof(**values),
+                assignment=assignment)
+        # The claim survives every rejected attempt.
+        self.assertIsNotNone(self.allocator.get_host_claim(
+            assignment.instance_uuid, host_id))
+
+    def test_fence_retired_generation_can_be_reclaimed_elsewhere(self):
+        """The evacuation destination can claim the freed generation."""
+        assignment = self.allocator.allocate(self._uuid(304))
+        assignment, dead_host, token = self._claim(
+            assignment, host_number=304, token_number=304)
+        self.allocator.mark_materialization_possible(
+            assignment.instance_uuid, dead_host, token,
+            assignment=assignment)
+        self.allocator.mark_materialization_committed(
+            assignment.instance_uuid, dead_host, token,
+            assignment=assignment)
+        assignment = self.allocator.fence_retire_claim(
+            assignment.instance_uuid, dead_host,
+            self._fence_proof(assignment, dead_host), assignment=assignment)
+
+        survivor = self._host(305)
+        current = self.allocator.claim(
+            assignment.instance_uuid, survivor, self._materialization(305),
+            assignment=assignment)
+
+        self.assertIn(survivor, current.host_ids)
+
     def test_unproven_claim_cannot_retire(self):
         assignment = self.allocator.allocate(self._uuid(10))
         assignment, host_id, token = self._claim(assignment)

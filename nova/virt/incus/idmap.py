@@ -128,6 +128,25 @@ class IDMapHostClaim:
 
 
 @dataclass(frozen=True)
+class IDMapFenceProof:
+    """Operator evidence that external STONITH powered off a claim holder.
+
+    This is the only authority that may dispose of a claim without the
+    holding host's storage release receipt, because a fenced host can never
+    produce one. It is written to the registry's fence ledger so the
+    disposal stays auditable and distinguishable from a normal cleanup.
+    """
+
+    instance_uuid: str
+    host_id: str
+    allocation_id: str
+    fence_agent: str
+    fenced_at: str
+    operator: str
+    evidence: str
+
+
+@dataclass(frozen=True)
 class IDMapMaterializationProof:
     """Exact Incus proof that one materialization cannot retain artifacts."""
 
@@ -542,6 +561,41 @@ class IDMapAllocator:
         return "%s/hosts/%s/%s" % (
             self._prefix, self._host_id(host_id),
             self._instance_uuid(instance_uuid))
+
+    def fence_key(self, host_id, instance_uuid):
+        """Key of the audit ledger entry for one fence-based retirement."""
+        return "%s/fences/%s/%s" % (
+            self._prefix, self._host_id(host_id),
+            self._instance_uuid(instance_uuid))
+
+    def _fence_proof_raw(self, proof):
+        return self._json_bytes({
+            "schema": _SCHEMA_VERSION,
+            "kind": "fence-retirement",
+            "instance_uuid": self._instance_uuid(proof.instance_uuid),
+            "host_id": self._host_id(proof.host_id),
+            "allocation_id": self._materialization_id(proof.allocation_id),
+            "fence_agent": proof.fence_agent,
+            "fenced_at": proof.fenced_at,
+            "operator": proof.operator,
+            "evidence": proof.evidence,
+        })
+
+    def get_fence_proof(self, instance_uuid, host_id):
+        """Return one recorded fence retirement, or None."""
+        self._ensure_initialized()
+        raw = self._get_raw(self.fence_key(host_id, instance_uuid))
+        if raw is None:
+            return None
+        value = jsonutils.loads(raw.decode("utf-8"))
+        return IDMapFenceProof(
+            instance_uuid=value["instance_uuid"],
+            host_id=value["host_id"],
+            allocation_id=value["allocation_id"],
+            fence_agent=value["fence_agent"],
+            fenced_at=value["fenced_at"],
+            operator=value["operator"],
+            evidence=value["evidence"])
 
     def _get_raw(self, key):
         try:
@@ -2671,6 +2725,104 @@ class IDMapAllocator:
             instance_uuid, host_id, materialization_id, proof,
             assignment=assignment)
 
+    def fence_retire_claim(self, instance_uuid, host_id, fence_proof,
+                           assignment=None):
+        """Retire a claim held by a host proven powered off by STONITH.
+
+        Ordinary retirement requires the holding host to produce a storage
+        release receipt, which a dead host can never do. Evacuation
+        therefore deadlocked: the destination's spawn pre-check refuses
+        while any claim of the generation is unreleased, and nothing could
+        release the source's.
+
+        External power fencing is the authority that replaces the receipt.
+        The caller must pass an ``IDMapFenceProof`` recording which host was
+        fenced, by which agent, when, and by whom; it is written into the
+        assignment's fence ledger before the claim is removed, so the
+        disposal is auditable and can never be mistaken for a normal
+        cleanup. A claim that is already ``cleaned`` must go through
+        ``retire_claim`` with its real proof instead.
+        """
+        validate_fence_proof(fence_proof)
+        self._ensure_initialized()
+        instance_uuid = self._instance_uuid(instance_uuid)
+        host_id = self._host_id(host_id)
+        if fence_proof.host_id != host_id:
+            raise IDMapIntegrityError(
+                reason="fence proof names another host")
+        if fence_proof.instance_uuid != instance_uuid:
+            raise IDMapIntegrityError(
+                reason="fence proof names another instance")
+
+        for unused_attempt in range(64):
+            current, current_raw, unused_intent, unused_intent_raw, claims, \
+                claim_raws = self._read_assignment_state(instance_uuid)
+            if current is None:
+                return None
+            self._require_generation(current, assignment)
+            claim = claims.get(host_id)
+            if claim is None:
+                return current
+            if claim.state == "cleaned" and claim.proof is not None:
+                raise IDMapConflict(
+                    reason="a cleaned claim must be retired with its own "
+                           "cleanup proof")
+            if fence_proof.allocation_id != current.allocation_id:
+                raise IDMapIntegrityError(
+                    reason="fence proof names another allocation generation")
+            desired = IDMapAssignment(
+                instance_uuid=current.instance_uuid,
+                base=current.base,
+                size=current.size,
+                slot=current.slot,
+                allocation_id=current.allocation_id,
+                fingerprint=current.fingerprint,
+                host_ids=tuple(
+                    value for value in current.host_ids if value != host_id),
+            )
+            desired_raw = self._assignment_raw(
+                desired.instance_uuid, desired.slot,
+                desired.allocation_id, desired.host_ids)
+            host_key = self.host_claim_key(host_id, instance_uuid)
+            fence_key = self.fence_key(host_id, instance_uuid)
+            transaction = {
+                "compare": [
+                    self._compare_config(),
+                    self._compare_value(
+                        self.instance_key(instance_uuid), current_raw),
+                    self._compare_value(
+                        self.slot_key(current.slot), current_raw),
+                    self._compare_value(host_key, claim_raws[host_id]),
+                ],
+                "success": [
+                    self._put(fence_key, self._fence_proof_raw(fence_proof)),
+                    self._put(self.instance_key(instance_uuid), desired_raw),
+                    self._put(self.slot_key(current.slot), desired_raw),
+                    self._delete(host_key),
+                ],
+                "failure": [],
+            }
+            try:
+                succeeded = self._transaction(transaction)
+            except IDMapBackendError:
+                observed, unused_raw, unused_intent, unused_intent_raw, \
+                    observed_claims, unused_claim_raws = (
+                        self._read_assignment_state(instance_uuid))
+                if observed is None or host_id not in observed_claims:
+                    return observed
+                raise
+            if not succeeded:
+                continue
+            observed, unused_raw, unused_intent, unused_intent_raw, \
+                observed_claims, unused_claim_raws = (
+                    self._read_assignment_state(instance_uuid))
+            if observed is None or host_id not in observed_claims:
+                return observed
+            raise IDMapIntegrityError(
+                reason="fence-retired host claim still exists")
+        raise IDMapConflict(
+            reason="fence retirement could not win CAS")
+
     def abandon_unregistered_claim(self, instance_uuid, host_id,
                                    materialization_id, assignment=None):
         """Remove one ``unmaterialized`` claim whose attempt never existed.
@@ -3003,3 +3155,21 @@ def rootfs_release_proof_digest(proof):
 def validate_rootfs_release_receipt(receipt):
     """Return the exact validated proof represented by a v2 receipt."""
     return IDMapAllocator._proof_from_receipt(receipt)
+
+
+def validate_fence_proof(proof):
+    """Fail closed unless *proof* is a complete operator fence record."""
+    if not isinstance(proof, IDMapFenceProof):
+        raise IDMapIntegrityError(
+            reason="fence retirement requires an IDMapFenceProof")
+    for field in ("instance_uuid", "host_id", "allocation_id",
+                  "fence_agent", "fenced_at", "operator", "evidence"):
+        value = getattr(proof, field)
+        if not isinstance(value, str) or not value.strip():
+            raise IDMapIntegrityError(
+                reason="fence proof field %s is missing" % field)
+    for field in ("instance_uuid", "host_id", "allocation_id"):
+        if not uuidutils.is_uuid_like(getattr(proof, field)):
+            raise IDMapIntegrityError(
+                reason="fence proof field %s must be a UUID" % field)
+    return proof
