@@ -3657,6 +3657,43 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertIs(boom, raised)
         self.assertEqual(3, drv.vif_driver.unplug.call_count)
 
+    def test_rollback_cleanup_shares_the_attempt_every_vif_guarantee(self):
+        """Both VIF cleanup paths must not stop at the first failure.
+
+        A device left behind stays until someone removes it by hand, so
+        the two paths now share one implementation of that guarantee
+        rather than each carrying its own copy for a future fix to miss.
+        """
+        drv = driver.IncusDriver(None)
+        drv.vif_driver = mock.Mock()
+        drv.vif_driver.unplug.side_effect = [
+            RuntimeError('vif 1'), None, RuntimeError('vif 3')]
+        instance = mock.Mock()
+        instance.name = 'instance-00000001'
+        vifs = [{'id': 'vif-1'}, {'id': 'vif-2'}, {'id': 'vif-3'}]
+
+        failures = drv._cleanup_vifs_best_effort(instance, vifs)
+
+        self.assertEqual(3, drv.vif_driver.unplug.call_count)
+        # Reported in full rather than only the first, because this
+        # caller aggregates them for the operator.
+        self.assertEqual(
+            ['unplug destination VIF vif-1', 'unplug destination VIF vif-3'],
+            [description for description, unused_exc in failures])
+
+    def test_rollback_cleanup_skips_the_firewall_when_not_asked(self):
+        drv = driver.IncusDriver(None)
+        drv.vif_driver = mock.Mock()
+        drv.firewall_driver = mock.Mock()
+        instance = mock.Mock()
+        instance.name = 'instance-00000001'
+
+        failures = drv._cleanup_vifs_best_effort(
+            instance, [{'id': 'vif-1'}], remove_firewall=False)
+
+        self.assertEqual([], failures)
+        drv.firewall_driver.unfilter_instance.assert_not_called()
+
     def test_incus_cloud_init_config_gzip_user_data(self):
         # Users gzip user-data to fit Nova's 64K API limit; it must arrive
         # at cloud-init as the equivalent decompressed text.

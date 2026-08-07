@@ -16,6 +16,7 @@ Contents:
    api_contract
    scale_design
    production_readiness
+   upgrade_matrix
    contributing
    exclusive_machine
    vif_wiring

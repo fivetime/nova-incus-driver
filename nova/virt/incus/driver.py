@@ -11738,47 +11738,60 @@ class IncusDriver(driver.ComputeDriver):
                 self._cleanup_vifs_best_effort(
                     instance, reversed(plugged))
 
-    def _cleanup_vifs_best_effort(
-            self, instance, network_info, remove_firewall=False):
-        """Attempt every target VIF cleanup and report all failures."""
+    def _unplug_every_vif(self, instance, network_info, description):
+        """Unplug all VIFs and report what failed, stopping for nothing.
+
+        Aborting on the first failure leaked every remaining interface of
+        a multi-NIC instance, and each host device left behind stays
+        until someone removes it by hand. Both callers need that
+        guarantee, so it lives here rather than in each of them: the
+        driver API re-raises the first failure, the rollback path
+        aggregates them all.
+
+        :returns: list of ``(vif_id, exception)`` in the order attempted.
+        """
         failures = []
         for vif in list(network_info or []):
             vif_id = vif.get('id', 'unknown')
             try:
                 self.vif_driver.unplug(instance, vif)
             except Exception as exc:
-                failures.append(
-                    ('unplug destination VIF %s' % vif_id, exc))
+                failures.append((vif_id, exc))
                 LOG.exception(
-                    'Failed to unplug destination VIF %s',
+                    'Failed to unplug %(description)s %(vif)s; continuing '
+                    'with the rest',
+                    {'description': description, 'vif': vif_id},
+                    instance=instance)
+        return failures
+
+    def _cleanup_vifs_best_effort(
+            self, instance, network_info, remove_firewall=False):
+        """Attempt every target VIF cleanup and report all failures."""
+        failures = [
+            ('unplug destination VIF %s' % vif_id, exc)
+            for vif_id, exc in self._unplug_every_vif(
+                instance, network_info, 'destination VIF')
+        ]
+        if not remove_firewall:
+            return failures
+        for vif in list(network_info or []):
+            vif_id = vif.get('id', 'unknown')
+            try:
+                self.firewall_driver.unfilter_instance(instance, [vif])
+            except Exception as exc:
+                failures.append(
+                    ('remove firewall filter for VIF %s' % vif_id, exc))
+                LOG.exception(
+                    'Failed to remove firewall filter for VIF %s',
                     vif_id, instance=instance)
-            if remove_firewall:
-                try:
-                    self.firewall_driver.unfilter_instance(instance, [vif])
-                except Exception as exc:
-                    failures.append(
-                        ('remove firewall filter for VIF %s' % vif_id, exc))
-                    LOG.exception(
-                        'Failed to remove firewall filter for VIF %s',
-                        vif_id, instance=instance)
         return failures
 
     def unplug_vifs(self, instance, network_info):
-        # Attempt every VIF: aborting on the first failure leaked every
-        # remaining interface of a multi-NIC instance. The first error is
-        # re-raised afterwards so callers still see the failure.
-        first_error = None
-        for vif in network_info:
-            try:
-                self.vif_driver.unplug(instance, vif)
-            except Exception as exc:
-                if first_error is None:
-                    first_error = exc
-                LOG.exception(
-                    'Failed to unplug VIF %s; continuing with the rest',
-                    vif.get('id', 'unknown'), instance=instance)
-        if first_error is not None:
-            raise first_error
+        # Every VIF is attempted; the first failure is re-raised afterwards
+        # so this still reports failure to Nova as the driver API requires.
+        failures = self._unplug_every_vif(instance, network_info, 'VIF')
+        if failures:
+            raise failures[0][1]
 
     def get_host_cpu_stats(self):
         return {
