@@ -71,6 +71,14 @@ class IDMapExhausted(IDMapError):
     pass
 
 
+class _GatewayResponseError(Exception):
+    """Normalize an etcd gateway error returned as a successful HTTP body."""
+
+    def __init__(self, detail):
+        super().__init__("etcd gateway returned an error response")
+        self.detail_text = detail
+
+
 @dataclass(frozen=True)
 class IDMapAssignment:
     """One durable, fleet-wide isolated ID-map allocation."""
@@ -493,13 +501,26 @@ class IDMapAllocator:
 
     def _call_with_auth_retry(self, callback):
         generation = self._ensure_authenticated()
+
+        def call():
+            result = callback()
+            if (isinstance(result, dict) and
+                    _INVALID_AUTH_TOKEN in self._gateway_error_text(
+                        _GatewayResponseError(result)).lower()):
+                # etcd3gw raises gateway errors for range requests, but its
+                # transaction method can return the same JSON error body as
+                # an ordinary result. Normalize both forms before applying
+                # the single generation-guarded authentication retry.
+                raise _GatewayResponseError(result)
+            return result
+
         try:
-            return callback()
+            return call()
         except Exception as exc:
             if generation is None or not self._is_invalid_auth_token(exc):
                 raise
             self._refresh_authentication(generation)
-            return callback()
+            return call()
 
     @staticmethod
     def _json_bytes(value):

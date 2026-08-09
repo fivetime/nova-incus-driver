@@ -230,6 +230,7 @@ class _AuthenticatedFakeEtcd(_FakeEtcd):
         self.session = self._Session()
         self.authentication_requests = []
         self.next_get_error = None
+        self.next_transaction_error = None
         self.invalid_token_barrier = None
 
     @staticmethod
@@ -258,6 +259,13 @@ class _AuthenticatedFakeEtcd(_FakeEtcd):
             self.next_get_error = None
             raise self._GatewayError(error)
         return super().get(key)
+
+    def transaction(self, transaction):
+        if self.next_transaction_error is not None:
+            error = self.next_transaction_error
+            self.next_transaction_error = None
+            return error
+        return super().transaction(transaction)
 
 
 class IDMapAllocatorV3Test(test.NoDBTestCase):
@@ -400,6 +408,39 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
         self.assertEqual(
             "rotated-password",
             etcd.authentication_requests[1][1]["password"])
+        self.assertEqual(
+            "allocator-token-2", etcd.session.headers["Authorization"])
+
+    def test_reauthenticates_after_transaction_returns_invalid_token(self):
+        directory = self.useFixture(fixtures.TempDir()).path
+        password_file = os.path.join(directory, "etcd-password")
+        with open(password_file, "w", encoding="utf-8") as stream:
+            stream.write("password\n")
+        os.chmod(password_file, 0o600)
+        etcd = _AuthenticatedFakeEtcd()
+        allocator = idmap.IDMapAllocator(
+            endpoint="https://etcd.example:2379",
+            namespace="cell1",
+            base=500000000,
+            size=65536,
+            count=8,
+            ca_cert="ca.crt",
+            cert_cert="client.crt",
+            cert_key="client.key",
+            username="nova-incus",
+            password_file=password_file,
+            client=etcd,
+        )
+        allocator.bootstrap()
+        etcd.next_transaction_error = {
+            "code": 16,
+            "message": "etcdserver: invalid auth token",
+        }
+
+        self.assertIsNone(
+            allocator.get("00000000-0000-0000-0000-000000000001"))
+
+        self.assertEqual(2, len(etcd.authentication_requests))
         self.assertEqual(
             "allocator-token-2", etcd.session.headers["Authorization"])
 
