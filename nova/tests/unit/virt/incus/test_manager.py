@@ -2195,7 +2195,7 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         bdm = mock.Mock(
             volume_id=volume_id,
             attachment_id='40000000-0000-0000-0000-000000000004',
-            device_name='/dev/vdb')
+            mount_device='/dev/vdb')
         bdm.get.side_effect = lambda key, default=None: (
             connection_info if key == 'connection_info' else default)
         base_attach.return_value = mock.sentinel.result
@@ -2228,7 +2228,7 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         bdm = mock.Mock(
             volume_id=volume_id,
             attachment_id='40000000-0000-0000-0000-000000000004',
-            device_name='/dev/vdb')
+            mount_device='/dev/vdb')
         bdm.get.side_effect = lambda key, default=None: (
             connection_info if key == 'connection_info' else default)
         base_attach.return_value = mock.sentinel.result
@@ -2249,7 +2249,7 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         bdm = mock.Mock(
             volume_id=volume_id,
             attachment_id='40000000-0000-0000-0000-000000000004',
-            device_name='/dev/vdb')
+            mount_device='/dev/vdb')
         base_attach.side_effect = RuntimeError('attach failed')
 
         self.assertRaises(

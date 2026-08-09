@@ -607,7 +607,10 @@ class IncusComputeManager(manager.ComputeManager):
         ComputeManager.attach_volume() to delete the live BDM.
         """
         attachment_id = getattr(bdm, 'attachment_id', None)
-        mountpoint = getattr(bdm, 'device_name', None)
+        # ``bdm`` is Nova's DriverVolumeBlockDevice here. Its canonical
+        # guest path is exposed as ``mount_device``; ``device_name`` belongs
+        # to the underlying BlockDeviceMapping object.
+        mountpoint = getattr(bdm, 'mount_device', None)
         intent = self.driver.prepare_managed_volume_attach(
             instance, bdm.volume_id, attachment_id, mountpoint)
         result = super()._attach_volume(context, instance, bdm)
