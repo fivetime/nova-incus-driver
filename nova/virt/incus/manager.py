@@ -2977,6 +2977,21 @@ class IncusComputeManager(manager.ComputeManager):
             raise
 
         try:
+            # Nova's destination finish path preserves the source-side
+            # power_state value.  Refresh it after the Incus target is
+            # authoritative so confirm_resize does not turn a running
+            # migrated container into a SHUTOFF Nova instance.
+            instance.power_state = self.driver.get_info(instance).state
+            instance.save(expected_task_state=[None])
+        except Exception:
+            # The migration is already committed at this point. A power
+            # state persistence failure must not tear down the target.
+            LOG.critical(
+                'Cold migration target completed but its authoritative '
+                'power state could not be persisted; periodic power sync '
+                'will retry', instance=instance, exc_info=True)
+
+        try:
             self._commit_formal_internal_volume_intents(
                 context, instance, cleanup_token, migration.uuid,
                 'cold-target')

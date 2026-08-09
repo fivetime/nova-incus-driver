@@ -6285,6 +6285,8 @@ class IncusComputeManagerTest(test.NoDBTestCase):
             self, prepare, base_finish):
         ctxt = context.get_admin_context()
         instance = mock.Mock(uuid='instance')
+        self.compute.driver.get_info.return_value.state = (
+            power_state.RUNNING)
         active = mock.Mock(share_id='active', status='active')
         inactive = mock.Mock(share_id='inactive', status='inactive')
         self.compute._get_share_info = mock.Mock(
@@ -6303,6 +6305,8 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         base_finish.assert_called_once_with(
             ctxt, 'prepared-disk', mock.sentinel.image, instance,
             mock.sentinel.migration, mock.sentinel.request_spec)
+        self.assertEqual(power_state.RUNNING, instance.power_state)
+        instance.save.assert_called_once_with(expected_task_state=[None])
 
     @mock.patch.object(
         manager.manager.ComputeManager, '_finish_resize_helper',
