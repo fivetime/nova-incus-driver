@@ -2659,6 +2659,7 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         self.compute._terminate_volume_connections(
             context.get_admin_context(), instance, volumes)
 
+        self.compute.volume_api.attachment_get_all.assert_not_called()
         self.assertEqual(
             {'bdm-rotated'}, {value['phase'] for value in rotations.values()})
         for bdm in volumes:

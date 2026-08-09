@@ -752,6 +752,7 @@ class IncusComputeManager(manager.ComputeManager):
 
     def _cold_rotation_attachment_inventory(
             self, context, instance, volume_id):
+        """Return visible attachments for conflict detection only."""
         attachments = self.volume_api.attachment_get_all(
             context, volume_id=volume_id)
         if not isinstance(attachments, list):
@@ -836,11 +837,12 @@ class IncusComputeManager(manager.ComputeManager):
                 _attachment_status(old_attachment) != 'attached'):
             raise exception.InvalidVolume(
                 reason='Cold attachment rotation has no attached old owner')
-        baseline = self._cold_rotation_attachment_inventory(
-            context, instance, volume_id)
-        if attachment_id not in baseline:
-            raise exception.InvalidVolume(
-                reason='Cinder attachment inventory omits the exact old owner')
+        # Nova's attachment_get_all wrapper is project-scoped even for the
+        # service context used by nova-compute, so an empty list cannot prove
+        # that a tenant attachment is absent. The exact attachment show above
+        # is the authority. We never adopt an unknown attachment after a lost
+        # create response, so the durable baseline only needs that exact ID.
+        baseline = [attachment_id]
         rotation, unused_created = (
             self.driver.prepare_cold_attachment_rotation(
                 instance, volume_id, attachment_id, mountpoint,
