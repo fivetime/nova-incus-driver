@@ -2018,14 +2018,7 @@ class IDMapAllocator:
         assignment, unused_raw = self._get_assignment(instance_uuid)
         return assignment
 
-    def _audit_snapshot(self):
-        """Read and validate one complete allocator snapshot.
-
-        Unlike normal allocation operations, audit is strictly read-only. It
-        will not create a missing configuration record. ``get_prefix`` maps to
-        one etcd range request, so all instance and slot records are examined
-        at one linearizable revision.
-        """
+    def _audit_records(self):
         namespace_prefix = "%s/" % self._prefix
         entries = self._get_prefix_raw(namespace_prefix)
         records = {}
@@ -2043,12 +2036,142 @@ class IDMapAllocator:
             raise IDMapIntegrityError(
                 reason="allocator configuration record is missing")
         self._validate_configuration(configuration_raw)
+        return records
 
-        instance_prefix = "%s/instances/" % self._prefix
-        slot_prefix = "%s/slots/" % self._prefix
-        release_prefix = "%s/releases/" % self._prefix
-        host_prefix = "%s/hosts/" % self._prefix
-        fence_prefix = "%s/fences/" % self._prefix
+    def _audit_parse_instance_record(
+            self, key, raw, prefix, instances, instance_raw):
+        key_uuid = key[len(prefix):]
+        try:
+            normalized_uuid = self._instance_uuid(key_uuid)
+        except IDMapConfigurationError as exc:
+            raise IDMapIntegrityError(
+                reason="invalid instance allocation key %s: %s" % (
+                    key, exc))
+        if key_uuid != normalized_uuid:
+            raise IDMapIntegrityError(
+                reason="instance allocation key is not canonical")
+        assignment = self._parse_assignment(
+            raw, expected_uuid=normalized_uuid)
+        if normalized_uuid in instances:
+            raise IDMapIntegrityError(
+                reason="duplicate instance allocation")
+        instances[normalized_uuid] = assignment
+        instance_raw[normalized_uuid] = raw
+
+    def _audit_parse_slot_record(
+            self, key, raw, prefix, slots, slot_raw):
+        key_slot = key[len(prefix):]
+        if not re.fullmatch(r"0|[1-9][0-9]*", key_slot):
+            raise IDMapIntegrityError(
+                reason="slot allocation key is not canonical")
+        slot = int(key_slot)
+        if slot >= self.count:
+            raise IDMapIntegrityError(
+                reason="slot allocation key is outside the range")
+        assignment = self._parse_assignment(raw, expected_slot=slot)
+        if slot in slots:
+            raise IDMapIntegrityError(reason="duplicate slot allocation")
+        slots[slot] = assignment
+        slot_raw[slot] = raw
+
+    def _audit_parse_release_record(
+            self, key, raw, prefix, intents):
+        key_uuid = key[len(prefix):]
+        try:
+            normalized_uuid = self._instance_uuid(key_uuid)
+        except IDMapConfigurationError as exc:
+            raise IDMapIntegrityError(
+                reason="invalid release intent key %s: %s" % (key, exc))
+        if key_uuid != normalized_uuid:
+            raise IDMapIntegrityError(
+                reason="release intent key is not canonical")
+        intent = self._parse_release_intent(
+            raw, expected_uuid=normalized_uuid)
+        if normalized_uuid in intents:
+            raise IDMapIntegrityError(reason="duplicate release intent")
+        intents[normalized_uuid] = intent
+
+    def _audit_parse_host_record(
+            self, key, raw, prefix, host_claims):
+        suffix = key[len(prefix):]
+        parts = suffix.split("/")
+        if len(parts) != 2:
+            raise IDMapIntegrityError(
+                reason="host claim index key is not canonical")
+        key_host_id, key_uuid = parts
+        try:
+            normalized_host_id = self._host_id(key_host_id)
+            normalized_uuid = self._instance_uuid(key_uuid)
+        except IDMapConfigurationError as exc:
+            raise IDMapIntegrityError(
+                reason="invalid host claim index key %s: %s" % (key, exc))
+        if (key_host_id != normalized_host_id or
+                key_uuid != normalized_uuid):
+            raise IDMapIntegrityError(
+                reason="host claim index key is not canonical")
+        claim = self._parse_host_claim(
+            raw, expected_host_id=normalized_host_id,
+            expected_uuid=normalized_uuid)
+        claim_key = (normalized_host_id, normalized_uuid)
+        if claim_key in host_claims:
+            raise IDMapIntegrityError(
+                reason="duplicate host claim index")
+        host_claims[claim_key] = claim
+
+    def _audit_parse_fence_record(
+            self, key, raw, prefix, fenced_tokens):
+        suffix = key[len(prefix):]
+        parts = suffix.split("/")
+        if len(parts) != 2:
+            raise IDMapIntegrityError(
+                reason="fence ledger key is not canonical")
+        key_host_id, key_uuid = parts
+        try:
+            normalized_host_id = self._host_id(key_host_id)
+            normalized_uuid = self._instance_uuid(key_uuid)
+        except IDMapConfigurationError as exc:
+            raise IDMapIntegrityError(
+                reason="invalid fence ledger key %s: %s" % (key, exc))
+        if (key_host_id != normalized_host_id or
+                key_uuid != normalized_uuid):
+            raise IDMapIntegrityError(
+                reason="fence ledger key is not canonical")
+        try:
+            value = jsonutils.loads(raw.decode("utf-8"))
+            proof = IDMapFenceProof(
+                instance_uuid=value["instance_uuid"],
+                host_id=value["host_id"],
+                allocation_id=value["allocation_id"],
+                fence_agent=value["fence_agent"],
+                fenced_at=value["fenced_at"],
+                operator=value["operator"],
+                evidence=value["evidence"])
+            validate_fence_proof(proof)
+            # Ledger entries written before the token was recorded cannot say
+            # which claim they disposed of. They do not participate in the
+            # coexistence check; rejecting them would latch the allocator.
+            legacy_token = value.get("materialization_id")
+            fenced_token = (
+                self._materialization_id(legacy_token)
+                if legacy_token else None)
+        except (ValueError, KeyError, TypeError,
+                IDMapConfigurationError) as exc:
+            raise IDMapIntegrityError(
+                reason="invalid fence ledger record %s: %s" % (key, exc))
+        if (proof.host_id != normalized_host_id or
+                proof.instance_uuid != normalized_uuid):
+            raise IDMapIntegrityError(
+                reason="fence ledger record contradicts its key")
+        fenced_tokens[(normalized_host_id, normalized_uuid)] = fenced_token
+
+    def _audit_parse_record_families(self, records):
+        prefixes = {
+            "instance": "%s/instances/" % self._prefix,
+            "slot": "%s/slots/" % self._prefix,
+            "release": "%s/releases/" % self._prefix,
+            "host": "%s/hosts/" % self._prefix,
+            "fence": "%s/fences/" % self._prefix,
+        }
         instances = {}
         slots = {}
         intents = {}
@@ -2057,143 +2180,32 @@ class IDMapAllocator:
         instance_raw = {}
         slot_raw = {}
         for key, raw in records.items():
-            if key.startswith(instance_prefix):
-                key_uuid = key[len(instance_prefix):]
-                try:
-                    normalized_uuid = self._instance_uuid(key_uuid)
-                except IDMapConfigurationError as exc:
-                    raise IDMapIntegrityError(
-                        reason="invalid instance allocation key %s: %s" % (
-                            key, exc))
-                if key_uuid != normalized_uuid:
-                    raise IDMapIntegrityError(
-                        reason="instance allocation key is not canonical")
-                assignment = self._parse_assignment(
-                    raw, expected_uuid=normalized_uuid)
-                if normalized_uuid in instances:
-                    raise IDMapIntegrityError(
-                        reason="duplicate instance allocation")
-                instances[normalized_uuid] = assignment
-                instance_raw[normalized_uuid] = raw
-            elif key.startswith(slot_prefix):
-                key_slot = key[len(slot_prefix):]
-                if not re.fullmatch(r"0|[1-9][0-9]*", key_slot):
-                    raise IDMapIntegrityError(
-                        reason="slot allocation key is not canonical")
-                slot = int(key_slot)
-                if slot >= self.count:
-                    raise IDMapIntegrityError(
-                        reason="slot allocation key is outside the range")
-                assignment = self._parse_assignment(
-                    raw, expected_slot=slot)
-                if slot in slots:
-                    raise IDMapIntegrityError(
-                        reason="duplicate slot allocation")
-                slots[slot] = assignment
-                slot_raw[slot] = raw
-            elif key.startswith(release_prefix):
-                key_uuid = key[len(release_prefix):]
-                try:
-                    normalized_uuid = self._instance_uuid(key_uuid)
-                except IDMapConfigurationError as exc:
-                    raise IDMapIntegrityError(
-                        reason="invalid release intent key %s: %s" % (
-                            key, exc))
-                if key_uuid != normalized_uuid:
-                    raise IDMapIntegrityError(
-                        reason="release intent key is not canonical")
-                intent = self._parse_release_intent(
-                    raw, expected_uuid=normalized_uuid)
-                if normalized_uuid in intents:
-                    raise IDMapIntegrityError(
-                        reason="duplicate release intent")
-                intents[normalized_uuid] = intent
-            elif key.startswith(host_prefix):
-                suffix = key[len(host_prefix):]
-                parts = suffix.split("/")
-                if len(parts) != 2:
-                    raise IDMapIntegrityError(
-                        reason="host claim index key is not canonical")
-                key_host_id, key_uuid = parts
-                try:
-                    normalized_host_id = self._host_id(key_host_id)
-                    normalized_uuid = self._instance_uuid(key_uuid)
-                except IDMapConfigurationError as exc:
-                    raise IDMapIntegrityError(
-                        reason="invalid host claim index key %s: %s" % (
-                            key, exc))
-                if (key_host_id != normalized_host_id or
-                        key_uuid != normalized_uuid):
-                    raise IDMapIntegrityError(
-                        reason="host claim index key is not canonical")
-                claim = self._parse_host_claim(
-                    raw, expected_host_id=normalized_host_id,
-                    expected_uuid=normalized_uuid)
-                claim_key = (normalized_host_id, normalized_uuid)
-                if claim_key in host_claims:
-                    raise IDMapIntegrityError(
-                        reason="duplicate host claim index")
-                host_claims[claim_key] = claim
-            elif key.startswith(fence_prefix):
-                suffix = key[len(fence_prefix):]
-                parts = suffix.split("/")
-                if len(parts) != 2:
-                    raise IDMapIntegrityError(
-                        reason="fence ledger key is not canonical")
-                key_host_id, key_uuid = parts
-                try:
-                    normalized_host_id = self._host_id(key_host_id)
-                    normalized_uuid = self._instance_uuid(key_uuid)
-                except IDMapConfigurationError as exc:
-                    raise IDMapIntegrityError(
-                        reason="invalid fence ledger key %s: %s" % (
-                            key, exc))
-                if (key_host_id != normalized_host_id or
-                        key_uuid != normalized_uuid):
-                    raise IDMapIntegrityError(
-                        reason="fence ledger key is not canonical")
-                try:
-                    value = jsonutils.loads(raw.decode("utf-8"))
-                    proof = IDMapFenceProof(
-                        instance_uuid=value["instance_uuid"],
-                        host_id=value["host_id"],
-                        allocation_id=value["allocation_id"],
-                        fence_agent=value["fence_agent"],
-                        fenced_at=value["fenced_at"],
-                        operator=value["operator"],
-                        evidence=value["evidence"])
-                    validate_fence_proof(proof)
-                    # Ledger entries written before the token was recorded
-                    # cannot say which claim they disposed of. They simply
-                    # do not participate in the coexistence check below;
-                    # refusing to parse them would latch every allocator
-                    # operation fleet-wide over a missing audit hint.
-                    legacy_token = value.get("materialization_id")
-                    fenced_token = (
-                        self._materialization_id(legacy_token)
-                        if legacy_token else None)
-                except (ValueError, KeyError, TypeError,
-                        IDMapConfigurationError) as exc:
-                    raise IDMapIntegrityError(
-                        reason="invalid fence ledger record %s: %s" % (
-                            key, exc))
-                if (proof.host_id != normalized_host_id or
-                        proof.instance_uuid != normalized_uuid):
-                    raise IDMapIntegrityError(
-                        reason="fence ledger record contradicts its key")
-                fenced_tokens[(normalized_host_id, normalized_uuid)] = (
-                    fenced_token)
+            if key.startswith(prefixes["instance"]):
+                self._audit_parse_instance_record(
+                    key, raw, prefixes["instance"], instances, instance_raw)
+            elif key.startswith(prefixes["slot"]):
+                self._audit_parse_slot_record(
+                    key, raw, prefixes["slot"], slots, slot_raw)
+            elif key.startswith(prefixes["release"]):
+                self._audit_parse_release_record(
+                    key, raw, prefixes["release"], intents)
+            elif key.startswith(prefixes["host"]):
+                self._audit_parse_host_record(
+                    key, raw, prefixes["host"], host_claims)
+            elif key.startswith(prefixes["fence"]):
+                self._audit_parse_fence_record(
+                    key, raw, prefixes["fence"], fenced_tokens)
             else:
                 raise IDMapIntegrityError(
                     reason="unexpected allocator key %s" % key)
+        return (
+            instances, slots, intents, host_claims, fenced_tokens,
+            instance_raw, slot_raw)
 
-        # fence_retire_claim writes the ledger entry and deletes that exact
-        # claim in one transaction, so seeing the *same* materialization
-        # token alive again means the registry was mutated outside the
-        # allocator. A different token is the ordinary case of an instance
-        # returning to a host that was repaired after being fenced: the
-        # ledger keeps that disposal permanently auditable and must never
-        # latch the registry against the reclaim.
+    @staticmethod
+    def _audit_validate_fence_relationships(fenced_tokens, host_claims):
+        # fence_retire_claim writes the ledger and deletes that exact claim in
+        # one transaction. The same materialization token cannot coexist.
         for fence_pair, fenced_token in fenced_tokens.items():
             if fenced_token is None:
                 continue
@@ -2203,6 +2215,9 @@ class IDMapAllocator:
                     reason="fence ledger entry coexists with the live host "
                            "claim it disposed of")
 
+    @staticmethod
+    def _audit_validate_slot_relationships(
+            instances, slots, instance_raw, slot_raw):
         claimed_slots = {}
         for instance_uuid, assignment in instances.items():
             previous = claimed_slots.get(assignment.slot)
@@ -2229,6 +2244,7 @@ class IDMapAllocator:
                 raise IDMapIntegrityError(
                     reason="slot allocation has no exact instance record")
 
+    def _audit_validate_release_relationships(self, instances, intents):
         for instance_uuid, intent in intents.items():
             assignment = instances.get(instance_uuid)
             if assignment is None:
@@ -2246,6 +2262,7 @@ class IDMapAllocator:
                 raise IDMapIntegrityError(
                     reason="release intent does not match its allocation")
 
+    def _audit_validate_host_relationships(self, instances, host_claims):
         for instance_uuid, assignment in instances.items():
             for host_id in assignment.host_ids:
                 claim = host_claims.get((host_id, instance_uuid))
@@ -2262,6 +2279,29 @@ class IDMapAllocator:
                 raise IDMapIntegrityError(
                     reason=("host claim reverse index has no exact "
                             "allocation"))
+
+    def _audit_snapshot(self):
+        """Read and validate one complete allocator snapshot.
+
+        Unlike normal allocation operations, audit is strictly read-only. It
+        will not create a missing configuration record. ``get_prefix`` maps to
+        one etcd range request, so all instance and slot records are examined
+        at one linearizable revision.
+        """
+        records = self._audit_records()
+
+        (instances, slots, intents, host_claims, fenced_tokens,
+         instance_raw, slot_raw) = self._audit_parse_record_families(records)
+
+        self._audit_validate_fence_relationships(
+            fenced_tokens, host_claims)
+
+        self._audit_validate_slot_relationships(
+            instances, slots, instance_raw, slot_raw)
+
+        self._audit_validate_release_relationships(instances, intents)
+
+        self._audit_validate_host_relationships(instances, host_claims)
 
         return (
             sorted(instances.values(), key=lambda value: value.slot),
