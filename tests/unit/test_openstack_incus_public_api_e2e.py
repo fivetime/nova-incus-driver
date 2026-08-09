@@ -55,11 +55,21 @@ class PublicApiE2EContractTest(unittest.TestCase):
             self.assertLess(gate, first_create)
 
     def test_scripts_do_not_call_private_compute_interfaces(self):
-        for script in (self.data, self.bfv):
+        for script in (self.bfv,):
             self.assertNotIn('incus exec', script)
             self.assertNotIn('podman exec', script)
             self.assertNotIn('ssh ', script)
             self.assertNotIn('/var/lib/incus', script)
+
+    def test_initial_volume_host_fallback_is_explicit_and_read_only(self):
+        self.assertIn('HOST_SSH_MAP=${HOST_SSH_MAP:-}', self.data)
+        self.assertIn(
+            '[[ -n "$host" && -n "$HOST_SSH_MAP" ]] || return 1',
+            self.data)
+        self.assertIn(
+            'podman exec incus incus exec \'$instance_name\'', self.data)
+        self.assertIn("-- cat '$GUEST_MARKER_LOG'", self.data)
+        self.assertNotIn('/var/lib/incus', self.data)
 
     def test_initial_volume_is_in_first_create_bdm(self):
         self.assertIn('--block-device "$bdm"', self.data)
@@ -73,7 +83,10 @@ class PublicApiE2EContractTest(unittest.TestCase):
         self.assertIn('OPENSTACK_INCUS_DATA_FIRST_OK', self.data)
         self.assertIn('OPENSTACK_INCUS_DATA_REBOOT_OK', self.data)
         self.assertIn('server reboot --hard --wait "$server_id"', self.data)
-        self.assertIn('fuse2fs -o rw+', self.data)
+        self.assertIn('fuse2fs "\\$device" "\\$mountpoint"', self.data)
+        self.assertNotIn('fuse2fs -o rw+', self.data)
+        self.assertIn(
+            'grep -q " \\$mountpoint fuse" /proc/mounts', self.data)
         self.assertNotIn('mount -t ext4', self.data)
 
     def test_initial_volume_requires_exact_attachment_inventory(self):
