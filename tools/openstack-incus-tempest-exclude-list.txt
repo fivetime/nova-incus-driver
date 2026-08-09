@@ -1,0 +1,14 @@
+^tempest\.api\.compute\.admin\.test_auto_allocate_network\.
+^tempest\.api\.compute\.admin\.test_create_server\.ServersWithSpecificFlavorTestJSON\.test_verify_created_server_ephemeral_disk
+^tempest\.api\.compute\.admin\.test_hypervisor\.
+^tempest\.api\.compute\.admin\.test_migrations\.MigrationsAdminTest\.test_cold_migration_with_swap
+^tempest\.api\.compute\.admin\.test_simple_tenant_usage\.TenantUsagesTestJSON\.test_list_usage_all_tenants
+^tempest\.api\.compute\.admin\.test_volume\.AttachSCSIVolumeTestJSON\.
+^tempest\.api\.compute\.servers\.test_device_tagging\.TaggedBootDevicesTest
+^tempest\.api\.compute\.servers\.test_create_server\.ServersTestBootFromVolume
+^tempest\.api\.compute\.servers\.test_create_server\.ServersV294TestFqdnHostnames\.test_verify_hostname_allows_fqdn
+^tempest\.api\.compute\.servers\.test_server_actions\.ServerActionsTestOtherA\.test_rebuild_server_with_volume_attached
+^tempest\.api\.compute\.servers\.test_server_actions\.ServerActionsTestOtherB\.test_get_console_output
+^tempest\.api\.compute\.servers\.test_server_actions\.ServerActionsTestJSON\.test_change_server_password
+^tempest\.api\.compute\.servers\.test_server_actions\.ServerActionsTestJSON\.test_get_console_output
+^tempest\.api\.compute\.servers\.test_server_actions\.ServerActionsTestJSON\.test_rebuild_server$

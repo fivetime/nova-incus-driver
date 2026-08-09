@@ -3118,6 +3118,8 @@ class IncusComputeManager(manager.ComputeManager):
     def _finish_revert_resize(
             self, context, instance, migration, request_spec=None):
         """Validate and reuse retained source mounts before source restart."""
+        self._handoff_cold_source_rotations_for_revert(
+            context, instance, migration)
         share_info = [
             mapping
             for mapping in self._get_share_info(context, instance)
@@ -3126,6 +3128,141 @@ class IncusComputeManager(manager.ComputeManager):
         self._mount_all_shares(context, instance, share_info)
         return super()._finish_revert_resize(
             context, instance, migration, request_spec=request_spec)
+
+    def _handoff_cold_source_rotations_for_revert(
+            self, context, instance, migration):
+        """Atomically move completed source-release owners to revert attach."""
+        if (migration.source_compute != self.host or
+                instance.host not in (
+                    migration.source_compute, migration.dest_compute) or
+                instance.task_state != task_states.RESIZE_REVERTING or
+                not uuidutils.is_uuid_like(getattr(migration, 'uuid', None))):
+            raise exception.MigrationError(
+                reason='Cold revert does not have exact source ownership')
+        bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
+            context, instance.uuid)
+        for bdm in bdms:
+            volume_id = getattr(bdm, 'volume_id', None)
+            if not uuidutils.is_uuid_like(volume_id):
+                continue
+            with contextlib.ExitStack() as locks:
+                locks.enter_context(lockutils.lock(
+                    _volume_manager_transaction_lock_name(
+                        instance.uuid, volume_id),
+                    external=True,
+                    lock_path=_volume_manager_transaction_lock_path()))
+                locks.enter_context(lockutils.lock(
+                    incus_driver._volume_topology_lock_name(instance),
+                    external=True,
+                    lock_path=incus_driver._volume_topology_lock_path()))
+                locks.enter_context(lockutils.lock(
+                    incus_driver._volume_operation_lock_name(volume_id),
+                    external=True,
+                    lock_path=incus_driver._volume_operation_lock_path()))
+                intent = self.driver.get_managed_volume_attach_intent(
+                    instance, volume_id)
+                rotation = self.driver.get_cold_attachment_rotation(
+                    instance, volume_id)
+                if intent is None and rotation is None:
+                    continue
+                if intent is None or rotation is None:
+                    raise exception.InvalidVolume(
+                        reason='Cold revert source generation is incomplete')
+                expected = {
+                    'operation_kind': 'migration',
+                    'operation_token': migration.uuid,
+                    'operation_direction': 'cold-source-restore',
+                    'operation_migration_uuid': migration.uuid,
+                    'mountpoint': rotation.get('mountpoint'),
+                    'boot_volume': rotation.get('boot_volume'),
+                    'attachment_id': rotation.get('old_attachment_id'),
+                }
+                if (rotation.get('operation_token') != migration.uuid or
+                        rotation.get('migration_uuid') != migration.uuid or
+                        rotation.get('phase') != 'bdm-rotated' or
+                        any(intent.get(key) != value
+                            for key, value in expected.items())):
+                    raise exception.InvalidVolume(
+                        reason='Cold revert source generation owner changed')
+                current_attachment_id = getattr(bdm, 'attachment_id', None)
+                if (not uuidutils.is_uuid_like(current_attachment_id) or
+                        current_attachment_id in {
+                            rotation['old_attachment_id'],
+                            rotation['new_attachment_id']} or
+                        getattr(bdm, 'device_name', None) !=
+                        rotation['mountpoint']):
+                    raise exception.InvalidVolume(
+                        reason='Cold revert BDM has no replacement source')
+                for stale_attachment_id in (
+                        rotation['old_attachment_id'],
+                        rotation['new_attachment_id']):
+                    if self._get_exact_cinder_attachment(
+                            context, stale_attachment_id, volume_id,
+                            instance.uuid) is not None:
+                        raise exception.InvalidVolume(
+                            reason='Cold revert retains a prior Cinder owner')
+                source_attachment = self._get_exact_cinder_attachment(
+                    context, current_attachment_id, volume_id, instance.uuid)
+                if (source_attachment is None or
+                        _attachment_status(source_attachment) not in (
+                            'reserved', 'attaching')):
+                    raise exception.InvalidVolume(
+                        reason='Cold revert replacement source is invalid')
+                if rotation['boot_volume']:
+                    if (self.driver.get_volume_journal_phase(
+                            instance, volume_id) is not None or
+                            self.driver.
+                            get_internal_volume_attach_connection_info(
+                                instance, volume_id,
+                                rotation['mountpoint']) is not None):
+                        raise exception.InvalidVolume(
+                            reason='Cold revert BFV has local data evidence')
+                elif self.driver.get_volume_journal_phase(
+                        instance, volume_id) != 'disconnected':
+                    raise exception.InvalidVolume(
+                        reason='Cold revert data volume is not disconnected')
+                replacement = (
+                    self.driver.replace_cold_source_volume_attach_intent(
+                        instance, volume_id, intent, current_attachment_id,
+                        operation_direction='cold-revert-source'))
+                if replacement.get('attachment_id') != current_attachment_id:
+                    raise exception.InvalidVolume(
+                        reason='Cold revert source intent replacement failed')
+                self._retire_handed_off_cold_rotation_locked(
+                    context, instance, volume_id, replacement, bdm, rotation,
+                    migration)
+
+    def _retire_handed_off_cold_rotation_locked(
+            self, context, instance, volume_id, intent, bdm, rotation,
+            migration):
+        """Retire the old rotation after its revert intent is durable."""
+        if (intent.get('operation_kind') != 'migration' or
+                intent.get('operation_direction') != 'cold-revert-source' or
+                intent.get('operation_token') != migration.uuid or
+                intent.get('operation_migration_uuid') != migration.uuid or
+                rotation.get('operation_token') != migration.uuid or
+                rotation.get('migration_uuid') != migration.uuid or
+                rotation.get('phase') != 'bdm-rotated' or
+                intent.get('attachment_id') !=
+                getattr(bdm, 'attachment_id', None) or
+                intent.get('mountpoint') != rotation.get('mountpoint') or
+                intent.get('boot_volume') != rotation.get('boot_volume')):
+            raise exception.InvalidVolume(
+                reason='Cold revert handoff generation changed')
+        if intent['attachment_id'] in {
+                rotation['old_attachment_id'],
+                rotation['new_attachment_id']}:
+            raise exception.InvalidVolume(
+                reason='Cold revert handoff retained a prior owner')
+        for stale_attachment_id in (
+                rotation['old_attachment_id'], rotation['new_attachment_id']):
+            if self._get_exact_cinder_attachment(
+                    context, stale_attachment_id, volume_id,
+                    instance.uuid) is not None:
+                raise exception.InvalidVolume(
+                    reason='Cold revert handoff retains a Cinder owner')
+        self.driver.cancel_cold_attachment_rotation(
+            instance, volume_id, rotation)
 
     @periodic_task.periodic_task(
         spacing=CONF.incus.migration_recovery_interval)
@@ -4804,6 +4941,14 @@ class IncusComputeManager(manager.ComputeManager):
                 raise exception.InvalidVolume(
                     reason='Internal migration volume owner names another '
                            'compute host')
+            if (direction == 'cold-revert-source' and
+                    self.driver.get_cold_attachment_rotation(
+                        instance, volume_id) is not None):
+                rotation = self.driver.get_cold_attachment_rotation(
+                    instance, volume_id)
+                self._retire_handed_off_cold_rotation_locked(
+                    context, instance, volume_id, intent, bdm, rotation,
+                    migration)
             if direction == 'cold-source-restore':
                 rotation = self.driver.get_cold_attachment_rotation(
                     instance, volume_id)

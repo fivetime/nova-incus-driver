@@ -3151,7 +3151,8 @@ def _read_managed_attach_intent(instance, volume_id):
 
 
 def _replace_managed_attach_intent(
-        instance, volume_id, expected, attachment_id):
+        instance, volume_id, expected, attachment_id,
+        operation_direction=None):
     current = _read_managed_attach_intent(instance, volume_id)
     if current != expected:
         raise exception.InvalidVolume(
@@ -3163,6 +3164,12 @@ def _replace_managed_attach_intent(
             reason='Nova managed attach intent replacement is invalid')
     payload = copy.deepcopy(current)
     payload['attachment_id'] = str(attachment_id)
+    if operation_direction is not None:
+        _validate_managed_attach_operation(
+            payload['operation_kind'], payload['operation_token'],
+            operation_direction, payload['operation_migration_uuid'],
+            payload['boot_volume'])
+        payload['operation_direction'] = operation_direction
     journal_dir = _volume_journal_directory(instance)
     fd, temporary = tempfile.mkstemp(
         prefix='.attach-', suffix='.tmp', dir=journal_dir)
@@ -5291,6 +5298,10 @@ def _decompress_bounded_user_data(raw):
 def _incus_cloud_init_config(instance, network_info=None):
     """Translate Nova bootstrap data to the Incus NoCloud template keys."""
     config = {'user.openstack.uuid': instance.uuid}
+    metadata = {
+        'instance-id': instance.uuid,
+        'local-hostname': instance.hostname,
+    }
 
     user_data = getattr(instance, 'user_data', None)
     if user_data:
@@ -5312,8 +5323,10 @@ def _incus_cloud_init_config(instance, network_info=None):
     key_data = getattr(instance, 'key_data', None)
     if key_data:
         key_name = getattr(instance, 'key_name', None) or 'nova-key'
-        config['user.meta-data'] = 'public-keys:\n  %s: %s\n' % (
-            jsonutils.dumps(key_name), jsonutils.dumps(key_data.strip()))
+        metadata['public-keys'] = {key_name: key_data.strip()}
+
+    config['user.meta-data'] = yaml.safe_dump(
+        metadata, default_flow_style=False, sort_keys=True)
 
     network_config = _incus_network_config(network_info)
     if network_config:
@@ -10126,9 +10139,11 @@ class IncusDriver(driver.ComputeDriver):
         _remove_managed_attach_intent(instance, volume_id, expected=intent)
 
     def replace_cold_source_volume_attach_intent(
-            self, instance, volume_id, expected, attachment_id):
+            self, instance, volume_id, expected, attachment_id,
+            operation_direction=None):
         return _replace_managed_attach_intent(
-            instance, volume_id, expected, attachment_id)
+            instance, volume_id, expected, attachment_id,
+            operation_direction=operation_direction)
 
     def resume_internal_volume_attach(
             self, context, instance, volume_id, connection_info,

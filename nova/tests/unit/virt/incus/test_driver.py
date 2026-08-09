@@ -56,6 +56,7 @@ from nova.virt import driver as nova_driver
 from pylxd import client as incus_client
 from pylxd import exceptions as incuscore_exceptions
 import six
+import yaml
 
 from nova.virt.incus import common
 from nova.virt.incus import driver
@@ -3961,17 +3962,24 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     def test_incus_cloud_init_config(self):
         instance = mock.Mock(
             uuid='instance-uuid',
+            hostname='tenant-server',
             user_data=base64.b64encode(b'#cloud-config\nruncmd: []\n'),
             key_name='tenant-key',
             key_data='ssh-ed25519 AAAATEST tenant')
 
+        config = driver._incus_cloud_init_config(instance)
+        metadata = yaml.safe_load(config.pop('user.meta-data'))
         self.assertEqual({
             'user.openstack.uuid': 'instance-uuid',
             'cloud-init.user-data': '#cloud-config\nruncmd: []\n',
-            'user.meta-data': (
-                'public-keys:\n'
-                '  "tenant-key": "ssh-ed25519 AAAATEST tenant"\n'),
-        }, driver._incus_cloud_init_config(instance))
+        }, config)
+        self.assertEqual({
+            'instance-id': 'instance-uuid',
+            'local-hostname': 'tenant-server',
+            'public-keys': {
+                'tenant-key': 'ssh-ed25519 AAAATEST tenant',
+            },
+        }, metadata)
 
     def test_get_vcpus_used_raises_when_inventory_unavailable(self):
         # Reporting zero would make a failing host look empty and attract
@@ -4040,6 +4048,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         payload = b'#cloud-config\nruncmd: []\n'
         instance = mock.Mock(
             uuid='instance-uuid',
+            hostname='tenant-server',
             user_data=base64.b64encode(gzip.compress(payload)),
             key_name=None, key_data=None)
 
@@ -4137,7 +4146,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             },
         }]
         instance = mock.Mock(
-            uuid='instance-uuid', user_data=None, key_data=None)
+            uuid='instance-uuid', hostname='tenant-server',
+            user_data=None, key_data=None)
 
         config = driver._incus_cloud_init_config(
             instance, network_info)

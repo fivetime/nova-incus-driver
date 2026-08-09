@@ -5890,6 +5890,129 @@ class IncusComputeManagerTest(test.NoDBTestCase):
             assert_called_once_with(
                 instance, token)
 
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_cold_revert_handoffs_retained_source_rotation(self, get_bdms):
+        ctxt = context.get_admin_context()
+        instance = self._volume_recovery_instance()
+        instance.host = 'compute-2'
+        instance.task_state = manager.task_states.RESIZE_REVERTING
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        old_id = '51000000-0000-0000-0000-000000000005'
+        target_id = '52000000-0000-0000-0000-000000000005'
+        source_id = '53000000-0000-0000-0000-000000000005'
+        token = '54000000-0000-0000-0000-000000000005'
+        bdm = self._volume_recovery_bdm(volume_id)
+        bdm.attachment_id = source_id
+        bdm.device_name = '/dev/sdb'
+        get_bdms.return_value = [bdm]
+        migration = mock.Mock(
+            uuid=token, source_compute=self.compute.host,
+            dest_compute='compute-2')
+        intent = {
+            'attachment_id': old_id,
+            'mountpoint': '/dev/sdb',
+            'operation_kind': 'migration',
+            'operation_token': token,
+            'operation_direction': 'cold-source-restore',
+            'operation_migration_uuid': token,
+            'boot_volume': False,
+        }
+        rotation = {
+            'old_attachment_id': old_id,
+            'new_attachment_id': target_id,
+            'mountpoint': '/dev/sdb',
+            'operation_token': token,
+            'migration_uuid': token,
+            'phase': 'bdm-rotated',
+            'boot_volume': False,
+        }
+        self.compute.driver.get_managed_volume_attach_intent.return_value = (
+            intent)
+        self.compute.driver.get_cold_attachment_rotation.return_value = (
+            rotation)
+        source_attachment = self._rotation_attachment(
+            instance, volume_id, source_id, status='attaching')
+        self.compute._get_exact_cinder_attachment = mock.Mock(
+            side_effect=lambda unused_context, attachment_id,
+            unused_volume, unused_instance: (
+                source_attachment if attachment_id == source_id else None))
+        self.compute.driver.get_volume_journal_phase.return_value = (
+            'disconnected')
+        replacement = dict(
+            intent, attachment_id=source_id,
+            operation_direction='cold-revert-source')
+        self.compute.driver.replace_cold_source_volume_attach_intent.\
+            return_value = replacement
+
+        self.compute._handoff_cold_source_rotations_for_revert(
+            ctxt, instance, migration)
+
+        self.compute.driver.replace_cold_source_volume_attach_intent.\
+            assert_called_once_with(
+                instance, volume_id, intent, source_id,
+                operation_direction='cold-revert-source')
+        self.compute.driver.cancel_cold_attachment_rotation.\
+            assert_called_once_with(instance, volume_id, rotation)
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_cold_revert_handoff_rejects_live_target_owner(self, get_bdms):
+        ctxt = context.get_admin_context()
+        instance = self._volume_recovery_instance()
+        instance.host = 'compute-2'
+        instance.task_state = manager.task_states.RESIZE_REVERTING
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        old_id = '51000000-0000-0000-0000-000000000005'
+        target_id = '52000000-0000-0000-0000-000000000005'
+        source_id = '53000000-0000-0000-0000-000000000005'
+        token = '54000000-0000-0000-0000-000000000005'
+        bdm = self._volume_recovery_bdm(volume_id)
+        bdm.attachment_id = source_id
+        bdm.device_name = '/dev/sdb'
+        get_bdms.return_value = [bdm]
+        migration = mock.Mock(
+            uuid=token, source_compute=self.compute.host,
+            dest_compute='compute-2')
+        intent = {
+            'attachment_id': old_id,
+            'mountpoint': '/dev/sdb',
+            'operation_kind': 'migration',
+            'operation_token': token,
+            'operation_direction': 'cold-source-restore',
+            'operation_migration_uuid': token,
+            'boot_volume': False,
+        }
+        rotation = {
+            'old_attachment_id': old_id,
+            'new_attachment_id': target_id,
+            'mountpoint': '/dev/sdb',
+            'operation_token': token,
+            'migration_uuid': token,
+            'phase': 'bdm-rotated',
+            'boot_volume': False,
+        }
+        self.compute.driver.get_managed_volume_attach_intent.return_value = (
+            intent)
+        self.compute.driver.get_cold_attachment_rotation.return_value = (
+            rotation)
+        target = self._rotation_attachment(
+            instance, volume_id, target_id, status='attached')
+        self.compute._get_exact_cinder_attachment = mock.Mock(
+            side_effect=lambda unused_context, attachment_id,
+            unused_volume, unused_instance: (
+                target if attachment_id == target_id else None))
+
+        self.assertRaises(
+            exception.InvalidVolume,
+            self.compute._handoff_cold_source_rotations_for_revert,
+            ctxt, instance, migration)
+
+        self.compute.driver.replace_cold_source_volume_attach_intent.\
+            assert_not_called()
+        self.compute.driver.cancel_cold_attachment_rotation.\
+            assert_not_called()
+
     def test_pre_live_migration_rollback_does_not_reassert_network(self):
         data = migrate_data.IncusLiveMigrateData()
 
@@ -6431,6 +6554,7 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         self.compute._get_share_info = mock.Mock(
             return_value=[active, inactive])
         self.compute._mount_all_shares = mock.Mock()
+        self.compute._handoff_cold_source_rotations_for_revert = mock.Mock()
 
         result = self.compute._finish_revert_resize(
             ctxt, instance, mock.sentinel.migration,
@@ -6439,6 +6563,9 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         self.assertIs(mock.sentinel.result, result)
         self.compute._mount_all_shares.assert_called_once_with(
             ctxt, instance, [active])
+        self.compute._handoff_cold_source_rotations_for_revert.\
+            assert_called_once_with(
+                ctxt, instance, mock.sentinel.migration)
         base_revert.assert_called_once_with(
             ctxt, instance, mock.sentinel.migration,
             request_spec=mock.sentinel.request_spec)

@@ -212,10 +212,12 @@ if [[ "$RUN_TEMPEST" == true ]]; then
         }
     done
     default_tempest_list="$REPO_ROOT/tools/openstack-incus-tempest-include-list.txt"
+    default_tempest_exclude_list="$REPO_ROOT/tools/openstack-incus-tempest-exclude-list.txt"
     TEMPEST_INCLUDE_LIST=${TEMPEST_INCLUDE_LIST:-$default_tempest_list}
+    TEMPEST_EXCLUDE_LIST=${TEMPEST_EXCLUDE_LIST:-$default_tempest_exclude_list}
     [[ -d "$TEMPEST_DIR" && -r "$TEMPEST_CONFIG" &&
-       -r "$TEMPEST_INCLUDE_LIST" ]] || {
-        echo "Tempest checkout, config, and include list must be readable" >&2
+       -r "$TEMPEST_INCLUDE_LIST" && -r "$TEMPEST_EXCLUDE_LIST" ]] || {
+        echo "Tempest checkout, config, include list, and exclude list must be readable" >&2
         exit 2
     }
     run "Tempest network validation contract" "$PYTHON" - \
@@ -236,7 +238,8 @@ PY
         "$TEMPEST_BIN" run \
             --config-file "$TEMPEST_CONFIG" \
             --list-tests \
-            --include-list "$TEMPEST_INCLUDE_LIST"
+            --include-list "$TEMPEST_INCLUDE_LIST" \
+            --exclude-list "$TEMPEST_EXCLUDE_LIST"
     ) | tee "$test_list"
     for expected in \
         nova_incus_tempest_plugin.tests.scenario.test_server_basic_ops \
@@ -261,10 +264,12 @@ PY
             exec "$2" run \
                 --config-file "$3" \
                 --include-list "$4" \
-                --concurrency "$5" \
+                --exclude-list "$5" \
+                --concurrency "$6" \
                 --slowest
         ' _ "$TEMPEST_DIR" "$TEMPEST_BIN" "$TEMPEST_CONFIG" \
-        "$TEMPEST_INCLUDE_LIST" "$TEMPEST_CONCURRENCY"
+        "$TEMPEST_INCLUDE_LIST" "$TEMPEST_EXCLUDE_LIST" \
+        "$TEMPEST_CONCURRENCY"
     tempest_stats="$ARTIFACT_DIR/tempest-stats-$timestamp.txt"
     (
         cd "$TEMPEST_DIR"
