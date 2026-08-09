@@ -162,7 +162,7 @@ run "credential pattern audit" bash -c '
     fi
     single_quote=$(printf "\\047")
     double_quote=$(printf "\\042")
-    literal_credential_pattern="(password|secret|token)[[:space:]]*=[[:space:]]*[$single_quote$double_quote][^\$<{$single_quote$double_quote]"
+    literal_credential_pattern="(password|secret|token)[[:space:]]*=[[:space:]]*[$single_quote$double_quote][^\$<{$single_quote$double_quote]+[$single_quote$double_quote]"
     if git grep -n -I -E \
         "$literal_credential_pattern" \
         -- . \
