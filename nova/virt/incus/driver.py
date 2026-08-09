@@ -159,6 +159,7 @@ MIGRATION_TARGET_OPERATION_KEY = (
     'user.openstack.migration_target_operation_id')
 MIGRATION_ROLLBACK_COMPLETE_KEY = (
     'user.openstack.migration_rollback_complete')
+MIGRATION_NOVA_UUID_KEY = 'user.openstack.migration_uuid'
 MIGRATION_IDMAP_RETIREMENT_KEY = (
     'user.openstack.migration_idmap_retirement')
 CLEANUP_RECOVERY_KEY = 'user.openstack.cleanup_required'
@@ -170,14 +171,36 @@ IDMAP_ALLOCATION_CONFIG_KEY = 'user.openstack.idmap_allocation_id'
 IDMAP_COMPUTE_CONFIG_KEY = 'user.openstack.compute_id'
 IDMAP_MATERIALIZATION_CONFIG_KEY = (
     'user.openstack.rootfs_materialization_id')
+SPAWN_VOLUME_GENERATION_KEY = 'user.openstack.spawn_volume_generation'
 _PRE_LIVE_DISCONNECTED_KEY = 'incus_pre_live_disconnected'
 _VOLUME_ATTACHMENT_RECORD_VERSION = 2
 _VOLUME_JOURNAL_VERSION = 1
+_MANAGED_DETACH_INTENT_VERSION = 1
+_MANAGED_ATTACH_INTENT_VERSION = 3
+_COLD_ATTACHMENT_ROTATION_VERSION = 1
+_COLD_ATTACHMENT_ROTATION_PHASES = frozenset({
+    'prepared', 'creating', 'new-created', 'source-old-retained',
+    'old-deleted', 'bdm-rotated',
+    'source-release-complete', 'source-rollback-complete',
+})
+_COLD_ATTACHMENT_ROTATION_TERMINAL_PHASES = frozenset({
+    'source-release-complete', 'source-rollback-complete',
+})
+_VOLUME_ATTACH_OPERATION_KINDS = frozenset({
+    'hot-attach', 'spawn', 'reconcile', 'migration',
+})
+_VOLUME_ATTACH_MIGRATION_DIRECTIONS = frozenset({
+    'cold-target', 'cold-source-restore', 'cold-revert-source',
+    'live-target', 'live-source-release',
+})
 _SHARE_JOURNAL_VERSION = 1
 _SPAWN_ATTEMPT_JOURNAL_VERSION = 1
 _SPAWN_ATTEMPT_PHASES = frozenset({'preflight', 'opening'})
 _HOST_RESOURCE_CACHE_TTL = 60
 _INSTANCE_INVENTORY_CACHE_TTL = 10
+_VOLUME_RECOVERY_TMP_STALE_SECONDS = 300
+_VOLUME_RECOVERY_TMP_RE = re.compile(
+    r'\.(?:attach|detach|rotation|volume)-[A-Za-z0-9_-]+\.tmp')
 
 
 @dataclass(frozen=True)
@@ -568,6 +591,17 @@ def _bdm_volume_id(bdm):
     return str(volume_id)
 
 
+def _bdm_attachment_id(bdm):
+    """Return the exact Cinder attachment generation from a driver BDM."""
+    attachment_id = getattr(bdm, 'attachment_id', None)
+    if not attachment_id and hasattr(bdm, 'get'):
+        attachment_id = bdm.get('attachment_id')
+    if not uuidutils.is_uuid_like(attachment_id):
+        raise exception.InvalidVolume(
+            reason='Cinder block-device mapping has no exact attachment ID')
+    return str(attachment_id)
+
+
 def _rbd_namespace(connection_data):
     """Return one unambiguous RBD namespace identity."""
     rbd_namespace = connection_data.get('rbd_namespace')
@@ -874,6 +908,40 @@ def _live_migration_cleanup_token(migrate_data):
     return migrate_data.cleanup_token
 
 
+def _live_migration_uuid(migrate_data):
+    if not isinstance(
+            migrate_data, incus_migrate_data.IncusLiveMigrateData):
+        raise exception.MigrationError(
+            reason='Missing Incus live migration data')
+    if (not migrate_data.obj_attr_is_set('migration_uuid') or
+            not uuidutils.is_uuid_like(migrate_data.migration_uuid)):
+        raise exception.MigrationError(
+            reason='Missing or invalid Nova live Migration UUID')
+    return migrate_data.migration_uuid
+
+
+def _active_live_migration_uuid(context, instance, destination_host):
+    """Resolve exactly one Nova live migration targeting this compute."""
+    migrations = objects.MigrationList.get_by_filters(
+        context, {'instance_uuid': instance.uuid})
+    terminal = {
+        'cancelled', 'completed', 'confirmed', 'done', 'error', 'failed',
+        'reverted',
+    }
+    candidates = [
+        migration for migration in migrations
+        if (getattr(migration, 'migration_type', None) == 'live-migration' and
+            getattr(migration, 'dest_compute', None) == destination_host and
+            getattr(migration, 'status', None) not in terminal and
+            uuidutils.is_uuid_like(getattr(migration, 'uuid', None)))
+    ]
+    if len(candidates) != 1:
+        raise exception.MigrationPreCheckError(
+            reason='Incus live migration destination cannot identify exactly '
+                   'one active Nova Migration')
+    return candidates[0].uuid
+
+
 def _cold_migration_cleanup_token(context, instance):
     """Return the canonical Nova Migration UUID for a cold migration."""
     migration_context = getattr(instance, 'migration_context', None)
@@ -1018,7 +1086,9 @@ def _migration_address_for_host(host):
 def _instance_migration_idmap(container, profile=None):
     """Return the fixed isolated idmap that must be reserved on a target."""
     config = (
-        container.config if isinstance(container.config, dict) else {})
+        container.config
+        if container is not None and isinstance(container.config, dict)
+        else {})
     expanded = (
         getattr(container, 'expanded_config', None)
         if isinstance(getattr(container, 'expanded_config', None), dict)
@@ -1031,7 +1101,8 @@ def _instance_migration_idmap(container, profile=None):
             config.get('volatile.idmap.base') or
             config.get('security.idmap.base') or
             expanded.get('volatile.idmap.base') or
-            expanded.get('security.idmap.base'))
+            expanded.get('security.idmap.base') or
+            profile_config.get('security.idmap.base'))
         size_value = (
             config.get('security.idmap.size') or
             expanded.get('security.idmap.size') or
@@ -1120,10 +1191,12 @@ def _destination_prepared_profile_binding(config):
             reason='Incus migration destination profile config is malformed')
     marker = config.get(MIGRATION_DESTINATION_PREPARED_KEY)
     cleanup_token = config.get(MIGRATION_CLEANUP_TOKEN_KEY)
+    migration_uuid = config.get(MIGRATION_NOVA_UUID_KEY)
     instance_uuid = config.get('user.openstack.uuid')
     if (config.get('environment.product_name') != 'OpenStack Nova' or
             not uuidutils.is_uuid_like(instance_uuid) or
             not uuidutils.is_uuid_like(cleanup_token) or
+            not uuidutils.is_uuid_like(migration_uuid) or
             marker != cleanup_token or
             config.get(MIGRATION_DESTINATION_KEY)):
         raise exception.MigrationError(
@@ -1143,6 +1216,7 @@ def _destination_prepared_profile_binding(config):
     return {
         'uuid': instance_uuid,
         'operation_token': cleanup_token,
+        'migration_uuid': migration_uuid,
         'idmap_base': idmap_base,
         'idmap_size': idmap_size,
     }
@@ -1401,11 +1475,16 @@ def _finalize_committed_migration_attempt(
         raise exception.MigrationError(
             reason='Incus migration target profile changed before attempt '
                    'retirement')
+    if os.path.lexists(_volume_journal_directory(instance)):
+        raise exception.MigrationError(
+            reason='Incus migration target still has a local Cinder volume '
+                   'transaction')
     original_config = dict(profile.config)
     updated_config = dict(profile.config)
     updated_config.pop(MIGRATION_CLEANUP_TOKEN_KEY, None)
     updated_config.pop(MIGRATION_CLEANUP_COMPLETE_KEY, None)
     updated_config.pop(MIGRATION_DESTINATION_PREPARED_KEY, None)
+    updated_config.pop(MIGRATION_NOVA_UUID_KEY, None)
     updated_config.pop(MIGRATION_TARGET_OPERATION_KEY, None)
     profile.config = updated_config
     try:
@@ -2175,22 +2254,53 @@ def _converge_migration_target_ownership(
             client, instance.name, desired_state)
 
 
-def _live_migration_share_mappings(context, instance, profile):
+def _validate_migration_share_mappings(context, instance, profile):
     """Validate Manila profile devices against Nova's authoritative records."""
     mappings = objects.ShareMappingList.get_by_instance_uuid(
         context, instance.uuid)
     expected = {}
     for mapping in mappings:
-        if mapping.status != obj_fields.ShareMappingStatus.ACTIVE:
+        share_id = getattr(mapping, 'share_id', None)
+        if (not isinstance(share_id, str) or
+                not _SHARE_ID_RE.fullmatch(share_id)):
             raise exception.MigrationPreCheckError(
-                reason='Manila share %s is not active' % mapping.share_id)
-        expected[_share_device_name(mapping)] = {
+                reason='Nova Manila mapping has a non-canonical share ID')
+        if (getattr(mapping, 'status', None) !=
+                obj_fields.ShareMappingStatus.ACTIVE):
+            raise exception.MigrationPreCheckError(
+                reason='Manila share %s is not active' % share_id)
+        if getattr(mapping, 'instance_uuid', None) != instance.uuid:
+            raise exception.MigrationPreCheckError(
+                reason='Nova Manila mapping %s belongs to another instance' %
+                       share_id)
+        tag = getattr(mapping, 'tag', None)
+        if not isinstance(tag, str) or not _SHARE_TAG_RE.fullmatch(tag):
+            raise exception.MigrationPreCheckError(
+                reason='Nova Manila mapping %s has an invalid guest tag' %
+                       share_id)
+
+        device_name = _share_device_name(mapping)
+        if device_name in expected:
+            raise exception.MigrationPreCheckError(
+                reason='Nova has duplicate Manila mappings for share %s' %
+                       share_id)
+        expected[device_name] = {
             'type': 'disk',
             'source': _share_mount_path(instance, mapping),
             'path': _share_guest_path(mapping),
             'readonly': 'false',
             'recursive': 'true',
         }
+
+    _mounts, malformed = _profile_share_mount_inventory(profile, instance)
+    if malformed:
+        device_name, reason = malformed[0]
+        raise exception.MigrationPreCheckError(
+            reason='Incus Manila profile device %(device)s is malformed: '
+                   '%(reason)s' % {
+                       'device': device_name,
+                       'reason': reason,
+                   })
 
     actual = {
         name: device
@@ -2211,8 +2321,9 @@ def _live_migration_profile_check(client, context, instance):
     if profile.config.get('security.privileged', 'false').lower() == 'true':
         raise exception.MigrationPreCheckError(
             reason='Privileged Incus containers cannot use Nova live '
-            'migration')
+                   'migration')
 
+    _validate_migration_share_mappings(context, instance, profile)
     unsupported = []
     for name, device in profile.devices.items():
         device_type = device.get('type')
@@ -2227,8 +2338,6 @@ def _live_migration_profile_check(client, context, instance):
         raise exception.MigrationPreCheckError(
             reason='Incus live migration does not support profile devices: '
             '%s' % ', '.join(sorted(unsupported)))
-    if any(name.startswith('manila-') for name in profile.devices):
-        _live_migration_share_mappings(context, instance, profile)
     return profile
 
 
@@ -2397,6 +2506,7 @@ def _live_migration_source_profile(container, profile):
     config.pop(MIGRATION_OPERATION_KEY, None)
     config.pop(MIGRATION_TARGET_OPERATION_KEY, None)
     config.pop(MIGRATION_ROLLBACK_COMPLETE_KEY, None)
+    config.pop(MIGRATION_NOVA_UUID_KEY, None)
     config.pop(CLEANUP_RECOVERY_KEY, None)
     config.pop(MIGRATION_DESTINATION_PREPARED_KEY, None)
 
@@ -2500,6 +2610,24 @@ def _volume_journal_path(instance, volume_id):
     return os.path.join(_volume_journal_directory(instance), digest + '.json')
 
 
+def _managed_detach_intent_path(instance, volume_id):
+    digest = hashlib.sha256(str(volume_id).encode('utf-8')).hexdigest()
+    return os.path.join(
+        _volume_journal_directory(instance), digest + '.detach-intent')
+
+
+def _managed_attach_intent_path(instance, volume_id):
+    digest = hashlib.sha256(str(volume_id).encode('utf-8')).hexdigest()
+    return os.path.join(
+        _volume_journal_directory(instance), digest + '.attach-intent')
+
+
+def _cold_attachment_rotation_path(instance, volume_id):
+    digest = hashlib.sha256(str(volume_id).encode('utf-8')).hexdigest()
+    return os.path.join(
+        _volume_journal_directory(instance), digest + '.attachment-rotation')
+
+
 def _fsync_directory(path):
     flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)
     fd = os.open(path, flags)
@@ -2507,6 +2635,55 @@ def _fsync_directory(path):
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _prune_orphan_volume_recovery_directory(instance):
+    """Remove only an empty or provably stale temporary journal directory.
+
+    The caller serializes this with the instance volume-topology lock.  A
+    recent temporary file may still belong to a writer that has not reached
+    ``os.replace`` yet, so only strictly named regular files older than the
+    conservative stale threshold are eligible.  Any durable evidence or
+    unknown entry keeps destroy fail-closed.
+    """
+    journal_dir = _volume_journal_directory(instance)
+    try:
+        names = os.listdir(journal_dir)
+    except FileNotFoundError:
+        return True
+
+    cutoff = time.time() - _VOLUME_RECOVERY_TMP_STALE_SECONDS
+    stale_temporary = []
+    for name in names:
+        if _VOLUME_RECOVERY_TMP_RE.fullmatch(name) is None:
+            return False
+        path = os.path.join(journal_dir, name)
+        try:
+            metadata = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        if (os.path.islink(path) or not os.path.isfile(path) or
+                metadata.st_mtime > cutoff):
+            return False
+        stale_temporary.append(path)
+
+    for path in stale_temporary:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+    if stale_temporary:
+        _fsync_directory(journal_dir)
+    try:
+        os.rmdir(journal_dir)
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
+            return False
+        raise
+    _fsync_directory(os.path.dirname(journal_dir))
+    return True
 
 
 def _spawn_attempt_journal_directory():
@@ -2719,6 +2896,442 @@ def _write_volume_journal(
             pass
 
 
+def _write_managed_detach_intent(
+        instance, volume_id, attachment_id, destroy_bdm, mountpoint):
+    """Persist Nova manager authority to finish one external detach."""
+    if (not uuidutils.is_uuid_like(volume_id) or
+            not uuidutils.is_uuid_like(attachment_id) or
+            not isinstance(destroy_bdm, bool) or
+            not isinstance(mountpoint, str) or not mountpoint):
+        raise exception.InvalidVolume(
+            reason='Nova managed detach intent is incomplete')
+    if _read_managed_attach_intent(instance, volume_id) is not None:
+        raise exception.InvalidVolume(
+            reason='A Nova managed attach transaction is still active')
+    payload = {
+        'version': _MANAGED_DETACH_INTENT_VERSION,
+        'instance_uuid': instance.uuid,
+        'instance_name': instance.name,
+        'volume_id': str(volume_id),
+        'attachment_id': str(attachment_id),
+        'destroy_bdm': destroy_bdm,
+        'mountpoint': mountpoint,
+    }
+    existing = _read_managed_detach_intent(instance, volume_id)
+    if existing is not None:
+        if existing != payload:
+            raise exception.InvalidVolume(
+                reason='Another Nova managed detach intent already exists')
+        return existing
+
+    journal_dir = _volume_journal_directory(instance)
+    journal_root = os.path.dirname(journal_dir)
+    root_created = not os.path.isdir(journal_root)
+    instance_created = not os.path.isdir(journal_dir)
+    os.makedirs(journal_dir, mode=0o700, exist_ok=True)
+    os.chmod(journal_root, 0o700)
+    os.chmod(journal_dir, 0o700)
+    fd, temporary = tempfile.mkstemp(
+        prefix='.detach-', suffix='.tmp', dir=journal_dir)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            fd = None
+            json.dump(payload, stream, sort_keys=True, separators=(',', ':'))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(
+            temporary, _managed_detach_intent_path(instance, volume_id))
+        _fsync_directory(journal_dir)
+        if instance_created:
+            _fsync_directory(journal_root)
+        if root_created:
+            _fsync_directory(os.path.dirname(journal_root))
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+    return payload
+
+
+def _read_managed_detach_intent(instance, volume_id):
+    try:
+        with open(
+                _managed_detach_intent_path(instance, volume_id),
+                encoding='utf-8') as stream:
+            payload = json.load(stream)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise exception.InvalidVolume(
+            reason='Nova managed detach intent is unreadable: %s' % exc)
+    if (not isinstance(payload, dict) or
+            payload.get('version') != _MANAGED_DETACH_INTENT_VERSION or
+            payload.get('instance_uuid') != instance.uuid or
+            payload.get('instance_name') != instance.name or
+            payload.get('volume_id') != str(volume_id) or
+            not uuidutils.is_uuid_like(payload.get('attachment_id')) or
+            not isinstance(payload.get('destroy_bdm'), bool) or
+            not isinstance(payload.get('mountpoint'), str) or
+            not payload.get('mountpoint')):
+        raise exception.InvalidVolume(
+            reason='Nova managed detach intent ownership is invalid')
+    return payload
+
+
+def _remove_managed_detach_intent(instance, volume_id, expected=None):
+    current = _read_managed_detach_intent(instance, volume_id)
+    if current is None:
+        return
+    if expected is not None and current != expected:
+        raise exception.InvalidVolume(
+            reason='Nova managed detach intent changed during cleanup')
+    journal_dir = _volume_journal_directory(instance)
+    os.unlink(_managed_detach_intent_path(instance, volume_id))
+    _fsync_directory(journal_dir)
+    try:
+        os.rmdir(journal_dir)
+    except OSError as exc:
+        if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST, errno.ENOENT):
+            raise
+    else:
+        _fsync_directory(os.path.dirname(journal_dir))
+
+
+def _validate_managed_attach_operation(
+        operation_kind, operation_token, operation_direction,
+        operation_migration_uuid=None, boot_volume=False):
+    if not isinstance(boot_volume, bool):
+        raise exception.InvalidVolume(
+            reason='Nova managed attach boot-volume marker is invalid')
+    if operation_kind not in _VOLUME_ATTACH_OPERATION_KINDS:
+        raise exception.InvalidVolume(
+            reason='Nova managed attach operation kind is invalid')
+    if (boot_volume and
+            (operation_kind != 'migration' or
+             operation_direction not in (
+                 'cold-source-restore', 'live-source-release'))):
+        raise exception.InvalidVolume(
+            reason='A boot-volume owner is valid only on a migration source')
+    if operation_kind == 'hot-attach':
+        if (operation_token is not None or operation_direction is not None or
+                operation_migration_uuid is not None):
+            raise exception.InvalidVolume(
+                reason='Nova hot attach must not carry an internal owner')
+        return
+    if not uuidutils.is_uuid_like(operation_token):
+        raise exception.InvalidVolume(
+            reason='Nova internal attach has no durable operation token')
+    expected_direction = {
+        'spawn': 'materialize',
+        'reconcile': 'power-reconcile',
+    }.get(operation_kind)
+    if expected_direction is not None:
+        if (operation_direction != expected_direction or
+                operation_migration_uuid is not None):
+            raise exception.InvalidVolume(
+                reason='Nova internal attach direction is invalid')
+        return
+    if operation_direction not in _VOLUME_ATTACH_MIGRATION_DIRECTIONS:
+        raise exception.InvalidVolume(
+            reason='Nova migration attach direction is invalid')
+    if not uuidutils.is_uuid_like(operation_migration_uuid):
+        raise exception.InvalidVolume(
+            reason='Nova migration attach has no exact Migration UUID')
+
+
+def _write_managed_attach_intent(
+        instance, volume_id, attachment_id, mountpoint,
+        operation_kind='hot-attach', operation_token=None,
+        operation_direction=None, operation_migration_uuid=None,
+        boot_volume=False):
+    """Persist the exact Cinder identity before ComputeManager attach."""
+    if (not uuidutils.is_uuid_like(volume_id) or
+            not uuidutils.is_uuid_like(attachment_id) or
+            not isinstance(mountpoint, str) or not mountpoint):
+        raise exception.InvalidVolume(
+            reason='Nova managed attach intent is incomplete')
+    _validate_managed_attach_operation(
+        operation_kind, operation_token, operation_direction,
+        operation_migration_uuid, boot_volume)
+    if _read_managed_detach_intent(instance, volume_id) is not None:
+        raise exception.InvalidVolume(
+            reason='A Nova managed detach transaction is still active')
+    payload = {
+        'version': _MANAGED_ATTACH_INTENT_VERSION,
+        'instance_uuid': instance.uuid,
+        'instance_name': instance.name,
+        'volume_id': str(volume_id),
+        'attachment_id': str(attachment_id),
+        'mountpoint': mountpoint,
+        'operation_kind': operation_kind,
+        'operation_token': operation_token,
+        'operation_direction': operation_direction,
+        'operation_migration_uuid': operation_migration_uuid,
+        'boot_volume': boot_volume,
+    }
+    existing = _read_managed_attach_intent(instance, volume_id)
+    if existing is not None:
+        if existing != payload:
+            raise exception.InvalidVolume(
+                reason='Another Nova managed attach intent already exists')
+        return existing
+    journal_dir = _volume_journal_directory(instance)
+    journal_root = os.path.dirname(journal_dir)
+    root_created = not os.path.isdir(journal_root)
+    instance_created = not os.path.isdir(journal_dir)
+    os.makedirs(journal_dir, mode=0o700, exist_ok=True)
+    os.chmod(journal_root, 0o700)
+    os.chmod(journal_dir, 0o700)
+    fd, temporary = tempfile.mkstemp(
+        prefix='.attach-', suffix='.tmp', dir=journal_dir)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            fd = None
+            json.dump(payload, stream, sort_keys=True, separators=(',', ':'))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(
+            temporary, _managed_attach_intent_path(instance, volume_id))
+        _fsync_directory(journal_dir)
+        if instance_created:
+            _fsync_directory(journal_root)
+        if root_created:
+            _fsync_directory(os.path.dirname(journal_root))
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+    return payload
+
+
+def _read_managed_attach_intent(instance, volume_id):
+    try:
+        with open(
+                _managed_attach_intent_path(instance, volume_id),
+                encoding='utf-8') as stream:
+            payload = json.load(stream)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise exception.InvalidVolume(
+            reason='Nova managed attach intent is unreadable: %s' % exc)
+    required = {
+        'version', 'instance_uuid', 'instance_name', 'volume_id',
+        'attachment_id', 'mountpoint', 'operation_kind', 'operation_token',
+        'operation_direction', 'operation_migration_uuid', 'boot_volume',
+    }
+    if (not isinstance(payload, dict) or set(payload) != required or
+            payload.get('version') != _MANAGED_ATTACH_INTENT_VERSION or
+            payload.get('instance_uuid') != instance.uuid or
+            payload.get('instance_name') != instance.name or
+            payload.get('volume_id') != str(volume_id) or
+            not uuidutils.is_uuid_like(payload.get('attachment_id')) or
+            not isinstance(payload.get('mountpoint'), str) or
+            not payload.get('mountpoint')):
+        raise exception.InvalidVolume(
+            reason='Nova managed attach intent ownership is invalid')
+    try:
+        _validate_managed_attach_operation(
+            payload.get('operation_kind'), payload.get('operation_token'),
+            payload.get('operation_direction'),
+            payload.get('operation_migration_uuid'),
+            payload.get('boot_volume'))
+    except exception.InvalidVolume as exc:
+        raise exception.InvalidVolume(
+            reason='Nova managed attach intent ownership is invalid') from exc
+    return payload
+
+
+def _replace_managed_attach_intent(
+        instance, volume_id, expected, attachment_id):
+    current = _read_managed_attach_intent(instance, volume_id)
+    if current != expected:
+        raise exception.InvalidVolume(
+            reason='Nova managed attach intent changed before replacement')
+    if (current.get('operation_kind') != 'migration' or
+            current.get('operation_direction') != 'cold-source-restore' or
+            not uuidutils.is_uuid_like(attachment_id)):
+        raise exception.InvalidVolume(
+            reason='Nova managed attach intent replacement is invalid')
+    payload = copy.deepcopy(current)
+    payload['attachment_id'] = str(attachment_id)
+    journal_dir = _volume_journal_directory(instance)
+    fd, temporary = tempfile.mkstemp(
+        prefix='.attach-', suffix='.tmp', dir=journal_dir)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            fd = None
+            json.dump(payload, stream, sort_keys=True, separators=(',', ':'))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(
+            temporary, _managed_attach_intent_path(instance, volume_id))
+        _fsync_directory(journal_dir)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+    return payload
+
+
+def _remove_managed_attach_intent(instance, volume_id, expected=None):
+    current = _read_managed_attach_intent(instance, volume_id)
+    if current is None:
+        return
+    if expected is not None and current != expected:
+        raise exception.InvalidVolume(
+            reason='Nova managed attach intent changed during cleanup')
+    journal_dir = _volume_journal_directory(instance)
+    os.unlink(_managed_attach_intent_path(instance, volume_id))
+    _fsync_directory(journal_dir)
+    try:
+        os.rmdir(journal_dir)
+    except OSError as exc:
+        if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST, errno.ENOENT):
+            raise
+    else:
+        _fsync_directory(os.path.dirname(journal_dir))
+
+
+def _validate_cold_attachment_rotation(instance, volume_id, payload):
+    required = {
+        'version', 'instance_uuid', 'instance_name', 'volume_id',
+        'mountpoint', 'operation_token', 'migration_uuid',
+        'old_attachment_id', 'new_attachment_id',
+        'baseline_attachment_ids', 'phase', 'boot_volume',
+    }
+    baseline = payload.get('baseline_attachment_ids') if isinstance(
+        payload, dict) else None
+    if (not isinstance(payload, dict) or set(payload) != required or
+            payload.get('version') != _COLD_ATTACHMENT_ROTATION_VERSION or
+            payload.get('instance_uuid') != instance.uuid or
+            payload.get('instance_name') != instance.name or
+            payload.get('volume_id') != str(volume_id) or
+            not isinstance(payload.get('mountpoint'), str) or
+            not payload.get('mountpoint') or
+            not uuidutils.is_uuid_like(payload.get('operation_token')) or
+            not uuidutils.is_uuid_like(payload.get('migration_uuid')) or
+            not uuidutils.is_uuid_like(payload.get('old_attachment_id')) or
+            (payload.get('new_attachment_id') is not None and
+             not uuidutils.is_uuid_like(payload.get('new_attachment_id'))) or
+            not isinstance(baseline, list) or
+            baseline != sorted(set(baseline)) or
+            any(not uuidutils.is_uuid_like(value) for value in baseline) or
+            payload.get('phase') not in _COLD_ATTACHMENT_ROTATION_PHASES or
+            not isinstance(payload.get('boot_volume'), bool)):
+        raise exception.InvalidVolume(
+            reason='Cold migration attachment rotation ownership is invalid')
+    if (payload['phase'] in ('prepared', 'creating',
+                             'source-rollback-complete') and
+            payload['new_attachment_id'] is not None):
+        if payload['phase'] != 'source-rollback-complete':
+            raise exception.InvalidVolume(
+                reason='Uncreated attachment rotation names a replacement')
+    if (payload['phase'] not in (
+            'prepared', 'creating', 'source-rollback-complete') and
+            payload['new_attachment_id'] is None):
+        raise exception.InvalidVolume(
+            reason='Attachment rotation has no durable replacement identity')
+    if payload['old_attachment_id'] not in baseline:
+        raise exception.InvalidVolume(
+            reason='Attachment rotation baseline omits its old owner')
+    return payload
+
+
+def _read_cold_attachment_rotation(instance, volume_id):
+    try:
+        with open(
+                _cold_attachment_rotation_path(instance, volume_id),
+                encoding='utf-8') as stream:
+            payload = json.load(stream)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise exception.InvalidVolume(
+            reason='Cold migration attachment rotation is unreadable: %s' %
+                   exc)
+    return _validate_cold_attachment_rotation(instance, volume_id, payload)
+
+
+def _write_cold_attachment_rotation(
+        instance, volume_id, payload, expected=None):
+    payload = _validate_cold_attachment_rotation(
+        instance, volume_id, copy.deepcopy(payload))
+    current = _read_cold_attachment_rotation(instance, volume_id)
+    if expected is None:
+        if current is not None:
+            if current != payload:
+                raise exception.InvalidVolume(
+                    reason='Another attachment rotation already exists')
+            return current, False
+    elif current != expected:
+        raise exception.InvalidVolume(
+            reason='Attachment rotation changed before durable transition')
+
+    journal_dir = _volume_journal_directory(instance)
+    journal_root = os.path.dirname(journal_dir)
+    root_created = not os.path.isdir(journal_root)
+    instance_created = not os.path.isdir(journal_dir)
+    os.makedirs(journal_dir, mode=0o700, exist_ok=True)
+    os.chmod(journal_root, 0o700)
+    os.chmod(journal_dir, 0o700)
+    fd, temporary = tempfile.mkstemp(
+        prefix='.rotation-', suffix='.tmp', dir=journal_dir)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            fd = None
+            json.dump(payload, stream, sort_keys=True, separators=(',', ':'))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(
+            temporary, _cold_attachment_rotation_path(instance, volume_id))
+        _fsync_directory(journal_dir)
+        if instance_created:
+            _fsync_directory(journal_root)
+        if root_created:
+            _fsync_directory(os.path.dirname(journal_root))
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+    return payload, True
+
+
+def _remove_cold_attachment_rotation(instance, volume_id, expected):
+    current = _read_cold_attachment_rotation(instance, volume_id)
+    if current is None:
+        return
+    if current != expected:
+        raise exception.InvalidVolume(
+            reason='Attachment rotation changed during cleanup')
+    journal_dir = _volume_journal_directory(instance)
+    os.unlink(_cold_attachment_rotation_path(instance, volume_id))
+    _fsync_directory(journal_dir)
+    try:
+        os.rmdir(journal_dir)
+    except OSError as exc:
+        if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST, errno.ENOENT):
+            raise
+    else:
+        _fsync_directory(os.path.dirname(journal_dir))
+
+
 def _read_volume_journal(instance, volume_id):
     path = _volume_journal_path(instance, volume_id)
     try:
@@ -2811,6 +3424,137 @@ def _volume_journal_records_by_uuid(instance_uuid):
     return records
 
 
+def _managed_attach_intents_by_uuid(instance_uuid):
+    journal_dir = os.path.join(
+        CONF.instances_path, 'incus-volume-journal', instance_uuid)
+    try:
+        names = os.listdir(journal_dir)
+    except FileNotFoundError:
+        return {}
+    intents = {}
+    for name in names:
+        if not name.endswith('.attach-intent'):
+            continue
+        try:
+            with open(os.path.join(journal_dir, name), encoding='utf-8') as f:
+                payload = json.load(f)
+        except (OSError, ValueError) as exc:
+            raise exception.InvalidVolume(
+                reason='Nova managed attach intent is unreadable: %s' % exc)
+        volume_id = payload.get('volume_id') if isinstance(
+            payload, dict) else None
+        expected_name = (
+            hashlib.sha256(str(volume_id).encode('utf-8')).hexdigest() +
+            '.attach-intent')
+        if (not isinstance(payload, dict) or
+                payload.get('version') != _MANAGED_ATTACH_INTENT_VERSION or
+                payload.get('instance_uuid') != instance_uuid or
+                not uuidutils.is_uuid_like(volume_id) or
+                not uuidutils.is_uuid_like(payload.get('attachment_id')) or
+                not isinstance(payload.get('instance_name'), str) or
+                not payload.get('instance_name') or
+                not isinstance(payload.get('mountpoint'), str) or
+                not payload.get('mountpoint') or
+                not isinstance(payload.get('boot_volume'), bool) or
+                name != expected_name):
+            raise exception.InvalidVolume(
+                reason='Nova managed attach intent ownership is invalid')
+        intents[volume_id] = payload
+    return intents
+
+
+def _cold_attachment_rotations_by_uuid(instance_uuid):
+    journal_dir = os.path.join(
+        CONF.instances_path, 'incus-volume-journal', instance_uuid)
+    try:
+        names = os.listdir(journal_dir)
+    except FileNotFoundError:
+        return {}
+    rotations = {}
+    for name in names:
+        if not name.endswith('.attachment-rotation'):
+            continue
+        try:
+            with open(os.path.join(journal_dir, name), encoding='utf-8') as f:
+                payload = json.load(f)
+        except (OSError, ValueError) as exc:
+            raise exception.InvalidVolume(
+                reason='Cold attachment rotation is unreadable: %s' % exc)
+        volume_id = payload.get('volume_id') if isinstance(
+            payload, dict) else None
+        expected_name = (
+            hashlib.sha256(str(volume_id).encode('utf-8')).hexdigest() +
+            '.attachment-rotation')
+        if (not isinstance(payload, dict) or
+                payload.get('version') !=
+                _COLD_ATTACHMENT_ROTATION_VERSION or
+                payload.get('instance_uuid') != instance_uuid or
+                not uuidutils.is_uuid_like(volume_id) or
+                not isinstance(payload.get('instance_name'), str) or
+                not payload.get('instance_name') or name != expected_name):
+            raise exception.InvalidVolume(
+                reason='Cold attachment rotation ownership is invalid')
+        rotations[volume_id] = payload
+    return rotations
+
+
+def _managed_detach_intents_by_uuid(instance_uuid):
+    """Read manager detach generations without requiring an Instance."""
+    journal_dir = os.path.join(
+        CONF.instances_path, 'incus-volume-journal', instance_uuid)
+    try:
+        names = os.listdir(journal_dir)
+    except FileNotFoundError:
+        return {}
+    intents = {}
+    for name in names:
+        if not name.endswith('.detach-intent'):
+            continue
+        try:
+            with open(os.path.join(journal_dir, name), encoding='utf-8') as f:
+                payload = json.load(f)
+        except (OSError, ValueError) as exc:
+            raise exception.InvalidVolume(
+                reason='Nova managed detach intent is unreadable: %s' % exc)
+        volume_id = payload.get('volume_id') if isinstance(
+            payload, dict) else None
+        expected_name = (
+            hashlib.sha256(str(volume_id).encode('utf-8')).hexdigest() +
+            '.detach-intent')
+        if (not isinstance(payload, dict) or
+                payload.get('version') != _MANAGED_DETACH_INTENT_VERSION or
+                payload.get('instance_uuid') != instance_uuid or
+                not uuidutils.is_uuid_like(volume_id) or
+                not uuidutils.is_uuid_like(payload.get('attachment_id')) or
+                not isinstance(payload.get('instance_name'), str) or
+                not payload.get('instance_name') or
+                not isinstance(payload.get('destroy_bdm'), bool) or
+                not isinstance(payload.get('mountpoint'), str) or
+                not payload.get('mountpoint') or name != expected_name):
+            raise exception.InvalidVolume(
+                reason='Nova managed detach intent ownership is invalid')
+        intents[volume_id] = payload
+    return intents
+
+
+def _volume_recovery_phase(
+        record, attach_intent, detach_intent, rotation=None):
+    """Classify one durable volume transaction by its owning generation."""
+    if attach_intent is not None and detach_intent is not None:
+        return 'intent-conflict'
+    if rotation is not None:
+        return 'rotation-{}'.format(rotation.get('phase'))
+    phase = record.get('phase') if record is not None else None
+    if attach_intent is not None and phase in (
+            'disconnecting', 'disconnected'):
+        return 'attach-{}'.format(phase)
+    if attach_intent is not None and phase is None:
+        return 'attach-pending'
+    if detach_intent is not None and phase is None:
+        return 'detach-pending'
+    return phase
+
+
 def _remove_volume_journal(instance, volume_id):
     journal_dir = _volume_journal_directory(instance)
     try:
@@ -2855,7 +3599,7 @@ def _profile_volume_record(profile, volume_id, device=None):
         device_info = decoded.get('device_info')
         connection_data = decoded.get('connection_data')
         if (decoded.get('phase') not in (
-                'connecting', 'connected', 'disconnecting') or
+                'connecting', 'connected', 'disconnecting', 'disconnected') or
                 not isinstance(device_info, dict) or
                 not isinstance(connection_data, dict) or
                 not isinstance(decoded.get('driver_volume_type'), str)):
@@ -3653,6 +4397,23 @@ def _volume_topology_lock_path():
     return CONF.state_path
 
 
+def _volume_operation_lock_name(volume_id):
+    """Serialize one Cinder volume across instances on this compute host."""
+    digest = hashlib.sha256(str(volume_id).encode('utf-8')).hexdigest()
+    return 'incus-volume-operation-{}'.format(digest)
+
+
+def _volume_operation_lock_path():
+    return CONF.state_path
+
+
+def _volume_manager_transaction_lock_name(instance_uuid, volume_id):
+    """Serialize manager and driver-owned Cinder transactions."""
+    digest = hashlib.sha256(
+        '{}\0{}'.format(instance_uuid, volume_id).encode('utf-8')).hexdigest()
+    return 'incus-nova-volume-transaction-{}'.format(digest)
+
+
 def _share_operation_lock_name(instance, share_id):
     digest = hashlib.sha256(str(share_id).encode('utf-8')).hexdigest()
     return 'incus-share-{}-{}'.format(instance.uuid, digest)
@@ -3730,25 +4491,52 @@ def _validate_existing_share_mount(
         reason='existing host mount is absent from the mount table')
 
 
-def _profile_share_mounts(profile, instance):
-    """Return validated host share mounts referenced by an Incus profile."""
+def _profile_share_mount_inventory(profile, instance):
+    """Return safe mount paths and malformed Manila profile device reasons."""
     instance_root = os.path.realpath(os.path.join(
         CONF.instances_path, 'incus-shares', instance.uuid))
     mounts = []
+    malformed = []
     devices = profile.devices
     if not isinstance(devices, dict):
-        return mounts
+        return mounts, [(
+            'profile.devices', 'profile device inventory is not a mapping')]
     for name, device in devices.items():
-        if not name.startswith('manila-'):
+        if not isinstance(name, str) or not name.startswith('manila-'):
             continue
         share_id = name.removeprefix('manila-')
         if not _SHARE_ID_RE.fullmatch(share_id):
+            malformed.append((name, 'device name does not contain a UUID'))
+            continue
+        if not isinstance(device, dict):
+            malformed.append((name, 'device configuration is not a mapping'))
+            continue
+        if device.get('type') != 'disk':
+            malformed.append((name, 'device type is not disk'))
             continue
         expected = os.path.realpath(os.path.join(instance_root, share_id))
         source = device.get('source')
-        if (device.get('type') == 'disk' and source and
-                os.path.realpath(source) == expected):
-            mounts.append(expected)
+        if not isinstance(source, str) or not source:
+            malformed.append((name, 'device source is missing'))
+            continue
+        if os.path.realpath(source) != expected:
+            malformed.append((
+                name,
+                'device source is outside its Nova staging directory'))
+            continue
+        mounts.append(expected)
+    return mounts, malformed
+
+
+def _profile_share_mounts(profile, instance):
+    """Return mounts, failing closed on malformed Manila profile devices."""
+    mounts, malformed = _profile_share_mount_inventory(profile, instance)
+    if malformed:
+        device_name, reason = malformed[0]
+        raise exception.ShareUmountError(
+            share_id=device_name,
+            server_id=instance.uuid,
+            reason='malformed Incus Manila profile device: %s' % reason)
     return mounts
 
 
@@ -3756,7 +4544,8 @@ def _profile_has_share_devices(profile):
     devices = profile.devices
     return (
         isinstance(devices, dict) and
-        any(name.startswith('manila-') for name in devices)
+        any(isinstance(name, str) and name.startswith('manila-')
+            for name in devices)
     )
 
 
@@ -3764,10 +4553,15 @@ def _cleanup_profile_share_mounts(profile, instance):
     """Unmount host-side Manila staging paths after migration handoff."""
     instance_root = os.path.realpath(os.path.join(
         CONF.instances_path, 'incus-shares', instance.uuid))
-    failures = []
+    mounts, malformed = _profile_share_mount_inventory(profile, instance)
+    failures = [
+        (device_name, ValueError(
+            'malformed Incus Manila profile device: %s' % reason))
+        for device_name, reason in malformed
+    ]
     removed_devices = {}
     mount_table = _share_mount_table_index()
-    for mount_path in reversed(_profile_share_mounts(profile, instance)):
+    for mount_path in reversed(mounts):
         share_id = os.path.basename(mount_path)
         real_mount_path = os.path.realpath(mount_path)
         try:
@@ -4279,7 +5073,9 @@ def _validate_volume_recovery_record(
             reason='Cinder volume %s has an invalid recovery record' %
                    volume_id)
     phase = record.get('phase')
-    if phase not in ('connecting', 'connected', 'disconnecting'):
+    if phase not in (
+            'connecting', 'connected', 'rolled-back', 'disconnecting',
+            'disconnected'):
         raise exception.InvalidVolume(
             reason='Cinder volume %s has an invalid recovery phase' %
                    volume_id)
@@ -5017,6 +5813,64 @@ def _profile_users_other_than(profile, instance):
     return sorted(_profile_instance_users(profile) - own)
 
 
+@dataclass(frozen=True)
+class _AllProjectIDMapInventory:
+    """One immutable, pre-indexed all-project Incus inventory.
+
+    The inventory is used only as a fail-closed screening snapshot.  Its
+    indexes make a batch of release candidates O(records + candidates)
+    instead of scanning every record again for every candidate.  A release
+    is still authorized by a fresh inventory fetched immediately before the
+    exact claim/range CAS.
+    """
+
+    by_uuid: dict
+    by_range: dict
+    invalid_ranges: frozenset
+    by_name: dict
+    by_materialization: dict
+
+
+def _idmap_inventory_add(index, key, resource):
+    if key is None:
+        return
+    index.setdefault(key, set()).add(resource)
+
+
+def _idmap_inventory_uuid(value):
+    """Return one UUID identity key independent of textual spelling."""
+    try:
+        return str(uuid.UUID(value))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _idmap_inventory_range(base, size):
+    """Return a canonical numeric ID-map range, else no usable key."""
+    if size is None or str(size).strip().lower() in ('', 'auto'):
+        size = 65536
+    try:
+        base = int(base)
+        size = int(size)
+    except (TypeError, ValueError):
+        return None
+    if base < 0 or base > ((1 << 32) - 1) or size <= 0:
+        return None
+    if size > (1 << 32) or base + size > (1 << 32):
+        return None
+    return str(base), str(size)
+
+
+def _idmap_inventory_ranges_overlap(left, right):
+    """Return whether two canonical half-open ID-map ranges overlap."""
+    if left is None or right is None:
+        return False
+    left_base, left_size = (int(value) for value in left)
+    right_base, right_size = (int(value) for value in right)
+    return (left_base < right_base + right_size and
+            right_base < left_base + left_size)
+
+
 def _all_project_idmap_inventory(client):
     """Return one all-project instance and profile listing.
 
@@ -5026,7 +5880,11 @@ def _all_project_idmap_inventory(client):
     actual release still refetches; see the callers.
     """
     params = {'recursion': 1, 'all-projects': True}
-    inventory = []
+    by_uuid = {}
+    by_range = {}
+    invalid_ranges = set()
+    by_name = {}
+    by_materialization = {}
     for endpoint, resource_type in (
             ('instances', 'instance'), ('profiles', 'profile')):
         response = getattr(client.api, endpoint).get(params=params)
@@ -5046,14 +5904,76 @@ def _all_project_idmap_inventory(client):
                 raise incus_idmap.IDMapIntegrityError(
                     'Incus all-project {} inventory contains a malformed '
                     'record'.format(resource_type))
-        inventory.append((resource_type, tuple(records)))
-    return tuple(inventory)
+            project = record.get('project')
+            name = record.get('name')
+            if (not isinstance(project, str) or not project or
+                    not isinstance(name, str) or not name):
+                raise incus_idmap.IDMapIntegrityError(
+                    'Incus all-project {} inventory contains an invalid '
+                    'resource identity'.format(resource_type))
+            resource = (resource_type, project, name)
+            _idmap_inventory_add(
+                by_name, (project, name), resource)
+            local_config = record.get('config')
+            if (not isinstance(local_config, dict) or
+                    any(not isinstance(key, str) or
+                        not isinstance(value, str)
+                        for key, value in local_config.items())):
+                raise incus_idmap.IDMapIntegrityError(
+                    'Incus all-project {} inventory contains malformed '
+                    'config'.format(resource_type))
+            effective_config = {}
+            if resource_type == 'instance':
+                # Instance expanded_config is omitted when empty. Profiles do
+                # not expose this field at all, so only instances consume it.
+                expanded_config = record.get('expanded_config', {})
+                if (not isinstance(expanded_config, dict) or
+                        any(not isinstance(key, str) or
+                            not isinstance(value, str)
+                            for key, value in expanded_config.items())):
+                    raise incus_idmap.IDMapIntegrityError(
+                        'Incus all-project instance inventory contains '
+                        'malformed expanded_config')
+                effective_config.update(expanded_config)
+            effective_config.update(local_config)
+            _idmap_inventory_add(
+                by_uuid, _idmap_inventory_uuid(
+                    effective_config.get('user.openstack.uuid')), resource)
+            volatile_base = effective_config.get('volatile.idmap.base')
+            security_base = effective_config.get('security.idmap.base')
+            base = volatile_base or security_base
+            size = effective_config.get('security.idmap.size')
+            idmap_range = _idmap_inventory_range(base, size)
+            if ((volatile_base is not None or security_base is not None) and
+                    idmap_range is None):
+                # A malformed configured range cannot prove absence. Incus
+                # normally validates these values, but legacy/corrupt records
+                # must retain every candidate rather than disappear here.
+                invalid_ranges.add(resource)
+            else:
+                _idmap_inventory_add(by_range, idmap_range, resource)
+            _idmap_inventory_add(
+                by_materialization,
+                effective_config.get(IDMAP_MATERIALIZATION_CONFIG_KEY),
+                resource)
+
+    def freeze(index):
+        return {
+            key: frozenset(values) for key, values in index.items()
+        }
+
+    return _AllProjectIDMapInventory(
+        by_uuid=freeze(by_uuid),
+        by_range=freeze(by_range),
+        invalid_ranges=frozenset(invalid_ranges),
+        by_name=freeze(by_name),
+        by_materialization=freeze(by_materialization))
 
 
 def _all_project_idmap_resources_absent(
         client, instance_uuid, idmap_base, idmap_size,
         allowed_profile_name=None, inventory=None):
-    """Prove no Incus project retains this UUID or exact idmap range.
+    """Prove no Incus project retains this UUID or overlapping idmap range.
 
     ``inventory`` screens against a snapshot the caller already fetched for
     a whole batch. A snapshot can only be stale in the direction of listing
@@ -5061,45 +5981,66 @@ def _all_project_idmap_resources_absent(
     evidence to retain. Absence from a snapshot is only a screen: the caller
     must repeat this proof without one immediately before it releases.
     """
-    expected_range = (str(int(idmap_base)), str(int(idmap_size)))
-    if inventory is None:
-        inventory = _all_project_idmap_inventory(client)
-    for resource_type, records in inventory:
-        for record in records:
-            configs = [
-                value for value in (
-                    record.get('config'), record.get('expanded_config'))
-                if isinstance(value, dict)
-            ]
-            uuid_match = any(
-                config.get('user.openstack.uuid') == instance_uuid
-                for config in configs)
-            range_match = any(
-                (str(config.get('security.idmap.base')),
-                 str(config.get('security.idmap.size'))) == expected_range
-                for config in configs)
-            if not uuid_match and not range_match:
-                continue
-
-            name = record.get('name')
+    expected_range = _idmap_inventory_range(idmap_base, idmap_size)
+    expected_uuid = _idmap_inventory_uuid(instance_uuid)
+    if expected_range is None or expected_uuid is None:
+        raise incus_idmap.IDMapIntegrityError(
+            'Cannot prove absence for an invalid ID map owner or range')
+    if (inventory is None and
+            client.has_api_extension('idmap_usage') is True):
+        response = client.api['idmap-usage'].get(params={
+            'owner': expected_uuid,
+            'base': expected_range[0],
+            'size': expected_range[1],
+        })
+        metadata = response.json().get('metadata')
+        if not isinstance(metadata, list):
+            raise incus_idmap.IDMapIntegrityError(
+                'Incus ID map usage response is not a list')
+        matches = set()
+        for record in metadata:
+            if not isinstance(record, dict):
+                raise incus_idmap.IDMapIntegrityError(
+                    'Incus ID map usage response contains a malformed '
+                    'record')
+            resource_type = record.get('type')
             project = record.get('project')
-            if (resource_type == 'profile' and allowed_profile_name and
-                    name == allowed_profile_name and
-                    project == CONF.incus.project):
-                continue
-            LOG.critical(
-                'Incus %(resource)s %(project)s/%(name)s still matches '
-                'Nova instance %(uuid)s or idmap %(base)s:%(size)s; '
-                'retaining its idmap host claim',
-                {
-                    'resource': resource_type,
-                    'project': project or '<unknown>',
-                    'name': name or '<unknown>',
-                    'uuid': instance_uuid,
-                    'base': expected_range[0],
-                    'size': expected_range[1],
-                })
-            return False
+            name = record.get('name')
+            if (resource_type not in ('instance', 'profile') or
+                    not isinstance(project, str) or not project or
+                    not isinstance(name, str) or not name):
+                raise incus_idmap.IDMapIntegrityError(
+                    'Incus ID map usage response contains an invalid '
+                    'resource identity')
+            matches.add((resource_type, project, name))
+    else:
+        if inventory is None:
+            inventory = _all_project_idmap_inventory(client)
+        matches = set(inventory.invalid_ranges)
+        matches.update(inventory.by_uuid.get(expected_uuid, ()))
+        for candidate_range, resources in inventory.by_range.items():
+            if _idmap_inventory_ranges_overlap(
+                    expected_range, candidate_range):
+                matches.update(resources)
+    for resource_type, project, name in sorted(
+            matches, key=lambda value: tuple(str(item) for item in value)):
+        if (resource_type == 'profile' and allowed_profile_name and
+                name == allowed_profile_name and
+                project == CONF.incus.project):
+            continue
+        LOG.critical(
+            'Incus %(resource)s %(project)s/%(name)s still matches '
+            'Nova instance %(uuid)s or idmap %(base)s:%(size)s; '
+            'retaining its idmap host claim',
+            {
+                'resource': resource_type,
+                'project': project or '<unknown>',
+                'name': name or '<unknown>',
+                'uuid': instance_uuid,
+                'base': expected_range[0],
+                'size': expected_range[1],
+            })
+        return False
     return True
 
 
@@ -5112,36 +6053,26 @@ def _all_project_spawn_attempt_resources_absent(
     """
     if inventory is None:
         inventory = _all_project_idmap_inventory(client)
-    for resource_type, records in inventory:
-        for record in records:
-            configs = [
-                value for value in (
-                    record.get('config'), record.get('expanded_config'))
-                if isinstance(value, dict)
-            ]
-            named_resource = (
-                record.get('name') == attempt['instance_name'] and
-                record.get('project') == CONF.incus.project)
-            owner_match = any(
-                config.get('user.openstack.uuid') ==
-                attempt['instance_uuid'] for config in configs)
-            token_match = any(
-                config.get(IDMAP_MATERIALIZATION_CONFIG_KEY) ==
-                attempt['attempt_uuid'] for config in configs)
-            if not any((named_resource, owner_match, token_match)):
-                continue
-            LOG.critical(
-                'Incus %(resource)s %(project)s/%(name)s still matches '
-                'preflight spawn attempt %(attempt)s for Nova instance '
-                '%(uuid)s',
-                {
-                    'resource': resource_type,
-                    'project': record.get('project') or '<unknown>',
-                    'name': record.get('name') or '<unknown>',
-                    'attempt': attempt['attempt_uuid'],
-                    'uuid': attempt['instance_uuid'],
-                })
-            return False
+    matches = set(inventory.by_name.get(
+        (CONF.incus.project, attempt['instance_name']), ()))
+    matches.update(inventory.by_uuid.get(
+        _idmap_inventory_uuid(attempt['instance_uuid']), ()))
+    matches.update(inventory.by_materialization.get(
+        attempt['attempt_uuid'], ()))
+    for resource_type, project, name in sorted(
+            matches, key=lambda value: tuple(str(item) for item in value)):
+        LOG.critical(
+            'Incus %(resource)s %(project)s/%(name)s still matches '
+            'preflight spawn attempt %(attempt)s for Nova instance '
+            '%(uuid)s',
+            {
+                'resource': resource_type,
+                'project': project or '<unknown>',
+                'name': name or '<unknown>',
+                'attempt': attempt['attempt_uuid'],
+                'uuid': attempt['instance_uuid'],
+            })
+        return False
     return True
 
 
@@ -5543,6 +6474,9 @@ class IncusDriver(driver.ComputeDriver):
                         CONF.incus.idmap_allocator_password_file),
                     allow_insecure=(
                         CONF.incus.idmap_allocator_allow_insecure),
+                    audit_lease_ttl=max(
+                        30,
+                        CONF.incus.idmap_allocator_audit_interval * 3),
                 )
             except incus_idmap.IDMapError as exc:
                 raise exception.InvalidConfiguration(
@@ -5550,13 +6484,11 @@ class IncusDriver(driver.ComputeDriver):
                         exc)) from exc
             try:
                 self.idmap_allocator.initialize()
-                # Do not admit this compute against a partially restored or
-                # otherwise inconsistent registry. Allocation repeats the
-                # audit around its CAS, while startup gives operators an
-                # immediate, fail-closed signal before any workload changes.
-                # Normal operations use exact keys; the compute manager's
-                # low-frequency full audit detects unrelated registry damage.
-                self.idmap_allocator.audit()
+                # Elect one lease-backed fleet auditor. Concurrent compute
+                # starts do not each scan the entire registry; followers are
+                # admitted only after their sensitive paths observe and CAS
+                # against the elected auditor's exact healthy generation.
+                self.idmap_allocator.run_coordinated_audit(full=True)
             except incus_idmap.IDMapBackendError:
                 # Existing running workloads and stop remain available while
                 # etcd is temporarily unavailable. Start, reboot, allocation,
@@ -6732,6 +7664,31 @@ class IncusDriver(driver.ComputeDriver):
             return False
 
         try:
+            release_intent = self.idmap_allocator.get_release_intent(
+                instance.uuid)
+        except Exception:
+            LOG.critical(
+                'Cannot establish whether a shared Incus idmap release is '
+                'coordinating this cleanup; retaining the host claim',
+                instance=instance, exc_info=True)
+            return False
+        if release_intent is not None:
+            if (release_intent.instance_name != instance.name or
+                    not _idmap_generation_matches_metadata(
+                        release_intent, stored)):
+                LOG.critical(
+                    'Shared Incus idmap release intent does not match the '
+                    'local Nova generation; retaining the host claim',
+                    instance=instance)
+                return False
+            # Final Nova deletion is coordinated by IncusComputeManager. It
+            # repeats the exact absence proof after the driver's cleanup and
+            # retires this claim together with the immutable release intent.
+            # Scanning every project here would duplicate that authoritative
+            # proof once per deleted instance.
+            return False
+
+        try:
             with lockutils.lock(
                     _idmap_host_claim_lock_name(instance.uuid), external=True,
                     lock_path=_idmap_host_claim_lock_path()):
@@ -7701,6 +8658,7 @@ class IncusDriver(driver.ComputeDriver):
             'source': ({'type': 'none'} if root_volume else {
                 'type': 'image', 'alias': instance.image_ref}),
         }
+
         def create_container():
             try:
                 return self.client.instances.create(
@@ -7746,12 +8704,20 @@ class IncusDriver(driver.ComputeDriver):
                 # non-root volume before the guest is first started.
                 # (Ephemeral disks are rejected in the preflight; the dead
                 # LVM/ZFS ephemeral module has been removed.)
+                if data_volume_bdms:
+                    with lockutils.lock(_profile_lock_name(instance)):
+                        profile = self.client.profiles.get(instance.name)
+                        _validate_profile_volume_owner(profile, instance)
+                        profile.config[SPAWN_VOLUME_GENERATION_KEY] = (
+                            materialization_id)
+                        profile.save(wait=True)
                 for bdm in data_volume_bdms:
-                    self.attach_volume(
+                    self._attach_and_commit_internal_volume_operation(
                         context, bdm['connection_info'], instance,
-                        bdm['mount_device'], encryption=bdm.get('encrypted'))
+                        bdm['mount_device'], _bdm_attachment_id(bdm),
+                        'spawn', materialization_id, 'materialize',
+                        encryption=bdm.get('encrypted'))
                     attached_data_volumes.append(bdm)
-
             if configdrive.required_by(instance):
                 with self._timed_phase(instance, 'spawn', 'configdrive'):
                     configdrive_path = self._add_configdrive(
@@ -7782,25 +8748,103 @@ class IncusDriver(driver.ComputeDriver):
 
             self.firewall_driver.apply_instance_filter(
                 instance, network_info)
+            if data_volume_bdms:
+                self.finalize_spawn_volume_generation(
+                    instance, materialization_id)
         except Exception:
             with excutils.save_and_reraise_exception():
                 self._fence_failed_spawn(
                     context, instance, network_info, block_device_info,
-                    materialization, attached_data_volumes)
+                    materialization, materialization_id, data_volume_bdms,
+                    attached_data_volumes)
         LOG.info(
             'timing operation=spawn phase=total outcome=ok '
             'duration_ms=%(ms)d',
             {'ms': int(spawn_watch.elapsed() * 1000)}, instance=instance)
 
+    def _rollback_failed_spawn_volume_intents(
+            self, context, instance, materialization_id, data_volume_bdms,
+            attached_data_volumes):
+        """Roll back every exact spawn-generation mapping before deletion."""
+        bdms = {}
+        for bdm in data_volume_bdms:
+            volume_id = _bdm_volume_id(bdm)
+            if volume_id in bdms:
+                raise exception.InvalidVolume(
+                    reason='Failed spawn has duplicate Cinder volume mappings')
+            bdms[volume_id] = bdm
+
+        intents = _managed_attach_intents_by_uuid(instance.uuid)
+        for volume_id, intent in intents.items():
+            if (intent.get('operation_kind') != 'spawn' or
+                    intent.get('operation_token') != materialization_id):
+                raise exception.InvalidVolume(
+                    reason='Failed spawn has a foreign unfinished Cinder '
+                           'transaction')
+            if volume_id not in bdms:
+                raise exception.InvalidVolume(
+                    reason='Failed spawn Cinder intent has no exact Nova BDM')
+
+        attempted_ids = {_bdm_volume_id(bdm) for bdm in attached_data_volumes}
+        volume_ids = set(intents) | attempted_ids
+        for volume_id in sorted(volume_ids):
+            bdm = bdms[volume_id]
+            connection_info = bdm.get('connection_info')
+            mountpoint = bdm.get('mount_device')
+            attachment_id = _bdm_attachment_id(bdm)
+            if (not connection_info or _volume_id(connection_info) != volume_id
+                    or not mountpoint):
+                raise exception.InvalidVolume(
+                    reason='Failed spawn Cinder BDM identity is incomplete')
+            with lockutils.lock(
+                    _volume_manager_transaction_lock_name(
+                        instance.uuid, volume_id),
+                    external=True, lock_path=_volume_operation_lock_path()):
+                intent = self.prepare_managed_volume_attach(
+                    instance, volume_id, attachment_id, mountpoint,
+                    operation_kind='spawn',
+                    operation_token=materialization_id,
+                    operation_direction='materialize')
+                with lockutils.lock(
+                        _volume_topology_lock_name(instance), external=True,
+                        lock_path=_volume_topology_lock_path()):
+                    with lockutils.lock(
+                            _volume_operation_lock_name(volume_id),
+                            external=True,
+                            lock_path=_volume_operation_lock_path()):
+                        current = self.get_managed_volume_attach_intent(
+                            instance, volume_id)
+                        if current != intent:
+                            raise exception.InvalidVolume(
+                                reason='Failed spawn Cinder intent changed '
+                                       'during rollback')
+                        self.validate_internal_volume_attach_owner(
+                            instance, intent)
+                        self.rollback_internal_volume_attach(
+                            context, instance, volume_id, connection_info,
+                            expected_mountpoint=mountpoint)
+                        record = _read_volume_journal(instance, volume_id)
+                        if record is not None:
+                            if record.get('phase') != 'rolled-back':
+                                raise exception.InvalidVolume(
+                                    reason='Failed spawn Cinder rollback did '
+                                           'not reach a terminal phase')
+                            self.finalize_rolled_back_volume_journal(
+                                instance, volume_id)
+                        self.cancel_managed_volume_attach(
+                            instance, volume_id, intent)
+        self.finalize_spawn_volume_generation(instance, materialization_id)
+
     def _fence_failed_spawn(self, context, instance, network_info,
                             block_device_info, materialization,
+                            materialization_id, data_volume_bdms,
                             attached_data_volumes):
         """Fence and roll back a spawn that failed after container creation.
 
         Called from inside ``save_and_reraise_exception``; the original
         spawn failure is always re-raised after this returns.
         """
-        def fence_spawn_container():
+        def stop_spawn_container():
             try:
                 current = self.client.instances.get(instance.name)
             except incus_exceptions.LXDAPIException as exc:
@@ -7809,6 +8853,14 @@ class IncusDriver(driver.ComputeDriver):
                 raise
             if current.status != 'Stopped':
                 current.stop(timeout=-1, force=True, wait=True)
+
+        def delete_spawn_container():
+            try:
+                current = self.client.instances.get(instance.name)
+            except incus_exceptions.LXDAPIException as exc:
+                if _is_incus_not_found(exc):
+                    return
+                raise
             if materialization is None:
                 current.delete(wait=True)
             else:
@@ -7817,8 +8869,8 @@ class IncusDriver(driver.ComputeDriver):
 
         try:
             _retry_incus_instance_action(
-                fence_spawn_container,
-                'failed spawn container fencing',
+                stop_spawn_container,
+                'failed spawn container stop',
                 instance, retry_transient=True)
         except Exception:
             # A still-running or ambiguously deleted workload must
@@ -7830,22 +8882,28 @@ class IncusDriver(driver.ComputeDriver):
                 instance=instance, exc_info=True)
             return
 
-        # Undo only attachments completed by this spawn attempt. A
-        # failed attach owns its own rollback and retains profile
-        # device_info if os-brick cannot be disconnected safely.
-        for bdm in reversed(attached_data_volumes):
-            try:
-                self.detach_volume(
-                    context, bdm['connection_info'], instance,
-                    bdm['mount_device'],
-                    encryption=bdm.get('encrypted'))
-            except Exception:
-                LOG.exception(
-                    'Failed to roll back spawn-time Cinder volume '
-                    '%s; retaining the Incus profile recovery '
-                    'metadata',
-                    _volume_id(bdm['connection_info']),
-                    instance=instance)
+        try:
+            self._rollback_failed_spawn_volume_intents(
+                context, instance, materialization_id, data_volume_bdms,
+                attached_data_volumes)
+        except Exception:
+            LOG.critical(
+                'Failed to roll back the exact spawn-generation Cinder '
+                'transactions; retaining the stopped Incus container',
+                instance=instance, exc_info=True)
+            return
+
+        try:
+            _retry_incus_instance_action(
+                delete_spawn_container,
+                'failed spawn container deletion',
+                instance, retry_transient=True)
+        except Exception:
+            LOG.critical(
+                'Failed to delete the stopped Incus container after its '
+                'spawn-generation Cinder mappings were rolled back',
+                instance=instance, exc_info=True)
+            return
         try:
             self.cleanup(
                 context, instance, network_info, block_device_info)
@@ -8070,6 +9128,32 @@ class IncusDriver(driver.ComputeDriver):
             release_placement=release_placement,
             reasons=tuple(sorted(reasons)))
 
+    def _assert_destroy_volume_transactions_settled(self, instance):
+        if not _prune_orphan_volume_recovery_directory(instance):
+            raise exception.InvalidVolume(
+                reason='Refusing to destroy an Incus instance with '
+                       'unfinished Cinder recovery evidence')
+        try:
+            profile = self.client.profiles.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if _is_incus_not_found(exc):
+                return
+            raise
+        config = profile.config if isinstance(profile.config, dict) else {}
+        cleanup_token = config.get(MIGRATION_CLEANUP_TOKEN_KEY)
+        rollback_token = config.get(MIGRATION_ROLLBACK_COMPLETE_KEY)
+        migration_uuid = config.get(MIGRATION_NOVA_UUID_KEY)
+        if (rollback_token is not None or migration_uuid is not None):
+            if (not uuidutils.is_uuid_like(cleanup_token) or
+                    rollback_token != cleanup_token or
+                    not uuidutils.is_uuid_like(migration_uuid)):
+                raise exception.InvalidVolume(
+                    reason='Incus source rollback volume generation is '
+                           'malformed')
+            raise exception.InvalidVolume(
+                reason='Refusing to destroy an Incus source while its '
+                       'rollback volume generation is not retired')
+
     @_invalidates_instance_inventory
     @_guards_serial_console
     def destroy(self, context, instance, network_info, block_device_info=None,
@@ -8089,6 +9173,15 @@ class IncusDriver(driver.ComputeDriver):
                 instance.name)
             return
 
+        # Removing the container first would destroy the only profile proof
+        # needed to reconcile a committed Cinder attach/detach generation.
+        # Keep the complete guest intact until periodic recovery (or a
+        # migration-specific manager hook) retires every local transaction.
+        with lockutils.lock(
+                _volume_topology_lock_name(instance), external=True,
+                lock_path=_volume_topology_lock_path()):
+            self._assert_destroy_volume_transactions_settled(instance)
+
         failed_build_cleanup = (
             getattr(instance, 'vm_state', None) == vm_states.BUILDING and
             getattr(instance, 'task_state', None) == task_states.SPAWNING)
@@ -8096,10 +9189,23 @@ class IncusDriver(driver.ComputeDriver):
             self._idmap_rootfs_release_context(instance))
 
         def destroy_container(name):
-            _retry_incus_instance_action(
-                lambda: stop_and_delete(name),
-                'stop and delete {}'.format(name),
-                instance, retry_transient=True)
+            if name != instance.name:
+                return _retry_incus_instance_action(
+                    lambda: stop_and_delete(name),
+                    'stop and delete {}'.format(name),
+                    instance, retry_transient=True)
+            # Hold the topology lock through stop/delete, not just the first
+            # preflight.  This closes the interval in which a periodic replay
+            # could otherwise publish new durable volume evidence after the
+            # check but before the container is irreversibly removed.
+            with lockutils.lock(
+                    _volume_topology_lock_name(instance), external=True,
+                    lock_path=_volume_topology_lock_path()):
+                self._assert_destroy_volume_transactions_settled(instance)
+                return _retry_incus_instance_action(
+                    lambda: stop_and_delete(name),
+                    'stop and delete {}'.format(name),
+                    instance, retry_transient=True)
 
         def stop_and_delete(name):
             try:
@@ -8327,11 +9433,21 @@ class IncusDriver(driver.ComputeDriver):
                     instance=instance)
                 continue
             if _profile_has_volume_connection(profile, volume_id):
+                attach_intent = _read_managed_attach_intent(
+                    instance, volume_id)
+                retain_source_release = (
+                    attach_intent is not None and
+                    attach_intent.get('operation_kind') == 'migration' and
+                    attach_intent.get('operation_direction') ==
+                    'live-source-release')
                 attempt(
                     'disconnect Cinder volume %s' % volume_id,
                     lambda connection_info=connection_info,
-                    mountpoint=mountpoint: self.detach_volume(
-                        context, connection_info, instance, mountpoint))
+                    mountpoint=mountpoint,
+                    retain_source_release=retain_source_release:
+                    self._detach_volume(
+                        context, connection_info, instance, mountpoint,
+                        retain_journal=retain_source_release))
 
         # Nova can deliberately omit destination BDMs after a source-side
         # detach attempt. The versioned profile record is therefore the
@@ -8373,6 +9489,16 @@ class IncusDriver(driver.ComputeDriver):
                         exception.InvalidVolume(
                             reason='Incus profile still contains Cinder '
                                    'connection metadata')))
+            elif os.path.lexists(_volume_journal_directory(instance)):
+                retain_profile = True
+                failures.append((
+                    'finish retained Cinder volume transaction',
+                    exception.InvalidVolume(
+                        reason='A durable Cinder attach/detach intent still '
+                               'owns destination cleanup')))
+                LOG.error(
+                    'Retaining Incus profile because a durable Cinder '
+                    'transaction is unfinished', instance=instance)
             elif delete_profile and not failures:
                 attempt('delete Incus profile', profile.delete)
             else:
@@ -8594,6 +9720,57 @@ class IncusDriver(driver.ComputeDriver):
             })
         return sorted(candidates, key=lambda item: item['name'])
 
+    def list_source_volume_generation_recovery_candidates(self):
+        """Return exact source rollback generations awaiting retirement."""
+        candidates = []
+        for profile in self._get_profile_inventory_snapshot():
+            config = profile.get('config')
+            name = profile.get('name')
+            if (not isinstance(config, dict) or
+                    config.get('environment.product_name') !=
+                    'OpenStack Nova' or
+                    not isinstance(name, str) or not name):
+                continue
+            instance_uuid = config.get('user.openstack.uuid')
+            operation_token = config.get(MIGRATION_CLEANUP_TOKEN_KEY)
+            migration_uuid = config.get(MIGRATION_NOVA_UUID_KEY)
+            if (not uuidutils.is_uuid_like(instance_uuid) or
+                    not uuidutils.is_uuid_like(operation_token) or
+                    not uuidutils.is_uuid_like(migration_uuid) or
+                    config.get(MIGRATION_ROLLBACK_COMPLETE_KEY) !=
+                    operation_token):
+                continue
+            candidates.append({
+                'name': name,
+                'uuid': instance_uuid,
+                'operation_token': operation_token,
+                'migration_uuid': migration_uuid,
+            })
+        return sorted(candidates, key=lambda item: item['name'])
+
+    def get_source_volume_generation_recovery_candidate(self, instance):
+        """Read one exact source generation without the inventory cache."""
+        with lockutils.lock(_profile_lock_name(instance)):
+            profile = self.client.profiles.get(instance.name)
+            _validate_profile_volume_owner(profile, instance)
+            config = profile.config if isinstance(profile.config, dict) else {}
+            operation_token = config.get(MIGRATION_CLEANUP_TOKEN_KEY)
+            rollback_token = config.get(MIGRATION_ROLLBACK_COMPLETE_KEY)
+            migration_uuid = config.get(MIGRATION_NOVA_UUID_KEY)
+            if rollback_token is None and migration_uuid is None:
+                return None
+            if (not uuidutils.is_uuid_like(operation_token) or
+                    not uuidutils.is_uuid_like(migration_uuid) or
+                    rollback_token != operation_token):
+                raise exception.MigrationError(
+                    reason='Incus source rollback generation is incomplete')
+            return {
+                'name': instance.name,
+                'uuid': instance.uuid,
+                'operation_token': operation_token,
+                'migration_uuid': migration_uuid,
+            }
+
     def list_destination_prepared_recovery_candidates(self):
         """Return target profiles that survive without their mount journal."""
         profiles = self._get_profile_inventory_snapshot()
@@ -8667,8 +9844,10 @@ class IncusDriver(driver.ComputeDriver):
                 reason='Prepared destination profile owner does not match '
                        'the Nova instance')
         cleanup_token = candidate.get('operation_token')
-        if (getattr(migration, 'uuid', None) != cleanup_token or
-                not uuidutils.is_uuid_like(cleanup_token)):
+        migration_uuid = candidate.get('migration_uuid')
+        if (getattr(migration, 'uuid', None) != migration_uuid or
+                not uuidutils.is_uuid_like(cleanup_token) or
+                not uuidutils.is_uuid_like(migration_uuid)):
             raise exception.MigrationError(
                 reason='Prepared destination profile does not match the '
                        'exact Nova migration')
@@ -8679,7 +9858,8 @@ class IncusDriver(driver.ComputeDriver):
                 profile.config if isinstance(profile.config, dict) else {})
             binding = _destination_prepared_profile_binding(config)
             if any(binding.get(key) != candidate.get(key) for key in (
-                    'uuid', 'operation_token', 'idmap_base', 'idmap_size')):
+                    'uuid', 'operation_token', 'migration_uuid', 'idmap_base',
+                    'idmap_size')):
                 raise exception.MigrationError(
                     reason='Prepared destination profile changed during '
                            'recovery')
@@ -8749,42 +9929,720 @@ class IncusDriver(driver.ComputeDriver):
         return (isinstance(device, dict) and
                 device.get('type') == 'unix-block')
 
-    def recover_volume_journal_candidate(self, context, instance, candidate):
-        """Replay an unfinished disconnect the manager has proven terminal."""
-        if candidate.get('uuid') != instance.uuid:
+    def prepare_managed_volume_detach(
+            self, instance, volume_id, attachment_id, destroy_bdm,
+            mountpoint):
+        """Record that ComputeManager may finish Cinder/BDM cleanup."""
+        return _write_managed_detach_intent(
+            instance, volume_id, attachment_id, destroy_bdm, mountpoint)
+
+    def prepare_managed_volume_attach(
+            self, instance, volume_id, attachment_id, mountpoint,
+            operation_kind='hot-attach', operation_token=None,
+            operation_direction=None, operation_migration_uuid=None,
+            boot_volume=False):
+        return _write_managed_attach_intent(
+            instance, volume_id, attachment_id, mountpoint,
+            operation_kind=operation_kind,
+            operation_token=operation_token,
+            operation_direction=operation_direction,
+            operation_migration_uuid=operation_migration_uuid,
+            boot_volume=boot_volume)
+
+    def get_managed_volume_attach_intent(self, instance, volume_id):
+        return _read_managed_attach_intent(instance, volume_id)
+
+    def get_cold_source_migration_token(self, instance):
+        """Return the exact source-profile generation for a cold migration."""
+        with lockutils.lock(_profile_lock_name(instance)):
+            profile = self.client.profiles.get(instance.name)
+            _validate_profile_volume_owner(profile, instance)
+            config = profile.config if isinstance(profile.config, dict) else {}
+            token = config.get(MIGRATION_CLEANUP_TOKEN_KEY)
+            if (not uuidutils.is_uuid_like(token) or
+                    not config.get(MIGRATION_DESTINATION_KEY) or
+                    not uuidutils.is_uuid_like(
+                        config.get(MIGRATION_OPERATION_KEY))):
+                raise exception.MigrationError(
+                    reason='Incus cold source has no durable migration owner')
+            return token
+
+    def prepare_cold_attachment_rotation(
+            self, instance, volume_id, old_attachment_id, mountpoint,
+            operation_token, migration_uuid, baseline_attachment_ids,
+            boot_volume=False):
+        """Fence a Cinder replacement attachment before its POST request."""
+        payload = {
+            'version': _COLD_ATTACHMENT_ROTATION_VERSION,
+            'instance_uuid': instance.uuid,
+            'instance_name': instance.name,
+            'volume_id': str(volume_id),
+            'mountpoint': mountpoint,
+            'operation_token': operation_token,
+            'migration_uuid': migration_uuid,
+            'old_attachment_id': old_attachment_id,
+            'new_attachment_id': None,
+            'baseline_attachment_ids': sorted(set(
+                str(value) for value in baseline_attachment_ids)),
+            'phase': 'prepared',
+            'boot_volume': bool(boot_volume),
+        }
+        return _write_cold_attachment_rotation(
+            instance, volume_id, payload)
+
+    def get_cold_attachment_rotation(self, instance, volume_id):
+        return _read_cold_attachment_rotation(instance, volume_id)
+
+    def transition_cold_attachment_rotation(
+            self, instance, volume_id, expected, phase,
+            new_attachment_id=None):
+        transitions = {
+            'prepared': 'creating',
+            'creating': 'new-created',
+            'new-created': 'old-deleted',
+            'old-deleted': 'bdm-rotated',
+        }
+        terminal_transitions = {
+            'source-release-complete': {'bdm-rotated'},
+            'source-rollback-complete': {
+                'prepared', 'source-old-retained', 'old-deleted',
+                'bdm-rotated'},
+        }
+        expected_phase = expected.get('phase')
+        if (expected_phase == 'new-created' and
+                phase == 'source-old-retained'):
+            pass
+        elif (transitions.get(expected_phase) != phase and
+                expected_phase not in terminal_transitions.get(phase, set())):
             raise exception.InvalidVolume(
-                reason='Cinder journal candidate is not this instance')
-        records = _volume_journal_records(instance)
-        for volume_id in candidate.get('volume_ids', ()):
-            attachment = records.get(volume_id)
-            if attachment is None:
-                continue
-            if attachment.get('phase') != 'disconnecting':
-                # A 'connecting' journal belongs to the attach path, which
-                # replays it under the caller's own topology lock.
-                continue
-            bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
-                context, instance.uuid)
-            if any(bdm.volume_id == volume_id and not bdm.deleted
-                   for bdm in bdms):
-                LOG.debug(
-                    'Retaining the Cinder journal for %s while Nova still '
-                    'maps it to this instance', volume_id, instance=instance)
-                continue
-            connection_data = attachment.get('connection_data') or {}
-            if not connection_data:
+                reason='Cold attachment rotation transition is invalid')
+        payload = copy.deepcopy(expected)
+        payload['phase'] = phase
+        if phase == 'new-created':
+            if not uuidutils.is_uuid_like(new_attachment_id):
                 raise exception.InvalidVolume(
-                    reason='Cinder journal has no connector data')
-            protocol = attachment.get('driver_volume_type')
-            if not protocol:
+                    reason='Cold attachment rotation has no replacement ID')
+            payload['new_attachment_id'] = str(new_attachment_id)
+        elif (new_attachment_id is not None and
+              new_attachment_id != payload.get('new_attachment_id')):
+            raise exception.InvalidVolume(
+                reason='Cold attachment rotation replacement ID changed')
+        return _write_cold_attachment_rotation(
+            instance, volume_id, payload, expected=expected)[0]
+
+    def cancel_cold_attachment_rotation(
+            self, instance, volume_id, expected):
+        _remove_cold_attachment_rotation(instance, volume_id, expected)
+
+    def validate_internal_volume_attach_owner(self, instance, intent):
+        """Validate durable Incus-side authority for an internal attach."""
+        operation_kind = intent.get('operation_kind')
+        if operation_kind == 'hot-attach':
+            return
+        profile = self.client.profiles.get(instance.name)
+        _validate_profile_volume_owner(profile, instance)
+        config = profile.config if isinstance(profile.config, dict) else {}
+        if operation_kind == 'migration':
+            if config.get(MIGRATION_CLEANUP_TOKEN_KEY) != intent.get(
+                    'operation_token'):
                 raise exception.InvalidVolume(
-                    reason='Cinder journal has no connector protocol')
-            LOG.warning(
-                'Replaying the unfinished Cinder disconnect for volume %s',
-                volume_id, instance=instance)
-            brick_get_connector(protocol).disconnect_volume(
-                connection_data, attachment.get('device_info') or {})
+                    reason='Incus migration profile no longer owns the volume '
+                           'attach generation')
+            return
+
+        if operation_kind == 'spawn' and config.get(
+                SPAWN_VOLUME_GENERATION_KEY) != intent.get('operation_token'):
+            raise exception.InvalidVolume(
+                reason='Incus profile no longer owns the spawn volume '
+                       'generation')
+
+        try:
+            container = self.client.instances.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if operation_kind == 'spawn' and _is_incus_not_found(exc):
+                # Older failed-spawn cleanup could delete the container before
+                # retiring its volume transaction.  The exact profile UUID,
+                # spawn generation, BDM and Cinder attachment remain enough
+                # authority to roll back only this host mapping.
+                return
+            raise
+        if _instance_nova_uuid(container) != instance.uuid:
+            raise exception.InvalidVolume(
+                reason='Incus instance no longer owns the volume attach')
+        if operation_kind == 'reconcile':
+            if intent.get('operation_token') != intent.get('attachment_id'):
+                raise exception.InvalidVolume(
+                    reason='Power reconciliation attachment generation '
+                           'changed')
+            return
+
+        container_config = (
+            container.config if isinstance(container.config, dict) else {})
+        materialization_id = container_config.get(
+            IDMAP_MATERIALIZATION_CONFIG_KEY)
+        if (materialization_id is not None and
+                materialization_id != intent.get('operation_token')):
+            raise exception.InvalidVolume(
+                reason='Incus spawn materialization generation changed')
+        if self.idmap_allocator is not None:
+            host_id = virt_node.read_local_node_uuid()
+            claim = self.idmap_allocator.get_host_claim(
+                instance.uuid, host_id)
+            if (claim is None or claim.materialization_id !=
+                    intent.get('operation_token') or
+                    claim.state != 'committed'):
+                raise exception.InvalidVolume(
+                    reason='Incus spawn volume owner has no exact committed '
+                           'materialization claim')
+
+    def internal_migration_attach_disposition(self, instance, intent):
+        """Return the token-bound target migration attempt disposition."""
+        if (intent.get('operation_kind') != 'migration' or
+                intent.get('operation_direction') not in (
+                    'cold-target', 'live-target')):
+            raise exception.InvalidVolume(
+                reason='Internal volume attach is not a migration target')
+        profile = self.client.profiles.get(instance.name)
+        _validate_profile_volume_owner(profile, instance)
+        config = profile.config if isinstance(profile.config, dict) else {}
+        binding = _destination_prepared_profile_binding(config)
+        if (binding['uuid'] != instance.uuid or
+                binding['operation_token'] != intent.get('operation_token') or
+                binding['migration_uuid'] !=
+                intent.get('operation_migration_uuid')):
+            raise exception.InvalidVolume(
+                reason='Incus migration target volume owner changed')
+        attempt = _get_migration_attempt(
+            self.client, instance, binding['operation_token'],
+            binding['idmap_base'], binding['idmap_size'])
+        if attempt['state'] == 'committed' and attempt.get('finished'):
+            return 'committed'
+        if (attempt['state'] in ('aborted', 'failed') and
+                attempt.get('finished')):
+            return 'aborted'
+        return 'active'
+
+    def cancel_managed_volume_attach(self, instance, volume_id, intent):
+        _remove_managed_attach_intent(instance, volume_id, expected=intent)
+
+    def replace_cold_source_volume_attach_intent(
+            self, instance, volume_id, expected, attachment_id):
+        return _replace_managed_attach_intent(
+            instance, volume_id, expected, attachment_id)
+
+    def resume_internal_volume_attach(
+            self, context, instance, volume_id, connection_info,
+            expected_mountpoint):
+        """Commit an exact internal attach, including intent-only crashes."""
+        record = _read_volume_journal(instance, volume_id)
+        if record is None:
+            self._attach_volume_locked(
+                context, connection_info, instance, expected_mountpoint,
+                retain_journal=True)
+        else:
+            self.resume_connecting_volume_journal(
+                context, instance, volume_id, connection_info,
+                expected_mountpoint=expected_mountpoint)
+        self.confirm_connected_volume_journal(
+            instance, volume_id, connection_info,
+            expected_mountpoint=expected_mountpoint)
+
+    def rollback_internal_volume_attach(
+            self, context, instance, volume_id, connection_info,
+            expected_mountpoint):
+        """Remove only the local mapping owned by an internal attach intent."""
+        record = _read_volume_journal(instance, volume_id)
+        if record is None:
+            profile = self.client.profiles.get(instance.name)
+            _validate_profile_volume_owner(profile, instance)
+            if not _profile_has_volume_connection(profile, volume_id):
+                _validate_profile_volume_slot(
+                    profile, volume_id, expected_mountpoint,
+                    replacing_volume_id=volume_id)
+                return
+            qos_limits = _data_volume_qos(
+                connection_info,
+                self.client.host_info.get('api_extensions', []))
+            if not _profile_volume_attachment_matches(
+                    profile, volume_id, expected_mountpoint, qos_limits,
+                    connection_info):
+                raise exception.InvalidVolume(
+                    reason='Incus migration target volume identity changed '
+                           'before rollback')
+            self._detach_volume_locked(
+                context, connection_info, instance, expected_mountpoint,
+                retain_journal=True)
+        self.rollback_connecting_volume_journal(
+            context, instance, volume_id,
+            connection_info=connection_info,
+            expected_mountpoint=expected_mountpoint)
+
+    def restart_internal_volume_attach(
+            self, context, instance, volume_id, connection_info,
+            expected_mountpoint):
+        """Replace a completed local rollback with the same formal owner."""
+        record = _read_volume_journal(instance, volume_id)
+        phase = record.get('phase') if isinstance(record, dict) else None
+        if phase not in ('disconnecting', 'disconnected', 'rolled-back'):
+            raise exception.InvalidVolume(
+                reason='Internal Cinder attach has no restartable rollback '
+                       'journal')
+        self.rollback_internal_volume_attach(
+            context, instance, volume_id, connection_info,
+            expected_mountpoint=expected_mountpoint)
+        self.finalize_rolled_back_volume_journal(instance, volume_id)
+        # The managed intent remains durable across the interval between
+        # retiring the old rollback record and writing the new connecting
+        # record, so a process death is replayable from exact Cinder/BDM data.
+        self.resume_internal_volume_attach(
+            context, instance, volume_id, connection_info,
+            expected_mountpoint=expected_mountpoint)
+
+    def get_internal_volume_attach_connection_info(
+            self, instance, volume_id, expected_mountpoint):
+        """Return the exact local connection owned by an internal intent.
+
+        Cinder may already have deleted a failed migration target attachment
+        and Nova may have restored the BDM to the source attachment.  The
+        destination journal/profile is therefore the only valid source for
+        the destination host connection that must be rolled back.
+        """
+        record = _read_volume_journal(instance, volume_id)
+        profile = self.client.profiles.get(instance.name)
+        _validate_profile_volume_owner(profile, instance)
+        devices = profile.devices if isinstance(profile.devices, dict) else {}
+        device = devices.get(volume_id)
+        if record is None:
+            if not _profile_has_volume_connection(profile, volume_id):
+                _validate_profile_volume_slot(
+                    profile, volume_id, expected_mountpoint,
+                    replacing_volume_id=volume_id)
+                return None
+            record = _profile_volume_record(
+                profile, volume_id, device=device)
+
+        mountpoint = record.get('mountpoint') or (device or {}).get('path')
+        protocol = record.get('driver_volume_type')
+        connection_data = record.get('connection_data')
+        if (mountpoint != expected_mountpoint or
+                not isinstance(protocol, str) or not protocol or
+                not isinstance(connection_data, dict)):
+            raise exception.InvalidVolume(
+                reason='Internal Cinder attach has incomplete or changed '
+                       'local connection metadata')
+        return {
+            'serial': volume_id,
+            'driver_volume_type': protocol,
+            'data': copy.deepcopy(connection_data),
+        }
+
+    def get_managed_volume_detach_intent(self, instance, volume_id):
+        return _read_managed_detach_intent(instance, volume_id)
+
+    def get_volume_journal_phase(self, instance, volume_id):
+        record = _read_volume_journal(instance, volume_id)
+        return record.get('phase') if record is not None else None
+
+    def get_volume_journal_recovery_phase(self, instance, volume_id):
+        """Re-read the intent owner and journal beneath manager locks."""
+        return _volume_recovery_phase(
+            _read_volume_journal(instance, volume_id),
+            _read_managed_attach_intent(instance, volume_id),
+            _read_managed_detach_intent(instance, volume_id),
+            _read_cold_attachment_rotation(instance, volume_id))
+
+    def cancel_managed_volume_detach(self, instance, volume_id, intent):
+        _remove_managed_detach_intent(instance, volume_id, expected=intent)
+
+    def _recover_disconnecting_volume_journal_locked(
+            self, context, instance, volume_id, connection_info,
+            expected_mountpoint):
+        """Replay host cleanup after manager validates its detach intent."""
+        attachment = _read_volume_journal(instance, volume_id)
+        if attachment is None:
+            return
+        phase = _validate_volume_recovery_record(
+            attachment, volume_id, expected_mountpoint, connection_info)
+        if phase == 'disconnected':
+            return
+        if phase != 'disconnecting':
+            raise exception.InvalidVolume(
+                reason='Cinder volume %s is not in detach recovery' %
+                       volume_id)
+        connection_data = attachment.get('connection_data') or {}
+        if not connection_data:
+            raise exception.InvalidVolume(
+                reason='Cinder journal has no connector data')
+        protocol = attachment.get('driver_volume_type')
+        if not protocol:
+            raise exception.InvalidVolume(
+                reason='Cinder journal has no connector protocol')
+        device_info = attachment.get('device_info') or {}
+        device_path = device_info.get('path')
+        if not isinstance(device_path, str) or not device_path:
+            raise exception.InvalidVolume(
+                reason='Cinder disconnect journal has no device path')
+        device_path = os.path.realpath(device_path)
+        _validate_block_device_path(
+            device_path, 'Recovered os-brick disconnect path')
+
+        # The process can die after journaling intent but before removing guest
+        # access. Persist the exact profile transition before touching os-brick
+        # so manager-side Cinder cleanup can never strand a live guest device.
+        with lockutils.lock(_profile_lock_name(instance)):
+            profile = self.client.profiles.get(instance.name)
+            _validate_profile_volume_owner(profile, instance)
+            device = profile.devices.get(volume_id)
+            if device is not None and (
+                    device.get('type') != 'unix-block' or
+                    device.get('path') != expected_mountpoint or
+                    os.path.realpath(device.get('source', '')) != device_path):
+                raise exception.InvalidVolume(
+                    reason='Incus guest device no longer matches the '
+                           'disconnect journal')
+            profile.devices.pop(volume_id, None)
+            profile.config[_volume_device_info_key(volume_id)] = (
+                _serialize_volume_attachment(
+                    connection_info, device_info, expected_mountpoint,
+                    phase='disconnecting'))
+            profile.config.pop(
+                _legacy_volume_device_info_key(volume_id), None)
+            try:
+                profile.save(wait=True)
+            except Exception:
+                persisted = self.client.profiles.get(instance.name)
+                persisted_device = persisted.devices.get(volume_id)
+                persisted_record = _profile_volume_record(
+                    persisted, volume_id, device=persisted_device)
+                if (persisted_device is not None or
+                        persisted_record.get('phase') != 'disconnecting'):
+                    raise
+                LOG.warning(
+                    'Incus reported a failed recovery profile update for '
+                    'Cinder volume %(volume)s, but guest access is removed '
+                    'and its disconnect journal is persisted',
+                    {'volume': volume_id}, instance=instance)
+        LOG.warning(
+            'Replaying the unfinished Cinder disconnect for volume %s',
+            volume_id, instance=instance)
+        brick_get_connector(protocol).disconnect_volume(
+            connection_data, device_info)
+        _write_volume_journal(
+            instance, volume_id, connection_info,
+            attachment.get('device_info') or {}, expected_mountpoint,
+            phase='disconnected')
+
+    def recover_source_release_volume_journal(
+            self, context, instance, volume_id, expected_mountpoint):
+        """Serialize cleanup replay against manager and periodic recovery."""
+        with lockutils.lock(
+                _volume_manager_transaction_lock_name(
+                    instance.uuid, volume_id),
+                external=True, lock_path=_volume_operation_lock_path()):
+            with lockutils.lock(
+                    _volume_topology_lock_name(instance), external=True,
+                    lock_path=_volume_topology_lock_path()):
+                with lockutils.lock(
+                        _volume_operation_lock_name(volume_id), external=True,
+                        lock_path=_volume_operation_lock_path()):
+                    return self._recover_source_release_volume_journal_locked(
+                        context, instance, volume_id, expected_mountpoint)
+
+    def _recover_source_release_volume_journal_locked(
+            self, context, instance, volume_id, expected_mountpoint):
+        """Finish a migration source disconnect from its local evidence."""
+        attachment = _read_volume_journal(instance, volume_id)
+        if attachment is None:
+            profile = self.client.profiles.get(instance.name)
+            _validate_profile_volume_owner(profile, instance)
+            device = profile.devices.get(volume_id)
+            record = _profile_volume_record(
+                profile, volume_id, device=device)
+            if not record:
+                return
+            connection_info = {
+                'serial': volume_id,
+                'driver_volume_type': record.get('driver_volume_type'),
+                'data': copy.deepcopy(record.get('connection_data') or {}),
+            }
+            if (record.get('mountpoint') != expected_mountpoint or
+                    not connection_info['driver_volume_type']):
+                raise exception.InvalidVolume(
+                    reason='Migration source volume metadata is incomplete')
+            self._detach_volume_locked(
+                context, connection_info, instance, expected_mountpoint,
+                retain_journal=True)
+            return
+        connection_info = {
+            'serial': volume_id,
+            'driver_volume_type': attachment.get('driver_volume_type'),
+            'data': copy.deepcopy(attachment.get('connection_data') or {}),
+        }
+        self._recover_disconnecting_volume_journal_locked(
+            context, instance, volume_id, connection_info,
+            expected_mountpoint)
+
+    def finalize_disconnected_volume_journal(self, instance, volume_id):
+        """Clear host evidence after manager finishes Cinder/BDM cleanup."""
+        record = _read_volume_journal(instance, volume_id)
+        if record is None:
+            return
+        if record.get('phase') != 'disconnected':
+            raise exception.InvalidVolume(
+                reason='Cinder volume %s has a non-disconnected journal' %
+                       volume_id)
+        try:
+            profile = self.client.profiles.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+        else:
+            _validate_profile_volume_owner(profile, instance)
+            if profile.devices.get(volume_id) is not None:
+                raise exception.InvalidVolume(
+                    reason='Incus still exposes disconnected Cinder volume '
+                           '%s' % volume_id)
+            changed = False
+            for metadata_key in _volume_device_info_keys(volume_id):
+                if metadata_key in profile.config:
+                    profile.config.pop(metadata_key, None)
+                    changed = True
+            if changed:
+                profile.save(wait=True)
+        _remove_volume_journal(instance, volume_id)
+
+    def validate_disconnected_volume_state(self, instance, volume_id):
+        """Prove an intent-only terminal detach has no local guest state."""
+        if _read_volume_journal(instance, volume_id) is not None:
+            raise exception.InvalidVolume(
+                reason='Cinder volume still has a host cleanup journal')
+        try:
+            profile = self.client.profiles.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+            return
+        _validate_profile_volume_owner(profile, instance)
+        if _profile_has_volume_connection(profile, volume_id):
+            raise exception.InvalidVolume(
+                reason='Incus still references terminally detached Cinder '
+                       'volume %s' % volume_id)
+
+    def resume_connecting_volume_journal(
+            self, context, instance, volume_id, connection_info,
+            expected_mountpoint=None):
+        """Finish guest-side attach while retaining the commit journal.
+
+        Cinder still reports the attachment as ``attaching`` when this is
+        called.  The journal must therefore survive the Incus profile commit:
+        the manager still has to persist the Nova BDM and call Cinder's
+        attachment-complete API.  A compute crash at either point re-enters
+        this method idempotently instead of leaking an os-brick mapping.
+        """
+        record = _read_volume_journal(instance, volume_id)
+        if record is None:
+            raise exception.InvalidVolume(
+                reason='Cinder connecting journal disappeared during recovery')
+        phase = _validate_volume_recovery_record(
+            record, volume_id, record.get('mountpoint'), connection_info)
+        if phase not in ('connecting', 'connected'):
+            raise exception.InvalidVolume(
+                reason='Cinder volume %s is not in attach recovery' %
+                       volume_id)
+        if (expected_mountpoint is not None and
+                record.get('mountpoint') != expected_mountpoint):
+            raise exception.InvalidVolume(
+                reason='Nova BDM target for volume %s does not match the '
+                       'connecting journal' % volume_id)
+
+        # The compute manager holds instance-topology then per-volume locks
+        # across Cinder/BDM commit. Do not reacquire the non-reentrant volume
+        # lock here.
+        self._attach_volume_locked(
+            context, connection_info, instance, record['mountpoint'],
+            retain_journal=True)
+        committed = _read_volume_journal(instance, volume_id)
+        if committed is None or committed.get('phase') != 'connected':
+            raise exception.InvalidVolume(
+                reason='Cinder volume %s did not reach the local connected '
+                       'recovery phase' % volume_id)
+        return record['mountpoint']
+
+    def confirm_connected_volume_journal(
+            self, instance, volume_id, connection_info,
+            expected_mountpoint=None):
+        """Remove a journal only after Cinder and Incus agree on attach."""
+        record = _read_volume_journal(instance, volume_id)
+        if record is None:
+            # A manager can commit the host journal and then fail to fsync
+            # removal of its exact attach intent. The formally attached BDM
+            # still needs a full Incus profile proof before that last intent
+            # is retired, even though no journal remains to validate.
+            if expected_mountpoint is None:
+                return
+            mountpoint = expected_mountpoint
+        else:
+            mountpoint = record.get('mountpoint')
+            phase = _validate_volume_recovery_record(
+                record, volume_id, mountpoint, connection_info)
+            if phase != 'connected':
+                raise exception.InvalidVolume(
+                    reason='Cinder reports volume %s attached while its '
+                           'local journal is still %s' % (volume_id, phase))
+            if (expected_mountpoint is not None and
+                    mountpoint != expected_mountpoint):
+                raise exception.InvalidVolume(
+                    reason='Nova BDM target for volume %s does not match the '
+                           'connected journal' % volume_id)
+
+        profile = self.client.profiles.get(instance.name)
+        _validate_profile_volume_owner(profile, instance)
+        qos_limits = _data_volume_qos(
+            connection_info,
+            self.client.host_info.get('api_extensions', []))
+        if not _profile_volume_attachment_matches(
+                profile, volume_id, mountpoint, qos_limits,
+                connection_info):
+            raise exception.InvalidVolume(
+                reason='Cinder reports volume %s attached but Incus has no '
+                       'matching guest device' % volume_id)
+        if record is not None:
             _remove_volume_journal(instance, volume_id)
+
+    def rollback_connecting_volume_journal(
+            self, context, instance, volume_id, connection_info=None,
+            expected_mountpoint=None):
+        """Remove host ownership and persist a monotonic rollback commit.
+
+        ``connecting`` may repeat the exact connector request to recover its
+        cleanup handle. A failed attach can also have entered the ordinary
+        detach path; its ``disconnecting``/``disconnected`` journal remains
+        owned by the same managed attach intent and is normalized here. After
+        disconnect succeeds the journal atomically advances to
+        ``rolled-back``. Replaying that phase never calls os-brick again; the
+        manager only finishes Cinder/BDM bookkeeping and removes the journal.
+        """
+        record = _read_volume_journal(instance, volume_id)
+        if record is None:
+            return
+        mountpoint = record.get('mountpoint')
+        if (expected_mountpoint is not None and
+                mountpoint != expected_mountpoint):
+            raise exception.InvalidVolume(
+                reason='Nova BDM target for volume %s does not match the '
+                       'rollback journal' % volume_id)
+        phase = record.get('phase')
+        if phase == 'rolled-back':
+            # Host ownership was already removed and Cinder may have exposed
+            # the volume to a new attachment. Never reconnect or disconnect
+            # it again; only manager-side Cinder/BDM finalization remains.
+            return
+        if phase not in (
+                'connecting', 'connected', 'disconnecting', 'disconnected'):
+            raise exception.InvalidVolume(
+                reason='Cinder volume %s is not in attach rollback' %
+                       volume_id)
+        stored_data = dict(record.get('connection_data') or {})
+        effective = copy.deepcopy(connection_info or {})
+        effective_data = stored_data
+        effective_data.update(effective.get('data') or {})
+        effective.update({
+            'serial': volume_id,
+            'driver_volume_type': (
+                effective.get('driver_volume_type') or
+                record.get('driver_volume_type')),
+            'data': effective_data,
+        })
+        _validate_recoverable_data_volume(effective, volume_id)
+        _validate_volume_recovery_record(
+            record, volume_id, mountpoint, effective)
+
+        # attach_volume() uses the normal detach implementation to undo a
+        # failed host connect. A crash in that cleanup therefore leaves a
+        # disconnecting/disconnected journal owned by the original managed
+        # attach intent, not by a Nova detach request. Finish only that local
+        # cleanup here, then convert its commit marker into the attach
+        # rollback phase used for exact Cinder/BDM finalization.
+        if phase == 'disconnecting':
+            self._recover_disconnecting_volume_journal_locked(
+                context, instance, volume_id, effective,
+                expected_mountpoint=mountpoint)
+            record = _read_volume_journal(instance, volume_id)
+            if record is None or record.get('phase') != 'disconnected':
+                raise exception.InvalidVolume(
+                    reason='Failed attach cleanup did not reach the local '
+                           'disconnected phase')
+            phase = 'disconnected'
+        if phase == 'disconnected':
+            _write_volume_journal(
+                instance, volume_id, effective,
+                record.get('device_info') or {}, mountpoint,
+                phase='rolled-back')
+            return
+
+        protocol = effective['driver_volume_type']
+        connector = brick_get_connector(protocol)
+        device_info = record.get('device_info') or {}
+        if not device_info.get('path'):
+            device_info = connector.connect_volume(effective_data)
+        if (not isinstance(device_info, dict) or
+                not device_info.get('path')):
+            raise exception.InvalidVolume(
+                reason='os-brick could not recover device information for '
+                       'unfinished Cinder volume %s' % volume_id)
+        device_path = os.path.realpath(device_info['path'])
+        _validate_block_device_path(
+            device_path, 'Recovered os-brick connector path')
+
+        try:
+            profile = self.client.profiles.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+            profile = None
+        if profile is not None:
+            _validate_profile_volume_owner(profile, instance)
+            device = profile.devices.get(volume_id)
+            if device is not None and (
+                    device.get('type') != 'unix-block' or
+                    device.get('path') != mountpoint or
+                    os.path.realpath(device.get('source', '')) != device_path):
+                raise exception.InvalidVolume(
+                    reason='Refusing to roll back a Cinder attach whose Incus '
+                           'device identity changed')
+            profile.devices.pop(volume_id, None)
+            for metadata_key in _volume_device_info_keys(volume_id):
+                profile.config.pop(metadata_key, None)
+            profile.save(wait=True)
+
+        connector.disconnect_volume(effective_data, device_info)
+        # Persist the host-side commit point before Cinder can release the
+        # attachment. A replay of this phase performs external bookkeeping
+        # only and therefore cannot disconnect a later owner on this host.
+        _write_volume_journal(
+            instance, volume_id, effective, device_info, mountpoint,
+            phase='rolled-back')
+
+    def finalize_rolled_back_volume_journal(self, instance, volume_id):
+        """Clear rollback evidence after Cinder and Nova records are gone."""
+        record = _read_volume_journal(instance, volume_id)
+        if record is None:
+            return
+        if record.get('phase') != 'rolled-back':
+            raise exception.InvalidVolume(
+                reason='Cinder volume %s has a non-rollback journal' %
+                       volume_id)
+        try:
+            profile = self.client.profiles.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+        else:
+            if _profile_has_volume_connection(profile, volume_id):
+                raise exception.InvalidVolume(
+                    reason='Incus still references rolled-back Cinder volume '
+                           '%s' % volume_id)
+        _remove_volume_journal(instance, volume_id)
 
     def list_volume_journal_recovery_candidates(self):
         """Return unfinished volume journals for manager-side validation.
@@ -8807,11 +10665,26 @@ class IncusDriver(driver.ComputeDriver):
             if not uuidutils.is_uuid_like(instance_uuid):
                 continue
             records = _volume_journal_records_by_uuid(instance_uuid)
-            if not records:
+            attach_intents = _managed_attach_intents_by_uuid(instance_uuid)
+            detach_intents = _managed_detach_intents_by_uuid(instance_uuid)
+            rotations = _cold_attachment_rotations_by_uuid(instance_uuid)
+            volume_ids = (
+                set(records) | set(attach_intents) | set(detach_intents) |
+                set(rotations))
+            if not volume_ids:
                 continue
+
             candidates.append({
                 'uuid': instance_uuid,
-                'volume_ids': sorted(records),
+                'volume_ids': sorted(volume_ids),
+                'phases': {
+                    volume_id: _volume_recovery_phase(
+                        records.get(volume_id),
+                        attach_intents.get(volume_id),
+                        detach_intents.get(volume_id),
+                        rotations.get(volume_id))
+                    for volume_id in volume_ids
+                },
             })
         return candidates
 
@@ -9173,6 +11046,15 @@ class IncusDriver(driver.ComputeDriver):
             _bdm_volume_id(bdm): bdm for bdm in data_volume_bdms
         }
 
+        def attach_desired_volume(bdm):
+            connection_info = bdm['connection_info']
+            mountpoint = bdm['mount_device']
+            attachment_id = _bdm_attachment_id(bdm)
+            self._attach_and_commit_internal_volume_operation(
+                context, connection_info, instance, mountpoint,
+                attachment_id, 'reconcile', attachment_id,
+                'power-reconcile')
+
         container = self.client.instances.get(instance.name)
         profile = self.client.profiles.get(instance.name)
         journals = _volume_journal_records(instance)
@@ -9211,12 +11093,10 @@ class IncusDriver(driver.ComputeDriver):
                     self.client.host_info.get('api_extensions', []))
 
                 if volume_id in journals:
-                    self.attach_volume(
-                        context, connection_info, instance, mountpoint)
+                    attach_desired_volume(bdm)
                     continue
                 if not _profile_has_volume_connection(profile, volume_id):
-                    self.attach_volume(
-                        context, connection_info, instance, mountpoint)
+                    attach_desired_volume(bdm)
                     continue
                 try:
                     _profile_volume_attachment_matches(
@@ -9231,8 +11111,7 @@ class IncusDriver(driver.ComputeDriver):
                         context, instance, volume_id,
                         connection_info=connection_info,
                         mountpoint=mountpoint)
-                    self.attach_volume(
-                        context, connection_info, instance, mountpoint)
+                    attach_desired_volume(bdm)
 
         profile = self.client.profiles.get(instance.name)
         journals = _volume_journal_records(instance)
@@ -9489,50 +11368,439 @@ class IncusDriver(driver.ComputeDriver):
     @_invalidates_instance_inventory
     def attach_volume(self, context, connection_info, instance, mountpoint,
                       disk_bus=None, device_type=None, encryption=None):
+        # The Nova hot-attach path completes its BDM and Cinder attachment
+        # only after this method returns.  Keep the connected journal across
+        # that gap; IncusComputeManager removes it after attachment_complete.
+        return self._attach_volume(
+            context, connection_info, instance, mountpoint,
+            disk_bus=disk_bus, device_type=device_type,
+            encryption=encryption, retain_journal=True)
+
+    def _attach_volume(
+            self, context, connection_info, instance, mountpoint,
+            disk_bus=None, device_type=None, encryption=None,
+            retain_journal=False):
+        """Attach a volume without extending Nova's public driver contract."""
+        volume_id = _volume_id(connection_info)
         with lockutils.lock(
                 _volume_topology_lock_name(instance), external=True,
                 lock_path=_volume_topology_lock_path()):
-            return self._attach_volume_locked(
-                context, connection_info, instance, mountpoint,
-                disk_bus=disk_bus, device_type=device_type,
-                encryption=encryption)
+            with lockutils.lock(
+                    _volume_operation_lock_name(volume_id), external=True,
+                    lock_path=_volume_operation_lock_path()):
+                return self._attach_volume_locked(
+                    context, connection_info, instance, mountpoint,
+                    disk_bus=disk_bus, device_type=device_type,
+                    encryption=encryption, retain_journal=retain_journal)
+
+    def _attach_volume_for_operation(
+            self, context, connection_info, instance, mountpoint,
+            attachment_id, operation_kind, operation_token,
+            operation_direction, operation_migration_uuid=None,
+            encryption=None, allow_missing_instance=False,
+            expected_migration_token=None, require_missing_instance=False,
+            commit_immediately=False):
+        """Attach under a durable non-hot-attach operation generation."""
+        volume_id = _volume_id(connection_info)
+        if expected_migration_token is not None:
+            with lockutils.lock(_profile_lock_name(instance)):
+                profile = self.client.profiles.get(instance.name)
+                _validate_profile_volume_owner(profile, instance)
+                config = (
+                    profile.config if isinstance(profile.config, dict) else {})
+                if (config.get(MIGRATION_CLEANUP_TOKEN_KEY) !=
+                        expected_migration_token or profile.used_by):
+                    raise exception.MigrationError(
+                        reason='Incus migration volume staging profile '
+                               'changed '
+                               'before durable attachment intent creation')
+        with lockutils.lock(
+                _volume_manager_transaction_lock_name(
+                    instance.uuid, volume_id),
+                external=True, lock_path=_volume_operation_lock_path()):
+            intent = self.prepare_managed_volume_attach(
+                instance, volume_id, attachment_id, mountpoint,
+                operation_kind=operation_kind,
+                operation_token=operation_token,
+                operation_direction=operation_direction,
+                operation_migration_uuid=operation_migration_uuid)
+            with lockutils.lock(
+                    _volume_topology_lock_name(instance), external=True,
+                    lock_path=_volume_topology_lock_path()):
+                with lockutils.lock(
+                        _volume_operation_lock_name(volume_id), external=True,
+                        lock_path=_volume_operation_lock_path()):
+                    self._attach_volume_locked(
+                        context, connection_info, instance, mountpoint,
+                        encryption=encryption,
+                        allow_missing_instance=allow_missing_instance,
+                        expected_migration_token=expected_migration_token,
+                        require_missing_instance=require_missing_instance,
+                        retain_journal=True)
+                    if commit_immediately:
+                        try:
+                            self.confirm_connected_volume_journal(
+                                instance, volume_id, connection_info,
+                                expected_mountpoint=mountpoint)
+                            self.cancel_managed_volume_attach(
+                                instance, volume_id, intent)
+                        except OSError:
+                            # unlink() can succeed before its directory fsync
+                            # fails. Re-publish the exact generation so the
+                            # caller cannot mistake an absent file for durable
+                            # retirement and clear the profile owner token.
+                            # Failure to restore that fence is not harmless:
+                            # fail while the container/profile still exist.
+                            recovered = self.prepare_managed_volume_attach(
+                                instance, volume_id, attachment_id, mountpoint,
+                                operation_kind=operation_kind,
+                                operation_token=operation_token,
+                                operation_direction=operation_direction,
+                                operation_migration_uuid=(
+                                    operation_migration_uuid))
+                            if recovered != intent:
+                                raise exception.InvalidVolume(
+                                    reason='Internal Cinder recovery intent '
+                                           'changed after an fsync failure')
+                            LOG.critical(
+                                'Internal Cinder volume %s committed but its '
+                                'local recovery evidence could not be retired',
+                                volume_id, instance=instance, exc_info=True)
+            # The caller's Nova operation commits after this driver call.
+            # Keep the connected journal and exact intent through that gap;
+            # either the caller or periodic recovery retires them once the
+            # owning Nova/Cinder transaction is durably authoritative.
+            return intent
+
+    def _commit_internal_volume_attach_operation(
+            self, instance, volume_id, connection_info, mountpoint, intent):
+        with lockutils.lock(
+                _volume_manager_transaction_lock_name(
+                    instance.uuid, volume_id),
+                external=True, lock_path=_volume_operation_lock_path()):
+            current = self.get_managed_volume_attach_intent(
+                instance, volume_id)
+            if current != intent:
+                raise exception.InvalidVolume(
+                    reason='Internal Cinder recovery intent changed before '
+                           'durable retirement')
+            with lockutils.lock(
+                    _volume_topology_lock_name(instance), external=True,
+                    lock_path=_volume_topology_lock_path()):
+                with lockutils.lock(
+                        _volume_operation_lock_name(volume_id), external=True,
+                        lock_path=_volume_operation_lock_path()):
+                    try:
+                        self.confirm_connected_volume_journal(
+                            instance, volume_id, connection_info,
+                            expected_mountpoint=mountpoint)
+                        self.cancel_managed_volume_attach(
+                            instance, volume_id, intent)
+                    except OSError:
+                        recovered = self.prepare_managed_volume_attach(
+                            instance, volume_id, intent['attachment_id'],
+                            mountpoint,
+                            operation_kind=intent['operation_kind'],
+                            operation_token=intent['operation_token'],
+                            operation_direction=(
+                                intent['operation_direction']),
+                            operation_migration_uuid=(
+                                intent.get('operation_migration_uuid')))
+                        if recovered != intent:
+                            raise exception.InvalidVolume(
+                                reason='Internal Cinder recovery intent '
+                                       'changed after an fsync failure')
+                        LOG.critical(
+                            'Internal Cinder volume %s is locally restored '
+                            'but its recovery evidence could not be retired',
+                            volume_id, instance=instance, exc_info=True)
+                        return False
+        return True
+
+    def _attach_and_commit_internal_volume_operation(
+            self, context, connection_info, instance, mountpoint,
+            attachment_id, operation_kind, operation_token,
+            operation_direction, operation_migration_uuid=None,
+            encryption=None):
+        intent = self._attach_volume_for_operation(
+            context, connection_info, instance, mountpoint, attachment_id,
+            operation_kind, operation_token, operation_direction,
+            operation_migration_uuid=operation_migration_uuid,
+            encryption=encryption, commit_immediately=True)
+        return intent
+
+    def finalize_spawn_volume_generation(self, instance, generation):
+        """Clear the spawn owner only after all of its intents are retired."""
+        intents = _managed_attach_intents_by_uuid(instance.uuid)
+        if any(
+                intent.get('operation_kind') == 'spawn' and
+                intent.get('operation_token') == generation
+                for intent in intents.values()):
+            return False
+        with lockutils.lock(_profile_lock_name(instance)):
+            profile = self.client.profiles.get(instance.name)
+            _validate_profile_volume_owner(profile, instance)
+            current = profile.config.get(SPAWN_VOLUME_GENERATION_KEY)
+            if current is None:
+                return True
+            if current != generation:
+                raise exception.InvalidVolume(
+                    reason='Incus spawn volume generation changed before '
+                           'retirement')
+            profile.config.pop(SPAWN_VOLUME_GENERATION_KEY)
+            profile.save(wait=True)
+        return True
+
+    def finalize_source_volume_generation(
+            self, instance, operation_token, require_rollback_complete=False):
+        """Retire a source rollback token after all volume intents are gone."""
+        intents = _managed_attach_intents_by_uuid(instance.uuid)
+        rotations = _cold_attachment_rotations_by_uuid(instance.uuid)
+        if any(
+                intent.get('operation_kind') == 'migration' and
+                intent.get('operation_token') == operation_token
+                for intent in intents.values()):
+            return False
+        if any(
+                rotation.get('operation_token') == operation_token
+                for rotation in rotations.values()):
+            return False
+        with lockutils.lock(_profile_lock_name(instance)):
+            profile = self.client.profiles.get(instance.name)
+            _validate_profile_volume_owner(profile, instance)
+            config = profile.config if isinstance(profile.config, dict) else {}
+            current = config.get(MIGRATION_CLEANUP_TOKEN_KEY)
+            if current is None:
+                if (config.get(MIGRATION_ROLLBACK_COMPLETE_KEY) is None and
+                        config.get(MIGRATION_NOVA_UUID_KEY) is None):
+                    return True
+                raise exception.MigrationError(
+                    reason='Incus source rollback marker has no owner token')
+            if current != operation_token:
+                raise exception.MigrationError(
+                    reason='Incus source volume generation owner changed')
+            if (require_rollback_complete and
+                    config.get(MIGRATION_ROLLBACK_COMPLETE_KEY) !=
+                    operation_token):
+                raise exception.MigrationError(
+                    reason='Incus source rollback is not durably complete')
+            # Re-read while holding the profile lock. Intent writers also
+            # require this profile generation to remain unchanged, so a new
+            # same-token transaction cannot be valid after token retirement.
+            intents = _managed_attach_intents_by_uuid(instance.uuid)
+            rotations = _cold_attachment_rotations_by_uuid(instance.uuid)
+            if any(
+                    intent.get('operation_kind') == 'migration' and
+                    intent.get('operation_token') == operation_token
+                    for intent in intents.values()):
+                return False
+            if any(
+                    rotation.get('operation_token') == operation_token
+                    for rotation in rotations.values()):
+                return False
+            config.pop(MIGRATION_CLEANUP_TOKEN_KEY, None)
+            config.pop(MIGRATION_ROLLBACK_COMPLETE_KEY, None)
+            config.pop(MIGRATION_NOVA_UUID_KEY, None)
+            config.pop(MIGRATION_DESTINATION_KEY, None)
+            config.pop(MIGRATION_OPERATION_KEY, None)
+            profile.config = config
+            profile.save(wait=True)
+        return True
+
+    def mark_source_volume_generation_rollback_complete(
+            self, instance, operation_token, migration_uuid):
+        """Persist the exact source owner before retiring volume evidence."""
+        if (not uuidutils.is_uuid_like(operation_token) or
+                not uuidutils.is_uuid_like(migration_uuid)):
+            raise exception.MigrationError(
+                reason='Incus source rollback generation is invalid')
+        with lockutils.lock(_profile_lock_name(instance)):
+            profile = self.client.profiles.get(instance.name)
+            _validate_profile_volume_owner(profile, instance)
+            config = profile.config if isinstance(profile.config, dict) else {}
+            if config.get(MIGRATION_CLEANUP_TOKEN_KEY) != operation_token:
+                raise exception.MigrationError(
+                    reason='Incus source rollback generation owner changed')
+            existing_token = config.get(MIGRATION_ROLLBACK_COMPLETE_KEY)
+            existing_migration = config.get(MIGRATION_NOVA_UUID_KEY)
+            if existing_token not in (None, operation_token):
+                raise exception.MigrationError(
+                    reason='Incus source rollback marker changed')
+            if existing_migration not in (None, migration_uuid):
+                raise exception.MigrationError(
+                    reason='Incus source rollback Nova migration changed')
+            config[MIGRATION_ROLLBACK_COMPLETE_KEY] = operation_token
+            config[MIGRATION_NOVA_UUID_KEY] = migration_uuid
+            profile.config = config
+            profile.save(wait=True)
+        return True
+
+    def fence_failed_cold_source_volume_generation(
+            self, instance, operation_token):
+        """Prove the target non-committed before restoring source I/O."""
+        with lockutils.lock(_profile_lock_name(instance)):
+            profile = self.client.profiles.get(instance.name)
+            _validate_profile_volume_owner(profile, instance)
+            config = profile.config if isinstance(profile.config, dict) else {}
+            if config.get(MIGRATION_CLEANUP_TOKEN_KEY) != operation_token:
+                raise exception.MigrationError(
+                    reason='Failed cold source generation owner changed')
+            destination_address = config.get(MIGRATION_DESTINATION_KEY)
+            operation_id = config.get(MIGRATION_OPERATION_KEY)
+        if not destination_address:
+            raise exception.MigrationError(
+                reason='Failed cold source generation has no destination')
+        container = self.client.instances.get(instance.name)
+        idmap_base, idmap_size = _instance_migration_idmap(
+            container, profile)
+        remote = _migration_client(destination_address)
+        attempt_absent = False
+        try:
+            attempt = _get_migration_attempt(
+                remote, instance, operation_token, idmap_base, idmap_size)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+            attempt_absent = True
+            attempt = None
+            for collection in (remote.instances, remote.profiles):
+                try:
+                    collection.get(instance.name)
+                except incus_exceptions.LXDAPIException as resource_exc:
+                    if not _is_incus_not_found(resource_exc):
+                        raise
+                else:
+                    raise exception.MigrationError(
+                        reason='Failed cold target resources exist without '
+                               'their exact migration attempt')
+        if not attempt_absent:
+            if attempt['state'] == 'active':
+                attempt = _abort_migration_attempt(
+                    remote, instance, operation_token, idmap_base, idmap_size,
+                    target_cleanup=lambda: _retry_migration_finish_action(
+                        lambda: self._delete_migration_target_with_idmap(
+                            remote, instance),
+                        'failed cold migration target deletion', instance))
+            elif attempt['state'] in ('aborted', 'failed'):
+                attempt = _wait_migration_attempt_finished(
+                    remote, instance, operation_token, idmap_base, idmap_size,
+                    ('aborted', 'failed'))
+            if attempt['state'] == 'committed':
+                raise exception.MigrationError(
+                    reason='Failed cold source restore lost ownership to a '
+                           'committed target')
+            if attempt['state'] not in ('aborted', 'failed'):
+                raise exception.MigrationError(
+                    reason='Failed cold source target is not durably fenced')
+        _settle_instance_migration_operations(
+            self.client, instance, operation_ids=(operation_id,))
+        if not attempt_absent:
+            _retire_migration_attempt(
+                remote, instance, operation_token, idmap_base, idmap_size)
+        return True
+
+    def restore_failed_cold_source_storage_ownership(
+            self, instance, operation_token):
+        """Fence the target and restore the exact source root ownership."""
+        self.fence_failed_cold_source_volume_generation(
+            instance, operation_token)
+        with lockutils.lock(_profile_lock_name(instance)):
+            profile = self.client.profiles.get(instance.name)
+            _validate_profile_volume_owner(profile, instance)
+            config = profile.config if isinstance(profile.config, dict) else {}
+            if (config.get(MIGRATION_CLEANUP_TOKEN_KEY) != operation_token or
+                    config.get(MIGRATION_ROLLBACK_COMPLETE_KEY) !=
+                    operation_token):
+                raise exception.MigrationError(
+                    reason='Failed cold source storage owner changed')
+        return _retry_migration_finish_action(
+            lambda: _restore_source_storage_ownership(self.client, instance),
+            'failed cold source storage ownership restore', instance)
+
+    def finalize_failed_cold_source_volume_generation(
+            self, instance, operation_token):
+        """Fence a failed cold target before retiring source volume state."""
+        intents = _managed_attach_intents_by_uuid(instance.uuid)
+        rotations = _cold_attachment_rotations_by_uuid(instance.uuid)
+        if any(
+                intent.get('operation_kind') == 'migration' and
+                intent.get('operation_token') == operation_token
+                for intent in intents.values()):
+            return False
+        if any(
+                rotation.get('operation_token') == operation_token
+                for rotation in rotations.values()):
+            return False
+        self.fence_failed_cold_source_volume_generation(
+            instance, operation_token)
+        return self.finalize_source_volume_generation(
+            instance, operation_token, require_rollback_complete=True)
+
+    def finalize_remote_source_volume_generation(
+            self, instance, operation_token):
+        """Retire a reverted source only after remote cleanup is settled."""
+        intents = _managed_attach_intents_by_uuid(instance.uuid)
+        rotations = _cold_attachment_rotations_by_uuid(instance.uuid)
+        if any(
+                intent.get('operation_kind') == 'migration' and
+                intent.get('operation_token') == operation_token
+                for intent in intents.values()):
+            return False
+        if any(
+                rotation.get('operation_token') == operation_token
+                for rotation in rotations.values()):
+            return False
+        with lockutils.lock(_profile_lock_name(instance)):
+            profile = self.client.profiles.get(instance.name)
+            _validate_profile_volume_owner(profile, instance)
+            config = profile.config if isinstance(profile.config, dict) else {}
+            if (config.get(MIGRATION_CLEANUP_TOKEN_KEY) != operation_token or
+                    config.get(MIGRATION_ROLLBACK_COMPLETE_KEY) !=
+                    operation_token or
+                    not uuidutils.is_uuid_like(
+                        config.get(MIGRATION_NOVA_UUID_KEY))):
+                raise exception.MigrationError(
+                    reason='Reverted source generation owner changed')
+            destination_address = config.get(MIGRATION_DESTINATION_KEY)
+            if not destination_address:
+                raise exception.MigrationError(
+                    reason='Reverted source generation has no destination')
+            idmap_base, idmap_size = _instance_migration_idmap(None, profile)
+
+        remote = _migration_client(destination_address)
+        try:
+            acknowledgement = remote.profiles.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+        else:
+            self._validate_remote_cleanup_acknowledgement(
+                acknowledgement, instance, operation_token,
+                idmap_base, idmap_size)
+            acknowledgement.delete()
+        _retire_migration_attempt(
+            remote, instance, operation_token, idmap_base, idmap_size)
+        return self.finalize_source_volume_generation(
+            instance, operation_token, require_rollback_complete=True)
 
     def _stage_volume_for_live_migration(
             self, context, connection_info, instance, mountpoint,
-            cleanup_token):
+            attachment_id, cleanup_token, migration_uuid):
         """Connect a target volume before the migrated instance exists."""
-        with lockutils.lock(
-                _volume_topology_lock_name(instance), external=True,
-                lock_path=_volume_topology_lock_path()):
-            try:
-                self.client.instances.get(instance.name)
-            except incus_exceptions.LXDAPIException as exc:
-                if not _is_incus_not_found(exc):
-                    raise
-            else:
-                raise exception.DestinationDiskExists(path=instance.name)
-
-            profile = self.client.profiles.get(instance.name)
-            config = (
-                profile.config if isinstance(profile.config, dict) else {})
-            if (config.get('environment.product_name') != 'OpenStack Nova' or
-                    config.get('user.openstack.uuid') != instance.uuid or
-                    config.get(MIGRATION_CLEANUP_TOKEN_KEY) != cleanup_token or
-                    profile.used_by):
-                raise exception.MigrationError(
-                    reason='Refusing to stage a Cinder volume on an '
-                           'unverified Incus migration profile')
-
-            return self._attach_volume_locked(
-                context, connection_info, instance, mountpoint,
-                allow_missing_instance=True,
-                expected_migration_token=cleanup_token)
+        return self._attach_volume_for_operation(
+            context, connection_info, instance, mountpoint,
+            attachment_id, 'migration', cleanup_token, 'live-target',
+            operation_migration_uuid=migration_uuid,
+            allow_missing_instance=True,
+            expected_migration_token=cleanup_token,
+            require_missing_instance=True)
 
     def _attach_volume_locked(
             self, context, connection_info, instance, mountpoint,
             disk_bus=None, device_type=None, encryption=None,
             allow_missing_instance=False,
-            expected_migration_token=None):
+            expected_migration_token=None, retain_journal=False,
+            require_missing_instance=False):
         """Attach block device to a nova instance.
 
         Attaching a block device to a container requires a couple of steps.
@@ -9569,6 +11837,8 @@ class IncusDriver(driver.ComputeDriver):
             if not allow_missing_instance or not _is_incus_not_found(exc):
                 raise
             container = None
+        if require_missing_instance and container is not None:
+            raise exception.DestinationDiskExists(path=instance.name)
         if container is not None and container.status == 'Running':
             for binary in flavor.data_volume_fuse_binaries():
                 result = container.execute(['which', binary])
@@ -9615,7 +11885,8 @@ class IncusDriver(driver.ComputeDriver):
                         _profile_volume_attachment_matches(
                             profile, volume_id, mountpoint, qos_limits,
                             connection_info)):
-                    _remove_volume_journal(instance, volume_id)
+                    if not retain_journal:
+                        _remove_volume_journal(instance, volume_id)
                     LOG.debug(
                         'Cinder volume %(volume)s is already connected at '
                         '%(mountpoint)s; treating attach as idempotent',
@@ -9759,7 +12030,8 @@ class IncusDriver(driver.ComputeDriver):
                     connection_info, device_info, mountpoint,
                     phase='connected')
                 profile.save(wait=True)
-            _remove_volume_journal(instance, volume_id)
+            if not retain_journal:
+                _remove_volume_journal(instance, volume_id)
         except Exception:
             with excutils.save_and_reraise_exception():
                 self._retain_volume_cleanup_metadata(
@@ -9778,16 +12050,28 @@ class IncusDriver(driver.ComputeDriver):
     @_invalidates_instance_inventory
     def detach_volume(self, context, connection_info, instance, mountpoint,
                       encryption=None):
+        return self._detach_volume(
+            context, connection_info, instance, mountpoint,
+            encryption=encryption, retain_journal=True)
+
+    def _detach_volume(
+            self, context, connection_info, instance, mountpoint,
+            encryption=None, retain_journal=False):
+        """Detach a volume without extending Nova's public driver contract."""
+        volume_id = _volume_id(connection_info)
         with lockutils.lock(
                 _volume_topology_lock_name(instance), external=True,
                 lock_path=_volume_topology_lock_path()):
-            return self._detach_volume_locked(
-                context, connection_info, instance, mountpoint,
-                encryption=encryption)
+            with lockutils.lock(
+                    _volume_operation_lock_name(volume_id), external=True,
+                    lock_path=_volume_operation_lock_path()):
+                return self._detach_volume_locked(
+                    context, connection_info, instance, mountpoint,
+                    encryption=encryption, retain_journal=retain_journal)
 
     def _detach_volume_locked(
             self, context, connection_info, instance, mountpoint,
-            encryption=None):
+            encryption=None, retain_journal=False):
         """Detach block device from a nova instance.
 
         First the volume id is deleted from the profile, and the
@@ -9847,6 +12131,10 @@ class IncusDriver(driver.ComputeDriver):
                 phase = _validate_volume_recovery_record(
                     journal, volume_id, mountpoint,
                     effective_connection_info)
+                if phase == 'disconnected':
+                    if not retain_journal:
+                        _remove_volume_journal(instance, volume_id)
+                    return
                 storage_driver = brick_get_connector(protocol)
                 if phase == 'connecting':
                     # The profile can be removed by an interrupted destroy
@@ -9866,7 +12154,11 @@ class IncusDriver(driver.ComputeDriver):
                         'Recovered os-brick connector path')
                 storage_driver.disconnect_volume(
                     connection_data, device_info)
-                _remove_volume_journal(instance, volume_id)
+                _write_volume_journal(
+                    instance, volume_id, effective_connection_info,
+                    device_info, mountpoint, phase='disconnected')
+                if not retain_journal:
+                    _remove_volume_journal(instance, volume_id)
                 return
             if pre_live_disconnected:
                 # ComputeManager intentionally issues a second detach after
@@ -9971,8 +12263,13 @@ class IncusDriver(driver.ComputeDriver):
         storage_driver.disconnect_volume(
             connection_data, device_info or {})
 
-        # Clearing the journal is the commit point. If this save is uncertain,
-        # retain/retry rather than telling Nova that cleanup completed.
+        # Host disconnect is the local commit point. Keep a monotonic marker
+        # until ComputeManager has deleted the Cinder attachment and applied
+        # its explicit BDM policy; internal callers opt out because they own
+        # their surrounding transaction.
+        _write_volume_journal(
+            instance, volume_id, effective_connection_info,
+            device_info or {}, mountpoint, phase='disconnected')
         with lockutils.lock(_profile_lock_name(instance)):
             profile = self.client.profiles.get(instance.name)
             profile.devices.pop(volume_id, None)
@@ -9991,7 +12288,8 @@ class IncusDriver(driver.ComputeDriver):
                     'Incus reported a failed final detach update for volume '
                     '%(volume)s, but its cleanup journal is absent',
                     {'volume': volume_id}, instance=instance)
-        _remove_volume_journal(instance, volume_id)
+        if not retain_journal:
+            _remove_volume_journal(instance, volume_id)
 
     def _remove_profile_volume_reference(
             self, instance, volume_id, metadata_keys):
@@ -10038,6 +12336,27 @@ class IncusDriver(driver.ComputeDriver):
             mountpoint=None):
         """Replay one connector cleanup from its durable profile record."""
         journal = _read_volume_journal(instance, volume_id)
+        attach_intent = _read_managed_attach_intent(instance, volume_id)
+        source_release = (
+            attach_intent is not None and
+            attach_intent.get('operation_kind') == 'migration' and
+            attach_intent.get('operation_direction') == 'live-source-release')
+        if source_release:
+            if attach_intent.get('boot_volume'):
+                raise exception.InvalidVolume(
+                    reason='BFV source release must never enter os-brick '
+                           'cleanup')
+            expected_mountpoint = attach_intent['mountpoint']
+            if mountpoint is not None and mountpoint != expected_mountpoint:
+                raise exception.InvalidVolume(
+                    reason='Live source release mountpoint changed during '
+                           'cleanup')
+            # ComputeManager still owns exact old-attachment deletion. Advance
+            # host cleanup only to its durable terminal phase and retain both
+            # records so a transient Cinder error remains replayable.
+            self.recover_source_release_volume_journal(
+                context, instance, volume_id, expected_mountpoint)
+            return
         try:
             current = self.client.profiles.get(instance.name)
         except incus_exceptions.LXDAPIException as exc:
@@ -10086,7 +12405,7 @@ class IncusDriver(driver.ComputeDriver):
                 stored_data, device_info)
             _remove_volume_journal(instance, volume_id)
             return
-        self.detach_volume(
+        self._detach_volume(
             context, effective, instance, mountpoint)
 
     def _disconnect_profile_volume_connections(self, context, instance):
@@ -10417,6 +12736,15 @@ class IncusDriver(driver.ComputeDriver):
                 dest, root_pool.name, source_identity)
         with lockutils.lock(_profile_lock_name(instance)):
             migration_profile = self.client.profiles.get(instance.name)
+            try:
+                _validate_migration_share_mappings(
+                    context, instance, migration_profile)
+            except exception.MigrationPreCheckError as exc:
+                # No source or destination state has changed yet. Preserve
+                # the pre-resize VM state while reporting the authoritative
+                # Nova/profile mismatch to the operator.
+                raise exception.InstanceFaultRollback(
+                    inner_exception=exc) from exc
             idmap_base, idmap_size = _instance_migration_idmap(
                 container, migration_profile)
             try:
@@ -10433,6 +12761,19 @@ class IncusDriver(driver.ComputeDriver):
             if migration_profile.config.get(CLEANUP_RECOVERY_KEY):
                 raise exception.MigrationError(
                     reason='Incus source profile has unresolved cleanup work')
+            unresolved_generation_keys = (
+                MIGRATION_CLEANUP_TOKEN_KEY,
+                MIGRATION_ROLLBACK_COMPLETE_KEY,
+                MIGRATION_NOVA_UUID_KEY,
+                MIGRATION_DESTINATION_KEY,
+                MIGRATION_OPERATION_KEY,
+            )
+            if any(
+                    migration_profile.config.get(key)
+                    for key in unresolved_generation_keys):
+                raise exception.MigrationError(
+                    reason='Incus source profile has an unresolved migration '
+                           'generation')
             migration_profile.config[MIGRATION_DESTINATION_KEY] = (
                 _migration_address_for_host(dest))
             migration_profile.config[MIGRATION_CLEANUP_TOKEN_KEY] = (
@@ -10504,9 +12845,22 @@ class IncusDriver(driver.ComputeDriver):
                     # disconnecting journal, so restoring only calls that
                     # returned successfully would leave the source with
                     # partial I/O.
-                    detach_attempted.append(bdm)
-                    self.detach_volume(
-                        context, connection_info, instance, mountpoint)
+                    volume_id = _volume_id(connection_info)
+                    with lockutils.lock(
+                            _volume_manager_transaction_lock_name(
+                                instance.uuid, volume_id),
+                            external=True,
+                            lock_path=_volume_operation_lock_path()):
+                        intent = self.prepare_managed_volume_attach(
+                            instance, volume_id, _bdm_attachment_id(bdm),
+                            mountpoint, operation_kind='migration',
+                            operation_token=cleanup_token,
+                            operation_direction='cold-source-restore',
+                            operation_migration_uuid=cleanup_token)
+                        detach_attempted.append(bdm)
+                        self._detach_volume(
+                            context, connection_info, instance, mountpoint,
+                            retain_journal=True)
         except Exception as original_error:
             rollback_failures = []
             try:
@@ -10536,16 +12890,23 @@ class IncusDriver(driver.ComputeDriver):
                     reason='Cold migration preparation failed and its Incus '
                            'source operation could not be fenced; the source '
                            'remains stopped') from operation_error
+            restored_volumes = []
             for bdm in reversed(detach_attempted):
                 connection_info = bdm['connection_info']
                 mountpoint = bdm['mount_device']
                 try:
-                    _retry_migration_finish_action(
+                    intent = _retry_migration_finish_action(
                         lambda connection_info=connection_info,
                         mountpoint=mountpoint:
-                        self.attach_volume(
-                            context, connection_info, instance, mountpoint),
+                        self._attach_volume_for_operation(
+                            context, connection_info, instance, mountpoint,
+                            _bdm_attachment_id(bdm), 'migration',
+                            cleanup_token, 'cold-source-restore',
+                            operation_migration_uuid=cleanup_token),
                         'source data-volume rollback', instance)
+                    restored_volumes.append((
+                        _volume_id(connection_info), connection_info,
+                        mountpoint, intent))
                 except Exception as rollback_error:
                     rollback_failures.append(
                         (_volume_id(connection_info), rollback_error))
@@ -10559,6 +12920,14 @@ class IncusDriver(driver.ComputeDriver):
                         'Cinder volume connection(s) could not be restored; '
                         'the source remains stopped to prevent partial I/O'
                     ).format(len(rollback_failures))) from original_error
+            # Persist an enumerable source generation before retiring the
+            # first per-volume intent. This also covers the zero-volume case.
+            self.mark_source_volume_generation_rollback_complete(
+                instance, cleanup_token, cleanup_token)
+            for volume_id, connection_info, mountpoint, intent in (
+                    restored_volumes):
+                self._commit_internal_volume_attach_operation(
+                    instance, volume_id, connection_info, mountpoint, intent)
             container.sync()
             if was_running and container.status != 'Running':
                 _retry_migration_finish_action(
@@ -10566,17 +12935,13 @@ class IncusDriver(driver.ComputeDriver):
                         instance, container),
                     'source restart after migration preparation failure',
                     instance)
-            with lockutils.lock(_profile_lock_name(instance)):
-                migration_profile = self.client.profiles.get(instance.name)
-                migration_profile.config.pop(
-                    MIGRATION_DESTINATION_KEY, None)
-                migration_profile.config.pop(MIGRATION_OPERATION_KEY, None)
-                migration_profile.config.pop(
-                    MIGRATION_CLEANUP_TOKEN_KEY, None)
-                migration_profile.save(wait=True)
-            _retire_migration_attempt(
-                migration_target, instance, cleanup_token,
-                idmap_base, idmap_size)
+            if not self.finalize_failed_cold_source_volume_generation(
+                    instance, cleanup_token):
+                LOG.critical(
+                    'Cold source runtime was restored but exact Cinder '
+                    'recovery evidence remains; retaining the migration '
+                    'profile token for periodic retirement',
+                    instance=instance)
             raise
 
         return jsonutils.dumps({
@@ -12066,6 +14431,7 @@ class IncusDriver(driver.ComputeDriver):
             profile_config = {
                 MIGRATION_CLEANUP_TOKEN_KEY: cleanup_token,
                 MIGRATION_DESTINATION_PREPARED_KEY: cleanup_token,
+                MIGRATION_NOVA_UUID_KEY: migration.uuid,
                 'security.idmap.base': str(idmap_base),
                 'security.idmap.size': str(idmap_size),
             }
@@ -12142,8 +14508,12 @@ class IncusDriver(driver.ComputeDriver):
                 if connection_info and mountpoint:
                     _retry_migration_finish_action(
                         lambda connection_info=connection_info,
-                        mountpoint=mountpoint: self.attach_volume(
-                            context, connection_info, instance, mountpoint),
+                        mountpoint=mountpoint, bdm=bdm:
+                        self._attach_volume_for_operation(
+                            context, connection_info, instance, mountpoint,
+                            _bdm_attachment_id(bdm), 'migration',
+                            cleanup_token, 'cold-target',
+                            operation_migration_uuid=migration.uuid),
                         'data-volume attachment', instance)
                     attached.append((connection_info, mountpoint))
 
@@ -12465,8 +14835,12 @@ class IncusDriver(driver.ComputeDriver):
                 if connection_info and mountpoint:
                     _retry_migration_finish_action(
                         lambda connection_info=connection_info,
-                        mountpoint=mountpoint: self.attach_volume(
-                            context, connection_info, instance, mountpoint),
+                        mountpoint=mountpoint, bdm=bdm:
+                        self._attach_volume_for_operation(
+                            context, connection_info, instance, mountpoint,
+                            _bdm_attachment_id(bdm), 'migration',
+                            cleanup_token, 'cold-revert-source',
+                            operation_migration_uuid=migration.uuid),
                         'revert data-volume attachment', instance)
             if network_info:
                 # The retained source VIF still exists after cold migration.
@@ -12483,7 +14857,7 @@ class IncusDriver(driver.ComputeDriver):
             with lockutils.lock(_profile_lock_name(instance)):
                 profile = self.client.profiles.get(instance.name)
                 profile.config[MIGRATION_ROLLBACK_COMPLETE_KEY] = cleanup_token
-                profile.config.pop(MIGRATION_DESTINATION_KEY, None)
+                profile.config[MIGRATION_NOVA_UUID_KEY] = migration.uuid
                 profile.config.pop(MIGRATION_OPERATION_KEY, None)
                 profile.save(wait=True)
 
@@ -12529,6 +14903,7 @@ class IncusDriver(driver.ComputeDriver):
                 reason='Missing Incus live migration destination data')
 
         cleanup_token = _live_migration_cleanup_token(migrate_data)
+        migration_uuid = _live_migration_uuid(migrate_data)
         idmap_base, idmap_size = _live_migration_idmap(migrate_data)
         config, devices = _live_migration_profile_data(migrate_data)
         if (config.get('user.openstack.uuid') != instance.uuid or
@@ -12578,6 +14953,7 @@ class IncusDriver(driver.ComputeDriver):
                 self._abort_idmap_materialization(materialization)
                 self._retire_instance_idmap_claim_if_clean(instance)
         config[MIGRATION_CLEANUP_COMPLETE_KEY] = ''
+        config[MIGRATION_NOVA_UUID_KEY] = migration_uuid
         try:
             _remove_stale_live_migration_profile(self.client, instance)
         except Exception:
@@ -12640,7 +15016,8 @@ class IncusDriver(driver.ComputeDriver):
                 if connection_info and mountpoint:
                     self._stage_volume_for_live_migration(
                         context, connection_info, instance, mountpoint,
-                        cleanup_token)
+                        _bdm_attachment_id(bdm), cleanup_token,
+                        migration_uuid)
                     connection_info.setdefault('data', {}).pop(
                         _PRE_LIVE_DISCONNECTED_KEY, None)
                     prepared_volumes.append(bdm)
@@ -12650,7 +15027,7 @@ class IncusDriver(driver.ComputeDriver):
                     connection_info = bdm['connection_info']
                     mountpoint = bdm['mount_device']
                     try:
-                        self.detach_volume(
+                        self._detach_volume(
                             context, connection_info, instance, mountpoint)
                     except Exception:
                         LOG.exception(
@@ -13066,6 +15443,86 @@ class IncusDriver(driver.ComputeDriver):
         # ownership so os-brick and Manila journals remain discoverable after
         # a compute-process restart.
         self._mark_cleanup_recovery_required(instance)
+
+        # Persist every source data-volume release owner before the first
+        # irreversible source-record operation.  A process that dies after
+        # deleting the source container must never leave a later volume with
+        # neither a journal nor an operation generation.
+        source_volume_releases = []
+        try:
+            for bdm in driver.block_device_info_get_mapping(
+                    block_device_info):
+                boot_volume = _is_boot_volume(bdm)
+                connection_info = bdm.get('connection_info')
+                mountpoint = bdm.get('mount_device')
+                if not connection_info or not mountpoint:
+                    raise exception.InvalidVolume(
+                        reason='Live migration source Cinder mapping has no '
+                               'connection information or mountpoint')
+                volume_id = _volume_id(connection_info)
+                with lockutils.lock(
+                        _volume_manager_transaction_lock_name(
+                            instance.uuid, volume_id),
+                        external=True,
+                        lock_path=_volume_operation_lock_path()):
+                    if not boot_volume:
+                        qos_limits = _data_volume_qos(
+                            connection_info,
+                            self.client.host_info.get('api_extensions', []))
+                        with lockutils.lock(_profile_lock_name(instance)):
+                            source_profile = self.client.profiles.get(
+                                instance.name)
+                            _validate_profile_volume_owner(
+                                source_profile, instance)
+                        if not _profile_volume_attachment_matches(
+                                source_profile, volume_id, mountpoint,
+                                qos_limits, connection_info):
+                            raise exception.InvalidVolume(
+                                reason='Live migration source profile does '
+                                       'not contain the exact Cinder '
+                                       'data-volume mapping for %s' %
+                                       volume_id)
+                    phase = self.get_volume_journal_phase(instance, volume_id)
+                    if phase is not None:
+                        raise exception.InvalidVolume(
+                            reason='Live migration source volume %s has '
+                                   'unfinished host work' % volume_id)
+                    intent = self.prepare_managed_volume_attach(
+                        instance, volume_id, _bdm_attachment_id(bdm),
+                        mountpoint, operation_kind='migration',
+                        operation_token=cleanup_token,
+                        operation_direction='live-source-release',
+                        operation_migration_uuid=(
+                            _live_migration_uuid(migrate_data)),
+                        boot_volume=boot_volume)
+                source_volume_releases.append((
+                    bdm, connection_info, mountpoint, volume_id, intent,
+                    boot_volume))
+        except Exception:
+            # No source record has been deleted yet.  Remove only exact
+            # prepared intents that still have no host journal; a journal is
+            # proof that a concurrent/retried transaction crossed the safe
+            # cancellation point and must remain for recovery.
+            for (unused_bdm, unused_info, unused_mountpoint, volume_id,
+                 intent, unused_boot_volume) in reversed(
+                    source_volume_releases):
+                try:
+                    with lockutils.lock(
+                            _volume_manager_transaction_lock_name(
+                                instance.uuid, volume_id),
+                            external=True,
+                            lock_path=_volume_operation_lock_path()):
+                        if self.get_volume_journal_phase(
+                                instance, volume_id) is None:
+                            self.cancel_managed_volume_attach(
+                                instance, volume_id, intent)
+                except Exception:
+                    LOG.critical(
+                        'Failed to cancel prepared live-source release for '
+                        'Cinder volume %s while the source record is intact',
+                        volume_id, instance=instance, exc_info=True)
+            raise
+
         # Protect the source record before deleting it. The destination stays
         # protected by Incus until this source record is gone, so there is
         # never a point at which both records can delete the shared RBD.
@@ -13142,16 +15599,28 @@ class IncusDriver(driver.ComputeDriver):
         # every source data-volume mapping while the profile still contains
         # the exact device_info returned by connect_volume(). The BFV root is
         # transferred by the Incus cephext handover and never uses os-brick.
-        for bdm in driver.block_device_info_get_mapping(block_device_info):
-            if _is_boot_volume(bdm):
-                continue
-            connection_info = bdm.get('connection_info')
-            mountpoint = bdm.get('mount_device')
-            if not connection_info or not mountpoint:
+        for (bdm, connection_info, mountpoint, volume_id, intent,
+             boot_volume) in source_volume_releases:
+            if boot_volume:
+                # The cephext handover already transferred the BFV root.  Its
+                # intent remains until ComputeManager removes the exact old
+                # Cinder attachment; it must never enter os-brick.
                 continue
             try:
-                self.detach_volume(
-                    context, connection_info, instance, mountpoint)
+                with lockutils.lock(
+                        _volume_manager_transaction_lock_name(
+                            instance.uuid, volume_id),
+                        external=True,
+                        lock_path=_volume_operation_lock_path()):
+                    current = self.get_managed_volume_attach_intent(
+                        instance, volume_id)
+                    if current != intent:
+                        raise exception.InvalidVolume(
+                            reason='Live migration source volume release '
+                                   'generation changed before disconnect')
+                    self._detach_volume(
+                        context, connection_info, instance, mountpoint,
+                        retain_journal=True)
             except Exception:
                 # Match Nova's libvirt contract: the instance is already
                 # running on the destination and cannot be rolled back here.
@@ -13463,6 +15932,8 @@ class IncusDriver(driver.ComputeDriver):
             source_profile = self.client.profiles.get(instance.name)
             source_profile.config[MIGRATION_ROLLBACK_COMPLETE_KEY] = (
                 cleanup_token)
+            source_profile.config[MIGRATION_NOVA_UUID_KEY] = (
+                _live_migration_uuid(migrate_data))
             source_profile.config.pop(MIGRATION_OPERATION_KEY, None)
             source_profile.save(wait=True)
 
@@ -13607,12 +16078,15 @@ class IncusDriver(driver.ComputeDriver):
         except exception.MigrationError as exc:
             raise exception.MigrationPreCheckError(reason=str(exc))
         facts = _migration_host_facts(self.client)
+        migration_uuid = _active_live_migration_uuid(
+            context, instance, CONF.host)
         return incus_migrate_data.IncusLiveMigrateData(
             destination_address=address,
             destination_architecture=facts['architecture'],
             destination_kernel_version=facts['kernel_version'],
             destination_server_version=facts['server_version'],
             cleanup_token=uuidutils.generate_uuid(),
+            migration_uuid=migration_uuid,
             source_operation_id=None,
             destination_operation_id=None)
 
@@ -13702,6 +16176,16 @@ class IncusDriver(driver.ComputeDriver):
                 profile.config.get(CLEANUP_RECOVERY_KEY)):
             raise exception.MigrationPreCheckError(
                 reason='Incus source profile has unresolved cleanup work')
+        if (isinstance(profile.config, dict) and any(
+                profile.config.get(key) for key in (
+                    MIGRATION_CLEANUP_TOKEN_KEY,
+                    MIGRATION_ROLLBACK_COMPLETE_KEY,
+                    MIGRATION_NOVA_UUID_KEY,
+                    MIGRATION_DESTINATION_KEY,
+                    MIGRATION_OPERATION_KEY))):
+            raise exception.MigrationPreCheckError(
+                reason='Incus source profile has an unresolved migration '
+                       'generation')
 
         source_facts = _migration_host_facts(self.client)
         comparisons = (

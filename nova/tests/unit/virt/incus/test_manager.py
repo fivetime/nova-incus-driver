@@ -20,10 +20,13 @@ import time
 from unittest import mock
 
 import fixtures
+from oslo_serialization import jsonutils
 
 from nova.compute import power_state
 from nova.compute import task_states
+from nova.compute import vm_states
 from nova import context
+from nova import exception
 from nova import test
 from nova.virt.incus import manager
 from nova.virt.incus import migrate_data
@@ -42,6 +45,7 @@ class IncusComputeManagerTest(test.NoDBTestCase):
             manager.IncusComputeManager)
         self.compute.host = 'compute-1'
         self.compute.driver = mock.Mock()
+        self.compute.driver.get_cold_attachment_rotation.return_value = None
         self.mount_table = {}
         self.compute.driver.get_share_mount_table.return_value = (
             self.mount_table)
@@ -81,8 +85,18 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         list_intents = (
             self.compute.driver.idmap_allocator.
             list_release_intent_candidates)
-        list_intents.return_value = [self.idmap_intent]
-        self.compute.driver.idmap_allocator.list_host_claims.return_value = []
+        list_intents.side_effect = AssertionError(
+            'per-compute replay must not scan the fleet release prefix')
+        self.compute.driver.idmap_allocator.list_host_claims.return_value = [
+            self.idmap_claim]
+        self.compute.driver.idmap_allocator.\
+            list_release_intents_for_instances.return_value = [
+                self.idmap_intent]
+        audit = self.compute.driver.idmap_allocator.run_coordinated_audit
+        audit.return_value = (True, None)
+        self.get_instances_by_host = mock.Mock(return_value=[])
+        self.compute._local_incus_idmap_claim_instances = (
+            self.get_instances_by_host)
         self.compute.driver.client.instances.get.side_effect = RuntimeError(
             'not found')
         self.compute.driver.client.profiles.get.side_effect = RuntimeError(
@@ -200,7 +214,8 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         allocator = self.compute.driver.idmap_allocator
         allocator.get_release_intent.side_effect = [
             RuntimeError('etcd read failed'), None]
-        get_by_uuid.return_value = self._adoption_deleted_row('instance-00000002')
+        get_by_uuid.return_value = self._adoption_deleted_row(
+            'instance-00000002')
         second = self._assignment(
             host_ids=(),
             instance_uuid='00000000-0000-0000-0000-000000000002', slot=1)
@@ -210,6 +225,117 @@ class IncusComputeManagerTest(test.NoDBTestCase):
 
         allocator.request_release.assert_called_once_with(
             second.instance_uuid, 'instance-00000002', assignment=second)
+
+    def test_unclaimed_adoption_rotates_before_external_reads(self):
+        allocator = self.compute.driver.idmap_allocator
+        allocator.get_release_intent.return_value = self.idmap_intent
+        assignments = [
+            self._assignment(
+                host_ids=(), slot=index,
+                base=500000000 + index * 65536,
+                instance_uuid=(
+                    '00000000-0000-4000-8000-{:012x}'.format(index + 1)),
+                allocation_id=(
+                    '10000000-0000-4000-8000-{:012x}'.format(index + 1)))
+            for index in range(250)
+        ]
+
+        expected = [
+            assignment.instance_uuid for assignment in assignments]
+        observed = []
+        for expected_start in (0, 100, 200):
+            allocator.get_release_intent.reset_mock()
+            self.compute._adopt_unclaimed_incus_idmap_allocations(
+                allocator, assignments)
+            calls = allocator.get_release_intent.call_args_list
+            self.assertEqual(100, len(calls))
+            observed_batch = [call.args[0] for call in calls]
+            self.assertEqual(
+                (expected[expected_start:] + expected[:expected_start])[:100],
+                observed_batch)
+            observed.extend(observed_batch)
+
+        self.assertEqual(set(expected), set(observed))
+
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_existing_intents_do_not_starve_missing_tail(self, get_by_uuid):
+        allocator = self.compute.driver.idmap_allocator
+        assignments = [
+            self._assignment(
+                host_ids=(), slot=index,
+                base=500000000 + index * 65536,
+                instance_uuid=(
+                    '00000000-0000-4000-8000-{:012x}'.format(index + 1)),
+                allocation_id=(
+                    '10000000-0000-4000-8000-{:012x}'.format(index + 1)))
+            for index in range(1001)
+        ]
+        intents = [
+            manager.incus_driver.incus_idmap.IDMapReleaseIntent(
+                instance_uuid=assignment.instance_uuid,
+                instance_name='instance-{:08x}'.format(index + 1),
+                base=assignment.base, size=assignment.size,
+                slot=assignment.slot,
+                allocation_id=assignment.allocation_id,
+                fingerprint=assignment.fingerprint)
+            for index, assignment in enumerate(assignments[:-1])
+        ]
+        missing = assignments[-1]
+        allocator.get_release_intent.return_value = None
+        get_by_uuid.return_value = self._adoption_deleted_row(
+            'instance-00001001')
+
+        self.compute._adopt_unclaimed_incus_idmap_allocations(
+            allocator, assignments, intents)
+
+        allocator.get_release_intent.assert_called_once_with(
+            missing.instance_uuid)
+        allocator.request_release.assert_called_once_with(
+            missing.instance_uuid, 'instance-00001001', assignment=missing)
+
+    def test_unclaimed_release_replay_rotates_before_external_io(self):
+        assignments = [
+            self._assignment(
+                host_ids=(), slot=index,
+                base=500000000 + index * 65536,
+                instance_uuid=(
+                    '00000000-0000-4000-8000-{:012x}'.format(index + 1)),
+                allocation_id=(
+                    '10000000-0000-4000-8000-{:012x}'.format(index + 1)))
+            for index in range(250)
+        ]
+        intents = [
+            manager.incus_driver.incus_idmap.IDMapReleaseIntent(
+                instance_uuid=assignment.instance_uuid,
+                instance_name='instance-{:08x}'.format(index + 1),
+                base=assignment.base, size=assignment.size,
+                slot=assignment.slot,
+                allocation_id=assignment.allocation_id,
+                fingerprint=assignment.fingerprint)
+            for index, assignment in enumerate(assignments)
+        ]
+        replay = mock.Mock()
+        self.compute._replay_incus_idmap_release = replay
+        self.compute._idmap_screening_inventory = mock.Mock(
+            return_value=mock.sentinel.inventory)
+
+        expected = [intent.instance_uuid for intent in intents]
+        observed = []
+        for expected_start in (0, 100, 200):
+            replay.reset_mock()
+            self.compute._replay_unclaimed_incus_idmap_releases(
+                context.get_admin_context(),
+                self.compute.driver.idmap_allocator,
+                assignments, intents)
+            calls = replay.call_args_list
+            self.assertEqual(100, len(calls))
+            observed_batch = [call.args[2].instance_uuid for call in calls]
+            self.assertEqual(
+                (expected[expected_start:] + expected[:expected_start])[:100],
+                observed_batch)
+            observed.extend(observed_batch)
+
+        self.assertEqual(set(expected), set(observed))
 
     def _assignment(self, host_ids=None, **overrides):
         values = {
@@ -615,8 +741,11 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         allocator.get.return_value = empty
         allocator.get_host_claim.return_value = None
 
-        result = self.compute._delete_instance(
-            mock.sentinel.context, instance, mock.sentinel.bdms)
+        with mock.patch.object(
+                self.compute, '_local_idmap_resources_absent',
+                return_value=True) as exact_absence:
+            result = self.compute._delete_instance(
+                mock.sentinel.context, instance, mock.sentinel.bdms)
 
         self.assertIs(mock.sentinel.result, result)
         allocator.claim.assert_not_called()
@@ -625,6 +754,7 @@ class IncusComputeManagerTest(test.NoDBTestCase):
             assignment=empty)
         allocator.retire_claim.assert_not_called()
         allocator.release.assert_called_once_with(self.idmap_intent)
+        exact_absence.assert_called_once_with(self.idmap_intent)
         base_delete.assert_called_once_with(
             mock.sentinel.context, instance, mock.sentinel.bdms)
 
@@ -698,7 +828,9 @@ class IncusComputeManagerTest(test.NoDBTestCase):
             instance_id=self.idmap_intent.instance_uuid)
         intents = [self.idmap_intent] * 4
         allocator = self.compute.driver.idmap_allocator
-        allocator.list_release_intent_candidates.return_value = intents
+        allocator.list_host_claims.return_value = [
+            mock.Mock(instance_uuid=str(index)) for index in range(4)]
+        allocator.list_release_intents_for_instances.return_value = intents
         instances_get = (
             self.compute.driver.inventory_client.api.instances.get)
         instances_get.reset_mock()
@@ -709,6 +841,22 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         # One screening listing for the whole batch, plus the exact proof
         # each candidate repeats immediately before it releases.
         self.assertEqual(1 + len(intents), instances_get.call_count)
+
+    def test_indexed_release_replay_skips_all_project_listing(self):
+        self.compute.driver.inventory_client.has_api_extension.return_value = (
+            True)
+        replay = mock.Mock()
+        with mock.patch.object(
+                self.compute, '_all_project_idmap_inventory') as inventory, \
+                mock.patch.object(
+                    self.compute, '_replay_incus_idmap_release', replay):
+            self.compute._replay_incus_idmap_releases(
+                context.get_admin_context())
+
+        inventory.assert_not_called()
+        replay.assert_called_once_with(
+            mock.ANY, self.compute.driver.idmap_allocator,
+            self.idmap_intent, self.host_id, inventory=None)
 
     @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
     def test_screening_listing_failure_never_releases(self, get_by_uuid):
@@ -737,7 +885,9 @@ class IncusComputeManagerTest(test.NoDBTestCase):
             instance_id=self.idmap_intent.instance_uuid)
         candidates = (
             self.compute.driver.idmap_allocator.
-            list_release_intent_candidates)
+            list_release_intents_for_instances)
+        self.compute.driver.idmap_allocator.list_host_claims.return_value = [
+            mock.Mock(instance_uuid=str(index)) for index in range(4)]
         candidates.return_value = [self.idmap_intent] * 4
         instances_response = (
             self.compute.driver.inventory_client.api.instances.get.
@@ -765,23 +915,24 @@ class IncusComputeManagerTest(test.NoDBTestCase):
     @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
     def test_unclaimed_intent_still_proves_absence_exactly(
             self, get_by_uuid):
-        """An intent with no claims reaches release on its own path."""
+        """The full-audit coordinator owns intents with no host index."""
         get_by_uuid.side_effect = manager.exception.InstanceNotFound(
             instance_id=self.idmap_intent.instance_uuid)
         allocator = self.compute.driver.idmap_allocator
-        allocator.get.return_value = self._assignment(host_ids=())
+        unclaimed = self._assignment(host_ids=())
+        allocator.get.return_value = unclaimed
         absent = mock.Mock(return_value=True)
         with mock.patch.object(
                 self.compute, '_local_idmap_resources_absent', absent):
-            self.compute._replay_incus_idmap_releases(
-                context.get_admin_context())
+            self.compute._replay_unclaimed_incus_idmap_releases(
+                context.get_admin_context(), allocator, [unclaimed],
+                [self.idmap_intent])
 
         allocator.retire_claim.assert_not_called()
         allocator.release.assert_called_once_with(self.idmap_intent)
-        # Screened once for the batch, then proved exactly before release.
-        self.assertEqual(2, absent.call_count)
-        self.assertIsNotNone(absent.call_args_list[0].kwargs['inventory'])
-        self.assertEqual({}, absent.call_args_list[1].kwargs)
+        # One exact proof remains after the batch inventory screen.
+        self.assertEqual(1, absent.call_count)
+        self.assertEqual({}, absent.call_args.kwargs)
 
     def _force_full_idmap_audit(self):
         """Make the next audit cycle owe its complete scan."""
@@ -853,17 +1004,18 @@ class IncusComputeManagerTest(test.NoDBTestCase):
 
     def test_idmap_full_audit_runs_against_allocator(self):
         allocator = self.compute.driver.idmap_allocator
-        allocator.audit.return_value = [self.idmap_assignment]
+        allocator.run_coordinated_audit.return_value = (
+            True, ([self.idmap_assignment], [], []))
         self._force_full_idmap_audit()
 
         self.compute._audit_incus_idmap_allocator(mock.sentinel.context)
 
-        allocator.audit.assert_called_once_with()
+        allocator.run_coordinated_audit.assert_called_once_with(full=True)
 
     @mock.patch.object(manager.LOG, 'critical')
     def test_idmap_full_audit_integrity_failure_is_critical(self, critical):
         allocator = self.compute.driver.idmap_allocator
-        allocator.audit.side_effect = (
+        allocator.run_coordinated_audit.side_effect = (
             manager.incus_driver.incus_idmap.IDMapIntegrityError(
                 reason='corrupt reverse index'))
         self._force_full_idmap_audit()
@@ -875,7 +1027,7 @@ class IncusComputeManagerTest(test.NoDBTestCase):
     @mock.patch.object(manager.LOG, 'warning')
     def test_idmap_full_audit_backend_failure_is_transient(self, warning):
         allocator = self.compute.driver.idmap_allocator
-        allocator.audit.side_effect = (
+        allocator.run_coordinated_audit.side_effect = (
             manager.incus_driver.incus_idmap.IDMapBackendError(
                 reason='etcd unavailable'))
         self._force_full_idmap_audit()
@@ -887,14 +1039,14 @@ class IncusComputeManagerTest(test.NoDBTestCase):
     def test_idle_audit_cycles_only_probe(self):
         """The steady-state cost must not grow with the registry."""
         allocator = self.compute.driver.idmap_allocator
-        allocator.probe.return_value = {
-            'instances': 4, 'slots': 4, 'releases': 1, 'hosts': 4}
 
         for _ in range(5):
             self.compute._audit_incus_idmap_allocator(mock.sentinel.context)
 
-        allocator.audit.assert_not_called()
-        self.assertEqual(5, allocator.probe.call_count)
+        self.assertEqual(5, allocator.run_coordinated_audit.call_count)
+        self.assertEqual(
+            [mock.call(full=False)] * 5,
+            allocator.run_coordinated_audit.call_args_list)
 
     def test_first_full_audit_deadline_is_jittered(self):
         """A fleet restarted together must not synchronize its scans."""
@@ -912,53 +1064,58 @@ class IncusComputeManagerTest(test.NoDBTestCase):
 
     def test_full_audit_runs_once_its_deadline_passes(self):
         allocator = self.compute.driver.idmap_allocator
-        allocator.probe.return_value = {
-            'instances': 0, 'slots': 0, 'releases': 0, 'hosts': 0}
-        allocator.audit.return_value = []
+        allocator.run_coordinated_audit.side_effect = [
+            (True, None), (True, ([], [], [])), (True, None)]
 
         self.compute._audit_incus_idmap_allocator(mock.sentinel.context)
-        allocator.audit.assert_not_called()
 
         self._force_full_idmap_audit()
         self.compute._audit_incus_idmap_allocator(mock.sentinel.context)
-        allocator.audit.assert_called_once_with()
 
         # The scan reschedules itself rather than repeating every cycle.
         self.compute._audit_incus_idmap_allocator(mock.sentinel.context)
-        allocator.audit.assert_called_once_with()
+        self.assertEqual([
+            mock.call(full=False),
+            mock.call(full=True),
+            mock.call(full=False),
+        ], allocator.run_coordinated_audit.call_args_list)
 
-    @mock.patch.object(manager.LOG, 'error')
-    def test_probe_mismatch_escalates_to_a_full_audit(self, error):
+    def test_full_audit_follower_does_not_scan_registry(self):
         allocator = self.compute.driver.idmap_allocator
-        allocator.probe.side_effect = (
-            manager.incus_driver.incus_idmap.IDMapIntegrityError(
-                reason='allocation and slot record counts differ'))
-        allocator.audit.side_effect = (
-            manager.incus_driver.incus_idmap.IDMapIntegrityError(
-                reason='instance allocation has no exact slot record'))
+        allocator.run_coordinated_audit.return_value = (False, None)
+        self._force_full_idmap_audit()
 
         self.compute._audit_incus_idmap_allocator(mock.sentinel.context)
 
-        error.assert_called_once()
-        allocator.audit.assert_called_once_with()
+        allocator.run_coordinated_audit.assert_called_once_with(full=True)
+
+    def test_audit_coordination_does_not_query_nova_service_inventory(self):
+        allocator = self.compute.driver.idmap_allocator
+        with mock.patch.object(
+                manager.objects.ServiceList,
+                'get_all_computes_by_hv_type') as get_services:
+            self.compute._audit_incus_idmap_allocator(
+                mock.sentinel.context)
+
+        get_services.assert_not_called()
+        allocator.run_coordinated_audit.assert_called_once_with(full=False)
 
     @mock.patch.object(manager.LOG, 'warning')
     def test_probe_backend_failure_does_not_escalate(self, warning):
         """A transport outage is not evidence of corruption."""
         allocator = self.compute.driver.idmap_allocator
-        allocator.probe.side_effect = (
+        allocator.run_coordinated_audit.side_effect = (
             manager.incus_driver.incus_idmap.IDMapBackendError(
                 reason='etcd unavailable'))
 
         self.compute._audit_incus_idmap_allocator(mock.sentinel.context)
 
         warning.assert_called_once()
-        allocator.audit.assert_not_called()
 
     def test_unavailable_full_audit_retries_on_the_next_cycle(self):
         """A missed scan must not wait out the whole interval."""
         allocator = self.compute.driver.idmap_allocator
-        allocator.audit.side_effect = (
+        allocator.run_coordinated_audit.side_effect = (
             manager.incus_driver.incus_idmap.IDMapBackendError(
                 reason='etcd unavailable'))
         self._force_full_idmap_audit()
@@ -966,8 +1123,10 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         self.compute._audit_incus_idmap_allocator(mock.sentinel.context)
         self.compute._audit_incus_idmap_allocator(mock.sentinel.context)
 
-        self.assertEqual(2, allocator.audit.call_count)
-        allocator.probe.assert_not_called()
+        self.assertEqual(2, allocator.run_coordinated_audit.call_count)
+        self.assertEqual([
+            mock.call(full=True), mock.call(full=True)],
+            allocator.run_coordinated_audit.call_args_list)
 
     @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
     def test_idmap_release_replay_retires_local_claim_after_absence(
@@ -1112,6 +1271,7 @@ class IncusComputeManagerTest(test.NoDBTestCase):
             '40000000-0000-0000-0000-000000000004',))
         self.compute.driver.idmap_allocator.get.return_value = assignment
         self.compute.driver.idmap_allocator.get_host_claim.return_value = None
+        self.compute.driver.idmap_allocator.list_host_claims.return_value = []
 
         with mock.patch.object(
                 manager.objects.Instance, 'get_by_uuid') as get_by_uuid:
@@ -1132,8 +1292,10 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         get_by_uuid.side_effect = manager.exception.InstanceNotFound(
             instance_id=self.idmap_intent.instance_uuid)
 
-        self.compute._replay_incus_idmap_releases(
-            context.get_admin_context())
+        unclaimed = self._assignment(host_ids=())
+        self.compute._replay_unclaimed_incus_idmap_releases(
+            context.get_admin_context(), self.compute.driver.idmap_allocator,
+            [unclaimed], [self.idmap_intent])
 
         self.compute.driver.idmap_allocator.retire_claim.assert_not_called()
         self.compute.driver.idmap_allocator.release.assert_called_once_with(
@@ -1169,8 +1331,11 @@ class IncusComputeManagerTest(test.NoDBTestCase):
 
     def test_idmap_release_replay_rotates_batch_cursor(self):
         intents = [mock.Mock(instance_uuid=str(index)) for index in range(150)]
+        claims = [mock.Mock(instance_uuid=str(index)) for index in range(150)]
         allocator = self.compute.driver.idmap_allocator
-        allocator.list_release_intent_candidates.return_value = intents
+        allocator.list_host_claims.return_value = claims
+        allocator.list_release_intents_for_instances.side_effect = [
+            intents[:100], intents[100:] + intents[:50]]
         self.compute._replay_incus_idmap_release = mock.Mock()
 
         self.compute._replay_incus_idmap_releases(
@@ -1192,12 +1357,110 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         self.compute._replay_incus_idmap_releases(
             context.get_admin_context())
 
-        list_intents = (
+        list_claims = (
             self.compute.driver.idmap_allocator.
-            list_release_intent_candidates)
-        list_intents.assert_not_called()
+            list_host_claims)
+        list_claims.assert_not_called()
         self.compute.driver.idmap_allocator.retire_claim.assert_not_called()
         self.compute.driver.idmap_allocator.release.assert_not_called()
+
+    def test_active_host_claim_batch_avoids_incus_inventory(self):
+        claims = [
+            mock.Mock(instance_uuid='00000000-0000-0000-0000-%012d' % index)
+            for index in range(1000)
+        ]
+        instances = []
+        for claim in claims:
+            instance = mock.Mock(uuid=claim.instance_uuid, deleted=False)
+            instance.obj_attr_is_set.return_value = True
+            instances.append(instance)
+        allocator = self.compute.driver.idmap_allocator
+        allocator.list_host_claims.return_value = claims
+        self.get_instances_by_host.return_value = instances
+        self.compute._all_project_idmap_inventory = mock.Mock()
+        self.compute._reconcile_incus_idmap_host_claim = mock.Mock()
+
+        self.compute._reconcile_incus_idmap_host_claims(
+            context.get_admin_context())
+
+        self.compute._all_project_idmap_inventory.assert_not_called()
+        self.compute._reconcile_incus_idmap_host_claim.assert_not_called()
+        allocator.get.assert_not_called()
+        self.get_instances_by_host.assert_called_once()
+
+    def test_host_claim_batch_filters_active_before_truncating(self):
+        active_claims = [
+            mock.Mock(instance_uuid='active-{}'.format(index))
+            for index in range(1000)
+        ]
+        stale_claim = mock.Mock(instance_uuid='stale')
+        instances = []
+        for claim in active_claims:
+            instance = mock.Mock(uuid=claim.instance_uuid, deleted=False)
+            instance.obj_attr_is_set.return_value = True
+            instances.append(instance)
+        allocator = self.compute.driver.idmap_allocator
+        allocator.list_host_claims.return_value = active_claims + [stale_claim]
+        self.get_instances_by_host.return_value = instances
+        self.compute.driver.inventory_client.has_api_extension.return_value = (
+            True)
+        self.compute._all_project_idmap_inventory = mock.Mock()
+        reconcile = mock.Mock()
+        self.compute._reconcile_incus_idmap_host_claim = reconcile
+
+        self.compute._reconcile_incus_idmap_host_claims(
+            context.get_admin_context())
+
+        allocator.list_host_claims.assert_called_once_with(self.host_id)
+        self.get_instances_by_host.assert_called_once()
+        self.compute._all_project_idmap_inventory.assert_not_called()
+        reconcile.assert_called_once_with(
+            mock.ANY, allocator, stale_claim, self.host_id, inventory=None)
+
+    def test_host_claim_batch_processes_one_hundred_stale_candidates(self):
+        active_claims = [
+            mock.Mock(instance_uuid='active-{}'.format(index))
+            for index in range(100)
+        ]
+        stale_claims = [
+            mock.Mock(instance_uuid='stale-{}'.format(index))
+            for index in range(100)
+        ]
+        instances = []
+        for claim in active_claims:
+            instance = mock.Mock(uuid=claim.instance_uuid, deleted=False)
+            instance.obj_attr_is_set.return_value = True
+            instances.append(instance)
+        allocator = self.compute.driver.idmap_allocator
+        allocator.list_host_claims.return_value = active_claims + stale_claims
+        self.get_instances_by_host.return_value = instances
+        self.compute.driver.inventory_client.has_api_extension.return_value = (
+            True)
+        reconcile = mock.Mock()
+        self.compute._reconcile_incus_idmap_host_claim = reconcile
+
+        self.compute._reconcile_incus_idmap_host_claims(
+            context.get_admin_context())
+
+        processed = [call.args[2] for call in reconcile.call_args_list]
+        self.assertEqual(stale_claims, processed)
+        self.assertEqual(100, len(processed))
+
+    def test_host_claim_bulk_nova_failure_uses_exact_fallback(self):
+        claim = self._host_claim()
+        allocator = self.compute.driver.idmap_allocator
+        allocator.list_host_claims.return_value = [claim]
+        self.get_instances_by_host.side_effect = RuntimeError('database down')
+        inventory = mock.sentinel.inventory
+        self.compute._all_project_idmap_inventory = mock.Mock(
+            return_value=inventory)
+        self.compute._reconcile_incus_idmap_host_claim = mock.Mock()
+
+        self.compute._reconcile_incus_idmap_host_claims(
+            context.get_admin_context())
+
+        self.compute._reconcile_incus_idmap_host_claim.assert_called_once_with(
+            mock.ANY, allocator, claim, self.host_id, inventory=inventory)
 
     @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
     def test_host_claim_reconcile_retires_clean_historical_host(
@@ -1919,6 +2182,3654 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         self.compute.volume_api.roll_detaching.assert_not_called()
         self.compute.driver.holds_volume_attachment.assert_not_called()
 
+    @mock.patch.object(manager.manager.ComputeManager, '_attach_volume')
+    def test_hot_attach_commits_journal_after_upstream_completion(
+            self, base_attach):
+        instance = self._idmap_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        connection_info = {
+            'serial': volume_id,
+            'driver_volume_type': 'rbd',
+            'data': {'name': 'volumes/volume-{}'.format(volume_id)},
+        }
+        bdm = mock.Mock(
+            volume_id=volume_id,
+            attachment_id='40000000-0000-0000-0000-000000000004',
+            device_name='/dev/vdb')
+        bdm.get.side_effect = lambda key, default=None: (
+            connection_info if key == 'connection_info' else default)
+        base_attach.return_value = mock.sentinel.result
+
+        result = self.compute._attach_volume(
+            context.get_admin_context(), instance, bdm)
+
+        self.assertIs(mock.sentinel.result, result)
+        base_attach.assert_called_once_with(mock.ANY, instance, bdm)
+        confirm = self.compute.driver.confirm_connected_volume_journal
+        confirm.assert_called_once_with(
+            instance, volume_id, connection_info,
+            expected_mountpoint='/dev/vdb')
+        self.compute.driver.prepare_managed_volume_attach.\
+            assert_called_once_with(
+                instance, volume_id,
+                '40000000-0000-0000-0000-000000000004', '/dev/vdb')
+        self.compute.driver.cancel_managed_volume_attach.assert_called_once()
+
+    @mock.patch.object(manager.manager.ComputeManager, '_attach_volume')
+    def test_hot_attach_retains_bdm_when_journal_confirmation_fails(
+            self, base_attach):
+        instance = self._idmap_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        connection_info = {
+            'serial': volume_id,
+            'driver_volume_type': 'rbd',
+            'data': {'name': 'volumes/volume-{}'.format(volume_id)},
+        }
+        bdm = mock.Mock(
+            volume_id=volume_id,
+            attachment_id='40000000-0000-0000-0000-000000000004',
+            device_name='/dev/vdb')
+        bdm.get.side_effect = lambda key, default=None: (
+            connection_info if key == 'connection_info' else default)
+        base_attach.return_value = mock.sentinel.result
+        confirm = self.compute.driver.confirm_connected_volume_journal
+        confirm.side_effect = RuntimeError('journal fsync failed')
+
+        result = self.compute._attach_volume(
+            context.get_admin_context(), instance, bdm)
+
+        self.assertIs(mock.sentinel.result, result)
+        confirm.assert_called_once()
+        bdm.destroy.assert_not_called()
+
+    @mock.patch.object(manager.manager.ComputeManager, '_attach_volume')
+    def test_hot_attach_failure_retains_pre_driver_intent(self, base_attach):
+        instance = self._idmap_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        bdm = mock.Mock(
+            volume_id=volume_id,
+            attachment_id='40000000-0000-0000-0000-000000000004',
+            device_name='/dev/vdb')
+        base_attach.side_effect = RuntimeError('attach failed')
+
+        self.assertRaises(
+            RuntimeError, self.compute._attach_volume,
+            context.get_admin_context(), instance, bdm)
+
+        self.compute.driver.prepare_managed_volume_attach.\
+            assert_called_once()
+        self.compute.driver.cancel_managed_volume_attach.assert_not_called()
+
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    @mock.patch.object(manager.manager.ComputeManager, '_attach_volume')
+    def test_hot_attach_transaction_blocks_periodic_recovery(
+            self, base_attach, get_instance):
+        instance = self._idmap_instance()
+        instance.host = self.compute.host
+        instance.task_state = None
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        connection_info = {
+            'serial': volume_id,
+            'driver_volume_type': 'rbd',
+            'data': {'name': 'volumes/volume-{}'.format(volume_id)},
+        }
+        bdm = mock.Mock(
+            volume_id=volume_id,
+            attachment_id='40000000-0000-0000-0000-000000000004',
+            device_name='/dev/vdb')
+        bdm.get.side_effect = lambda key, default=None: (
+            connection_info if key == 'connection_info' else default)
+        base_entered = threading.Event()
+        release_base = threading.Event()
+        recovery_waiting = threading.Event()
+        failures = []
+        locks = {}
+        transaction_name = manager._volume_manager_transaction_lock_name(
+            instance.uuid, volume_id)
+
+        @contextlib.contextmanager
+        def serialized_lock(name, **kwargs):
+            lock = locks.setdefault(name, threading.Lock())
+            if (name == transaction_name and
+                    threading.current_thread().name == 'periodic'):
+                recovery_waiting.set()
+            lock.acquire()
+            try:
+                yield
+            finally:
+                lock.release()
+
+        def hold_base(*args, **kwargs):
+            base_entered.set()
+            self.assertTrue(release_base.wait(5))
+            return mock.sentinel.result
+
+        base_attach.side_effect = hold_base
+        get_instance.return_value = instance
+        self.compute.driver.list_volume_journal_recovery_candidates.\
+            return_value = [{
+                'uuid': instance.uuid,
+                'volume_ids': [volume_id],
+                'phases': {volume_id: 'connecting'},
+            }]
+        self.compute.driver.get_volume_journal_recovery_phase.return_value = (
+            'connecting')
+
+        def run_attach():
+            try:
+                self.compute._attach_volume(
+                    context.get_admin_context(), instance, bdm)
+            except Exception as exc:
+                failures.append(exc)
+
+        def run_periodic():
+            try:
+                self.compute._recover_incus_volume_journals(
+                    context.get_admin_context())
+            except Exception as exc:
+                failures.append(exc)
+
+        with mock.patch.object(
+                manager.lockutils, 'lock', side_effect=serialized_lock), \
+                mock.patch.object(
+                    self.compute,
+                    '_recover_incus_connecting_volume_journal') as recover:
+            attach_thread = threading.Thread(
+                target=run_attach, name='attach')
+            periodic_thread = threading.Thread(
+                target=run_periodic, name='periodic')
+            attach_thread.start()
+            self.assertTrue(base_entered.wait(5))
+            periodic_thread.start()
+            self.assertTrue(recovery_waiting.wait(5))
+            recover.assert_not_called()
+            release_base.set()
+            attach_thread.join(5)
+            periodic_thread.join(5)
+
+        self.assertFalse(attach_thread.is_alive())
+        self.assertFalse(periodic_thread.is_alive())
+        self.assertEqual([], failures)
+        recover.assert_called_once_with(
+            mock.ANY, instance, volume_id, journal_phase='connecting')
+
+    @mock.patch.object(manager.manager.ComputeManager, '_detach_volume')
+    def test_managed_detach_transaction_covers_upstream_and_finalize(
+            self, base_detach):
+        instance = self._idmap_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        bdm = mock.Mock(
+            volume_id=volume_id,
+            attachment_id='40000000-0000-0000-0000-000000000004',
+            device_name='/dev/vdb')
+        events = []
+        transaction_name = manager._volume_manager_transaction_lock_name(
+            instance.uuid, volume_id)
+
+        @contextlib.contextmanager
+        def tracked_lock(name, **kwargs):
+            events.append(('enter', name))
+            try:
+                yield
+            finally:
+                events.append(('exit', name))
+
+        base_detach.side_effect = lambda *args, **kwargs: events.append(
+            ('base', volume_id))
+        finalize = self.compute.driver.finalize_disconnected_volume_journal
+        finalize.side_effect = (
+            lambda *args, **kwargs: events.append(('finalize', volume_id)))
+
+        with mock.patch.object(
+                manager.lockutils, 'lock', side_effect=tracked_lock):
+            self.compute._detach_volume(
+                context.get_admin_context(), bdm, instance)
+
+        self.assertEqual(('enter', transaction_name), events[0])
+        self.assertLess(
+            events.index(('base', volume_id)),
+            events.index(('finalize', volume_id)))
+        self.assertEqual(('exit', transaction_name), events[-1])
+
+    @staticmethod
+    def _cinder_attachment(instance, volume_id, status):
+        return {
+            'id': '40000000-0000-0000-0000-000000000004',
+            'volume_id': volume_id,
+            'connection_info': {
+                'status': status,
+                'instance': instance.uuid,
+                'volume_id': volume_id,
+                'driver_volume_type': 'rbd',
+                'data': {
+                    'name': 'volumes/volume-{}'.format(volume_id),
+                },
+            },
+        }
+
+    @staticmethod
+    def _cinder_volume(instance, volume_id, attachment_status=None,
+                       attachment_id=None, volume_status=None):
+        attachments = {}
+        if attachment_status == 'attached':
+            attachments[instance.uuid] = {
+                'attachment_id': attachment_id,
+                'mountpoint': '/dev/vdb',
+            }
+        return {
+            'id': volume_id,
+            'status': volume_status or (
+                'in-use' if attachments else 'available'),
+            'attach_status': 'attached' if attachments else 'detached',
+            'attachments': attachments,
+        }
+
+    def _configure_cinder_recovery_attachment(
+            self, instance, volume_id, status):
+        detail = self._cinder_attachment(instance, volume_id, status)
+        self.compute.volume_api.attachment_get.return_value = detail
+        volume_status = {
+            'attached': 'in-use',
+            'attaching': 'attaching',
+            'reserved': 'reserved',
+            'error_attaching': 'error',
+            'detached': 'available',
+            'deleted': 'available',
+        }.get(status, 'error')
+        self.compute.volume_api.get.return_value = self._cinder_volume(
+            instance, volume_id, attachment_status=status,
+            attachment_id=detail['id'], volume_status=volume_status)
+        return detail
+
+    def _volume_recovery_instance(self):
+        instance = self._idmap_instance()
+        instance.host = self.compute.host
+        instance.task_state = None
+        self.compute.driver.get_managed_volume_attach_intent.return_value = {
+            'attachment_id': '40000000-0000-0000-0000-000000000004',
+            'mountpoint': '/dev/vdb',
+            'operation_kind': 'hot-attach',
+            'operation_token': None,
+            'operation_direction': None,
+        }
+        self.compute.driver.get_volume_journal_phase.return_value = (
+            'connecting')
+        self.compute.driver.get_volume_journal_recovery_phase.return_value = (
+            'connecting')
+        return instance
+
+    def _volume_recovery_bdm(self, volume_id, connection_info=None):
+        bdm = mock.Mock(
+            volume_id=volume_id,
+            deleted=False,
+            attachment_id='40000000-0000-0000-0000-000000000004',
+            device_name='/dev/vdb')
+        bdm.connection_info = (
+            jsonutils.dumps(connection_info)
+            if connection_info is not None else None)
+        return bdm
+
+    def _configure_internal_volume_recovery(
+            self, instance, volume_id, operation_kind, operation_token,
+            operation_direction, operation_migration_uuid=None):
+        attachment = self._cinder_attachment(
+            instance, volume_id, 'attached')
+        connection_info = dict(attachment['connection_info'])
+        connection_info['serial'] = volume_id
+        bdm = self._volume_recovery_bdm(
+            volume_id, connection_info=connection_info)
+        self.compute.driver.get_managed_volume_attach_intent.return_value = {
+            'attachment_id': bdm.attachment_id,
+            'mountpoint': bdm.device_name,
+            'operation_kind': operation_kind,
+            'operation_token': operation_token,
+            'operation_direction': operation_direction,
+            'operation_migration_uuid': (
+                operation_migration_uuid
+                if operation_kind == 'migration' else None),
+        }
+        self.compute.volume_api = mock.Mock()
+        self._configure_cinder_recovery_attachment(
+            instance, volume_id, 'attached')
+        return bdm
+
+    def _configure_managed_detach(
+            self, volume_id, phase='disconnecting', destroy_bdm=True):
+        intent = {
+            'attachment_id': '40000000-0000-0000-0000-000000000004',
+            'mountpoint': '/dev/vdb',
+            'destroy_bdm': destroy_bdm,
+        }
+        self.compute.driver.get_managed_volume_detach_intent.return_value = (
+            intent)
+        self.compute.driver.get_volume_journal_phase.return_value = phase
+        return intent
+
+    @staticmethod
+    def _rotation_attachment(
+            instance, volume_id, attachment_id, status='attached'):
+        connection_info = {
+            'status': status,
+            'instance': instance.uuid,
+            'volume_id': volume_id,
+        }
+        if status in ('attaching', 'attached'):
+            connection_info.update({
+                'driver_volume_type': 'rbd',
+                'data': {'name': 'volumes/volume-{}'.format(volume_id)},
+            })
+        return {
+            'id': attachment_id,
+            'volume_id': volume_id,
+            'status': status,
+            'instance': instance.uuid,
+            'connection_info': connection_info,
+        }
+
+    def _configure_cold_rotation(self, volume_count=2):
+        instance = self._volume_recovery_instance()
+        instance.task_state = task_states.RESIZE_MIGRATING
+        instance.migration_context = mock.Mock(migration_id=7)
+        token = '60000000-0000-0000-0000-000000000006'
+        migration = mock.MagicMock(
+            uuid=token, source_compute=self.compute.host,
+            dest_compute='compute-2', status='migrating')
+        self.compute.driver.get_cold_source_migration_token.return_value = (
+            token)
+        volumes = []
+        attachments = {}
+        intents = {}
+        rotations = {}
+        events = []
+        for index in range(volume_count):
+            volume_id = '50000000-0000-0000-0000-{:012d}'.format(index + 1)
+            old_id = '40000000-0000-0000-0000-{:012d}'.format(index + 1)
+            mountpoint = '/dev/vd{}'.format(chr(ord('b') + index))
+            connection_info = self._rotation_attachment(
+                instance, volume_id, old_id)['connection_info']
+            bdm = mock.Mock(
+                is_volume=True, boot_index=-1, volume_id=volume_id,
+                attachment_id=old_id, device_name=mountpoint, deleted=False)
+            bdm.connection_info = jsonutils.dumps(connection_info)
+            bdm.save.side_effect = lambda volume_id=volume_id: events.append(
+                ('bdm-save', volume_id))
+            volumes.append(bdm)
+            attachments[old_id] = self._rotation_attachment(
+                instance, volume_id, old_id)
+            intents[volume_id] = {
+                'attachment_id': old_id,
+                'mountpoint': mountpoint,
+                'operation_kind': 'migration',
+                'operation_token': token,
+                'operation_direction': 'cold-source-restore',
+                'operation_migration_uuid': token,
+                'boot_volume': False,
+            }
+
+        self.compute.volume_api = mock.Mock()
+
+        def attachment_get(unused_context, attachment_id):
+            try:
+                return attachments[attachment_id]
+            except KeyError:
+                raise exception.VolumeAttachmentNotFound(
+                    attachment_id=attachment_id)
+
+        def attachment_get_all(unused_context, instance_id=None,
+                               volume_id=None):
+            return [
+                value for value in attachments.values()
+                if value['volume_id'] == volume_id]
+
+        def attachment_create(unused_context, volume_id, instance_uuid):
+            new_id = '70000000-0000-0000-0000-{}'.format(volume_id[-12:])
+            attachments[new_id] = self._rotation_attachment(
+                instance, volume_id, new_id, status='reserved')
+            events.append(('create', volume_id))
+            return {'id': new_id}
+
+        def attachment_delete(unused_context, attachment_id):
+            volume_id = attachments[attachment_id]['volume_id']
+            events.append(('delete', volume_id))
+            attachments.pop(attachment_id)
+
+        self.compute.volume_api.attachment_get.side_effect = attachment_get
+        self.compute.volume_api.attachment_get_all.side_effect = (
+            attachment_get_all)
+        self.compute.volume_api.attachment_create.side_effect = (
+            attachment_create)
+        self.compute.volume_api.attachment_delete.side_effect = (
+            attachment_delete)
+        self.compute.driver.get_managed_volume_attach_intent.side_effect = (
+            lambda unused_instance, volume_id: intents.get(volume_id))
+        self.compute.driver.get_cold_attachment_rotation.side_effect = (
+            lambda unused_instance, volume_id: rotations.get(volume_id))
+
+        def prepare_rotation(
+                unused_instance, volume_id, old_attachment_id, mountpoint,
+                operation_token, migration_uuid, baseline_attachment_ids,
+                boot_volume=False):
+            payload = {
+                'old_attachment_id': old_attachment_id,
+                'new_attachment_id': None,
+                'mountpoint': mountpoint,
+                'operation_token': operation_token,
+                'migration_uuid': migration_uuid,
+                'baseline_attachment_ids': baseline_attachment_ids,
+                'phase': 'prepared',
+                'boot_volume': boot_volume,
+            }
+            rotations[volume_id] = payload
+            events.append(('prepared', volume_id))
+            return payload, True
+
+        def transition(
+                unused_instance, volume_id, expected, phase,
+                new_attachment_id=None):
+            self.assertEqual(expected, rotations[volume_id])
+            payload = dict(expected)
+            payload['phase'] = phase
+            if new_attachment_id is not None:
+                payload['new_attachment_id'] = new_attachment_id
+            rotations[volume_id] = payload
+            events.append((phase, volume_id))
+            return payload
+
+        self.compute.driver.prepare_cold_attachment_rotation.side_effect = (
+            prepare_rotation)
+        self.compute.driver.transition_cold_attachment_rotation.side_effect = (
+            transition)
+        return (
+            instance, migration, volumes, attachments, intents, rotations,
+            events)
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMapping, 'get_by_volume_and_instance')
+    @mock.patch.object(manager.objects.Migration, 'get_by_id_and_instance')
+    def test_cold_attachment_rotation_n2_orders_every_commit_point(
+            self, get_migration, get_bdm):
+        (instance, migration, volumes, unused_attachments, unused_intents,
+         rotations, events) = self._configure_cold_rotation()
+        get_migration.return_value = migration
+        by_volume = {bdm.volume_id: bdm for bdm in volumes}
+        get_bdm.side_effect = (
+            lambda unused_context, volume_id, unused_instance:
+            by_volume[volume_id])
+
+        self.compute._terminate_volume_connections(
+            context.get_admin_context(), instance, volumes)
+
+        self.assertEqual(
+            {'bdm-rotated'}, {value['phase'] for value in rotations.values()})
+        for bdm in volumes:
+            volume_id = bdm.volume_id
+            self.assertLess(
+                events.index(('prepared', volume_id)),
+                events.index(('creating', volume_id)))
+            self.assertLess(
+                events.index(('creating', volume_id)),
+                events.index(('create', volume_id)))
+            self.assertLess(
+                events.index(('new-created', volume_id)),
+                events.index(('delete', volume_id)))
+            self.assertLess(
+                events.index(('old-deleted', volume_id)),
+                events.index(('bdm-save', volume_id)))
+            self.assertLess(
+                events.index(('bdm-save', volume_id)),
+                events.index(('bdm-rotated', volume_id)))
+
+    @mock.patch.object(manager.objects.Migration, 'get_by_id_and_instance')
+    def test_cold_attachment_rotation_lost_create_response_fails_closed(
+            self, get_migration):
+        (instance, migration, volumes, attachments, unused_intents, rotations,
+         events) = self._configure_cold_rotation(volume_count=1)
+        get_migration.return_value = migration
+        bdm = volumes[0]
+        new_id = '70000000-0000-0000-0000-000000000001'
+
+        def lost_response(unused_context, volume_id, unused_instance):
+            attachments[new_id] = self._rotation_attachment(
+                instance, volume_id, new_id, status='reserved')
+            events.append(('create', volume_id))
+            raise RuntimeError('response lost')
+
+        self.compute.volume_api.attachment_create.side_effect = lost_response
+        self.assertRaises(
+            RuntimeError, self.compute._terminate_volume_connections,
+            context.get_admin_context(), instance, volumes)
+        self.assertEqual('creating', rotations[bdm.volume_id]['phase'])
+        old_id = rotations[bdm.volume_id]['old_attachment_id']
+        self.assertIn(old_id, attachments)
+        self.assertEqual(old_id, bdm.attachment_id)
+
+        self.assertRaises(
+            exception.InvalidVolume,
+            self.compute._terminate_volume_connections,
+            context.get_admin_context(), instance, volumes)
+        self.assertEqual(1, events.count(('create', bdm.volume_id)))
+        self.compute.volume_api.attachment_delete.assert_not_called()
+        bdm.save.assert_not_called()
+
+    def test_cold_attachment_rotation_never_adopts_unknown_create_result(self):
+        (instance, unused_migration, volumes, attachments, unused_intents,
+         rotations, unused_events) = self._configure_cold_rotation(
+             volume_count=1)
+        bdm = volumes[0]
+        volume_id = bdm.volume_id
+        old_id = bdm.attachment_id
+        rotation = {
+            'old_attachment_id': old_id,
+            'new_attachment_id': None,
+            'mountpoint': bdm.device_name,
+            'operation_token':
+                '60000000-0000-0000-0000-000000000006',
+            'migration_uuid':
+                '60000000-0000-0000-0000-000000000006',
+            'baseline_attachment_ids': [old_id],
+            'phase': 'creating',
+            'boot_volume': False,
+        }
+        rotations[volume_id] = rotation
+
+        for candidate_count in (0, 1, 2):
+            with self.subTest(candidate_count=candidate_count):
+                candidates = []
+                for index in range(candidate_count):
+                    attachment_id = (
+                        '71000000-0000-0000-0000-{:012d}'.format(index + 1))
+                    candidate = self._rotation_attachment(
+                        instance, volume_id, attachment_id, status='reserved')
+                    attachments[attachment_id] = candidate
+                    candidates.append(candidate)
+                self.compute.volume_api.attachment_get_all.return_value = (
+                    candidates)
+
+                self.assertRaises(
+                    exception.InvalidVolume,
+                    self.compute._advance_cold_attachment_rotation_locked,
+                    context.get_admin_context(), instance, bdm, rotation)
+
+                self.assertEqual(old_id, bdm.attachment_id)
+                self.compute.volume_api.attachment_create.assert_not_called()
+                self.compute.volume_api.attachment_delete.assert_not_called()
+                self.compute.volume_api.attachment_get_all.assert_not_called()
+                bdm.save.assert_not_called()
+                for candidate in candidates:
+                    attachments.pop(candidate['id'])
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMapping, 'get_by_volume_and_instance')
+    def test_cold_attachment_rotation_recovers_delete_response_loss(
+            self, get_bdm):
+        (instance, unused_migration, volumes, attachments, unused_intents,
+         rotations, events) = self._configure_cold_rotation(volume_count=1)
+        bdm = volumes[0]
+        volume_id = bdm.volume_id
+        old_id = bdm.attachment_id
+        new_id = '70000000-0000-0000-0000-000000000001'
+        attachments[new_id] = self._rotation_attachment(
+            instance, volume_id, new_id, status='reserved')
+        rotations[volume_id] = {
+            'old_attachment_id': old_id,
+            'new_attachment_id': new_id,
+            'mountpoint': bdm.device_name,
+            'operation_token':
+                '60000000-0000-0000-0000-000000000006',
+            'migration_uuid':
+                '60000000-0000-0000-0000-000000000006',
+            'baseline_attachment_ids': [old_id],
+            'phase': 'new-created',
+            'boot_volume': False,
+        }
+        get_bdm.return_value = bdm
+        attempts = [0]
+
+        def lost_delete(unused_context, attachment_id):
+            attempts[0] += 1
+            attachments.pop(attachment_id)
+            raise RuntimeError('delete response lost')
+
+        self.compute.volume_api.attachment_delete.side_effect = lost_delete
+        result = self.compute._advance_cold_attachment_rotation_locked(
+            context.get_admin_context(), instance, bdm, rotations[volume_id])
+
+        self.assertEqual('bdm-rotated', result['phase'])
+        self.assertEqual(1, attempts[0])
+        self.assertEqual(new_id, bdm.attachment_id)
+        self.assertNotIn(old_id, attachments)
+        self.assertLess(
+            events.index(('old-deleted', volume_id)),
+            events.index(('bdm-save', volume_id)))
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMapping, 'get_by_volume_and_instance')
+    def test_cold_attachment_rotation_recovers_bdm_save_response_loss(
+            self, get_bdm):
+        (instance, unused_migration, volumes, attachments, unused_intents,
+         rotations, unused_events) = self._configure_cold_rotation(
+             volume_count=1)
+        bdm = volumes[0]
+        volume_id = bdm.volume_id
+        old_id = bdm.attachment_id
+        new_id = '70000000-0000-0000-0000-000000000001'
+        attachments.pop(old_id)
+        attachments[new_id] = self._rotation_attachment(
+            instance, volume_id, new_id, status='reserved')
+        rotations[volume_id] = {
+            'old_attachment_id': old_id,
+            'new_attachment_id': new_id,
+            'mountpoint': bdm.device_name,
+            'operation_token':
+                '60000000-0000-0000-0000-000000000006',
+            'migration_uuid':
+                '60000000-0000-0000-0000-000000000006',
+            'baseline_attachment_ids': [old_id],
+            'phase': 'old-deleted',
+            'boot_volume': False,
+        }
+        durable_id = [old_id]
+        save_calls = [0]
+
+        def current_bdm(unused_context, unused_volume, unused_instance):
+            current = mock.Mock(
+                attachment_id=durable_id[0], volume_id=volume_id,
+                device_name=bdm.device_name)
+
+            def save():
+                save_calls[0] += 1
+                durable_id[0] = current.attachment_id
+                raise RuntimeError('BDM save response lost')
+
+            current.save.side_effect = save
+            return current
+
+        get_bdm.side_effect = current_bdm
+        result = self.compute._advance_cold_attachment_rotation_locked(
+            context.get_admin_context(), instance, bdm, rotations[volume_id])
+
+        self.assertEqual('bdm-rotated', result['phase'])
+        self.assertEqual(new_id, durable_id[0])
+        self.assertEqual(1, save_calls[0])
+        self.compute.volume_api.attachment_delete.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMapping, 'get_by_volume_and_instance')
+    def test_cold_attachment_rotation_rejects_unknown_bdm_owner(
+            self, get_bdm):
+        (instance, unused_migration, volumes, attachments, unused_intents,
+         rotations, unused_events) = self._configure_cold_rotation(
+             volume_count=1)
+        bdm = volumes[0]
+        volume_id = bdm.volume_id
+        old_id = bdm.attachment_id
+        new_id = '70000000-0000-0000-0000-000000000001'
+        third_id = '72000000-0000-0000-0000-000000000001'
+        attachments.pop(old_id)
+        attachments[new_id] = self._rotation_attachment(
+            instance, volume_id, new_id, status='reserved')
+        rotations[volume_id] = {
+            'old_attachment_id': old_id,
+            'new_attachment_id': new_id,
+            'mountpoint': bdm.device_name,
+            'operation_token':
+                '60000000-0000-0000-0000-000000000006',
+            'migration_uuid':
+                '60000000-0000-0000-0000-000000000006',
+            'baseline_attachment_ids': [old_id],
+            'phase': 'old-deleted',
+            'boot_volume': False,
+        }
+        current = mock.Mock(
+            attachment_id=third_id, volume_id=volume_id,
+            device_name=bdm.device_name)
+        get_bdm.return_value = current
+
+        self.assertRaises(
+            exception.InvalidVolume,
+            self.compute._advance_cold_attachment_rotation_locked,
+            context.get_admin_context(), instance, bdm, rotations[volume_id])
+
+        self.assertEqual(third_id, current.attachment_id)
+        current.save.assert_not_called()
+        self.compute.volume_api.attachment_create.assert_not_called()
+        self.compute.volume_api.attachment_delete.assert_not_called()
+
+    def test_failed_cold_rotation_keeps_old_and_deletes_replacement(self):
+        (instance, migration, volumes, attachments, intents, rotations,
+         unused_events) = self._configure_cold_rotation(volume_count=1)
+        migration.status = 'failed'
+        bdm = volumes[0]
+        volume_id = bdm.volume_id
+        old_id = bdm.attachment_id
+        new_id = '70000000-0000-0000-0000-000000000001'
+        attachments[new_id] = self._rotation_attachment(
+            instance, volume_id, new_id, status='reserved')
+        rotations[volume_id] = {
+            'old_attachment_id': old_id,
+            'new_attachment_id': new_id,
+            'mountpoint': bdm.device_name,
+            'operation_token': migration.uuid,
+            'migration_uuid': migration.uuid,
+            'baseline_attachment_ids': [old_id],
+            'phase': 'new-created',
+            'boot_volume': False,
+        }
+        self.compute.driver.cancel_cold_attachment_rotation.side_effect = (
+            lambda unused_instance, unused_volume, unused_rotation:
+            rotations.pop(volume_id))
+
+        handled = self.compute._recover_failed_cold_attachment_rotation_locked(
+            context.get_admin_context(), instance, volume_id,
+            intents[volume_id], bdm, rotations[volume_id], migration)
+
+        self.assertFalse(handled)
+        self.assertIn(old_id, attachments)
+        self.assertNotIn(new_id, attachments)
+        self.assertEqual(old_id, bdm.attachment_id)
+        self.compute.driver.fence_failed_cold_source_volume_generation.\
+            assert_called_once_with(instance, migration.uuid)
+        self.compute.driver.restart_internal_volume_attach.assert_not_called()
+
+    def test_failed_cold_rotation_replays_deleted_replacement(self):
+        (instance, migration, volumes, attachments, intents, rotations,
+         events) = self._configure_cold_rotation(volume_count=1)
+        migration.status = 'failed'
+        bdm = volumes[0]
+        volume_id = bdm.volume_id
+        old_id = bdm.attachment_id
+        new_id = '70000000-0000-0000-0000-000000000001'
+        rotations[volume_id] = {
+            'old_attachment_id': old_id,
+            'new_attachment_id': new_id,
+            'mountpoint': bdm.device_name,
+            'operation_token': migration.uuid,
+            'migration_uuid': migration.uuid,
+            'baseline_attachment_ids': [old_id],
+            'phase': 'new-created',
+            'boot_volume': False,
+        }
+
+        handled = self.compute._recover_failed_cold_attachment_rotation_locked(
+            context.get_admin_context(), instance, volume_id,
+            intents[volume_id], bdm, rotations[volume_id], migration)
+
+        self.assertFalse(handled)
+        self.assertIn(old_id, attachments)
+        self.assertNotIn(new_id, attachments)
+        self.assertEqual(old_id, bdm.attachment_id)
+        self.assertIn(('source-old-retained', volume_id), events)
+        self.compute.volume_api.attachment_delete.assert_not_called()
+        self.compute.driver.restart_internal_volume_attach.assert_not_called()
+
+    @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
+    def test_failed_cold_bfv_replays_source_old_retained(
+            self, get_migrations):
+        (instance, migration, volumes, unused_attachments, intents, rotations,
+         events) = self._configure_cold_rotation(volume_count=1)
+        migration.status = 'failed'
+        bdm = volumes[0]
+        bdm.boot_index = 0
+        volume_id = bdm.volume_id
+        intents[volume_id]['boot_volume'] = True
+        rotations[volume_id] = {
+            'old_attachment_id': bdm.attachment_id,
+            'new_attachment_id':
+                '70000000-0000-0000-0000-000000000001',
+            'mountpoint': bdm.device_name,
+            'operation_token': migration.uuid,
+            'migration_uuid': migration.uuid,
+            'baseline_attachment_ids': [bdm.attachment_id],
+            'phase': 'source-old-retained',
+            'boot_volume': True,
+        }
+        get_migrations.return_value = [migration]
+        self.compute.driver.get_source_volume_generation_recovery_candidate.\
+            return_value = {
+                'operation_token': migration.uuid,
+                'migration_uuid': migration.uuid,
+            }
+        self.compute.driver.get_internal_volume_attach_connection_info.\
+            return_value = None
+        self.compute.driver.get_volume_journal_phase.return_value = None
+
+        handled = self.compute._recover_failed_cold_attachment_rotation_locked(
+            context.get_admin_context(), instance, volume_id,
+            intents[volume_id], bdm, rotations[volume_id], migration)
+
+        self.assertTrue(handled)
+        self.assertIn(('source-rollback-complete', volume_id), events)
+        self.compute.driver.mark_source_volume_generation_rollback_complete.\
+            assert_called_once_with(instance, migration.uuid, migration.uuid)
+        self.compute.driver.cancel_managed_volume_attach.\
+            assert_called_once_with(instance, volume_id, intents[volume_id])
+        self.compute.driver.restart_internal_volume_attach.assert_not_called()
+        self.compute.driver.confirm_connected_volume_journal.\
+            assert_not_called()
+
+    @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
+    def test_failed_cold_bfv_prepared_retains_terminal_owner_mismatch(
+            self, get_migrations):
+        (instance, migration, volumes, attachments, intents, rotations,
+         unused_events) = self._configure_cold_rotation(volume_count=1)
+        migration.status = 'failed'
+        bdm = volumes[0]
+        bdm.boot_index = 0
+        volume_id = bdm.volume_id
+        intents[volume_id]['boot_volume'] = True
+        rotations[volume_id] = {
+            'old_attachment_id': bdm.attachment_id,
+            'new_attachment_id': None,
+            'mountpoint': bdm.device_name,
+            'operation_token': migration.uuid,
+            'migration_uuid': migration.uuid,
+            'baseline_attachment_ids': [bdm.attachment_id],
+            'phase': 'prepared',
+            'boot_volume': True,
+        }
+        attachments.pop(bdm.attachment_id)
+        get_migrations.return_value = [migration]
+        self.compute.driver.get_source_volume_generation_recovery_candidate.\
+            return_value = {
+                'operation_token': migration.uuid,
+                'migration_uuid': migration.uuid,
+            }
+        self.compute.driver.get_internal_volume_attach_connection_info.\
+            return_value = None
+        self.compute.driver.get_volume_journal_phase.return_value = None
+
+        self.assertRaises(
+            exception.InvalidVolume,
+            self.compute._recover_failed_cold_attachment_rotation_locked,
+            context.get_admin_context(), instance, volume_id,
+            intents[volume_id], bdm, rotations[volume_id], migration)
+
+        self.assertEqual(
+            'source-rollback-complete', rotations[volume_id]['phase'])
+        self.compute.driver.cancel_managed_volume_attach.assert_not_called()
+        self.compute.driver.cancel_cold_attachment_rotation.assert_not_called()
+        self.compute.driver.restart_internal_volume_attach.assert_not_called()
+
+    @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
+    def test_failed_cold_bfv_intent_only_is_control_plane_recovery(
+            self, get_migrations):
+        (instance, migration, volumes, attachments, intents, unused_rotations,
+         unused_events) = self._configure_cold_rotation(volume_count=1)
+        migration.status = 'failed'
+        bdm = volumes[0]
+        bdm.boot_index = 0
+        volume_id = bdm.volume_id
+        intent = dict(intents[volume_id], boot_volume=True)
+        get_migrations.return_value = [migration]
+        self.compute.driver.get_volume_journal_phase.return_value = None
+        self.compute.driver.get_internal_volume_attach_connection_info.\
+            return_value = None
+        attachment = attachments[bdm.attachment_id]
+
+        self.compute._recover_incus_internal_attach_locked(
+            context.get_admin_context(), instance, volume_id,
+            'attach-pending', intent, bdm, attachment, 'attached',
+            attachment['connection_info'])
+
+        self.compute.driver.mark_source_volume_generation_rollback_complete.\
+            assert_called_once_with(instance, migration.uuid, migration.uuid)
+        self.compute.driver.cancel_managed_volume_attach.\
+            assert_called_once_with(instance, volume_id, intent)
+        self.compute.driver.resume_internal_volume_attach.assert_not_called()
+        self.compute.driver.restart_internal_volume_attach.assert_not_called()
+        self.compute.driver.confirm_connected_volume_journal.\
+            assert_not_called()
+
+    @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
+    def test_failed_cold_bfv_intent_only_rejects_local_data_mapping(
+            self, get_migrations):
+        (instance, migration, volumes, attachments, intents, unused_rotations,
+         unused_events) = self._configure_cold_rotation(volume_count=1)
+        migration.status = 'failed'
+        bdm = volumes[0]
+        bdm.boot_index = 0
+        volume_id = bdm.volume_id
+        intent = dict(intents[volume_id], boot_volume=True)
+        get_migrations.return_value = [migration]
+        self.compute.driver.get_volume_journal_phase.return_value = None
+        self.compute.driver.get_internal_volume_attach_connection_info.\
+            return_value = {'driver_volume_type': 'rbd', 'data': {}}
+        attachment = attachments[bdm.attachment_id]
+
+        self.assertRaises(
+            exception.InvalidVolume,
+            self.compute._recover_incus_internal_attach_locked,
+            context.get_admin_context(), instance, volume_id,
+            'attach-pending', intent, bdm, attachment, 'attached',
+            attachment['connection_info'])
+
+        self.compute.driver.cancel_managed_volume_attach.assert_not_called()
+        self.compute.driver.resume_internal_volume_attach.assert_not_called()
+        self.compute.driver.confirm_connected_volume_journal.\
+            assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMapping, 'get_by_volume_and_instance')
+    def test_failed_cold_rotation_promotes_known_replacement(
+            self, get_bdm):
+        (instance, migration, volumes, attachments, intents, rotations,
+         unused_events) = self._configure_cold_rotation(volume_count=1)
+        migration.status = 'error'
+        bdm = volumes[0]
+        volume_id = bdm.volume_id
+        old_id = bdm.attachment_id
+        new_id = '70000000-0000-0000-0000-000000000001'
+        attachments.pop(old_id)
+        attachments[new_id] = self._rotation_attachment(
+            instance, volume_id, new_id, status='reserved')
+        rotations[volume_id] = {
+            'old_attachment_id': old_id,
+            'new_attachment_id': new_id,
+            'mountpoint': bdm.device_name,
+            'operation_token': migration.uuid,
+            'migration_uuid': migration.uuid,
+            'baseline_attachment_ids': [old_id],
+            'phase': 'old-deleted',
+            'boot_volume': False,
+        }
+        get_bdm.return_value = bdm
+
+        def attachment_update(
+                unused_context, attachment_id, unused_connector,
+                mountpoint=None):
+            self.assertEqual(new_id, attachment_id)
+            self.assertEqual(bdm.device_name, mountpoint)
+            attachments[new_id] = self._rotation_attachment(
+                instance, volume_id, new_id, status='attaching')
+            return attachments[new_id]
+
+        def attachment_complete(unused_context, attachment_id):
+            attachments[attachment_id] = self._rotation_attachment(
+                instance, volume_id, attachment_id, status='attached')
+
+        self.compute.volume_api.attachment_update.side_effect = (
+            attachment_update)
+        self.compute.volume_api.attachment_complete.side_effect = (
+            attachment_complete)
+        replacement_intent = dict(intents[volume_id])
+        replacement_intent['attachment_id'] = new_id
+        self.compute.driver.replace_cold_source_volume_attach_intent.\
+            return_value = replacement_intent
+
+        handled = self.compute._recover_failed_cold_attachment_rotation_locked(
+            context.get_admin_context(), instance, volume_id,
+            intents[volume_id], bdm, rotations[volume_id], migration)
+
+        self.assertTrue(handled)
+        self.assertEqual(new_id, bdm.attachment_id)
+        self.compute.driver.restart_internal_volume_attach.\
+            assert_called_once_with(
+                mock.ANY, instance, volume_id, mock.ANY,
+                expected_mountpoint=bdm.device_name)
+        self.compute.driver.cancel_managed_volume_attach.\
+            assert_called_once_with(instance, volume_id, replacement_intent)
+        self.compute.driver.finalize_failed_cold_source_volume_generation.\
+            assert_called_once_with(instance, migration.uuid)
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMapping, 'get_by_volume_and_instance')
+    def test_failed_cold_bfv_promotes_without_os_brick_or_data_journal(
+            self, get_bdm):
+        (instance, migration, volumes, attachments, intents, rotations,
+         events) = self._configure_cold_rotation(volume_count=1)
+        migration.status = 'error'
+        bdm = volumes[0]
+        bdm.boot_index = 0
+        volume_id = bdm.volume_id
+        old_id = bdm.attachment_id
+        new_id = '70000000-0000-0000-0000-000000000001'
+        attachments.pop(old_id)
+        attachments[new_id] = self._rotation_attachment(
+            instance, volume_id, new_id, status='reserved')
+        intents[volume_id]['boot_volume'] = True
+        rotations[volume_id] = {
+            'old_attachment_id': old_id,
+            'new_attachment_id': new_id,
+            'mountpoint': bdm.device_name,
+            'operation_token': migration.uuid,
+            'migration_uuid': migration.uuid,
+            'baseline_attachment_ids': [old_id],
+            'phase': 'old-deleted',
+            'boot_volume': True,
+        }
+        get_bdm.return_value = bdm
+
+        def attachment_update(
+                unused_context, attachment_id, unused_connector,
+                mountpoint=None):
+            attachments[attachment_id] = self._rotation_attachment(
+                instance, volume_id, attachment_id, status='attaching')
+            return attachments[attachment_id]
+
+        def attachment_complete(unused_context, attachment_id):
+            attachments[attachment_id] = self._rotation_attachment(
+                instance, volume_id, attachment_id, status='attached')
+
+        self.compute.volume_api.attachment_update.side_effect = (
+            attachment_update)
+        self.compute.volume_api.attachment_complete.side_effect = (
+            attachment_complete)
+        replacement_intent = dict(
+            intents[volume_id], attachment_id=new_id)
+        self.compute.driver.replace_cold_source_volume_attach_intent.\
+            return_value = replacement_intent
+        self.compute.driver.cancel_cold_attachment_rotation.side_effect = (
+            lambda unused_instance, unused_volume, unused_rotation:
+            rotations.pop(volume_id))
+
+        handled = self.compute._recover_failed_cold_attachment_rotation_locked(
+            context.get_admin_context(), instance, volume_id,
+            intents[volume_id], bdm, rotations[volume_id], migration)
+
+        self.assertTrue(handled)
+        self.assertEqual(new_id, bdm.attachment_id)
+        self.assertIn(('source-rollback-complete', volume_id), events)
+        self.compute.driver.restart_internal_volume_attach.assert_not_called()
+        self.compute.driver.confirm_connected_volume_journal.\
+            assert_not_called()
+        self.compute.driver.cancel_managed_volume_attach.\
+            assert_called_once_with(instance, volume_id, replacement_intent)
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMapping, 'get_by_volume_and_instance')
+    @mock.patch.object(manager.objects.Migration, 'get_by_id_and_instance')
+    def test_cold_bfv_rotation_has_no_os_brick_side_effect(
+            self, get_migration, get_bdm):
+        (instance, migration, volumes, unused_attachments, intents, rotations,
+         unused_events) = self._configure_cold_rotation(volume_count=1)
+        bdm = volumes[0]
+        bdm.boot_index = 0
+        volume_id = bdm.volume_id
+        old_intent = intents.pop(volume_id)
+        boot_intent = dict(old_intent, boot_volume=True)
+
+        def prepare_intent(unused_instance, requested_volume, *_args,
+                           **kwargs):
+            self.assertEqual(volume_id, requested_volume)
+            self.assertTrue(kwargs['boot_volume'])
+            intents[volume_id] = boot_intent
+            return boot_intent
+
+        self.compute.driver.prepare_managed_volume_attach.side_effect = (
+            prepare_intent)
+        get_migration.return_value = migration
+        get_bdm.return_value = bdm
+
+        self.compute._terminate_volume_connections(
+            context.get_admin_context(), instance, volumes)
+
+        self.assertEqual('bdm-rotated', rotations[volume_id]['phase'])
+        self.assertTrue(rotations[volume_id]['boot_volume'])
+        self.compute.driver.restart_internal_volume_attach.assert_not_called()
+        self.compute.driver._recover_source_release_volume_journal_locked.\
+            assert_not_called()
+
+    def test_terminate_volume_connections_delegates_other_operations(self):
+        instance = self._volume_recovery_instance()
+        instance.task_state = None
+        bdms = [mock.Mock(is_volume=True)]
+        ctxt = context.get_admin_context()
+        with mock.patch.object(
+                manager.manager.ComputeManager,
+                '_terminate_volume_connections',
+                return_value='delegated') as terminate:
+            result = self.compute._terminate_volume_connections(
+                ctxt, instance, bdms)
+
+        self.assertEqual('delegated', result)
+        terminate.assert_called_once_with(ctxt, instance, bdms)
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    @mock.patch.object(manager.objects.RequestSpec, 'get_by_instance_uuid')
+    @mock.patch.object(manager.objects.Migration, 'get_by_id_and_instance')
+    def test_startup_recovers_cold_rotation_before_generic_init(
+            self, get_migration, get_request_spec, get_bdms):
+        instance = self._volume_recovery_instance()
+        instance.task_state = task_states.RESIZE_MIGRATING
+        instance.migration_context = mock.Mock(migration_id=7)
+        token = '60000000-0000-0000-0000-000000000006'
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        migration = mock.MagicMock(
+            uuid=token, source_compute=self.compute.host,
+            dest_compute='compute-2', source_node='node-1',
+            dest_node='node-2', status='migrating')
+        get_migration.return_value = migration
+        request_spec = mock.sentinel.request_spec
+        get_request_spec.return_value = request_spec
+        get_bdms.return_value = [mock.Mock(is_volume=True)]
+        generation = {
+            'uuid': instance.uuid,
+            'operation_token': token,
+            'migration_uuid': token,
+        }
+        self.compute._cold_source_recovery_evidence = mock.Mock(
+            side_effect=[
+                ({volume_id}, {token}, []),
+                (set(), {token}, [generation]),
+            ])
+        events = []
+        migration.save.side_effect = lambda: events.append(
+            'migration-{}'.format(migration.status))
+        self.compute._recover_incus_volume_journals = mock.Mock(
+            side_effect=lambda unused_context: events.append('journal-replay'))
+        self.compute._get_instance_block_device_info = mock.Mock(
+            return_value={'block_device_mapping': []})
+        self.compute.network_api = mock.Mock()
+        self.compute.driver.restore_failed_cold_source_storage_ownership.\
+            side_effect = lambda *_args: events.append('source-owned')
+        source_allocations = {'source-rp': {'resources': {'VCPU': 1}}}
+        self.compute._restore_interrupted_cold_source_allocations = mock.Mock(
+            side_effect=lambda *_args: events.append('placement') or
+            source_allocations)
+        provider_mappings = {'port-1': ['source-rp']}
+        self.compute._fill_provider_mapping_based_on_allocs = mock.Mock(
+            return_value=provider_mappings)
+        self.compute.network_api.setup_networks_on_host.side_effect = (
+            lambda *_args: events.append('network-setup'))
+        self.compute.network_api.migrate_instance_finish.side_effect = (
+            lambda *_args, **_kwargs: events.append('network-finish'))
+        self.compute.network_api.get_instance_nw_info.return_value = []
+        self.compute.driver.power_on.side_effect = (
+            lambda *_args, **_kwargs: events.append('power-on'))
+        self.compute._get_power_state = mock.Mock(
+            return_value=power_state.RUNNING)
+        instance.save.side_effect = lambda **_kwargs: events.append(
+            'task-cleared')
+        self.compute.driver.finalize_failed_cold_source_volume_generation.\
+            side_effect = lambda *_args: events.append('finalize') or True
+
+        recovered = self.compute._recover_interrupted_cold_source_rotation(
+            context.get_admin_context(), instance)
+
+        self.assertTrue(recovered)
+        self.assertEqual('reverted', migration.status)
+        self.assertIsNone(instance.task_state)
+        self.assertEqual(vm_states.ACTIVE, instance.vm_state)
+        self.assertEqual(power_state.RUNNING, instance.power_state)
+        self.assertNotIn('old_vm_state', instance.system_metadata)
+        self.assertIsNone(instance.old_flavor)
+        self.assertIsNone(instance.new_flavor)
+        instance.drop_migration_context.assert_called_once_with()
+        self.assertEqual([
+            'migration-error', 'journal-replay', 'source-owned',
+            'placement', 'network-setup', 'network-finish', 'power-on',
+            'migration-reverted', 'task-cleared', 'finalize'], events)
+        self.compute.driver.restore_failed_cold_source_storage_ownership.\
+            assert_called_once_with(instance, token)
+        self.compute.network_api.setup_networks_on_host.\
+            assert_called_once_with(mock.ANY, instance, self.compute.host)
+        self.compute.network_api.migrate_instance_finish.\
+            assert_called_once_with(
+                mock.ANY, instance, migration,
+                provider_mappings=provider_mappings)
+        self.compute._fill_provider_mapping_based_on_allocs.\
+            assert_called_once_with(
+                mock.ANY, source_allocations, request_spec)
+        self.compute.driver.power_on.assert_called_once_with(
+            mock.ANY, instance, [], {'block_device_mapping': []})
+        instance.save.assert_called_once_with(
+            expected_task_state=task_states.RESIZE_MIGRATING)
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    @mock.patch.object(manager.objects.Migration, 'get_by_id_and_instance')
+    def test_startup_periodic_retires_terminal_rotation_before_runtime(
+            self, get_migration, get_instance, get_bdms):
+        instance = self._volume_recovery_instance()
+        instance.task_state = task_states.RESIZE_MIGRATING
+        instance.migration_context = mock.Mock(migration_id=7)
+        token = '60000000-0000-0000-0000-000000000006'
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        migration = mock.Mock(
+            uuid=token, source_compute=self.compute.host,
+            dest_compute='compute-2', status='failed')
+        get_migration.return_value = migration
+        get_instance.side_effect = [instance, instance]
+        bdm = self._volume_recovery_bdm(volume_id)
+        get_bdms.return_value = [bdm]
+        rotation = {
+            'phase': 'source-rollback-complete',
+            'operation_token': token,
+            'migration_uuid': token,
+        }
+        rotations = {volume_id: rotation}
+        generation = {
+            'uuid': instance.uuid,
+            'operation_token': token,
+            'migration_uuid': token,
+        }
+
+        def candidates():
+            if volume_id not in rotations:
+                return []
+            return [{
+                'uuid': instance.uuid,
+                'volume_ids': [volume_id],
+                'phases': {
+                    volume_id: 'rotation-source-rollback-complete'},
+            }]
+
+        self.compute.driver.list_volume_journal_recovery_candidates.\
+            side_effect = candidates
+        self.compute.driver.get_managed_volume_attach_intent.return_value = (
+            None)
+        self.compute.driver.get_cold_attachment_rotation.side_effect = (
+            lambda unused_instance, requested_volume:
+            rotations.get(requested_volume))
+        self.compute.driver.get_volume_journal_recovery_phase.side_effect = (
+            lambda unused_instance, requested_volume:
+            ('rotation-source-rollback-complete'
+             if requested_volume in rotations else None))
+        self.compute.driver.get_source_volume_generation_recovery_candidate.\
+            return_value = generation
+
+        def retire(
+                unused_context, unused_instance, requested_volume,
+                unused_rotation, unused_bdm):
+            rotations.pop(requested_volume)
+
+        self.compute._retire_terminal_cold_attachment_rotation_locked = (
+            mock.Mock(side_effect=retire))
+        self.compute.driver.restore_failed_cold_source_storage_ownership.\
+            side_effect = RuntimeError('stop after terminal replay')
+
+        self.assertRaises(
+            RuntimeError,
+            self.compute._recover_interrupted_cold_source_rotation,
+            context.get_admin_context(), instance)
+
+        self.assertEqual({}, rotations)
+        self.compute._retire_terminal_cold_attachment_rotation_locked.\
+            assert_called_once_with(
+                mock.ANY, instance, volume_id, rotation, bdm)
+        self.compute.driver.restore_failed_cold_source_storage_ownership.\
+            assert_called_once_with(instance, token)
+
+    @mock.patch.object(manager.objects.Migration, 'get_by_id_and_instance')
+    def test_startup_retains_uncertain_cold_rotation(self, get_migration):
+        instance = self._volume_recovery_instance()
+        instance.task_state = task_states.RESIZE_MIGRATING
+        instance.migration_context = mock.Mock(migration_id=7)
+        token = '60000000-0000-0000-0000-000000000006'
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        migration = mock.Mock(
+            uuid=token, source_compute=self.compute.host,
+            dest_compute='compute-2', status='migrating')
+        get_migration.return_value = migration
+        self.compute._cold_source_recovery_evidence = mock.Mock(
+            side_effect=[
+                ({volume_id}, {token}, []),
+                ({volume_id}, {token}, []),
+            ])
+        self.compute._recover_incus_volume_journals = mock.Mock()
+
+        recovered = self.compute._recover_interrupted_cold_source_rotation(
+            context.get_admin_context(), instance)
+
+        self.assertFalse(recovered)
+        self.assertEqual('error', migration.status)
+        self.assertEqual(task_states.RESIZE_MIGRATING, instance.task_state)
+        self.compute.driver.power_on.assert_not_called()
+        instance.save.assert_not_called()
+
+    @mock.patch.object(manager.objects.Migration, 'get_by_id_and_instance')
+    def test_startup_accepts_post_migrating_source_window(self, get_migration):
+        instance = self._volume_recovery_instance()
+        instance.task_state = task_states.RESIZE_MIGRATING
+        instance.migration_context = mock.Mock(migration_id=7)
+        token = '60000000-0000-0000-0000-000000000006'
+        migration = mock.Mock(
+            uuid=token, source_compute=self.compute.host,
+            dest_compute='compute-2', status='post-migrating')
+        get_migration.return_value = migration
+        self.compute._cold_source_recovery_evidence = mock.Mock(
+            return_value=(
+                {'50000000-0000-0000-0000-000000000005'}, {token}, []))
+        self.compute._recover_incus_volume_journals = mock.Mock(
+            side_effect=RuntimeError('stop after source decision'))
+
+        self.assertRaises(
+            RuntimeError,
+            self.compute._recover_interrupted_cold_source_rotation,
+            context.get_admin_context(), instance)
+
+        self.assertEqual('error', migration.status)
+        migration.save.assert_called_once_with()
+
+    @mock.patch.object(manager.objects.Migration, 'get_by_id_and_instance')
+    def test_startup_storage_restore_failure_keeps_runtime_fenced(
+            self, get_migration):
+        instance = self._volume_recovery_instance()
+        instance.task_state = task_states.RESIZE_MIGRATING
+        instance.migration_context = mock.Mock(migration_id=7)
+        token = '60000000-0000-0000-0000-000000000006'
+        migration = mock.Mock(
+            uuid=token, source_compute=self.compute.host,
+            dest_compute='compute-2', status='error')
+        get_migration.return_value = migration
+        generation = {
+            'uuid': instance.uuid,
+            'operation_token': token,
+            'migration_uuid': token,
+        }
+        self.compute._cold_source_recovery_evidence = mock.Mock(
+            side_effect=[
+                ({'50000000-0000-0000-0000-000000000005'}, {token}, []),
+                (set(), {token}, [generation]),
+            ])
+        self.compute._recover_incus_volume_journals = mock.Mock()
+        self.compute.driver.restore_failed_cold_source_storage_ownership.\
+            side_effect = RuntimeError('handover unavailable')
+
+        self.assertRaises(
+            RuntimeError,
+            self.compute._recover_interrupted_cold_source_rotation,
+            context.get_admin_context(), instance)
+
+        self.assertEqual(task_states.RESIZE_MIGRATING, instance.task_state)
+        instance.save.assert_not_called()
+        self.compute.network_api.migrate_instance_finish.assert_not_called()
+        self.compute.driver.power_on.assert_not_called()
+
+    def test_startup_placement_revert_accepts_only_exact_source_owner(self):
+        instance = self._volume_recovery_instance()
+        migration = mock.Mock(
+            uuid='60000000-0000-0000-0000-000000000006',
+            source_node='node-1', dest_node='node-2')
+        source_uuid = '61000000-0000-0000-0000-000000000006'
+        dest_uuid = '62000000-0000-0000-0000-000000000006'
+        source_allocations = {
+            source_uuid: {'resources': {'VCPU': 1}},
+            '63000000-0000-0000-0000-000000000006': {
+                'resources': {'NET_BW_EGR_KILOBIT_PER_SEC': 1000}},
+        }
+        self.compute.reportclient = mock.Mock()
+        self.compute.reportclient.get_provider_by_name.side_effect = [
+            {'uuid': source_uuid}, {'uuid': dest_uuid}]
+        self.compute.reportclient.get_allocs_for_consumer.side_effect = [
+            {'allocations': {source_uuid: {'resources': {'VCPU': 1}}}},
+            {'allocations': {}}, {'allocations': source_allocations},
+        ]
+        self.compute._revert_allocation = mock.Mock()
+
+        result = self.compute._restore_interrupted_cold_source_allocations(
+            context.get_admin_context(), instance, migration)
+
+        self.assertEqual(source_allocations, result)
+        self.compute._revert_allocation.assert_called_once_with(
+            mock.ANY, instance, migration)
+
+    def test_startup_placement_lost_ack_requires_exact_reread(self):
+        instance = self._volume_recovery_instance()
+        migration = mock.Mock(
+            uuid='60000000-0000-0000-0000-000000000006',
+            source_node='node-1', dest_node='node-2')
+        source_uuid = '61000000-0000-0000-0000-000000000006'
+        dest_uuid = '62000000-0000-0000-0000-000000000006'
+        self.compute.reportclient = mock.Mock()
+        self.compute.reportclient.get_provider_by_name.side_effect = [
+            {'uuid': source_uuid}, {'uuid': dest_uuid}]
+        self.compute.reportclient.get_allocs_for_consumer.side_effect = [
+            {'allocations': {source_uuid: {'resources': {'VCPU': 1}}}},
+            {'allocations': {}},
+            {'allocations': {
+                source_uuid: {'resources': {'VCPU': 1}}}},
+        ]
+        self.compute._revert_allocation = mock.Mock(
+            side_effect=RuntimeError('Placement response lost'))
+
+        result = self.compute._restore_interrupted_cold_source_allocations(
+            context.get_admin_context(), instance, migration)
+
+        self.assertIn(source_uuid, result)
+
+    def test_startup_placement_rejects_destination_or_missing_source(self):
+        instance = self._volume_recovery_instance()
+        migration = mock.Mock(
+            uuid='60000000-0000-0000-0000-000000000006',
+            source_node='node-1', dest_node='node-2')
+        source_uuid = '61000000-0000-0000-0000-000000000006'
+        dest_uuid = '62000000-0000-0000-0000-000000000006'
+        self.compute.reportclient = mock.Mock()
+        self.compute.reportclient.get_provider_by_name.side_effect = [
+            {'uuid': source_uuid}, {'uuid': dest_uuid}]
+        self.compute.reportclient.get_allocs_for_consumer.side_effect = [
+            {'allocations': {}}, {'allocations': {}},
+            {'allocations': {
+                dest_uuid: {'resources': {'VCPU': 1}}}},
+        ]
+
+        self.assertRaises(
+            exception.MigrationError,
+            self.compute._restore_interrupted_cold_source_allocations,
+            context.get_admin_context(), instance, migration)
+
+    def test_startup_placement_query_failure_never_means_no_allocation(self):
+        instance = self._volume_recovery_instance()
+        migration = mock.Mock(
+            uuid='60000000-0000-0000-0000-000000000006',
+            source_node='node-1', dest_node='node-2')
+        self.compute.reportclient = mock.Mock()
+        self.compute.reportclient.get_provider_by_name.side_effect = [
+            {'uuid': '61000000-0000-0000-0000-000000000006'},
+            {'uuid': '62000000-0000-0000-0000-000000000006'},
+        ]
+        self.compute.reportclient.get_allocs_for_consumer.side_effect = (
+            RuntimeError('Placement unavailable'))
+
+        self.assertRaises(
+            RuntimeError,
+            self.compute._restore_interrupted_cold_source_allocations,
+            context.get_admin_context(), instance, migration)
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    @mock.patch.object(manager.objects.RequestSpec, 'get_by_instance_uuid')
+    @mock.patch.object(manager.objects.Migration, 'get_by_id_and_instance')
+    def test_startup_stopped_source_restores_storage_and_network_only(
+            self, get_migration, get_request_spec, get_bdms):
+        instance = self._volume_recovery_instance()
+        instance.system_metadata['old_vm_state'] = vm_states.STOPPED
+        instance.task_state = task_states.RESIZE_MIGRATING
+        instance.migration_context = mock.Mock(migration_id=7)
+        token = '60000000-0000-0000-0000-000000000006'
+        migration = mock.MagicMock(
+            uuid=token, source_compute=self.compute.host,
+            dest_compute='compute-2', source_node='node-1',
+            dest_node='node-2', status='error')
+        get_migration.return_value = migration
+        get_request_spec.return_value = mock.sentinel.request_spec
+        get_bdms.return_value = []
+        generation = {
+            'uuid': instance.uuid,
+            'operation_token': token,
+            'migration_uuid': token,
+        }
+        self.compute._cold_source_recovery_evidence = mock.Mock(
+            side_effect=[
+                ({'50000000-0000-0000-0000-000000000005'}, {token}, []),
+                (set(), {token}, [generation]),
+            ])
+        self.compute._recover_incus_volume_journals = mock.Mock()
+        self.compute._get_instance_block_device_info = mock.Mock(
+            return_value={'block_device_mapping': []})
+        self.compute.network_api = mock.Mock()
+        self.compute.network_api.get_instance_nw_info.return_value = []
+        self.compute._restore_interrupted_cold_source_allocations = mock.Mock(
+            return_value={'source-rp': {'resources': {'VCPU': 1}}})
+        self.compute._fill_provider_mapping_based_on_allocs = mock.Mock(
+            return_value={'port-1': ['source-rp']})
+        self.compute._get_power_state = mock.Mock(
+            return_value=power_state.SHUTDOWN)
+        self.compute.driver.finalize_failed_cold_source_volume_generation.\
+            return_value = True
+
+        recovered = self.compute._recover_interrupted_cold_source_rotation(
+            context.get_admin_context(), instance)
+
+        self.assertTrue(recovered)
+        self.compute.driver.restore_failed_cold_source_storage_ownership.\
+            assert_called_once_with(instance, token)
+        self.compute.network_api.setup_networks_on_host.assert_called_once()
+        self.compute.network_api.migrate_instance_finish.assert_called_once()
+        self.compute.driver.power_on.assert_not_called()
+        self.assertIsNone(instance.task_state)
+        self.assertEqual(vm_states.STOPPED, instance.vm_state)
+        self.assertEqual(power_state.SHUTDOWN, instance.power_state)
+        self.assertEqual('reverted', migration.status)
+        self.assertNotIn('old_vm_state', instance.system_metadata)
+        instance.drop_migration_context.assert_called_once_with()
+
+    def test_init_instance_fails_startup_while_rotation_unresolved(self):
+        instance = self._volume_recovery_instance()
+        self.compute._recover_interrupted_cold_source_rotation = mock.Mock(
+            return_value=False)
+        with mock.patch.object(
+                manager.manager.ComputeManager, '_init_instance') as base:
+            self.assertRaises(
+                exception.MigrationError, self.compute._init_instance,
+                context.get_admin_context(), instance)
+
+        base.assert_not_called()
+
+    def test_init_instance_propagates_rotation_recovery_failure(self):
+        instance = self._volume_recovery_instance()
+        self.compute._recover_interrupted_cold_source_rotation = mock.Mock(
+            side_effect=exception.InvalidVolume(reason='ambiguous owner'))
+        with mock.patch.object(
+                manager.manager.ComputeManager, '_init_instance') as base:
+            self.assertRaises(
+                exception.InvalidVolume, self.compute._init_instance,
+                context.get_admin_context(), instance)
+
+        base.assert_not_called()
+
+    def test_post_live_source_volumes_use_durable_recovery_per_volume(self):
+        instance = self._volume_recovery_instance()
+        root_volume_id = '52000000-0000-0000-0000-000000000005'
+        data_volume_id = '53000000-0000-0000-0000-000000000005'
+        source_bdms = [
+            mock.Mock(
+                is_volume=True, volume_id=root_volume_id,
+                attachment_id='44000000-0000-0000-0000-000000000004'),
+            mock.Mock(
+                is_volume=True, volume_id=data_volume_id,
+                attachment_id='45000000-0000-0000-0000-000000000004'),
+        ]
+        self.compute.driver.get_volume_journal_recovery_phase.side_effect = [
+            None, 'attach-disconnected']
+        self.compute._recover_incus_connecting_volume_journal = mock.Mock()
+        self.compute.volume_api = mock.Mock()
+
+        self.compute._post_live_migration_remove_source_vol_connections(
+            context.get_admin_context(), instance, source_bdms)
+
+        self.assertEqual(
+            [
+                mock.call(
+                    mock.ANY, instance, root_volume_id,
+                    journal_phase='attach-pending'),
+                mock.call(
+                    mock.ANY, instance, data_volume_id,
+                    journal_phase='attach-disconnected'),
+            ],
+            self.compute._recover_incus_connecting_volume_journal.
+            call_args_list)
+        self.compute.volume_api.attachment_delete.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_periodic_volume_recovery_completes_attaching_volume(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        bdm = self._volume_recovery_bdm(volume_id)
+        get_bdms.return_value = [bdm]
+        self.compute.volume_api = mock.Mock()
+        attachment = self._configure_cinder_recovery_attachment(
+            instance, volume_id, 'attaching')
+        self.compute.driver.resume_connecting_volume_journal.return_value = (
+            '/dev/vdb')
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id)
+
+        resume = self.compute.driver.resume_connecting_volume_journal
+        resume.assert_called_once()
+        expected_connection_info = dict(attachment['connection_info'])
+        expected_connection_info['serial'] = volume_id
+        self.assertEqual(
+            expected_connection_info, jsonutils.loads(bdm.connection_info))
+        bdm.save.assert_called_once_with()
+        self.compute.volume_api.attachment_complete.assert_called_once_with(
+            mock.ANY, attachment['id'])
+        self.compute.volume_api.attachment_get.assert_called_once_with(
+            mock.ANY, attachment['id'])
+        confirm = self.compute.driver.confirm_connected_volume_journal
+        confirm.assert_called_once()
+        rollback = self.compute.driver.rollback_connecting_volume_journal
+        rollback.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_periodic_volume_recovery_after_driver_before_bdm_save(
+            self, get_bdms):
+        """Cinder's attachment is authoritative before Nova saves the BDM."""
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        bdm = self._volume_recovery_bdm(volume_id)
+        bdm.connection_info = None
+        get_bdms.return_value = [bdm]
+        self.compute.volume_api = mock.Mock()
+        attachment = self._configure_cinder_recovery_attachment(
+            instance, volume_id, 'attaching')
+        self.compute.driver.resume_connecting_volume_journal.return_value = (
+            '/dev/vdb')
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id)
+
+        expected_connection_info = dict(attachment['connection_info'])
+        expected_connection_info['serial'] = volume_id
+        self.assertEqual(
+            expected_connection_info, jsonutils.loads(bdm.connection_info))
+        bdm.save.assert_called_once_with()
+        self.compute.volume_api.attachment_complete.assert_called_once_with(
+            mock.ANY, attachment['id'])
+        confirm = self.compute.driver.confirm_connected_volume_journal
+        confirm.assert_called_once()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_periodic_volume_recovery_after_bdm_save_before_complete(
+            self, get_bdms):
+        """An attaching Cinder record is replayable after the BDM commit."""
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        bdm = self._volume_recovery_bdm(volume_id)
+        attachment = self._cinder_attachment(
+            instance, volume_id, 'attaching')
+        bdm_connection_info = dict(attachment['connection_info'])
+        bdm_connection_info['serial'] = volume_id
+        bdm.connection_info = jsonutils.dumps(bdm_connection_info)
+        get_bdms.return_value = [bdm]
+        self.compute.volume_api = mock.Mock()
+        attachment = self._configure_cinder_recovery_attachment(
+            instance, volume_id, 'attaching')
+        self.compute.driver.resume_connecting_volume_journal.return_value = (
+            '/dev/vdb')
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id)
+
+        resume = self.compute.driver.resume_connecting_volume_journal
+        resume.assert_called_once()
+        bdm.save.assert_called_once_with()
+        self.compute.volume_api.attachment_complete.assert_called_once_with(
+            mock.ANY, attachment['id'])
+        confirm = self.compute.driver.confirm_connected_volume_journal
+        confirm.assert_called_once()
+        rollback = self.compute.driver.rollback_connecting_volume_journal
+        rollback.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_periodic_volume_recovery_preserves_formally_attached_volume(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        attachment = self._cinder_attachment(instance, volume_id, 'attached')
+        bdm_connection_info = dict(attachment['connection_info'])
+        bdm_connection_info['status'] = 'attaching'
+        bdm_connection_info['serial'] = volume_id
+        bdm = self._volume_recovery_bdm(
+            volume_id, connection_info=bdm_connection_info)
+        get_bdms.return_value = [bdm]
+        self.compute.volume_api = mock.Mock()
+        attachment = self._configure_cinder_recovery_attachment(
+            instance, volume_id, 'attached')
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id)
+
+        confirm = self.compute.driver.confirm_connected_volume_journal
+        confirm.assert_called_once()
+        resume = self.compute.driver.resume_connecting_volume_journal
+        resume.assert_not_called()
+        rollback = self.compute.driver.rollback_connecting_volume_journal
+        rollback.assert_not_called()
+        self.compute.volume_api.attachment_delete.assert_not_called()
+        bdm.destroy.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_attach_intent_only_committed_volume_retires_intent(
+            self, get_bdms):
+        """A failed intent unlink after commit never rolls back the volume."""
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        attachment = self._cinder_attachment(instance, volume_id, 'attached')
+        bdm_connection_info = dict(attachment['connection_info'])
+        bdm_connection_info['serial'] = volume_id
+        bdm = self._volume_recovery_bdm(
+            volume_id, connection_info=bdm_connection_info)
+        get_bdms.return_value = [bdm]
+        self.compute.volume_api = mock.Mock()
+        self._configure_cinder_recovery_attachment(
+            instance, volume_id, 'attached')
+        self.compute.driver.get_volume_journal_phase.return_value = None
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='attach-pending')
+
+        self.compute.driver.confirm_connected_volume_journal.\
+            assert_called_once_with(
+                instance, volume_id, mock.ANY,
+                expected_mountpoint='/dev/vdb')
+        self.compute.driver.cancel_managed_volume_attach.assert_called_once()
+        self.compute.driver.rollback_connecting_volume_journal.\
+            assert_not_called()
+        self.compute.volume_api.attachment_delete.assert_not_called()
+        bdm.destroy.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_attach_pending_missing_attachment_retires_exact_bdm(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        bdm = self._volume_recovery_bdm(volume_id)
+        get_bdms.return_value = [bdm]
+        self.compute.volume_api = mock.Mock()
+        self.compute.volume_api.attachment_get.side_effect = (
+            exception.VolumeAttachmentNotFound(
+                attachment_id=bdm.attachment_id))
+        self.compute.volume_api.get.return_value = self._cinder_volume(
+            instance, volume_id)
+        self.compute.driver.get_volume_journal_phase.return_value = None
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='attach-pending')
+
+        bdm.destroy.assert_called_once_with()
+        self.compute.driver.cancel_managed_volume_attach.assert_called_once()
+        self.compute.driver.rollback_connecting_volume_journal.\
+            assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_spawn_attach_pending_replays_exact_internal_owner(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        token = '60000000-0000-0000-0000-000000000006'
+        bdm = self._configure_internal_volume_recovery(
+            instance, volume_id, 'spawn', token, 'materialize')
+        get_bdms.return_value = [bdm]
+        self.compute.driver.get_volume_journal_phase.return_value = None
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='attach-pending')
+
+        self.compute.driver.validate_internal_volume_attach_owner.\
+            assert_called_once()
+        self.compute.driver.resume_internal_volume_attach.\
+            assert_called_once_with(
+                mock.ANY, instance, volume_id, mock.ANY,
+                expected_mountpoint='/dev/vdb')
+        self.compute.driver.confirm_connected_volume_journal.\
+            assert_not_called()
+        self.compute.driver.cancel_managed_volume_attach.assert_called_once()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_spawn_connected_retires_exact_internal_owner(self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        token = '60000000-0000-0000-0000-000000000006'
+        bdm = self._configure_internal_volume_recovery(
+            instance, volume_id, 'spawn', token, 'materialize')
+        get_bdms.return_value = [bdm]
+        self.compute.driver.get_volume_journal_phase.return_value = 'connected'
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='connected')
+
+        self.compute.driver.confirm_connected_volume_journal.\
+            assert_called_once_with(
+                instance, volume_id, mock.ANY,
+                expected_mountpoint='/dev/vdb')
+        self.compute.driver.resume_internal_volume_attach.assert_not_called()
+        self.compute.driver.cancel_managed_volume_attach.assert_called_once()
+
+    @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_aborted_migration_target_rolls_back_local_mapping(
+            self, get_bdms, get_migrations):
+        instance = self._volume_recovery_instance()
+        source_host = 'incus-source'
+        instance.host = source_host
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        token = '60000000-0000-0000-0000-000000000006'
+        migration_uuid = '70000000-0000-0000-0000-000000000007'
+        bdm = self._configure_internal_volume_recovery(
+            instance, volume_id, 'migration', token, 'cold-target',
+            operation_migration_uuid=migration_uuid)
+        target_attachment_id = bdm.attachment_id
+        source_attachment_id = '41000000-0000-0000-0000-000000000004'
+        target_attachment = self._cinder_attachment(
+            instance, volume_id, 'attached')
+        source_attachment = self._cinder_attachment(
+            instance, volume_id, 'attached')
+        source_attachment['id'] = source_attachment_id
+        source_connection_info = dict(source_attachment['connection_info'])
+        source_connection_info['serial'] = volume_id
+        bdm.attachment_id = source_attachment_id
+        bdm.connection_info = jsonutils.dumps(source_connection_info)
+        get_bdms.return_value = [bdm]
+        self.compute.driver.get_volume_journal_phase.return_value = 'connected'
+        get_migrations.return_value = [mock.Mock(
+            uuid=migration_uuid, source_compute=source_host,
+            dest_compute=self.compute.host, status='failed')]
+        self.compute.driver.internal_migration_attach_disposition.\
+            return_value = 'aborted'
+        self.compute.driver.get_internal_volume_attach_connection_info.\
+            return_value = dict(target_attachment['connection_info'])
+        target_reads = [target_attachment]
+
+        def attachment_get(unused_context, attachment_id):
+            if attachment_id == source_attachment_id:
+                return source_attachment
+            if attachment_id == target_attachment_id and target_reads:
+                return target_reads.pop()
+            raise exception.VolumeAttachmentNotFound(
+                attachment_id=attachment_id)
+
+        self.compute.volume_api.attachment_get.side_effect = attachment_get
+        self.compute.volume_api.get.return_value = self._cinder_volume(
+            instance, volume_id, attachment_status='attached',
+            attachment_id=source_attachment_id)
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='connected')
+
+        self.compute.driver.rollback_internal_volume_attach.\
+            assert_called_once_with(
+                mock.ANY, instance, volume_id, mock.ANY,
+                expected_mountpoint='/dev/vdb')
+        self.compute.driver.finalize_rolled_back_volume_journal.\
+            assert_called_once_with(instance, volume_id)
+        self.compute.driver.cancel_managed_volume_attach.assert_called_once()
+        self.compute.driver.confirm_connected_volume_journal.\
+            assert_not_called()
+        self.compute.volume_api.attachment_delete.assert_called_once_with(
+            mock.ANY, target_attachment_id)
+        bdm.destroy.assert_not_called()
+
+    @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_committed_migration_target_retires_connected_owner(
+            self, get_bdms, get_migrations):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        token = '60000000-0000-0000-0000-000000000006'
+        migration_uuid = '70000000-0000-0000-0000-000000000007'
+        bdm = self._configure_internal_volume_recovery(
+            instance, volume_id, 'migration', token, 'live-target',
+            operation_migration_uuid=migration_uuid)
+        get_bdms.return_value = [bdm]
+        self.compute.driver.get_volume_journal_phase.return_value = 'connected'
+        get_migrations.return_value = [mock.Mock(
+            uuid=migration_uuid, source_compute='incus-source',
+            dest_compute=self.compute.host, status='completed')]
+        self.compute.driver.internal_migration_attach_disposition.\
+            return_value = 'committed'
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='connected')
+
+        self.compute.driver.confirm_connected_volume_journal.\
+            assert_called_once_with(
+                instance, volume_id, mock.ANY,
+                expected_mountpoint='/dev/vdb')
+        self.compute.driver.rollback_internal_volume_attach.assert_not_called()
+        self.compute.driver.cancel_managed_volume_attach.assert_called_once()
+
+    @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_live_source_release_disconnects_then_deletes_exact_attachment(
+            self, get_bdms, get_migrations):
+        instance = self._volume_recovery_instance()
+        instance.host = 'compute-2'
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        source_attachment_id = '40000000-0000-0000-0000-000000000004'
+        target_attachment_id = '41000000-0000-0000-0000-000000000004'
+        token = '60000000-0000-0000-0000-000000000006'
+        migration_uuid = '70000000-0000-0000-0000-000000000007'
+        source_attachment = self._cinder_attachment(
+            instance, volume_id, 'attached')
+        source_attachment['id'] = source_attachment_id
+        target_attachment = self._cinder_attachment(
+            instance, volume_id, 'attached')
+        target_attachment['id'] = target_attachment_id
+        target_info = dict(target_attachment['connection_info'])
+        target_info['serial'] = volume_id
+        bdm = self._volume_recovery_bdm(
+            volume_id, connection_info=target_info)
+        bdm.attachment_id = target_attachment_id
+        get_bdms.return_value = [bdm]
+        intent = {
+            'attachment_id': source_attachment_id,
+            'mountpoint': '/dev/vdb',
+            'operation_kind': 'migration',
+            'operation_token': token,
+            'operation_direction': 'live-source-release',
+            'operation_migration_uuid': migration_uuid,
+        }
+        self.compute.driver.get_managed_volume_attach_intent.return_value = (
+            intent)
+        get_migrations.return_value = [mock.Mock(
+            uuid=migration_uuid, source_compute=self.compute.host,
+            dest_compute='compute-2', status='completed',
+            migration_type='live-migration')]
+        not_found = mock.Mock(status_code=404)
+        not_found.json.return_value = {'error': 'not found'}
+        self.compute.driver.client.instances.get.side_effect = (
+            manager.incus_driver.incus_exceptions.LXDAPIException(not_found))
+        source_info = dict(source_attachment['connection_info'])
+        source_info['serial'] = volume_id
+        self.compute.driver.get_internal_volume_attach_connection_info.\
+            return_value = source_info
+        phase_reads = [0]
+
+        def journal_phase(unused_instance, unused_volume_id):
+            phase_reads[0] += 1
+            return 'disconnecting' if phase_reads[0] == 1 else 'disconnected'
+
+        self.compute.driver.get_volume_journal_phase.side_effect = (
+            journal_phase)
+        self.compute.volume_api = mock.Mock()
+        source_exists = [True]
+
+        def attachment_get(unused_context, attachment_id):
+            if attachment_id == source_attachment_id and source_exists[0]:
+                return source_attachment
+            if attachment_id == target_attachment_id:
+                return target_attachment
+            raise exception.VolumeAttachmentNotFound(
+                attachment_id=attachment_id)
+
+        delete_attempts = [0]
+
+        def attachment_delete(unused_context, attachment_id):
+            self.assertEqual(source_attachment_id, attachment_id)
+            delete_attempts[0] += 1
+            if delete_attempts[0] == 1:
+                raise RuntimeError('transient Cinder failure')
+            source_exists[0] = False
+
+        self.compute.volume_api.attachment_get.side_effect = attachment_get
+        self.compute.volume_api.attachment_delete.side_effect = (
+            attachment_delete)
+        target_volume = self._cinder_volume(
+            instance, volume_id, attachment_status='attached',
+            attachment_id=target_attachment_id)
+        self.compute.volume_api.get.return_value = target_volume
+        self.assertRaises(
+            RuntimeError,
+            self.compute._recover_incus_connecting_volume_journal,
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='attach-disconnecting')
+        self.compute.driver.finalize_disconnected_volume_journal.\
+            assert_not_called()
+        self.compute.driver.cancel_managed_volume_attach.assert_not_called()
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='attach-disconnected')
+
+        self.compute.driver._recover_source_release_volume_journal_locked.\
+            assert_called_once_with(
+                mock.ANY, instance, volume_id, '/dev/vdb')
+        self.assertEqual(2, delete_attempts[0])
+        self.compute.driver.finalize_disconnected_volume_journal.\
+            assert_called_once_with(instance, volume_id)
+        self.compute.driver.cancel_managed_volume_attach.\
+            assert_called_once_with(instance, volume_id, intent)
+        bdm.destroy.assert_not_called()
+
+    @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_live_source_release_retains_while_source_container_exists(
+            self, get_bdms, get_migrations):
+        instance = self._volume_recovery_instance()
+        instance.host = 'compute-2'
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        token = '60000000-0000-0000-0000-000000000006'
+        migration_uuid = '70000000-0000-0000-0000-000000000007'
+        self.compute.driver.get_managed_volume_attach_intent.return_value = {
+            'attachment_id':
+                '40000000-0000-0000-0000-000000000004',
+            'mountpoint': '/dev/vdb',
+            'operation_kind': 'migration',
+            'operation_token': token,
+            'operation_direction': 'live-source-release',
+            'operation_migration_uuid': migration_uuid,
+        }
+        bdm = self._configure_internal_volume_recovery(
+            instance, volume_id, 'migration', token,
+            'live-source-release',
+            operation_migration_uuid=migration_uuid)
+        bdm.attachment_id = '41000000-0000-0000-0000-000000000004'
+        get_bdms.return_value = [bdm]
+        get_migrations.return_value = [mock.Mock(
+            uuid=migration_uuid, source_compute=self.compute.host,
+            dest_compute='compute-2', status='completed',
+            migration_type='live-migration')]
+        self.compute.driver.client.instances.get.return_value = mock.Mock(
+            status='Stopped')
+
+        self.assertRaises(
+            exception.InvalidVolume,
+            self.compute._recover_incus_connecting_volume_journal,
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='connected')
+
+        self.compute.driver._recover_source_release_volume_journal_locked.\
+            assert_not_called()
+        self.compute.volume_api.attachment_delete.assert_not_called()
+
+    @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_bfv_source_release_retries_exact_attachment_without_os_brick(
+            self, get_bdms, get_migrations):
+        instance = self._volume_recovery_instance()
+        instance.host = 'compute-2'
+        volume_id = '51000000-0000-0000-0000-000000000005'
+        source_attachment_id = '42000000-0000-0000-0000-000000000004'
+        target_attachment_id = '43000000-0000-0000-0000-000000000004'
+        token = '61000000-0000-0000-0000-000000000006'
+        migration_uuid = '71000000-0000-0000-0000-000000000007'
+        source_attachment = self._cinder_attachment(
+            instance, volume_id, 'attached')
+        source_attachment['id'] = source_attachment_id
+        target_attachment = self._cinder_attachment(
+            instance, volume_id, 'attached')
+        target_attachment['id'] = target_attachment_id
+        target_info = dict(target_attachment['connection_info'])
+        target_info['serial'] = volume_id
+        bdm = self._volume_recovery_bdm(
+            volume_id, connection_info=target_info)
+        bdm.attachment_id = target_attachment_id
+        bdm.device_name = '/dev/sda'
+        get_bdms.return_value = [bdm]
+        intent = {
+            'attachment_id': source_attachment_id,
+            'mountpoint': '/dev/sda',
+            'operation_kind': 'migration',
+            'operation_token': token,
+            'operation_direction': 'live-source-release',
+            'operation_migration_uuid': migration_uuid,
+            'boot_volume': True,
+        }
+        self.compute.driver.get_managed_volume_attach_intent.return_value = (
+            intent)
+        get_migrations.return_value = [mock.Mock(
+            uuid=migration_uuid, source_compute=self.compute.host,
+            dest_compute='compute-2', status='completed',
+            migration_type='live-migration')]
+        not_found = mock.Mock(status_code=404)
+        not_found.json.return_value = {'error': 'not found'}
+        self.compute.driver.client.instances.get.side_effect = (
+            manager.incus_driver.incus_exceptions.LXDAPIException(not_found))
+        self.compute.driver.get_internal_volume_attach_connection_info.\
+            return_value = None
+        self.compute.driver.get_volume_journal_phase.return_value = None
+        self.compute.volume_api = mock.Mock()
+        source_exists = [True]
+
+        def attachment_get(unused_context, attachment_id):
+            if attachment_id == source_attachment_id and source_exists[0]:
+                return source_attachment
+            if attachment_id == target_attachment_id:
+                return target_attachment
+            raise exception.VolumeAttachmentNotFound(
+                attachment_id=attachment_id)
+
+        delete_attempts = [0]
+
+        def attachment_delete(unused_context, attachment_id):
+            self.assertEqual(source_attachment_id, attachment_id)
+            delete_attempts[0] += 1
+            if delete_attempts[0] == 1:
+                raise RuntimeError('transient Cinder failure')
+            source_exists[0] = False
+
+        self.compute.volume_api.attachment_get.side_effect = attachment_get
+        self.compute.volume_api.attachment_delete.side_effect = (
+            attachment_delete)
+        target_volume = self._cinder_volume(
+            instance, volume_id, attachment_status='attached',
+            attachment_id=target_attachment_id)
+        target_volume['attachments'][instance.uuid]['mountpoint'] = '/dev/sda'
+        self.compute.volume_api.get.return_value = target_volume
+
+        self.assertRaises(
+            RuntimeError,
+            self.compute._recover_incus_connecting_volume_journal,
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='attach-pending')
+        self.compute.driver.cancel_managed_volume_attach.assert_not_called()
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='attach-pending')
+
+        self.assertEqual(2, delete_attempts[0])
+        self.compute.driver._recover_source_release_volume_journal_locked.\
+            assert_not_called()
+        self.compute.driver.finalize_disconnected_volume_journal.\
+            assert_not_called()
+        self.compute.driver.cancel_managed_volume_attach.\
+            assert_called_once_with(instance, volume_id, intent)
+        bdm.destroy.assert_not_called()
+
+    def test_finished_cold_bfv_releases_only_rotated_source_attachment(self):
+        instance = self._volume_recovery_instance()
+        instance.host = 'compute-2'
+        volume_id = '51000000-0000-0000-0000-000000000005'
+        old_id = '42000000-0000-0000-0000-000000000004'
+        new_id = '43000000-0000-0000-0000-000000000004'
+        token = '61000000-0000-0000-0000-000000000006'
+        old_attachment = self._rotation_attachment(
+            instance, volume_id, old_id, status='attached')
+        new_attachment = self._rotation_attachment(
+            instance, volume_id, new_id, status='attached')
+        target_info = dict(new_attachment['connection_info'])
+        target_info['serial'] = volume_id
+        bdm = self._volume_recovery_bdm(
+            volume_id, connection_info=target_info)
+        bdm.attachment_id = new_id
+        bdm.device_name = '/dev/sda'
+        intent = {
+            'attachment_id': old_id,
+            'mountpoint': '/dev/sda',
+            'operation_kind': 'migration',
+            'operation_token': token,
+            'operation_direction': 'cold-source-restore',
+            'operation_migration_uuid': token,
+            'boot_volume': True,
+        }
+        rotation = {
+            'old_attachment_id': old_id,
+            'new_attachment_id': new_id,
+            'mountpoint': '/dev/sda',
+            'operation_token': token,
+            'migration_uuid': token,
+            'baseline_attachment_ids': [old_id],
+            'phase': 'bdm-rotated',
+            'boot_volume': True,
+        }
+        migration = mock.Mock(
+            uuid=token, source_compute=self.compute.host,
+            dest_compute='compute-2', status='finished',
+            migration_type='migration')
+        not_found = mock.Mock(status_code=404)
+        not_found.json.return_value = {'error': 'not found'}
+        self.compute.driver.client.instances.get.side_effect = (
+            manager.incus_driver.incus_exceptions.LXDAPIException(not_found))
+        self.compute.driver.get_cold_attachment_rotation.return_value = (
+            rotation)
+        self.compute.driver.get_internal_volume_attach_connection_info.\
+            return_value = None
+        self.compute.driver.get_volume_journal_phase.return_value = None
+        self.compute.volume_api = mock.Mock()
+        attachments = {old_id: old_attachment, new_id: new_attachment}
+
+        def attachment_get(unused_context, attachment_id):
+            if attachment_id not in attachments:
+                raise exception.VolumeAttachmentNotFound(
+                    attachment_id=attachment_id)
+            return attachments[attachment_id]
+
+        self.compute.volume_api.attachment_get.side_effect = attachment_get
+        self.compute.volume_api.attachment_delete.side_effect = (
+            lambda unused_context, attachment_id:
+            attachments.pop(attachment_id))
+        target_volume = self._cinder_volume(
+            instance, volume_id, attachment_status='attached',
+            attachment_id=new_id)
+        target_volume['attachments'][instance.uuid]['mountpoint'] = '/dev/sda'
+        self.compute.volume_api.get.return_value = target_volume
+        terminal_rotation = dict(
+            rotation, phase='source-release-complete')
+        transition = self.compute.driver.transition_cold_attachment_rotation
+        transition.return_value = terminal_rotation
+
+        self.compute._recover_incus_migration_source_release_locked(
+            context.get_admin_context(), instance, volume_id, 'attach-pending',
+            intent, bdm, old_attachment, migration)
+
+        self.assertNotIn(old_id, attachments)
+        self.assertIn(new_id, attachments)
+        self.compute.volume_api.attachment_delete.assert_called_once_with(
+            mock.ANY, old_id)
+        self.compute.driver.cancel_cold_attachment_rotation.\
+            assert_called_once_with(instance, volume_id, terminal_rotation)
+        self.compute.driver.transition_cold_attachment_rotation.\
+            assert_called_once_with(
+                instance, volume_id, rotation, 'source-release-complete')
+        self.compute.driver.cancel_managed_volume_attach.\
+            assert_called_once_with(instance, volume_id, intent)
+        self.compute.driver._recover_source_release_volume_journal_locked.\
+            assert_not_called()
+
+    @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
+    def test_terminal_cold_release_retires_intent_before_rotation(
+            self, get_migrations):
+        instance = self._volume_recovery_instance()
+        instance.host = 'compute-2'
+        volume_id = '51000000-0000-0000-0000-000000000005'
+        old_id = '42000000-0000-0000-0000-000000000004'
+        new_id = '43000000-0000-0000-0000-000000000004'
+        token = '61000000-0000-0000-0000-000000000006'
+        rotation = {
+            'old_attachment_id': old_id,
+            'new_attachment_id': new_id,
+            'mountpoint': '/dev/sda',
+            'operation_token': token,
+            'migration_uuid': token,
+            'baseline_attachment_ids': [old_id],
+            'phase': 'source-release-complete',
+            'boot_volume': True,
+        }
+        intent = {
+            'attachment_id': old_id,
+            'mountpoint': '/dev/sda',
+            'operation_kind': 'migration',
+            'operation_token': token,
+            'operation_direction': 'cold-source-restore',
+            'operation_migration_uuid': token,
+            'boot_volume': True,
+        }
+        target = self._rotation_attachment(
+            instance, volume_id, new_id, status='attached')
+        target_info = dict(target['connection_info'])
+        target_info['serial'] = volume_id
+        bdm = self._volume_recovery_bdm(
+            volume_id, connection_info=target_info)
+        bdm.attachment_id = new_id
+        bdm.device_name = '/dev/sda'
+        get_migrations.return_value = [mock.Mock(
+            uuid=token, source_compute=self.compute.host,
+            dest_compute='compute-2', status='finished')]
+        not_found = mock.Mock(status_code=404)
+        not_found.json.return_value = {'error': 'not found'}
+        self.compute.driver.client.instances.get.side_effect = (
+            manager.incus_driver.incus_exceptions.LXDAPIException(not_found))
+        self.compute.driver.get_volume_journal_phase.return_value = None
+        current_intent = [intent]
+        self.compute.driver.get_managed_volume_attach_intent.side_effect = (
+            lambda unused_instance, unused_volume: current_intent[0])
+        self.compute.driver.cancel_managed_volume_attach.side_effect = (
+            lambda *_args: current_intent.__setitem__(0, None))
+        self.compute.volume_api = mock.Mock()
+
+        def attachment_get(unused_context, attachment_id):
+            if attachment_id == new_id:
+                return target
+            raise exception.VolumeAttachmentNotFound(
+                attachment_id=attachment_id)
+
+        self.compute.volume_api.attachment_get.side_effect = attachment_get
+        self.compute.driver.cancel_cold_attachment_rotation.side_effect = [
+            OSError('rotation fsync failed'), None]
+
+        self.assertRaises(
+            OSError,
+            self.compute._retire_terminal_cold_attachment_rotation_locked,
+            context.get_admin_context(), instance, volume_id, rotation, bdm)
+        self.compute._retire_terminal_cold_attachment_rotation_locked(
+            context.get_admin_context(), instance, volume_id, rotation, bdm)
+
+        self.compute.driver.cancel_managed_volume_attach.\
+            assert_called_once_with(instance, volume_id, intent)
+        self.assertEqual(
+            2, self.compute.driver.cancel_cold_attachment_rotation.call_count)
+
+    @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
+    def test_terminal_cold_bfv_rollback_replays_without_os_brick(
+            self, get_migrations):
+        instance = self._volume_recovery_instance()
+        volume_id = '51000000-0000-0000-0000-000000000005'
+        old_id = '42000000-0000-0000-0000-000000000004'
+        token = '61000000-0000-0000-0000-000000000006'
+        rotation = {
+            'old_attachment_id': old_id,
+            'new_attachment_id': None,
+            'mountpoint': '/dev/sda',
+            'operation_token': token,
+            'migration_uuid': token,
+            'baseline_attachment_ids': [old_id],
+            'phase': 'source-rollback-complete',
+            'boot_volume': True,
+        }
+        intent = {
+            'attachment_id': old_id,
+            'mountpoint': '/dev/sda',
+            'operation_kind': 'migration',
+            'operation_token': token,
+            'operation_direction': 'cold-source-restore',
+            'operation_migration_uuid': token,
+            'boot_volume': True,
+        }
+        source_attachment = self._rotation_attachment(
+            instance, volume_id, old_id, status='attached')
+        bdm = self._volume_recovery_bdm(volume_id)
+        bdm.attachment_id = old_id
+        bdm.device_name = '/dev/sda'
+        get_migrations.return_value = [mock.Mock(
+            uuid=token, source_compute=self.compute.host,
+            dest_compute='compute-2', status='failed')]
+        self.compute.driver.get_source_volume_generation_recovery_candidate.\
+            return_value = {
+                'operation_token': token, 'migration_uuid': token}
+        self.compute.driver.get_internal_volume_attach_connection_info.\
+            return_value = None
+        self.compute.driver.get_volume_journal_phase.return_value = None
+        current_intent = [intent]
+        self.compute.driver.get_managed_volume_attach_intent.side_effect = (
+            lambda unused_instance, unused_volume: current_intent[0])
+        self.compute.driver.cancel_managed_volume_attach.side_effect = (
+            lambda *_args: current_intent.__setitem__(0, None))
+        self.compute.volume_api = mock.Mock()
+
+        def attachment_get(unused_context, attachment_id):
+            if attachment_id == old_id:
+                return source_attachment
+            raise exception.VolumeAttachmentNotFound(
+                attachment_id=attachment_id)
+
+        self.compute.volume_api.attachment_get.side_effect = attachment_get
+        self.compute.driver.cancel_cold_attachment_rotation.side_effect = [
+            OSError('rotation fsync failed'), None]
+
+        self.assertRaises(
+            OSError,
+            self.compute._retire_terminal_cold_attachment_rotation_locked,
+            context.get_admin_context(), instance, volume_id, rotation, bdm)
+        self.compute._retire_terminal_cold_attachment_rotation_locked(
+            context.get_admin_context(), instance, volume_id, rotation, bdm)
+
+        self.compute.driver.restart_internal_volume_attach.assert_not_called()
+        self.compute.driver.confirm_connected_volume_journal.\
+            assert_not_called()
+        self.compute.driver.cancel_managed_volume_attach.\
+            assert_called_once_with(instance, volume_id, intent)
+
+    @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_committed_cold_target_restarts_rolled_back_generation(
+            self, get_bdms, get_migrations):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        token = '60000000-0000-0000-0000-000000000006'
+        migration_uuid = '70000000-0000-0000-0000-000000000007'
+        bdm = self._configure_internal_volume_recovery(
+            instance, volume_id, 'migration', token, 'cold-target',
+            operation_migration_uuid=migration_uuid)
+        get_bdms.return_value = [bdm]
+        self.compute.driver.get_volume_journal_phase.return_value = (
+            'rolled-back')
+        get_migrations.return_value = [mock.Mock(
+            uuid=migration_uuid, source_compute='incus-source',
+            dest_compute=self.compute.host, status='finished')]
+        self.compute.driver.internal_migration_attach_disposition.\
+            return_value = 'committed'
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='rolled-back')
+
+        self.compute.driver.restart_internal_volume_attach.\
+            assert_called_once_with(
+                mock.ANY, instance, volume_id, mock.ANY,
+                expected_mountpoint='/dev/vdb')
+        self.compute.driver.rollback_internal_volume_attach.assert_not_called()
+        self.compute.driver.cancel_managed_volume_attach.assert_called_once()
+
+    @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_cold_revert_source_completes_attaching_generation(
+            self, get_bdms, get_migrations):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        token = '60000000-0000-0000-0000-000000000006'
+        migration_uuid = '70000000-0000-0000-0000-000000000007'
+        bdm = self._configure_internal_volume_recovery(
+            instance, volume_id, 'migration', token, 'cold-revert-source',
+            operation_migration_uuid=migration_uuid)
+        get_bdms.return_value = [bdm]
+        attaching = self._cinder_attachment(
+            instance, volume_id, 'attaching')
+        attached = self._cinder_attachment(instance, volume_id, 'attached')
+        reads = [attaching, attached]
+        self.compute.volume_api.attachment_get.side_effect = (
+            lambda unused_context, unused_attachment: reads.pop(0))
+        self.compute.volume_api.get.return_value = self._cinder_volume(
+            instance, volume_id, attachment_status='attached',
+            attachment_id=bdm.attachment_id)
+        get_migrations.return_value = [mock.Mock(
+            uuid=migration_uuid, source_compute=self.compute.host,
+            dest_compute='incus-target', status='reverting')]
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='connecting')
+
+        self.compute.driver.resume_internal_volume_attach.\
+            assert_called_once_with(
+                mock.ANY, instance, volume_id, mock.ANY,
+                expected_mountpoint='/dev/vdb')
+        bdm.save.assert_called_once_with()
+        self.compute.volume_api.attachment_complete.assert_called_once_with(
+            mock.ANY, bdm.attachment_id)
+        self.compute.driver.cancel_managed_volume_attach.assert_called_once()
+
+    @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_failed_cold_source_restarts_disconnecting_generation(
+            self, get_bdms, get_migrations):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        token = '60000000-0000-0000-0000-000000000006'
+        bdm = self._configure_internal_volume_recovery(
+            instance, volume_id, 'migration', token,
+            'cold-source-restore', operation_migration_uuid=token)
+        get_bdms.return_value = [bdm]
+        self.compute.driver.get_volume_journal_phase.return_value = (
+            'disconnecting')
+        get_migrations.return_value = [mock.Mock(
+            uuid=token, source_compute=self.compute.host,
+            dest_compute='incus-target', status='failed')]
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='attach-disconnecting')
+
+        self.compute.driver.restart_internal_volume_attach.\
+            assert_called_once_with(
+                mock.ANY, instance, volume_id, mock.ANY,
+                expected_mountpoint='/dev/vdb')
+        self.compute.driver.mark_source_volume_generation_rollback_complete.\
+            assert_called_once_with(instance, token, token)
+        self.compute.driver.cancel_managed_volume_attach.assert_called_once()
+        self.compute.driver.finalize_failed_cold_source_volume_generation.\
+            assert_called_once_with(instance, token)
+
+    @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_failed_cold_source_restarts_disconnected_generation(
+            self, get_bdms, get_migrations):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        token = '60000000-0000-0000-0000-000000000006'
+        bdm = self._configure_internal_volume_recovery(
+            instance, volume_id, 'migration', token,
+            'cold-source-restore', operation_migration_uuid=token)
+        get_bdms.return_value = [bdm]
+        self.compute.driver.get_volume_journal_phase.return_value = (
+            'disconnected')
+        get_migrations.return_value = [mock.Mock(
+            uuid=token, source_compute=self.compute.host,
+            dest_compute='incus-target', status='error')]
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='attach-disconnected')
+
+        self.compute.driver.restart_internal_volume_attach.\
+            assert_called_once_with(
+                mock.ANY, instance, volume_id, mock.ANY,
+                expected_mountpoint='/dev/vdb')
+        self.compute.driver.mark_source_volume_generation_rollback_complete.\
+            assert_called_once_with(instance, token, token)
+        self.compute.driver.cancel_managed_volume_attach.assert_called_once()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_failed_spawn_rolls_back_connecting_generation(self, get_bdms):
+        instance = self._volume_recovery_instance()
+        instance.vm_state = manager.vm_states.ERROR
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        token = '60000000-0000-0000-0000-000000000006'
+        bdm = self._configure_internal_volume_recovery(
+            instance, volume_id, 'spawn', token, 'materialize')
+        get_bdms.return_value = [bdm]
+        self.compute.driver.get_volume_journal_phase.return_value = (
+            'connecting')
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='connecting')
+
+        self.compute.driver.rollback_internal_volume_attach.\
+            assert_called_once_with(
+                mock.ANY, instance, volume_id, mock.ANY,
+                expected_mountpoint='/dev/vdb')
+        self.compute.driver.finalize_rolled_back_volume_journal.\
+            assert_called_once_with(instance, volume_id)
+        self.compute.driver.cancel_managed_volume_attach.assert_called_once()
+        self.compute.driver.finalize_spawn_volume_generation.\
+            assert_called_once_with(instance, token)
+        self.compute.driver.resume_internal_volume_attach.assert_not_called()
+        self.compute.volume_api.attachment_complete.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_failed_spawn_rolls_back_connected_generation(self, get_bdms):
+        instance = self._volume_recovery_instance()
+        instance.vm_state = manager.vm_states.ERROR
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        token = '60000000-0000-0000-0000-000000000006'
+        bdm = self._configure_internal_volume_recovery(
+            instance, volume_id, 'spawn', token, 'materialize')
+        get_bdms.return_value = [bdm]
+        self.compute.driver.get_volume_journal_phase.return_value = 'connected'
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='connected')
+
+        self.compute.driver.rollback_internal_volume_attach.\
+            assert_called_once_with(
+                mock.ANY, instance, volume_id, mock.ANY,
+                expected_mountpoint='/dev/vdb')
+        self.compute.driver.finalize_rolled_back_volume_journal.\
+            assert_called_once_with(instance, volume_id)
+        self.compute.driver.cancel_managed_volume_attach.assert_called_once()
+        self.compute.driver.finalize_spawn_volume_generation.\
+            assert_called_once_with(instance, token)
+        self.compute.driver.confirm_connected_volume_journal.\
+            assert_not_called()
+        self.compute.volume_api.attachment_complete.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_internal_attach_pending_retires_formal_owner(self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        token = '60000000-0000-0000-0000-000000000006'
+        bdm = self._configure_internal_volume_recovery(
+            instance, volume_id, 'reconcile', token, 'power-reconcile')
+        get_bdms.return_value = [bdm]
+        self.compute.driver.get_volume_journal_phase.return_value = None
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='attach-pending')
+
+        self.compute.driver.confirm_connected_volume_journal.\
+            assert_not_called()
+        self.compute.driver.cancel_managed_volume_attach.assert_called_once()
+        self.compute.driver.resume_internal_volume_attach.\
+            assert_called_once_with(
+                mock.ANY, instance, volume_id, mock.ANY,
+                expected_mountpoint='/dev/vdb')
+        self.compute.volume_api.attachment_complete.assert_not_called()
+
+    @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_nonterminal_live_target_retires_formally_attached_intent(
+            self, get_bdms, get_migrations):
+        instance = self._volume_recovery_instance()
+        source_host = 'incus-source'
+        instance.host = source_host
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        token = '60000000-0000-0000-0000-000000000006'
+        migration_uuid = '70000000-0000-0000-0000-000000000007'
+        bdm = self._configure_internal_volume_recovery(
+            instance, volume_id, 'migration', token, 'live-target',
+            operation_migration_uuid=migration_uuid)
+        get_bdms.return_value = [bdm]
+        self.compute.driver.get_volume_journal_phase.return_value = 'connected'
+        get_migrations.return_value = [mock.Mock(
+            uuid=migration_uuid, source_compute=source_host,
+            dest_compute=self.compute.host, status='running')]
+        self.compute.driver.internal_migration_attach_disposition.\
+            return_value = 'active'
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='connected')
+
+        self.compute.driver.confirm_connected_volume_journal.\
+            assert_called_once()
+        self.compute.driver.cancel_managed_volume_attach.assert_called_once()
+        self.compute.driver.rollback_internal_volume_attach.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_formal_migration_commit_republishes_intent_after_fsync_error(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        token = '60000000-0000-0000-0000-000000000006'
+        migration_uuid = '70000000-0000-0000-0000-000000000007'
+        bdm = self._configure_internal_volume_recovery(
+            instance, volume_id, 'migration', token, 'cold-target',
+            operation_migration_uuid=migration_uuid)
+        get_bdms.return_value = [bdm]
+        intent = self.compute.driver.\
+            get_managed_volume_attach_intent.return_value
+        self.compute.driver.confirm_connected_volume_journal.side_effect = (
+            OSError('fsync failed'))
+        self.compute.driver.prepare_managed_volume_attach.return_value = intent
+
+        self.compute._commit_formal_internal_volume_intents(
+            context.get_admin_context(), instance, token, migration_uuid,
+            'cold-target')
+
+        self.compute.driver.prepare_managed_volume_attach.\
+            assert_called_once_with(
+                instance, volume_id, bdm.attachment_id, bdm.device_name,
+                operation_kind='migration', operation_token=token,
+                operation_direction='cold-target',
+                operation_migration_uuid=migration_uuid)
+
+    @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_failed_cold_target_keeps_formal_cinder_owner(
+            self, get_bdms, get_migrations):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        token = '60000000-0000-0000-0000-000000000006'
+        migration_uuid = '70000000-0000-0000-0000-000000000007'
+        bdm = self._configure_internal_volume_recovery(
+            instance, volume_id, 'migration', token, 'cold-target',
+            operation_migration_uuid=migration_uuid)
+        get_bdms.return_value = [bdm]
+        self.compute.driver.get_volume_journal_phase.return_value = 'connected'
+        target = self._cinder_attachment(instance, volume_id, 'attached')
+        self.compute.driver.get_internal_volume_attach_connection_info.\
+            return_value = dict(target['connection_info'])
+        get_migrations.return_value = [mock.Mock(
+            uuid=migration_uuid, source_compute='incus-source',
+            dest_compute=self.compute.host, status='failed')]
+        self.compute.driver.internal_migration_attach_disposition.\
+            return_value = 'aborted'
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='connected')
+
+        self.compute.driver.rollback_internal_volume_attach.\
+            assert_called_once()
+        self.compute.driver.finalize_rolled_back_volume_journal.\
+            assert_called_once_with(instance, volume_id)
+        self.compute.volume_api.attachment_delete.assert_not_called()
+        bdm.destroy.assert_not_called()
+        self.compute.driver.cancel_managed_volume_attach.assert_called_once()
+
+    @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_active_migration_target_has_no_volume_side_effects(
+            self, get_bdms, get_migrations):
+        instance = self._volume_recovery_instance()
+        instance.host = 'incus-source'
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        token = '60000000-0000-0000-0000-000000000006'
+        migration_uuid = '70000000-0000-0000-0000-000000000007'
+        bdm = self._configure_internal_volume_recovery(
+            instance, volume_id, 'migration', token, 'live-target',
+            operation_migration_uuid=migration_uuid)
+        get_bdms.return_value = [bdm]
+        self._configure_cinder_recovery_attachment(
+            instance, volume_id, 'attaching')
+        get_migrations.return_value = [mock.Mock(
+            uuid=migration_uuid, source_compute='incus-source',
+            dest_compute=self.compute.host, status='running')]
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='connecting')
+
+        self.compute.driver.internal_migration_attach_disposition.\
+            assert_not_called()
+        self.compute.driver.resume_internal_volume_attach.assert_not_called()
+        self.compute.driver.rollback_internal_volume_attach.assert_not_called()
+        self.compute.driver.cancel_managed_volume_attach.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_attached_recovery_rejects_bdm_connection_info_mismatch(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        attachment = self._cinder_attachment(instance, volume_id, 'attached')
+        bdm_connection_info = dict(attachment['connection_info'])
+        bdm_connection_info['data'] = dict(bdm_connection_info['data'])
+        bdm_connection_info['data']['name'] = 'volumes/another-volume'
+        bdm_connection_info['serial'] = volume_id
+        bdm = self._volume_recovery_bdm(
+            volume_id, connection_info=bdm_connection_info)
+        get_bdms.return_value = [bdm]
+        self.compute.volume_api = mock.Mock()
+        attachment = self._configure_cinder_recovery_attachment(
+            instance, volume_id, 'attached')
+
+        self.assertRaises(
+            exception.InvalidVolume,
+            self.compute._recover_incus_connecting_volume_journal,
+            context.get_admin_context(), instance, volume_id)
+
+        confirm = self.compute.driver.confirm_connected_volume_journal
+        confirm.assert_not_called()
+        rollback = self.compute.driver.rollback_connecting_volume_journal
+        rollback.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_attaching_recovery_rejects_bdm_connection_info_mismatch(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        attachment = self._cinder_attachment(instance, volume_id, 'attaching')
+        bdm_connection_info = dict(attachment['connection_info'])
+        bdm_connection_info['data'] = dict(bdm_connection_info['data'])
+        bdm_connection_info['data']['name'] = 'volumes/another-volume'
+        bdm_connection_info['serial'] = volume_id
+        bdm = self._volume_recovery_bdm(
+            volume_id, connection_info=bdm_connection_info)
+        get_bdms.return_value = [bdm]
+        self.compute.volume_api = mock.Mock()
+        self._configure_cinder_recovery_attachment(
+            instance, volume_id, 'attaching')
+
+        self.assertRaises(
+            exception.InvalidVolume,
+            self.compute._recover_incus_connecting_volume_journal,
+            context.get_admin_context(), instance, volume_id)
+
+        resume = self.compute.driver.resume_connecting_volume_journal
+        resume.assert_not_called()
+        bdm.save.assert_not_called()
+        self.compute.volume_api.attachment_complete.assert_not_called()
+        confirm = self.compute.driver.confirm_connected_volume_journal
+        confirm.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_attaching_recovery_rejects_bdm_without_target(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        bdm = self._volume_recovery_bdm(volume_id)
+        bdm.device_name = None
+        get_bdms.return_value = [bdm]
+        self.compute.volume_api = mock.Mock()
+        self._configure_cinder_recovery_attachment(
+            instance, volume_id, 'attaching')
+
+        self.assertRaises(
+            exception.InvalidVolume,
+            self.compute._recover_incus_connecting_volume_journal,
+            context.get_admin_context(), instance, volume_id)
+
+        resume = self.compute.driver.resume_connecting_volume_journal
+        resume.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_periodic_volume_recovery_rolls_back_error_attaching(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        bdm = self._volume_recovery_bdm(volume_id)
+        get_bdms.return_value = [bdm]
+        self.compute.volume_api = mock.Mock()
+        attachment = self._configure_cinder_recovery_attachment(
+            instance, volume_id, 'error_attaching')
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id)
+
+        rollback = self.compute.driver.rollback_connecting_volume_journal
+        rollback.assert_called_once()
+        self.compute.volume_api.attachment_delete.assert_called_once_with(
+            mock.ANY, attachment['id'])
+        bdm.destroy.assert_called_once_with()
+        finalize = self.compute.driver.finalize_rolled_back_volume_journal
+        finalize.assert_called_once()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_failed_attach_disconnect_journal_keeps_attach_generation(
+            self, get_bdms):
+        """Failed attach cleanup is not misclassified as managed detach."""
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        bdm = self._volume_recovery_bdm(volume_id)
+        get_bdms.return_value = [bdm]
+        self.compute.volume_api = mock.Mock()
+        attachment = self._configure_cinder_recovery_attachment(
+            instance, volume_id, 'error_attaching')
+        self.compute.driver.get_volume_journal_phase.return_value = (
+            'disconnecting')
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='attach-disconnecting')
+
+        self.compute.driver.rollback_connecting_volume_journal.\
+            assert_called_once()
+        self.compute.driver._recover_disconnecting_volume_journal_locked.\
+            assert_not_called()
+        self.compute.volume_api.attachment_delete.assert_called_once_with(
+            mock.ANY, attachment['id'])
+        bdm.destroy.assert_called_once_with()
+        self.compute.driver.finalize_rolled_back_volume_journal.\
+            assert_called_once()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid',
+        return_value=[])
+    def test_failed_attach_disconnected_without_bdm_finishes_rollback(
+            self, get_bdms):
+        """Nova may destroy the BDM after attachment_complete fails."""
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        attachment_id = (
+            self.compute.driver.get_managed_volume_attach_intent.
+            return_value['attachment_id'])
+        self.compute.volume_api = mock.Mock()
+        self.compute.volume_api.attachment_get.side_effect = (
+            exception.VolumeAttachmentNotFound(
+                attachment_id=attachment_id))
+        self.compute.volume_api.get.return_value = self._cinder_volume(
+            instance, volume_id)
+        self.compute.driver.get_volume_journal_phase.return_value = (
+            'disconnected')
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='attach-disconnected')
+
+        self.compute.driver.rollback_connecting_volume_journal.\
+            assert_called_once_with(
+                mock.ANY, instance, volume_id, connection_info=None,
+                expected_mountpoint='/dev/vdb')
+        self.compute.volume_api.attachment_delete.assert_not_called()
+        self.compute.driver.finalize_rolled_back_volume_journal.\
+            assert_called_once_with(instance, volume_id)
+        self.compute.driver.cancel_managed_volume_attach.assert_called_once()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_rolled_back_intent_rejects_new_same_volume_bdm(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        bdm = self._volume_recovery_bdm(volume_id)
+        bdm.attachment_id = '70000000-0000-0000-0000-000000000007'
+        get_bdms.return_value = [bdm]
+        self.compute.volume_api = mock.Mock()
+        self.compute.driver.get_volume_journal_phase.return_value = (
+            'rolled-back')
+
+        self.assertRaises(
+            exception.InvalidVolume,
+            self.compute._recover_incus_connecting_volume_journal,
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='rolled-back')
+
+        self.compute.volume_api.attachment_get.assert_not_called()
+        self.compute.driver.rollback_connecting_volume_journal.\
+            assert_not_called()
+        self.compute.volume_api.attachment_delete.assert_not_called()
+        bdm.destroy.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_attach_recovery_rejects_stale_candidate_phase(self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        get_bdms.return_value = [self._volume_recovery_bdm(volume_id)]
+        self.compute.driver.get_volume_journal_phase.return_value = 'connected'
+        self.compute.volume_api = mock.Mock()
+
+        self.assertRaises(
+            exception.InvalidVolume,
+            self.compute._recover_incus_connecting_volume_journal,
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='rolled-back')
+
+        get_bdms.assert_not_called()
+        self.compute.volume_api.attachment_get.assert_not_called()
+        self.compute.driver.rollback_connecting_volume_journal.\
+            assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_volume_rollback_rejects_bdm_connection_info_mismatch(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        attachment = self._cinder_attachment(
+            instance, volume_id, 'error_attaching')
+        bdm_connection_info = dict(attachment['connection_info'])
+        bdm_connection_info['data'] = dict(bdm_connection_info['data'])
+        bdm_connection_info['data']['name'] = 'volumes/another-volume'
+        bdm_connection_info['serial'] = volume_id
+        bdm = self._volume_recovery_bdm(
+            volume_id, connection_info=bdm_connection_info)
+        get_bdms.return_value = [bdm]
+        self.compute.volume_api = mock.Mock()
+        self._configure_cinder_recovery_attachment(
+            instance, volume_id, 'error_attaching')
+
+        self.assertRaises(
+            exception.InvalidVolume,
+            self.compute._recover_incus_connecting_volume_journal,
+            context.get_admin_context(), instance, volume_id)
+
+        rollback = self.compute.driver.rollback_connecting_volume_journal
+        rollback.assert_not_called()
+        self.compute.volume_api.attachment_delete.assert_not_called()
+        bdm.destroy.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_volume_rollback_rejects_bdm_for_another_volume(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        bdm_connection_info = self._cinder_attachment(
+            instance, volume_id, 'attaching')['connection_info']
+        bdm_connection_info = dict(bdm_connection_info)
+        bdm_connection_info['serial'] = (
+            '60000000-0000-0000-0000-000000000006')
+        bdm = self._volume_recovery_bdm(
+            volume_id, connection_info=bdm_connection_info)
+        get_bdms.return_value = [bdm]
+        self.compute.volume_api = mock.Mock()
+        self.compute.volume_api.attachment_get.side_effect = (
+            exception.VolumeAttachmentNotFound(
+                attachment_id=bdm.attachment_id))
+        self.compute.volume_api.get.return_value = self._cinder_volume(
+            instance, volume_id)
+
+        self.assertRaises(
+            exception.InvalidVolume,
+            self.compute._recover_incus_connecting_volume_journal,
+            context.get_admin_context(), instance, volume_id)
+
+        rollback = self.compute.driver.rollback_connecting_volume_journal
+        rollback.assert_not_called()
+        bdm.destroy.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid',
+        return_value=[])
+    def test_periodic_volume_recovery_retains_orphan_without_bdm(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        self.compute.volume_api = mock.Mock()
+        self.assertRaises(
+            exception.InvalidVolume,
+            self.compute._recover_incus_connecting_volume_journal,
+            context.get_admin_context(), instance, volume_id)
+
+        rollback = self.compute.driver.rollback_connecting_volume_journal
+        rollback.assert_not_called()
+        self.compute.volume_api.attachment_delete.assert_not_called()
+        finalize = self.compute.driver.finalize_rolled_back_volume_journal
+        finalize.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid',
+        return_value=[])
+    def test_periodic_volume_recovery_fails_closed_without_attached_bdm(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        self.compute.volume_api = mock.Mock()
+        self._configure_cinder_recovery_attachment(
+            instance, volume_id, 'attached')
+
+        self.assertRaises(
+            exception.InvalidVolume,
+            self.compute._recover_incus_connecting_volume_journal,
+            context.get_admin_context(), instance, volume_id)
+
+        confirm = self.compute.driver.confirm_connected_volume_journal
+        confirm.assert_not_called()
+        rollback = self.compute.driver.rollback_connecting_volume_journal
+        rollback.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_periodic_volume_recovery_fails_closed_on_unknown_status(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        get_bdms.return_value = [self._volume_recovery_bdm(volume_id)]
+        self.compute.volume_api = mock.Mock()
+        self._configure_cinder_recovery_attachment(
+            instance, volume_id, 'error_detaching')
+
+        self.assertRaises(
+            exception.InvalidVolume,
+            self.compute._recover_incus_connecting_volume_journal,
+            context.get_admin_context(), instance, volume_id)
+
+        rollback = self.compute.driver.rollback_connecting_volume_journal
+        rollback.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_periodic_volume_recovery_retries_after_attachment_complete_error(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        bdm = self._volume_recovery_bdm(volume_id)
+        get_bdms.return_value = [bdm]
+        self.compute.volume_api = mock.Mock()
+        self._configure_cinder_recovery_attachment(
+            instance, volume_id, 'attaching')
+        self.compute.volume_api.attachment_complete.side_effect = RuntimeError(
+            'ambiguous Cinder reply')
+        self.compute.driver.resume_connecting_volume_journal.return_value = (
+            '/dev/vdb')
+
+        self.assertRaises(
+            RuntimeError,
+            self.compute._recover_incus_connecting_volume_journal,
+            context.get_admin_context(), instance, volume_id)
+
+        bdm.save.assert_called_once_with()
+        confirm = self.compute.driver.confirm_connected_volume_journal
+        confirm.assert_not_called()
+        self.compute.volume_api.attachment_delete.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_periodic_volume_rollback_keeps_journal_until_cinder_delete(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        bdm = self._volume_recovery_bdm(volume_id)
+        get_bdms.return_value = [bdm]
+        self.compute.volume_api = mock.Mock()
+        self._configure_cinder_recovery_attachment(
+            instance, volume_id, 'error_attaching')
+        self.compute.volume_api.attachment_delete.side_effect = RuntimeError(
+            'Cinder unavailable')
+
+        self.assertRaises(
+            RuntimeError,
+            self.compute._recover_incus_connecting_volume_journal,
+            context.get_admin_context(), instance, volume_id)
+
+        rollback = self.compute.driver.rollback_connecting_volume_journal
+        rollback.assert_called_once()
+        bdm.destroy.assert_not_called()
+        finalize = self.compute.driver.finalize_rolled_back_volume_journal
+        finalize.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_periodic_volume_recovery_retains_on_cinder_query_failure(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        get_bdms.return_value = [self._volume_recovery_bdm(volume_id)]
+        self.compute.volume_api = mock.Mock()
+        self.compute.volume_api.attachment_get.side_effect = RuntimeError(
+            'Cinder unavailable')
+
+        self.assertRaises(
+            RuntimeError,
+            self.compute._recover_incus_connecting_volume_journal,
+            context.get_admin_context(), instance, volume_id)
+
+        resume = self.compute.driver.resume_connecting_volume_journal
+        resume.assert_not_called()
+        rollback = self.compute.driver.rollback_connecting_volume_journal
+        rollback.assert_not_called()
+        confirm = self.compute.driver.confirm_connected_volume_journal
+        confirm.assert_not_called()
+
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_volume_periodic_loads_instance_before_lock_when_migration_off(
+            self, get_instance):
+        self.flags(migration_auto_recovery=False, group='incus')
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        candidate = {
+            'uuid': instance.uuid,
+            'volume_ids': [volume_id],
+            'phases': {volume_id: 'connecting'},
+        }
+        get_instance.side_effect = [instance, instance]
+        list_candidates = (
+            self.compute.driver.list_volume_journal_recovery_candidates)
+        list_candidates.return_value = [candidate]
+
+        with mock.patch.object(
+                manager.incus_driver, '_volume_topology_lock_name',
+                return_value='volume-topology') as lock_name, \
+                mock.patch.object(
+                    self.compute,
+                    '_recover_incus_connecting_volume_journal') as recover:
+            self.compute._recover_incus_volume_journals(
+                context.get_admin_context())
+
+        lock_name.assert_called_once_with(instance)
+        recover.assert_called_once_with(
+            mock.ANY, instance, volume_id, journal_phase='connecting')
+
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_volume_periodic_retains_deleted_instance_journal(
+            self, get_instance):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        list_candidates = (
+            self.compute.driver.list_volume_journal_recovery_candidates)
+        list_candidates.return_value = [{
+                'uuid': instance.uuid,
+                'volume_ids': [volume_id],
+                'phases': {volume_id: 'connecting'},
+            }]
+        get_instance.side_effect = exception.InstanceNotFound(
+            instance_id=instance.uuid)
+
+        with mock.patch.object(
+                manager.incus_driver,
+                '_volume_topology_lock_name') as lock_name:
+            self.compute._recover_incus_volume_journals(
+                context.get_admin_context())
+
+        lock_name.assert_not_called()
+
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_volume_periodic_skips_stale_completed_candidate(
+            self, get_instance):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        get_instance.side_effect = [instance, instance]
+        self.compute.driver.list_volume_journal_recovery_candidates.\
+            return_value = [{
+                'uuid': instance.uuid,
+                'volume_ids': [volume_id],
+                'phases': {volume_id: 'connecting'},
+            }]
+        self.compute.driver.get_volume_journal_recovery_phase.return_value = (
+            None)
+
+        with mock.patch.object(
+                self.compute,
+                '_recover_incus_connecting_volume_journal') as attach, \
+                mock.patch.object(
+                    self.compute,
+                    '_recover_incus_disconnecting_volume_journal') as detach:
+            self.compute._recover_incus_volume_journals(
+                context.get_admin_context())
+
+        attach.assert_not_called()
+        detach.assert_not_called()
+
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_volume_periodic_dispatches_locked_current_phase(
+            self, get_instance):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        get_instance.side_effect = [instance, instance]
+        self.compute.driver.list_volume_journal_recovery_candidates.\
+            return_value = [{
+                'uuid': instance.uuid,
+                'volume_ids': [volume_id],
+                'phases': {volume_id: 'connecting'},
+            }]
+        self.compute.driver.get_volume_journal_recovery_phase.return_value = (
+            'attach-disconnected')
+
+        with mock.patch.object(
+                self.compute,
+                '_recover_incus_connecting_volume_journal') as recover:
+            self.compute._recover_incus_volume_journals(
+                context.get_admin_context())
+
+        recover.assert_called_once_with(
+            mock.ANY, instance, volume_id,
+            journal_phase='attach-disconnected')
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_volume_periodic_dispatches_terminal_rotation_without_intent(
+            self, get_instance, get_bdms):
+        instance = self._volume_recovery_instance()
+        instance.task_state = task_states.RESIZE_MIGRATING
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        rotation = {
+            'phase': 'source-rollback-complete',
+            'operation_token':
+                '60000000-0000-0000-0000-000000000006',
+        }
+        bdm = self._volume_recovery_bdm(volume_id)
+        get_instance.side_effect = [instance, instance]
+        get_bdms.return_value = [bdm]
+        self.compute.driver.get_managed_volume_attach_intent.return_value = (
+            None)
+        self.compute.driver.get_cold_attachment_rotation.return_value = (
+            rotation)
+        self.compute.driver.list_volume_journal_recovery_candidates.\
+            return_value = [{
+                'uuid': instance.uuid,
+                'volume_ids': [volume_id],
+                'phases': {
+                    volume_id: 'rotation-source-rollback-complete'},
+            }]
+        self.compute.driver.get_volume_journal_recovery_phase.return_value = (
+            'rotation-source-rollback-complete')
+
+        with mock.patch.object(
+                self.compute,
+                '_retire_terminal_cold_attachment_rotation_locked') as retire:
+            self.compute._recover_incus_volume_journals(
+                context.get_admin_context())
+
+        retire.assert_called_once_with(
+            mock.ANY, instance, volume_id, rotation, bdm)
+
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_volume_periodic_rejects_unknown_rotation_phase(
+            self, get_instance):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        self.compute.driver.list_volume_journal_recovery_candidates.\
+            return_value = [{
+                'uuid': instance.uuid,
+                'volume_ids': [volume_id],
+                'phases': {volume_id: 'rotation-unknown'},
+            }]
+
+        self.compute._recover_incus_volume_journals(
+            context.get_admin_context())
+
+        get_instance.assert_not_called()
+
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_volume_periodic_dispatches_cross_host_source_release(
+            self, get_instance):
+        instance = self._volume_recovery_instance()
+        instance.host = 'compute-2'
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        token = '20000000-0000-0000-0000-000000000002'
+        migration_uuid = '30000000-0000-0000-0000-000000000003'
+        self.compute.driver.get_managed_volume_attach_intent.return_value = {
+            'attachment_id':
+                '40000000-0000-0000-0000-000000000004',
+            'mountpoint': '/dev/vdb',
+            'operation_kind': 'migration',
+            'operation_token': token,
+            'operation_direction': 'live-source-release',
+            'operation_migration_uuid': migration_uuid,
+        }
+        get_instance.side_effect = [instance, instance]
+        self.compute.driver.list_volume_journal_recovery_candidates.\
+            return_value = [{
+                'uuid': instance.uuid,
+                'volume_ids': [volume_id],
+                'phases': {volume_id: 'attach-disconnected'},
+            }]
+        self.compute.driver.get_volume_journal_recovery_phase.return_value = (
+            'attach-disconnected')
+
+        with mock.patch.object(
+                self.compute,
+                '_recover_incus_connecting_volume_journal') as recover:
+            self.compute._recover_incus_volume_journals(
+                context.get_admin_context())
+
+        recover.assert_called_once_with(
+            mock.ANY, instance, volume_id,
+            journal_phase='attach-disconnected')
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_volume_recovery_rejects_attachment_without_status(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        get_bdms.return_value = [self._volume_recovery_bdm(volume_id)]
+        self.compute.volume_api = mock.Mock()
+        malformed = self._cinder_attachment(instance, volume_id, 'attaching')
+        malformed['connection_info'].pop('status')
+        self.compute.volume_api.attachment_get.return_value = malformed
+
+        self.assertRaises(
+            exception.InvalidVolume,
+            self.compute._recover_incus_connecting_volume_journal,
+            context.get_admin_context(), instance, volume_id)
+
+        self.compute.volume_api.attachment_get.assert_called_once()
+        rollback = self.compute.driver.rollback_connecting_volume_journal
+        rollback.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_volume_recovery_rejects_attachment_without_id(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        get_bdms.return_value = [self._volume_recovery_bdm(volume_id)]
+        self.compute.volume_api = mock.Mock()
+        malformed = self._cinder_attachment(
+            instance, volume_id, 'error_attaching')
+        malformed['id'] = None
+        self.compute.volume_api.attachment_get.return_value = malformed
+
+        self.assertRaises(
+            exception.InvalidVolume,
+            self.compute._recover_incus_connecting_volume_journal,
+            context.get_admin_context(), instance, volume_id)
+
+        self.compute.volume_api.attachment_delete.assert_not_called()
+        rollback = self.compute.driver.rollback_connecting_volume_journal
+        rollback.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_volume_rollback_rejects_new_attachment_owner(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        get_bdms.return_value = [self._volume_recovery_bdm(volume_id)]
+        self.compute.volume_api = mock.Mock()
+        new_instance = mock.Mock(
+            uuid='60000000-0000-0000-0000-000000000006')
+        new_attachment_id = '70000000-0000-0000-0000-000000000007'
+        old_attachment_id = get_bdms.return_value[0].attachment_id
+        self.compute.volume_api.attachment_get.side_effect = (
+            exception.VolumeAttachmentNotFound(
+                attachment_id=old_attachment_id))
+        self.compute.volume_api.get.return_value = self._cinder_volume(
+            new_instance, volume_id, attachment_status='attached',
+            attachment_id=new_attachment_id)
+
+        self.assertRaises(
+            exception.InvalidVolume,
+            self.compute._recover_incus_connecting_volume_journal,
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='connecting')
+
+        rollback = self.compute.driver.rollback_connecting_volume_journal
+        rollback.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_volume_rollback_rechecks_cinder_inside_volume_lock(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        bdm = self._volume_recovery_bdm(volume_id)
+        get_bdms.return_value = [bdm]
+        self.compute.volume_api = mock.Mock()
+        events = []
+
+        @contextlib.contextmanager
+        def tracked_lock(name, **kwargs):
+            events.append(('enter', name))
+            try:
+                yield
+            finally:
+                events.append(('exit', name))
+
+        def get_volume(_context, requested_volume_id):
+            events.append(('get', requested_volume_id))
+            return self._cinder_volume(instance, requested_volume_id)
+
+        self.compute.volume_api.attachment_get.side_effect = (
+            exception.VolumeAttachmentNotFound(
+                attachment_id=bdm.attachment_id))
+        self.compute.volume_api.get.side_effect = get_volume
+        self.compute.driver.rollback_connecting_volume_journal.side_effect = (
+            lambda *_args, **_kwargs: events.append(('rollback', volume_id)))
+
+        with mock.patch.object(
+                manager.lockutils, 'lock', side_effect=tracked_lock):
+            self.compute._recover_incus_connecting_volume_journal(
+                context.get_admin_context(), instance, volume_id,
+                journal_phase='connecting')
+
+        volume_lock = manager.incus_driver._volume_operation_lock_name(
+            volume_id)
+        self.assertEqual(('enter', volume_lock), events[0])
+        self.assertLess(
+            events.index(('get', volume_id)),
+            events.index(('rollback', volume_id)))
+        self.assertEqual(('exit', volume_lock), events[-1])
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_disconnecting_recovery_finishes_exact_managed_detach(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        attachment = self._cinder_attachment(instance, volume_id, 'attached')
+        bdm_connection_info = dict(attachment['connection_info'])
+        bdm_connection_info['serial'] = volume_id
+        bdm = self._volume_recovery_bdm(
+            volume_id, connection_info=bdm_connection_info)
+        get_bdms.return_value = [bdm]
+        self.compute.volume_api = mock.Mock()
+        attachment = self._configure_cinder_recovery_attachment(
+            instance, volume_id, 'attached')
+        self._configure_managed_detach(volume_id)
+
+        self.compute._recover_incus_disconnecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='disconnecting')
+
+        recover = (
+            self.compute.driver._recover_disconnecting_volume_journal_locked)
+        recover.assert_called_once_with(
+            mock.ANY, instance, volume_id, bdm_connection_info,
+            expected_mountpoint='/dev/vdb')
+        self.compute.volume_api.attachment_delete.assert_called_once_with(
+            mock.ANY, attachment['id'])
+        bdm.destroy.assert_called_once_with()
+        self.compute.driver.finalize_disconnected_volume_journal.\
+            assert_called_once_with(instance, volume_id)
+        self.compute.driver.cancel_managed_volume_detach.\
+            assert_called_once()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_detach_pending_rolls_back_before_driver_intent(
+            self, get_bdms):
+        """A restart before driver entry restores the exact live attach."""
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        attachment = self._cinder_attachment(instance, volume_id, 'attached')
+        bdm_connection_info = dict(attachment['connection_info'])
+        bdm_connection_info['serial'] = volume_id
+        bdm = self._volume_recovery_bdm(
+            volume_id, connection_info=bdm_connection_info)
+        get_bdms.return_value = [bdm]
+        self.compute.volume_api = mock.Mock()
+        self.compute.volume_api.attachment_get.return_value = attachment
+        self.compute.volume_api.get.return_value = self._cinder_volume(
+            instance, volume_id, attachment_status='attached',
+            attachment_id=attachment['id'], volume_status='detaching')
+        self._configure_managed_detach(volume_id, phase=None)
+
+        self.compute._recover_incus_disconnecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='detach-pending')
+
+        self.compute.driver.confirm_connected_volume_journal.\
+            assert_called_once_with(
+                instance, volume_id, bdm_connection_info,
+                expected_mountpoint='/dev/vdb')
+        self.compute.volume_api.roll_detaching.assert_called_once_with(
+            mock.ANY, volume_id)
+        self.compute.driver.cancel_managed_volume_detach.\
+            assert_called_once()
+        self.compute.driver._recover_disconnecting_volume_journal_locked.\
+            assert_not_called()
+        self.compute.volume_api.attachment_delete.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid',
+        return_value=[])
+    def test_terminal_detach_intent_does_not_touch_new_owner(self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        intent = self._configure_managed_detach(volume_id, phase=None)
+        self.compute.volume_api = mock.Mock()
+        self.compute.volume_api.attachment_get.side_effect = (
+            exception.VolumeAttachmentNotFound(
+                attachment_id=intent['attachment_id']))
+        new_instance = mock.Mock(
+            uuid='60000000-0000-0000-0000-000000000006')
+        self.compute.volume_api.get.return_value = self._cinder_volume(
+            new_instance, volume_id, attachment_status='attached',
+            attachment_id='70000000-0000-0000-0000-000000000007')
+
+        self.compute._recover_incus_disconnecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='detach-pending')
+
+        self.compute.driver.validate_disconnected_volume_state.\
+            assert_called_once_with(instance, volume_id)
+        self.compute.driver.cancel_managed_volume_detach.\
+            assert_called_once()
+        self.compute.driver._recover_disconnecting_volume_journal_locked.\
+            assert_not_called()
+        self.compute.volume_api.attachment_delete.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_detach_pending_retries_after_roll_detaching_committed(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        attachment = self._cinder_attachment(instance, volume_id, 'attached')
+        bdm_connection_info = dict(attachment['connection_info'])
+        bdm_connection_info['serial'] = volume_id
+        get_bdms.return_value = [self._volume_recovery_bdm(
+            volume_id, connection_info=bdm_connection_info)]
+        self.compute.volume_api = mock.Mock()
+        self.compute.volume_api.attachment_get.return_value = attachment
+        self.compute.volume_api.get.return_value = self._cinder_volume(
+            instance, volume_id, attachment_status='attached',
+            attachment_id=attachment['id'], volume_status='in-use')
+        self._configure_managed_detach(volume_id, phase=None)
+
+        self.compute._recover_incus_disconnecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='detach-pending')
+
+        self.compute.volume_api.roll_detaching.assert_not_called()
+        self.compute.driver.cancel_managed_volume_detach.\
+            assert_called_once()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid',
+        return_value=[])
+    def test_detach_intent_only_after_commit_is_retired(self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        intent = self._configure_managed_detach(volume_id, phase=None)
+        self.compute.volume_api = mock.Mock()
+        self.compute.volume_api.attachment_get.side_effect = (
+            exception.VolumeAttachmentNotFound(
+                attachment_id=intent['attachment_id']))
+        self.compute.volume_api.get.return_value = self._cinder_volume(
+            instance, volume_id)
+
+        self.compute._recover_incus_disconnecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='detach-pending')
+
+        self.compute.driver.cancel_managed_volume_detach.\
+            assert_called_once()
+        self.compute.driver.validate_disconnected_volume_state.\
+            assert_called_once_with(instance, volume_id)
+        self.compute.driver._recover_disconnecting_volume_journal_locked.\
+            assert_not_called()
+        self.compute.volume_api.attachment_delete.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_disconnecting_recovery_rejects_new_attachment_owner(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        attachment = self._cinder_attachment(instance, volume_id, 'attached')
+        bdm_connection_info = dict(attachment['connection_info'])
+        bdm_connection_info['serial'] = volume_id
+        bdm = self._volume_recovery_bdm(
+            volume_id, connection_info=bdm_connection_info)
+        get_bdms.return_value = [bdm]
+        self.compute.volume_api = mock.Mock()
+        self.compute.volume_api.attachment_get.return_value = attachment
+        new_instance = mock.Mock(
+            uuid='60000000-0000-0000-0000-000000000006')
+        self.compute.volume_api.get.return_value = self._cinder_volume(
+            new_instance, volume_id, attachment_status='attached',
+            attachment_id='70000000-0000-0000-0000-000000000007')
+        self._configure_managed_detach(volume_id)
+
+        self.assertRaises(
+            exception.InvalidVolume,
+            self.compute._recover_incus_disconnecting_volume_journal,
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='disconnecting')
+
+        recover = (
+            self.compute.driver._recover_disconnecting_volume_journal_locked)
+        recover.assert_not_called()
+        self.compute.volume_api.attachment_delete.assert_not_called()
+        bdm.destroy.assert_not_called()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_disconnected_recovery_never_repeats_host_disconnect(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        attachment = self._cinder_attachment(instance, volume_id, 'detached')
+        bdm_connection_info = dict(attachment['connection_info'])
+        bdm_connection_info['serial'] = volume_id
+        bdm = self._volume_recovery_bdm(
+            volume_id, connection_info=bdm_connection_info)
+        get_bdms.return_value = [bdm]
+        self.compute.volume_api = mock.Mock()
+        self.compute.volume_api.attachment_get.return_value = attachment
+        self._configure_managed_detach(volume_id, phase='disconnected')
+
+        self.compute._recover_incus_disconnecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='disconnected')
+
+        self.compute.driver._recover_disconnecting_volume_journal_locked.\
+            assert_not_called()
+        self.compute.volume_api.attachment_delete.assert_called_once_with(
+            mock.ANY, attachment['id'])
+        bdm.destroy.assert_called_once_with()
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_disconnecting_destroy_bdm_false_fails_closed(self, get_bdms):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        bdm = self._volume_recovery_bdm(volume_id)
+        get_bdms.return_value = [bdm]
+        self.compute.volume_api = mock.Mock()
+        self._configure_managed_detach(
+            volume_id, destroy_bdm=False)
+
+        self.assertRaises(
+            exception.InvalidVolume,
+            self.compute._recover_incus_disconnecting_volume_journal,
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='disconnecting')
+
+        self.compute.volume_api.attachment_get.assert_not_called()
+        self.compute.driver._recover_disconnecting_volume_journal_locked.\
+            assert_not_called()
+        bdm.destroy.assert_not_called()
+
     def test_complete_live_migration_rollback_reasserts_network(self):
         ctxt = context.get_admin_context()
         instance = mock.sentinel.instance
@@ -1930,6 +5841,53 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         self.assertIsNone(result)
         finalize = self.compute.driver.finalize_live_migration_rollback
         finalize.assert_called_once_with(ctxt, instance, data)
+
+    def test_complete_live_rollback_retires_source_volume_generation(self):
+        ctxt = context.get_admin_context()
+        instance = mock.Mock(host=self.compute.host)
+        token = '10000000-0000-0000-0000-000000000001'
+        migration_uuid = '20000000-0000-0000-0000-000000000002'
+        data = migrate_data.IncusLiveMigrateData(
+            cleanup_token=token, migration_uuid=migration_uuid)
+
+        self.compute._complete_live_migration_rollback(
+            ctxt, instance, data, migration_status='failed')
+
+        self.compute.driver.finalize_live_migration_rollback.\
+            assert_called_once_with(ctxt, instance, data)
+        self.compute.driver.finalize_remote_source_volume_generation.\
+            assert_called_once_with(
+                instance, token)
+
+    @mock.patch.object(
+        manager.manager.ComputeManager, 'finish_revert_resize',
+        return_value=mock.sentinel.result)
+    def test_finish_cold_revert_retires_source_volume_generation(
+            self, base_finish):
+        ctxt = context.get_admin_context()
+        token = '10000000-0000-0000-0000-000000000001'
+        migration_uuid = '20000000-0000-0000-0000-000000000002'
+        instance = mock.Mock(host=self.compute.host)
+        instance.name = 'instance-00000001'
+        migration = mock.Mock(uuid=migration_uuid, status='reverted')
+        self.compute.driver.client.profiles.get.side_effect = None
+        self.compute.driver.client.profiles.get.return_value = mock.Mock(
+            config={manager.incus_driver.MIGRATION_CLEANUP_TOKEN_KEY: token})
+        self.compute._commit_formal_internal_volume_intents = mock.Mock()
+
+        result = self.compute._finish_revert_resize_and_commit_volumes(
+            ctxt, instance, migration, mock.sentinel.request_spec)
+
+        self.assertIs(mock.sentinel.result, result)
+        base_finish.assert_called_once_with(
+            ctxt, instance, migration, mock.sentinel.request_spec)
+        self.compute._commit_formal_internal_volume_intents.\
+            assert_called_once_with(
+                ctxt, instance, token, migration_uuid,
+                'cold-revert-source')
+        self.compute.driver.finalize_remote_source_volume_generation.\
+            assert_called_once_with(
+                instance, token)
 
     def test_pre_live_migration_rollback_does_not_reassert_network(self):
         data = migrate_data.IncusLiveMigrateData()
@@ -1951,7 +5909,9 @@ class IncusComputeManagerTest(test.NoDBTestCase):
             mock.sentinel.context, mock.sentinel.instance, data, migration)
 
         self.assertIs(data, result)
-        self.assertEqual(token, data.cleanup_token)
+        self.assertEqual(token, data.migration_uuid)
+        self.assertEqual(
+            '20000000-0000-0000-0000-000000000002', data.cleanup_token)
 
     def test_live_migration_check_data_rejects_missing_migration_uuid(self):
         data = migrate_data.IncusLiveMigrateData(
@@ -3114,15 +7074,17 @@ class IncusComputeManagerTest(test.NoDBTestCase):
             deleted=False, info_cache=None)
         instance.name = 'instance-candidate'
         token = '20000000-0000-0000-0000-000000000002'
+        migration_uuid = '30000000-0000-0000-0000-000000000003'
         get_by_uuid.return_value = instance
         migration = mock.Mock(
-            uuid=token, source_compute=self.compute.host,
+            uuid=migration_uuid, source_compute=self.compute.host,
             dest_compute='compute-2', status='error')
         get_migrations.return_value = [migration]
         candidate = {
             'name': instance.name,
             'uuid': instance.uuid,
             'operation_token': token,
+            'migration_uuid': migration_uuid,
             'idmap_base': 1065536,
             'idmap_size': 65536,
         }
@@ -3142,6 +7104,70 @@ class IncusComputeManagerTest(test.NoDBTestCase):
             self.compute.driver.recover_destination_prepared_profile)
         recover.assert_called_once_with(
             mock.ANY, instance, candidate, migration, network_info)
+
+    @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_source_volume_generation_recovery_retires_exact_source_owner(
+            self, get_by_uuid, get_migrations):
+        instance = mock.Mock(
+            uuid='10000000-0000-0000-0000-000000000001',
+            host=self.compute.host, task_state=None, deleted=False)
+        instance.name = 'instance-source'
+        instance.obj_attr_is_set.return_value = True
+        token = '20000000-0000-0000-0000-000000000002'
+        migration_uuid = '30000000-0000-0000-0000-000000000003'
+        candidate = {
+            'name': instance.name,
+            'uuid': instance.uuid,
+            'operation_token': token,
+            'migration_uuid': migration_uuid,
+        }
+        self.compute.driver.\
+            list_source_volume_generation_recovery_candidates.return_value = [
+                candidate]
+        get_by_uuid.return_value = instance
+        get_migrations.return_value = [mock.Mock(
+            uuid=migration_uuid, source_compute=self.compute.host,
+            dest_compute='compute-2', status='reverted')]
+        self.compute.driver.\
+            finalize_remote_source_volume_generation.return_value = True
+
+        self.compute._recover_incus_source_volume_generations(
+            context.get_admin_context())
+
+        get_migrations.assert_called_once_with(
+            mock.ANY, {'instance_uuid': instance.uuid})
+        self.compute.driver.finalize_remote_source_volume_generation.\
+            assert_called_once_with(instance, token)
+
+    @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_source_volume_generation_recovery_rejects_target_owner(
+            self, get_by_uuid, get_migrations):
+        instance = mock.Mock(
+            uuid='10000000-0000-0000-0000-000000000001',
+            host=self.compute.host, task_state=None, deleted=False)
+        instance.name = 'instance-source'
+        instance.obj_attr_is_set.return_value = True
+        token = '20000000-0000-0000-0000-000000000002'
+        migration_uuid = '30000000-0000-0000-0000-000000000003'
+        self.compute.driver.\
+            list_source_volume_generation_recovery_candidates.return_value = [{
+                'name': instance.name,
+                'uuid': instance.uuid,
+                'operation_token': token,
+                'migration_uuid': migration_uuid,
+            }]
+        get_by_uuid.return_value = instance
+        get_migrations.return_value = [mock.Mock(
+            uuid=migration_uuid, source_compute='compute-2',
+            dest_compute=self.compute.host, status='completed')]
+
+        self.compute._recover_incus_source_volume_generations(
+            context.get_admin_context())
+
+        self.compute.driver.finalize_source_volume_generation.\
+            assert_not_called()
 
     @mock.patch.object(
         manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')

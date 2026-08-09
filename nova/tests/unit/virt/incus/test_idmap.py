@@ -31,6 +31,26 @@ def _decode(value):
     return base64.b64decode(value.encode("ascii"))
 
 
+class _FakeLease:
+
+    def __init__(self, lease_id, client, ttl):
+        self.id = lease_id
+        self.client = client
+        self._ttl = ttl
+        self.refresh_count = 0
+
+    def refresh(self):
+        self.refresh_count += 1
+        with self.client.lock:
+            if self.id not in self.client.leases:
+                return -1
+        return self._ttl
+
+    def revoke(self):
+        self.client.revoke_lease(self.id)
+        return True
+
+
 class _FakeEtcd:
     """Thread-safe subset of the etcd v3 gateway used by allocator tests."""
 
@@ -47,6 +67,27 @@ class _FakeEtcd:
         self.get_calls = []
         self.get_prefix_calls = []
         self.transactions = []
+        self.next_lease_id = 1
+        self.leases = {}
+        self.key_leases = {}
+
+    def lease(self, ttl):
+        with self.lock:
+            lease = _FakeLease(self.next_lease_id, self, ttl)
+            self.next_lease_id += 1
+            self.leases[lease.id] = lease
+            return lease
+
+    def revoke_lease(self, lease_id):
+        with self.lock:
+            self.leases.pop(lease_id, None)
+            for key, attached in list(self.key_leases.items()):
+                if attached == lease_id:
+                    self.values.pop(key, None)
+                    self.key_leases.pop(key, None)
+
+    def expire_lease(self, lease_id):
+        self.revoke_lease(lease_id)
 
     def get(self, key):
         with self.lock:
@@ -103,6 +144,9 @@ class _FakeEtcd:
                     matches = current is None
                 elif comparison["target"] == "VALUE":
                     matches = current == _decode(comparison["value"])
+                elif comparison["target"] == "LEASE":
+                    matches = self.key_leases.get(key, 0) == int(
+                        comparison["lease"])
                 else:
                     raise AssertionError("unsupported comparison")
                 if comparison["result"] != "EQUAL":
@@ -114,10 +158,20 @@ class _FakeEtcd:
             for request in transaction.get(branch, []):
                 if "request_put" in request:
                     item = request["request_put"]
-                    self.values[_decode(item["key"])] = _decode(item["value"])
+                    key = _decode(item["key"])
+                    self.values[key] = _decode(item["value"])
+                    lease_id = item.get("lease")
+                    if lease_id is None:
+                        self.key_leases.pop(key, None)
+                    else:
+                        if lease_id not in self.leases:
+                            raise AssertionError("put uses unknown lease")
+                        self.key_leases[key] = lease_id
                 elif "request_delete_range" in request:
                     item = request["request_delete_range"]
-                    self.values.pop(_decode(item["key"]), None)
+                    key = _decode(item["key"])
+                    self.values.pop(key, None)
+                    self.key_leases.pop(key, None)
                 elif "request_range" in request:
                     item = request["request_range"]
                     key = _decode(item["key"])
@@ -140,6 +194,8 @@ class _FakeEtcd:
                         kvs = [{
                             "key": base64.b64encode(
                                 stored_key).decode("ascii"),
+                            "lease": str(
+                                self.key_leases.get(stored_key, 0)),
                             "value": base64.b64encode(
                                 stored).decode("ascii"),
                         } for stored_key, stored in matched]
@@ -211,6 +267,7 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
         self.etcd = _FakeEtcd()
         self.allocator = self._allocator()
         self.allocator.bootstrap()
+        self.allocator.run_coordinated_audit(full=True)
 
     def _allocator(self, client=None, namespace="cell1", count=8):
         return idmap.IDMapAllocator(
@@ -1400,10 +1457,36 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
 
         self.assertEqual(
             {'instances': 2, 'slots': 2, 'releases': 1, 'hosts': 1}, counts)
-        # One transaction, and it transfers counts rather than records.
-        self.assertEqual(1, len(self.etcd.transactions))
-        for request in self.etcd.transactions[0]['success']:
+        # One exact health read plus one count-only transaction.
+        self.assertEqual(2, len(self.etcd.transactions))
+        for request in self.etcd.transactions[-1]['success']:
             self.assertTrue(request['request_range']['count_only'])
+
+    def test_release_intents_for_instances_are_one_exact_transaction(self):
+        first = self.allocator.allocate(self._uuid(160))
+        second = self.allocator.allocate(self._uuid(161))
+        intent = self.allocator.request_release(
+            first.instance_uuid, "instance-00000160",
+            assignment=self.allocator.get(first.instance_uuid))
+        self.etcd.transactions.clear()
+        self.etcd.get_prefix_calls.clear()
+
+        intents = self.allocator.list_release_intents_for_instances([
+            second.instance_uuid, first.instance_uuid,
+            first.instance_uuid,
+        ])
+
+        self.assertEqual([intent], intents)
+        self.assertEqual([], self.etcd.get_prefix_calls)
+        self.assertEqual(2, len(self.etcd.transactions))
+        keys = {
+            _decode(request['request_range']['key'])
+            for request in self.etcd.transactions[-1]['success']
+        }
+        self.assertEqual({
+            self.allocator.release_key(first.instance_uuid).encode(),
+            self.allocator.release_key(second.instance_uuid).encode(),
+        }, keys)
 
     def test_probe_does_not_read_the_namespace(self):
         """The probe's whole point is not paying for a full scan."""
@@ -1413,6 +1496,233 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
         self.allocator.probe()
 
         self.assertEqual([], self.etcd.get_prefix_calls)
+
+    def test_audit_control_is_outside_legacy_audited_prefix(self):
+        self.assertFalse(self.allocator.audit_coordinator_key.startswith(
+            self.allocator._prefix + '/'))
+        self.assertFalse(self.allocator.audit_failure_key.startswith(
+            self.allocator._prefix + '/'))
+        self.assertEqual([], self.allocator.audit())
+
+    def test_lease_expiry_elects_one_new_full_auditor(self):
+        follower = self._allocator(client=self.etcd)
+        follower.initialize()
+        owner, snapshot = follower.run_coordinated_audit(full=False)
+        self.assertFalse(owner)
+        self.assertIsNone(snapshot)
+
+        old_lease_id = self.allocator._audit_lease.id
+        self.etcd.expire_lease(old_lease_id)
+        owner, snapshot = follower.run_coordinated_audit(full=False)
+
+        self.assertTrue(owner)
+        self.assertEqual(([], [], []), snapshot)
+        coordinator = follower._parse_audit_coordinator(
+            self.etcd.values[follower.audit_coordinator_key.encode()])
+        self.assertEqual(follower._coordinator_token, coordinator['token'])
+        self.assertEqual('healthy', coordinator['state'])
+
+        losing_follower = self._allocator(client=self.etcd)
+        losing_follower.initialize()
+        self.assertEqual(
+            (False, None),
+            losing_follower.run_coordinated_audit(full=True))
+
+    def test_concurrent_lease_takeover_elects_exactly_one_owner(self):
+        self.etcd.expire_lease(self.allocator._audit_lease.id)
+        contenders = [self._allocator(client=self.etcd) for unused in range(2)]
+        for contender in contenders:
+            contender.initialize()
+        self.etcd.transaction_barrier = threading.Barrier(2)
+        self.etcd.transaction_barrier_remaining = 2
+
+        with futures.ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(
+                lambda allocator: allocator.run_coordinated_audit(full=True),
+                contenders))
+
+        self.assertEqual(1, sum(owner for owner, unused in results))
+        self.assertEqual(1, sum(
+            snapshot is not None for unused, snapshot in results))
+
+    def test_owner_refuses_a_coordinator_rebound_to_another_lease(self):
+        coordinator_key = self.allocator.audit_coordinator_key.encode()
+        replacement = self.etcd.lease(self.allocator.audit_lease_ttl)
+        self.etcd.key_leases[coordinator_key] = replacement.id
+
+        self.assertRaisesRegex(
+            idmap.IDMapBackendError, 'lost its owning lease',
+            self.allocator.run_coordinated_audit, full=False)
+
+    def test_exact_guard_rejects_lease_replacement_with_same_value(self):
+        coordinator_key = self.allocator.audit_coordinator_key.encode()
+        replacement = self.etcd.lease(self.allocator.audit_lease_ttl)
+
+        def replace_lease(client, unused_transaction):
+            client.key_leases[coordinator_key] = replacement.id
+
+        self.etcd.before_transaction = replace_lease
+        self.assertRaisesRegex(
+            idmap.IDMapBackendError, 'compare failed',
+            self.allocator._read_exact,
+            (self.allocator.instance_key(self._uuid(76)),))
+
+    def test_pending_coordinator_fails_sensitive_reads_closed(self):
+        token = str(uuid.uuid4())
+        self.etcd.values[self.allocator.audit_coordinator_key.encode()] = (
+            self.allocator._audit_coordinator_raw(
+                token, 'pending', str(uuid.uuid4())))
+
+        self.assertRaisesRegex(
+            idmap.IDMapBackendError, 'audit is in progress',
+            self.allocator.get, self._uuid(70))
+
+    def test_sticky_audit_failure_propagates_to_another_process(self):
+        assignment = self.allocator.allocate(self._uuid(71))
+        self.etcd.values.pop(
+            self.allocator.slot_key(assignment.slot).encode())
+
+        self.assertRaises(
+            idmap.IDMapIntegrityError,
+            self.allocator.run_coordinated_audit, full=True)
+        self.assertIn(
+            self.allocator.audit_failure_key.encode(), self.etcd.values)
+
+        follower = self._allocator(client=self.etcd)
+        follower.initialize()
+        self.assertRaisesRegex(
+            idmap.IDMapIntegrityError, 'fleet audit failure is sticky',
+            follower.get, assignment.instance_uuid)
+        self.assertIsNotNone(follower._integrity_latch)
+
+    def test_leased_failure_record_is_rejected_and_latched(self):
+        failure_key = self.allocator.audit_failure_key.encode()
+        lease = self.etcd.lease(self.allocator.audit_lease_ttl)
+        self.etcd.values[failure_key] = self.allocator._audit_failure_raw(
+            'operator miswrite')
+        self.etcd.key_leases[failure_key] = lease.id
+        follower = self._allocator(client=self.etcd)
+        follower.initialize()
+
+        self.assertRaisesRegex(
+            idmap.IDMapIntegrityError, 'must not have a lease',
+            follower.get, self._uuid(77))
+        self.assertIsNotNone(follower._integrity_latch)
+
+    def test_failure_publication_error_leaves_pending_until_takeover(self):
+        assignment = self.allocator.allocate(self._uuid(73))
+        self.etcd.values.pop(
+            self.allocator.slot_key(assignment.slot).encode())
+
+        with mock.patch.object(
+                self.allocator, '_publish_integrity_failure',
+                side_effect=idmap.IDMapBackendError(
+                    reason='failure key unavailable')):
+            self.assertRaises(
+                idmap.IDMapIntegrityError,
+                self.allocator.run_coordinated_audit, full=True)
+
+        coordinator_raw = self.etcd.values[
+            self.allocator.audit_coordinator_key.encode()]
+        self.assertEqual(
+            'pending',
+            self.allocator._parse_audit_coordinator(
+                coordinator_raw)['state'])
+        self.assertNotIn(
+            self.allocator.audit_failure_key.encode(), self.etcd.values)
+
+        follower = self._allocator(client=self.etcd)
+        follower.initialize()
+        self.assertRaisesRegex(
+            idmap.IDMapBackendError, 'audit is in progress',
+            follower.get, assignment.instance_uuid)
+
+        self.etcd.expire_lease(self.allocator._audit_lease.id)
+        self.assertRaises(
+            idmap.IDMapIntegrityError,
+            follower.run_coordinated_audit, full=False)
+        self.assertIn(
+            follower.audit_failure_key.encode(), self.etcd.values)
+
+    def test_mutation_cas_compares_fleet_health_generation(self):
+        self.etcd.transactions.clear()
+        self.allocator.allocate(self._uuid(72))
+
+        mutations = [
+            transaction for transaction in self.etcd.transactions
+            if any('request_put' in request for request in
+                   transaction.get('success', []))
+        ]
+        self.assertTrue(mutations)
+        compared_keys = {
+            _decode(comparison['key'])
+            for comparison in mutations[-1]['compare']
+        }
+        self.assertIn(
+            self.allocator.audit_coordinator_key.encode(), compared_keys)
+        self.assertIn(
+            self.allocator.audit_failure_key.encode(), compared_keys)
+        health_compares = [
+            comparison for comparison in mutations[-1]['compare']
+            if (_decode(comparison['key']) ==
+                self.allocator.audit_coordinator_key.encode())
+        ]
+        self.assertEqual({'LEASE', 'VALUE'}, {
+            comparison['target'] for comparison in health_compares})
+
+    def test_unleased_healthy_record_forces_a_new_full_audit(self):
+        coordinator_key = self.allocator.audit_coordinator_key.encode()
+        stale_raw = self.etcd.values[coordinator_key]
+        self.etcd.key_leases.pop(coordinator_key)
+        follower = self._allocator(client=self.etcd)
+        follower.initialize()
+
+        with mock.patch.object(
+                follower, '_audit_with_latch',
+                wraps=follower._audit_with_latch) as full_audit:
+            self.assertIsNone(follower.get(self._uuid(74)))
+
+        full_audit.assert_called_once_with()
+        self.assertNotEqual(stale_raw, self.etcd.values[coordinator_key])
+        self.assertGreater(self.etcd.key_leases[coordinator_key], 0)
+        coordinator = follower._parse_audit_coordinator(
+            self.etcd.values[coordinator_key])
+        self.assertEqual('healthy', coordinator['state'])
+
+    def test_expired_lease_residual_cannot_authorize_a_sensitive_read(self):
+        coordinator_key = self.allocator.audit_coordinator_key.encode()
+        stale_raw = self.etcd.values[coordinator_key]
+        old_lease_id = self.etcd.key_leases[coordinator_key]
+        self.etcd.expire_lease(old_lease_id)
+        # Model a stale backup/operator write that restored the value without
+        # restoring its expired lease. The raw value alone is not authority.
+        self.etcd.values[coordinator_key] = stale_raw
+        follower = self._allocator(client=self.etcd)
+        follower.initialize()
+
+        with mock.patch.object(
+                follower, '_audit_with_latch',
+                wraps=follower._audit_with_latch) as full_audit:
+            self.assertIsNone(follower.get(self._uuid(75)))
+
+        full_audit.assert_called_once_with()
+        self.assertNotEqual(
+            old_lease_id, self.etcd.key_leases[coordinator_key])
+
+    def test_audit_generation_prevents_cross_audit_aba(self):
+        stale_compares = list(self.allocator._guard_compares())
+        stale_raw = self.allocator._fleet_health_raw
+
+        owner, snapshot = self.allocator.run_coordinated_audit(full=False)
+
+        self.assertTrue(owner)
+        self.assertIsNone(snapshot)
+        self.assertNotEqual(stale_raw, self.allocator._fleet_health_raw)
+        self.assertFalse(self.allocator._transaction({
+            'compare': stale_compares,
+            'success': [],
+            'failure': [],
+        }))
 
     def test_probe_rejects_an_orphan_slot_record(self):
         assignment = self.allocator.allocate(self._uuid(63))
@@ -1475,7 +1785,7 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
 
         self.assertRaisesRegex(
             idmap.IDMapIntegrityError, "configuration record changed",
-            self.allocator.probe)
+            self.allocator._probe_snapshot, guarded=True)
 
     def test_probe_does_not_latch_on_its_own(self):
         """Counts escalate to the audit; only a scan may latch."""

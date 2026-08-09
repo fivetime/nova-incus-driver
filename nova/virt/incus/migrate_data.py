@@ -22,7 +22,7 @@ from oslo_utils import versionutils
 class IncusLiveMigrateData(migrate_data.LiveMigrateData):
     """Incus destination facts carried through Nova's migration RPCs."""
 
-    VERSION = '1.4'
+    VERSION = '1.5'
 
     fields = {
         'destination_address': fields.StringField(),
@@ -35,6 +35,9 @@ class IncusLiveMigrateData(migrate_data.LiveMigrateData):
         # Per-attempt fencing token used for positive destination cleanup
         # acknowledgement during rollback.
         'cleanup_token': fields.StringField(),
+        # Nova Migration UUID is independent from the Incus attempt token.
+        # Periodic recovery needs both identities to reject a stale attempt.
+        'migration_uuid': fields.StringField(),
         # Incus operation identities are carried explicitly so rollback can
         # cancel and prove terminal both sides before it restores the source.
         'source_operation_id': fields.StringField(nullable=True),
@@ -56,3 +59,5 @@ class IncusLiveMigrateData(migrate_data.LiveMigrateData):
         if versionutils.convert_version_to_tuple(target_version) < (1, 4):
             primitive.pop('idmap_base', None)
             primitive.pop('idmap_size', None)
+        if versionutils.convert_version_to_tuple(target_version) < (1, 5):
+            primitive.pop('migration_uuid', None)

@@ -39,6 +39,8 @@ _MATERIALIZATION_OUTCOMES = frozenset((
     "not-materialized", "reconciled-clean"))
 _RELEASE_OUTCOMES = frozenset(("deleted", "normalized", "detached"))
 _INVALID_AUTH_TOKEN = "etcdserver: invalid auth token"
+_AUDIT_CONTROL_SCHEMA = 1
+_AUDIT_CONTROL_STATES = frozenset(("pending", "healthy"))
 
 
 class IDMapError(exception.NovaException):
@@ -240,7 +242,7 @@ class IDMapAllocator:
     def __init__(self, endpoint, namespace, base, size, count, timeout=5,
                  ca_cert=None, cert_cert=None, cert_key=None,
                  username=None, password_file=None,
-                 allow_insecure=False, client=None):
+                 allow_insecure=False, client=None, audit_lease_ttl=180):
         self.endpoint = endpoint
         if namespace is None or not str(namespace).strip():
             raise IDMapConfigurationError(
@@ -250,6 +252,8 @@ class IDMapAllocator:
         self.size = self._positive_int(size, "size")
         self.count = self._positive_int(count, "count")
         self.timeout = self._positive_int(timeout, "timeout")
+        self.audit_lease_ttl = self._positive_int(
+            audit_lease_ttl, "audit lease TTL")
         self.ca_cert = ca_cert
         self.cert_cert = cert_cert
         self.cert_key = cert_key
@@ -292,6 +296,12 @@ class IDMapAllocator:
                 reason="configured ID-map range exceeds uint32")
 
         self._prefix = "%s/%s" % (_KEY_PREFIX, self.namespace)
+        # This sibling prefix is intentionally outside the v3 allocator
+        # namespace. Older binaries reject unknown records below _prefix
+        # during a full audit, but safely ignore these rolling-upgrade
+        # coordination records.
+        self._control_prefix = "%s-control/%s" % (
+            _KEY_PREFIX, self.namespace)
         material = {
             "base": self.base,
             "count": self.count,
@@ -306,6 +316,10 @@ class IDMapAllocator:
         self._client = client or self._new_client(parsed)
         self._initialized = False
         self._integrity_latch = None
+        self._coordinator_token = str(uuid.uuid4())
+        self._audit_lease = None
+        self._fleet_health_raw = None
+        self._fleet_health_lease_id = None
 
     @staticmethod
     def _positive_int(value, name, allow_zero=False):
@@ -565,6 +579,90 @@ class IDMapAllocator:
     def configuration_key(self):
         return "%s/config" % self._prefix
 
+    @property
+    def audit_coordinator_key(self):
+        return "%s/coordinator" % self._control_prefix
+
+    @property
+    def audit_failure_key(self):
+        return "%s/failure" % self._control_prefix
+
+    def _audit_coordinator_raw(self, token, state, generation):
+        return self._json_bytes({
+            "fingerprint": self.fingerprint,
+            "generation": generation,
+            "kind": "audit-coordinator",
+            "namespace": self.namespace,
+            "schema": _AUDIT_CONTROL_SCHEMA,
+            "state": state,
+            "token": token,
+        })
+
+    def _parse_audit_coordinator(self, raw):
+        try:
+            value = jsonutils.loads(raw.decode("utf-8"))
+            token = str(uuid.UUID(value["token"]))
+            generation = str(uuid.UUID(value["generation"]))
+        except (AttributeError, KeyError, TypeError, UnicodeDecodeError,
+                ValueError) as exc:
+            raise IDMapIntegrityError(
+                reason="invalid audit coordinator record: %s" % exc)
+        expected_keys = {
+            "fingerprint", "generation", "kind", "namespace", "schema",
+            "state", "token",
+        }
+        if (not isinstance(value, dict) or set(value) != expected_keys or
+                value.get("schema") != _AUDIT_CONTROL_SCHEMA or
+                value.get("kind") != "audit-coordinator" or
+                value.get("namespace") != self.namespace or
+                value.get("fingerprint") != self.fingerprint or
+                value.get("state") not in _AUDIT_CONTROL_STATES or
+                value.get("token") != token or
+                value.get("generation") != generation or
+                raw != self._audit_coordinator_raw(
+                    token, value.get("state"), generation)):
+            raise IDMapIntegrityError(
+                reason="audit coordinator record is not canonical")
+        return value
+
+    def _audit_failure_raw(self, reason):
+        reason = str(reason)[:2048]
+        return self._json_bytes({
+            "fingerprint": self.fingerprint,
+            "kind": "audit-failure",
+            "namespace": self.namespace,
+            "reason": reason,
+            "schema": _AUDIT_CONTROL_SCHEMA,
+            "token": self._coordinator_token,
+        })
+
+    def _parse_audit_failure(self, raw):
+        try:
+            value = jsonutils.loads(raw.decode("utf-8"))
+            token = str(uuid.UUID(value["token"]))
+        except (AttributeError, KeyError, TypeError, UnicodeDecodeError,
+                ValueError) as exc:
+            raise IDMapIntegrityError(
+                reason="invalid fleet audit failure record: %s" % exc)
+        expected_keys = {
+            "fingerprint", "kind", "namespace", "reason", "schema",
+            "token",
+        }
+        if (not isinstance(value, dict) or set(value) != expected_keys or
+                value.get("schema") != _AUDIT_CONTROL_SCHEMA or
+                value.get("kind") != "audit-failure" or
+                value.get("namespace") != self.namespace or
+                value.get("fingerprint") != self.fingerprint or
+                not isinstance(value.get("reason"), str) or
+                not value.get("reason") or value.get("token") != token):
+            raise IDMapIntegrityError(
+                reason="fleet audit failure record is not canonical")
+        canonical = self._json_bytes(dict(value, token=token))
+        if raw != canonical:
+            raise IDMapIntegrityError(
+                reason="fleet audit failure record is not canonical")
+        return value
+
     def instance_key(self, instance_uuid):
         return "%s/instances/%s" % (
             self._prefix, self._instance_uuid(instance_uuid))
@@ -615,7 +713,8 @@ class IDMapAllocator:
     def get_fence_proof(self, instance_uuid, host_id):
         """Return one recorded fence retirement, or None."""
         self._ensure_initialized()
-        raw = self._get_raw(self.fence_key(host_id, instance_uuid))
+        key = self.fence_key(host_id, instance_uuid)
+        raw = self._read_exact((key,))[key]
         if raw is None:
             return None
         value = jsonutils.loads(raw.decode("utf-8"))
@@ -674,6 +773,49 @@ class IDMapAllocator:
             result.append((key, self._as_bytes(entry[0])))
         return result
 
+    def _grant_audit_lease(self):
+        try:
+            return self._call_with_auth_retry(
+                lambda: self._client.lease(self.audit_lease_ttl))
+        except Exception as exc:
+            raise IDMapBackendError(
+                reason="etcd audit lease grant failed: %s" %
+                self._gateway_error_text(exc))
+
+    def _refresh_audit_lease(self, lease):
+        try:
+            ttl = self._call_with_auth_retry(lease.refresh)
+        except Exception as exc:
+            raise IDMapBackendError(
+                reason="etcd audit lease refresh failed: %s" %
+                self._gateway_error_text(exc))
+        if not isinstance(ttl, int) or ttl <= 0:
+            raise IDMapBackendError(
+                reason="etcd audit lease expired before refresh")
+        return ttl
+
+    def _revoke_audit_lease(self, lease):
+        if lease is None:
+            return
+        try:
+            self._call_with_auth_retry(lease.revoke)
+        except Exception:
+            # A losing candidate's unattached lease expires by itself. A
+            # revoke failure must not replace the authoritative CAS result.
+            pass
+
+    def _put_with_lease(self, key, raw, lease):
+        lease_id = getattr(lease, "id", None)
+        if not isinstance(lease_id, int) or lease_id <= 0:
+            raise IDMapBackendError(reason="etcd returned an invalid lease")
+        return {
+            "request_put": {
+                "key": self._b64(key),
+                "value": self._b64(raw),
+                "lease": lease_id,
+            },
+        }
+
     def _transaction_response(self, transaction):
         try:
             result = self._call_with_auth_retry(
@@ -704,6 +846,15 @@ class IDMapAllocator:
             "result": "EQUAL",
             "target": "VALUE",
             "value": self._b64(raw),
+        }
+
+    def _compare_lease(self, key, lease_id):
+        lease_id = self._positive_int(lease_id, "lease ID")
+        return {
+            "key": self._b64(key),
+            "result": "EQUAL",
+            "target": "LEASE",
+            "lease": lease_id,
         }
 
     def _compare_absent(self, key):
@@ -762,7 +913,7 @@ class IDMapAllocator:
                 reason="etcd returned invalid base64 %s: %s" % (
                     description, exc))
 
-    def _parse_transaction_range(self, response, expected_key):
+    def _parse_transaction_range_entry(self, response, expected_key):
         if not isinstance(response, dict):
             raise IDMapBackendError(
                 reason="etcd transaction returned an invalid range response")
@@ -775,7 +926,7 @@ class IDMapAllocator:
             raise IDMapIntegrityError(
                 reason="etcd exact range returned multiple values")
         if not kvs:
-            return None
+            return None, 0
         kv = kvs[0]
         if not isinstance(kv, dict) or "key" not in kv or "value" not in kv:
             raise IDMapBackendError(
@@ -784,7 +935,25 @@ class IDMapAllocator:
         if key != expected_key.encode("utf-8"):
             raise IDMapIntegrityError(
                 reason="etcd exact range returned another key")
-        return self._decode_b64(kv["value"], "value")
+        lease = kv.get("lease", 0)
+        if type(lease) not in (int, str):
+            raise IDMapIntegrityError(
+                reason="etcd exact range returned an invalid lease ID")
+        try:
+            lease_id = int(lease)
+        except ValueError:
+            raise IDMapIntegrityError(
+                reason="etcd exact range returned an invalid lease ID")
+        if lease_id < 0 or (isinstance(lease, str) and
+                            lease != str(lease_id)):
+            raise IDMapIntegrityError(
+                reason="etcd exact range returned a non-canonical lease ID")
+        return self._decode_b64(kv["value"], "value"), lease_id
+
+    def _parse_transaction_range(self, response, expected_key):
+        raw, unused_lease_id = self._parse_transaction_range_entry(
+            response, expected_key)
+        return raw
 
     def _read_exact(self, keys):
         """Read a bounded key set at one etcd transaction revision."""
@@ -793,7 +962,7 @@ class IDMapAllocator:
             raise IDMapConfigurationError(
                 reason="exact allocator read contains duplicate keys")
         transaction = {
-            "compare": [self._compare_config()],
+            "compare": self._guard_compares(),
             "success": [self._range(key) for key in keys],
             "failure": [self._range(self.configuration_key)],
         }
@@ -821,6 +990,278 @@ class IDMapAllocator:
             key: self._parse_transaction_range(response, key)
             for key, response in zip(keys, responses)
         }
+
+    def _read_audit_control(self):
+        """Read lease health and sticky failure at one etcd revision."""
+        keys = (self.audit_coordinator_key, self.audit_failure_key)
+        transaction = {
+            "compare": [self._compare_config()],
+            "success": [self._range(key) for key in keys],
+            "failure": [self._range(self.configuration_key)],
+        }
+        result = self._transaction_response(transaction)
+        responses = result.get("responses")
+        if not isinstance(responses, list):
+            raise IDMapBackendError(
+                reason="etcd audit control read omitted responses")
+        if not result["succeeded"]:
+            if len(responses) != 1:
+                raise IDMapBackendError(
+                    reason="etcd audit control config check is invalid")
+            raw = self._parse_transaction_range(
+                responses[0], self.configuration_key)
+            if raw is None:
+                raise IDMapIntegrityError(
+                    reason="allocator configuration record is missing")
+            self._validate_configuration(raw)
+            raise IDMapBackendError(
+                reason="allocator configuration compare failed unexpectedly")
+        if len(responses) != len(keys):
+            raise IDMapBackendError(
+                reason="etcd audit control read returned wrong response count")
+        return tuple(
+            self._parse_transaction_range_entry(response, key)
+            for key, response in zip(keys, responses))
+
+    def _latch_fleet_failure(self, raw, lease_id=0):
+        failure = self._parse_audit_failure(raw)
+        if lease_id != 0:
+            reason = "fleet audit failure record must not have a lease"
+            if self._integrity_latch is None:
+                self._integrity_latch = reason
+            raise IDMapIntegrityError(reason=reason)
+        if self._integrity_latch is None:
+            self._integrity_latch = failure["reason"]
+        raise IDMapIntegrityError(
+            reason="fleet audit failure is sticky: %s" % failure["reason"])
+
+    def _publish_integrity_failure(self, reason):
+        """Persist the first integrity failure outside the legacy prefix."""
+        reason = str(reason)
+        if self._integrity_latch is None:
+            self._integrity_latch = reason
+        desired = self._audit_failure_raw(reason)
+        transaction = {
+            "compare": [
+                self._compare_config(),
+                self._compare_absent(self.audit_failure_key),
+            ],
+            "success": [self._put(self.audit_failure_key, desired)],
+            "failure": [self._range(self.audit_failure_key)],
+        }
+        try:
+            result = self._transaction_response(transaction)
+        except IDMapBackendError:
+            # The local process remains latched and a coordinator already in
+            # pending state cannot publish healthy. Its lease expiry is the
+            # fleet backstop when the failure record cannot be written.
+            raise
+        if result["succeeded"]:
+            return
+        responses = result.get("responses")
+        if not isinstance(responses, list) or len(responses) != 1:
+            raise IDMapBackendError(
+                reason="etcd failure publication returned invalid state")
+        existing, lease_id = self._parse_transaction_range_entry(
+            responses[0], self.audit_failure_key)
+        if existing is None:
+            raise IDMapBackendError(
+                reason="fleet audit failure publication lost its CAS")
+        self._parse_audit_failure(existing)
+        if lease_id != 0:
+            raise IDMapIntegrityError(
+                reason="fleet audit failure record must not have a lease")
+
+    def _replace_audit_coordinator(
+            self, expected_raw, expected_lease_id, desired_raw, lease):
+        if expected_raw is None:
+            coordinator_compares = [
+                self._compare_absent(self.audit_coordinator_key)]
+        else:
+            if expected_lease_id is None or expected_lease_id < 0:
+                raise IDMapConfigurationError(
+                    reason="expected coordinator lease ID is invalid")
+            coordinator_compares = [
+                self._compare_value(self.audit_coordinator_key, expected_raw),
+            ]
+            if expected_lease_id == 0:
+                coordinator_compares.append({
+                    "key": self._b64(self.audit_coordinator_key),
+                    "result": "EQUAL",
+                    "target": "LEASE",
+                    "lease": 0,
+                })
+            else:
+                coordinator_compares.append(self._compare_lease(
+                    self.audit_coordinator_key, expected_lease_id))
+        transaction = {
+            "compare": [
+                self._compare_config(),
+                self._compare_absent(self.audit_failure_key),
+            ] + coordinator_compares,
+            "success": [self._put_with_lease(
+                self.audit_coordinator_key, desired_raw, lease)],
+            "failure": [],
+        }
+        return self._transaction(transaction)
+
+    def _begin_coordinated_audit(self):
+        """Acquire or heartbeat the one lease-backed fleet auditor."""
+        (coordinator_raw, coordinator_lease_id), (
+            failure_raw, failure_lease_id) = self._read_audit_control()
+        if failure_raw is not None:
+            self._latch_fleet_failure(failure_raw, failure_lease_id)
+
+        newly_acquired = False
+        if coordinator_raw is None or coordinator_lease_id == 0:
+            if coordinator_raw is not None:
+                # A canonical but unleased control record is not authority.
+                # Replace it with pending under a fresh lease and force the
+                # same full audit as an ordinary lease-expiry takeover.
+                self._parse_audit_coordinator(coordinator_raw)
+            lease = self._grant_audit_lease()
+            generation = str(uuid.uuid4())
+            pending_raw = self._audit_coordinator_raw(
+                self._coordinator_token, "pending", generation)
+            try:
+                acquired = self._replace_audit_coordinator(
+                    coordinator_raw, coordinator_lease_id,
+                    pending_raw, lease)
+            except Exception:
+                self._revoke_audit_lease(lease)
+                raise
+            if not acquired:
+                self._revoke_audit_lease(lease)
+                return False, None, False
+            self._audit_lease = lease
+            self._fleet_health_raw = None
+            self._fleet_health_lease_id = None
+            return True, pending_raw, True
+
+        coordinator = self._parse_audit_coordinator(coordinator_raw)
+        if coordinator["token"] != self._coordinator_token:
+            return False, None, False
+        if self._audit_lease is None:
+            # A process can only own the record together with the in-memory
+            # lease object that created it. A restarted process has a new
+            # token and waits for automatic expiry instead of stealing it.
+            raise IDMapBackendError(
+                reason="local audit coordinator has no owning lease")
+        lease_id = getattr(self._audit_lease, "id", None)
+        if (not isinstance(lease_id, int) or lease_id <= 0 or
+                coordinator_lease_id != lease_id):
+            self._fleet_health_raw = None
+            self._fleet_health_lease_id = None
+            raise IDMapBackendError(
+                reason="local audit coordinator lost its owning lease")
+
+        generation = str(uuid.uuid4())
+        pending_raw = self._audit_coordinator_raw(
+            self._coordinator_token, "pending", generation)
+        if not self._replace_audit_coordinator(
+                coordinator_raw, coordinator_lease_id,
+                pending_raw, self._audit_lease):
+            self._fleet_health_raw = None
+            self._fleet_health_lease_id = None
+            return False, None, False
+        self._fleet_health_raw = None
+        self._fleet_health_lease_id = None
+        self._refresh_audit_lease(self._audit_lease)
+        return True, pending_raw, newly_acquired
+
+    def run_coordinated_audit(self, full=False):
+        """Heartbeat one fleet auditor and return a full snapshot if run."""
+        self._raise_if_integrity_latched()
+        try:
+            owner, pending_raw, newly_acquired = (
+                self._begin_coordinated_audit())
+        except IDMapIntegrityError as exc:
+            try:
+                self._publish_integrity_failure(exc)
+            except IDMapBackendError:
+                pass
+            raise
+        if not owner:
+            return False, None
+
+        snapshot = None
+        try:
+            if full or newly_acquired:
+                snapshot = self._audit_with_latch()
+            else:
+                try:
+                    self._probe_snapshot()
+                except IDMapIntegrityError:
+                    # Counts are an escalation signal, not sufficient proof
+                    # for a sticky fleet failure by themselves.
+                    snapshot = self._audit_with_latch()
+        except Exception:
+            # The key was switched to pending before the scan. Never restore
+            # healthy from an ambiguous result; lease expiry permits a new
+            # process to acquire and run a complete audit.
+            raise
+
+        healthy_raw = self._audit_coordinator_raw(
+            self._coordinator_token, "healthy",
+            self._parse_audit_coordinator(pending_raw)["generation"])
+        lease_id = getattr(self._audit_lease, "id", None)
+        if not self._replace_audit_coordinator(
+                pending_raw, lease_id, healthy_raw, self._audit_lease):
+            raise IDMapBackendError(
+                reason="audit coordinator lost ownership before commit")
+        self._fleet_health_raw = healthy_raw
+        self._fleet_health_lease_id = lease_id
+        return True, snapshot
+
+    def _ensure_fleet_healthy(self):
+        (coordinator_raw, coordinator_lease_id), (
+            failure_raw, failure_lease_id) = self._read_audit_control()
+        if failure_raw is not None:
+            self._latch_fleet_failure(failure_raw, failure_lease_id)
+        if coordinator_raw is not None and coordinator_lease_id > 0:
+            coordinator = self._parse_audit_coordinator(coordinator_raw)
+            if coordinator["state"] == "healthy":
+                self._fleet_health_raw = coordinator_raw
+                self._fleet_health_lease_id = coordinator_lease_id
+                return
+            raise IDMapBackendError(
+                reason="fleet ID-map audit is in progress")
+
+        # Lease expiry is both failure detection and election. The first
+        # sensitive caller after an absent heartbeat may acquire the key,
+        # but must complete a full audit before its own operation proceeds.
+        owner, unused_snapshot = self.run_coordinated_audit(full=True)
+        if owner:
+            return
+        (coordinator_raw, coordinator_lease_id), (
+            failure_raw, failure_lease_id) = self._read_audit_control()
+        if failure_raw is not None:
+            self._latch_fleet_failure(failure_raw, failure_lease_id)
+        if coordinator_raw is None or coordinator_lease_id <= 0:
+            raise IDMapBackendError(
+                reason="fleet ID-map auditor has no live lease")
+        coordinator = self._parse_audit_coordinator(coordinator_raw)
+        if coordinator["state"] != "healthy":
+            raise IDMapBackendError(
+                reason="fleet ID-map audit is in progress")
+        self._fleet_health_raw = coordinator_raw
+        self._fleet_health_lease_id = coordinator_lease_id
+
+    def _guard_compares(self):
+        if (self._fleet_health_raw is None or
+                not isinstance(self._fleet_health_lease_id, int) or
+                self._fleet_health_lease_id <= 0):
+            raise IDMapBackendError(
+                reason="no verified fleet audit generation")
+        return [
+            self._compare_config(),
+            self._compare_absent(self.audit_failure_key),
+            self._compare_value(
+                self.audit_coordinator_key, self._fleet_health_raw),
+            self._compare_lease(
+                self.audit_coordinator_key,
+                self._fleet_health_lease_id),
+        ]
 
     def _create_configuration(self):
         key = self.configuration_key
@@ -957,16 +1398,23 @@ class IDMapAllocator:
         self._raise_if_integrity_latched()
         now = time.monotonic()
         checked = getattr(self, '_initialized_checked_at', None)
-        if (self._initialized and checked is not None and
-                now - checked < self._INITIALIZE_REVALIDATE_SECONDS):
-            return
-        try:
-            self.initialize()
-        except IDMapIntegrityError as exc:
-            if self._integrity_latch is None:
-                self._integrity_latch = str(exc)
-            raise
-        self._initialized_checked_at = time.monotonic()
+        if (not self._initialized or checked is None or
+                now - checked >= self._INITIALIZE_REVALIDATE_SECONDS):
+            try:
+                self.initialize()
+            except IDMapIntegrityError as exc:
+                if self._integrity_latch is None:
+                    self._integrity_latch = str(exc)
+                try:
+                    self._publish_integrity_failure(exc)
+                except IDMapBackendError:
+                    pass
+                raise
+            self._initialized_checked_at = time.monotonic()
+        # Lease-backed health is intentionally not cached. Every sensitive
+        # operation reads the exact coordinator/failure generation that its
+        # subsequent etcd transactions compare atomically.
+        self._ensure_fleet_healthy()
 
     def _assignment_raw(self, instance_uuid, slot, allocation_id,
                         host_ids=()):
@@ -1831,6 +2279,10 @@ class IDMapAllocator:
         except IDMapIntegrityError as exc:
             if self._integrity_latch is None:
                 self._integrity_latch = str(exc)
+            try:
+                self._publish_integrity_failure(exc)
+            except IDMapBackendError:
+                pass
             raise
 
     def audit(self):
@@ -1852,6 +2304,11 @@ class IDMapAllocator:
         return self._audit_with_latch()
 
     def probe(self):
+        """Run a guarded count-only drift probe."""
+        self._ensure_initialized()
+        return self._probe_snapshot(guarded=True)
+
+    def _probe_snapshot(self, guarded=False):
         """Return key-family counts and check their exact relationships.
 
         A full audit reads and parses every record in the namespace, which
@@ -1872,10 +2329,11 @@ class IDMapAllocator:
         inside a record, is visible only to a full scan. Callers escalate a
         mismatch to one rather than latching from counts alone.
         """
-        self._ensure_initialized()
         families = ("instances", "slots", "releases", "hosts")
         transaction = {
-            "compare": [self._compare_config()],
+            "compare": (
+                self._guard_compares()
+                if guarded else [self._compare_config()]),
             "success": [
                 self._count_range("%s/%s/" % (self._prefix, family))
                 for family in families
@@ -1980,6 +2438,34 @@ class IDMapAllocator:
         return sorted(
             intents, key=lambda value: (value.slot, value.instance_uuid))
 
+    def list_release_intents_for_instances(self, instance_uuids):
+        """Read release intents for a bounded exact UUID set in one txn.
+
+        A compute already has a reverse index of the allocations it may need
+        to reconcile under ``hosts/<host_id>/``.  Reading the corresponding
+        exact release keys as one transaction avoids making every compute
+        scan the fleet-wide ``releases/`` prefix.  The returned values are
+        candidate-discovery hints only; every replay still re-reads the exact
+        assignment, claim and intent before its compare-and-swap.
+        """
+        self._ensure_initialized()
+        instance_uuids = tuple(sorted({
+            self._instance_uuid(value) for value in instance_uuids
+        }))
+        if not instance_uuids:
+            return []
+        keys = tuple(self.release_key(value) for value in instance_uuids)
+        state = self._read_exact(keys)
+        intents = []
+        for instance_uuid, key in zip(instance_uuids, keys):
+            raw = state[key]
+            if raw is None:
+                continue
+            intents.append(self._parse_release_intent(
+                raw, expected_uuid=instance_uuid))
+        return sorted(
+            intents, key=lambda value: (value.slot, value.instance_uuid))
+
     def list_host_claims(self, host_id):
         """Return one compute's indexed claim candidates efficiently.
 
@@ -2034,31 +2520,10 @@ class IDMapAllocator:
         slot_key = self.slot_key(slot)
         raw = self._assignment_raw(instance_uuid, slot, allocation_id)
         transaction = {
-            "compare": [
-                {
-                    "key": self._b64(self.configuration_key),
-                    "result": "EQUAL",
-                    "target": "VALUE",
-                    "value": self._b64(self._configuration_raw),
-                },
-                {
-                    "key": self._b64(instance_key),
-                    "result": "EQUAL",
-                    "target": "CREATE",
-                    "create_revision": 0,
-                },
-                {
-                    "key": self._b64(slot_key),
-                    "result": "EQUAL",
-                    "target": "CREATE",
-                    "create_revision": 0,
-                },
-                {
-                    "key": self._b64(self.release_key(instance_uuid)),
-                    "result": "EQUAL",
-                    "target": "CREATE",
-                    "create_revision": 0,
-                },
+            "compare": self._guard_compares() + [
+                self._compare_absent(instance_key),
+                self._compare_absent(slot_key),
+                self._compare_absent(self.release_key(instance_uuid)),
             ],
             "success": [
                 {
@@ -2339,8 +2804,7 @@ class IDMapAllocator:
                                 "intent"))
 
                 transaction = {
-                    "compare": [
-                        self._compare_config(),
+                    "compare": self._guard_compares() + [
                         self._compare_value(instance_key, raw),
                         self._compare_value(slot_key, raw),
                         self._compare_absent(release_key),
@@ -2384,8 +2848,7 @@ class IDMapAllocator:
                     reason="restore found an intent without an allocation")
 
             transaction = {
-                "compare": [
-                    self._compare_config(),
+                "compare": self._guard_compares() + [
                     self._compare_absent(instance_key),
                     self._compare_absent(slot_key),
                     self._compare_absent(release_key),
@@ -2501,8 +2964,7 @@ class IDMapAllocator:
                 replacement_raw = self._host_claim_raw(
                     current, host_id, materialization_id)
                 transaction = {
-                    "compare": [
-                        self._compare_config(),
+                    "compare": self._guard_compares() + [
                         self._compare_value(
                             self.instance_key(instance_uuid), current_raw),
                         self._compare_value(
@@ -2565,8 +3027,7 @@ class IDMapAllocator:
             claim_raw = self._host_claim_raw(
                 current, host_id, materialization_id)
             transaction = {
-                "compare": [
-                    self._compare_config(),
+                "compare": self._guard_compares() + [
                     self._compare_value(
                         self.instance_key(instance_uuid), current_raw),
                     self._compare_value(
@@ -2643,8 +3104,7 @@ class IDMapAllocator:
                 desired, host_id, materialization_id, state="possible")
             host_key = self.host_claim_key(host_id, instance_uuid)
             transaction = {
-                "compare": [
-                    self._compare_config(),
+                "compare": self._guard_compares() + [
                     self._compare_value(
                         self.instance_key(instance_uuid), current_raw),
                     self._compare_value(
@@ -2704,8 +3164,7 @@ class IDMapAllocator:
                 desired, host_id, materialization_id, state="committed")
             host_key = self.host_claim_key(host_id, instance_uuid)
             transaction = {
-                "compare": [
-                    self._compare_config(),
+                "compare": self._guard_compares() + [
                     self._compare_value(
                         self.instance_key(instance_uuid), current_raw),
                     self._compare_value(
@@ -2778,8 +3237,7 @@ class IDMapAllocator:
                 state="cleaned", proof=proof)
             host_key = self.host_claim_key(host_id, instance_uuid)
             transaction = {
-                "compare": [
-                    self._compare_config(),
+                "compare": self._guard_compares() + [
                     self._compare_value(
                         self.instance_key(instance_uuid), current_raw),
                     self._compare_value(
@@ -2884,8 +3342,7 @@ class IDMapAllocator:
             host_key = self.host_claim_key(host_id, instance_uuid)
             fence_key = self.fence_key(host_id, instance_uuid)
             transaction = {
-                "compare": [
-                    self._compare_config(),
+                "compare": self._guard_compares() + [
                     self._compare_value(
                         self.instance_key(instance_uuid), current_raw),
                     self._compare_value(
@@ -2972,8 +3429,7 @@ class IDMapAllocator:
                 desired.allocation_id, desired.host_ids)
             host_key = self.host_claim_key(host_id, instance_uuid)
             transaction = {
-                "compare": [
-                    self._compare_config(),
+                "compare": self._guard_compares() + [
                     self._compare_value(
                         self.instance_key(instance_uuid), current_raw),
                     self._compare_value(
@@ -3046,8 +3502,7 @@ class IDMapAllocator:
                 desired.allocation_id, desired.host_ids)
             host_key = self.host_claim_key(host_id, instance_uuid)
             transaction = {
-                "compare": [
-                    self._compare_config(),
+                "compare": self._guard_compares() + [
                     self._compare_value(
                         self.instance_key(instance_uuid), current_raw),
                     self._compare_value(
@@ -3104,8 +3559,7 @@ class IDMapAllocator:
                 raise IDMapConflict(
                     reason="another immutable release intent already exists")
             transaction = {
-                "compare": [
-                    self._compare_config(),
+                "compare": self._guard_compares() + [
                     self._compare_value(
                         self.instance_key(instance_uuid), current_raw),
                     self._compare_value(
@@ -3194,8 +3648,7 @@ class IDMapAllocator:
             raise IDMapIntegrityError(
                 reason="empty host index conflicts with exact claim read")
         transaction = {
-            "compare": [
-                self._compare_config(),
+            "compare": self._guard_compares() + [
                 self._compare_value(
                     self.instance_key(current.instance_uuid), current_raw),
                 self._compare_value(self.slot_key(current.slot), current_raw),

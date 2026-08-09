@@ -1,11 +1,11 @@
 Scale hotspot elimination design
 ================================
 
-Status: **implemented**; the measured baseline recorded in
-``TEST_STATUS.md`` is what the release SLO limits are derived from.
-This chapter records the design for removing the remaining super-linear
-driver and periodic audit costs before the 100/500/1,000-instance release
-gate becomes routine.
+Status: **code-level hotspot elimination implemented**. The current
+100/500/1,000-instance production baseline and release gate are still
+deferred; ``TEST_STATUS.md`` remains authoritative for that incomplete
+evidence. This chapter records the implemented design for removing the
+super-linear driver and periodic audit costs before that gate is rerun.
 It complements :doc:`architecture` (which documents behavior that already
 exists) and :doc:`production_readiness` (which defines the release evidence).
 
@@ -24,123 +24,155 @@ single-flight generation-guarded caches and rotating-cursor batching:
   and ``get_all_volume_usage``.
 - A single-use host resource snapshot halves per-ResourceTracker-cycle host
   probing.
-- All etcd periodic lookups outside the full audit use exact keys or
-  bounded prefixes (``releases/``, ``hosts/<host_id>/``), never a full
-  namespace scan, and every recovery periodic rotates a cursor over a
-  bounded batch.
+- Per-host etcd recovery starts from the exact ``hosts/<host_id>/`` reverse
+  index. Release intents for those claims are fetched by exact keys in one
+  transaction; no compute scans the fleet-wide ``releases/`` prefix. Only
+  the elected audit coordinator reads full registry families.
 
 Every mutating driver path invalidates the caches before and after the
 Incus write, so a raced periodic read can never publish a stale snapshot.
 This baseline is validated by the cache single-flight unit tests and by the
 idle-soak phase of ``tools/openstack-incus-scale-e2e.py``.
 
-Hotspot 1 (fixed): all-project absence proofs were O(N²)
----------------------------------------------------------
+Hotspot 1 (fixed): exact absence proofs no longer scan every project
+--------------------------------------------------------------------
 
-``IncusDriver._all_project_idmap_resources_absent`` and its spawn-attempt
-sibling each issue two unscoped recursive listings (instances and profiles)
-and scan every record. The idmap host-claim reconciliation and release
-replay periodics call them up to twice per candidate, with batches of up to
-100 candidates per 60-second cycle. When the number of pending claims or
-release intents scales with instance count, the per-cycle cost is
+``IncusDriver._all_project_idmap_resources_absent`` used to issue two
+unscoped recursive listings (instances and profiles) and scan every record.
+Calling that proof for every release candidate made deletion and recovery
 effectively O(N²).
 
 Design
 ~~~~~~
 
-Split the proof into a cheap screening phase and an authoritative
-confirmation phase:
+The final absence proof is now an indexed Incus operation rather than a
+cached assertion:
 
-1. **One shared all-project snapshot per periodic cycle.** At the start of
-   each reconciliation/replay cycle the manager fetches the two unscoped
-   listings once and passes the snapshot to every candidate evaluation in
-   that batch. Cost per cycle becomes O(N), independent of batch size.
-2. **Snapshot presence is authoritative negative evidence.** If the
-   snapshot shows a matching instance, profile, UUID reference, or idmap
-   range overlap, the candidate is blocked immediately — a stale snapshot
-   can only over-retain, never over-release, which is the fail-closed
-   direction.
-3. **Snapshot absence is only a screen.** A candidate whose resources are
-   absent from the snapshot proceeds to the existing exact per-candidate
-   proof (fresh all-project listing plus local path and journal checks)
-   immediately before the claim is retired or the release intent is
-   completed. The authoritative absent-proof semantics required by the
-   registry specification are unchanged; the exact scan simply runs only
-   for candidates that are actually about to release, which is a
-   per-lifecycle event rather than a per-cycle event.
+1. **Indexed exact query on current Incus.** The ``idmap_usage`` API
+   extension adds ``GET /1.0/idmap-usage?owner=<uuid>&base=<n>&size=<n>``.
+   It returns every instance and profile, across all projects, whose
+   effective ``user.openstack.uuid`` matches or whose effective half-open
+   ID-map range overlaps the request. Candidate selection uses partial
+   expression indexes containing only those idmap keys, not arbitrary large
+   instance configuration values. The database query implements expanded
+   configuration semantics: a non-empty ``volatile.idmap.base`` takes
+   precedence over local ``security.idmap.base``; local values override
+   profiles and, otherwise, the last applied profile value for each key wins.
+   A missing, empty, or ``auto`` ID-map size is 65536. Profiles themselves are
+   also returned.
+2. **Equivalent stored forms cannot evade the index.** UUID matching is
+   case-, brace-, hyphen-, and ``urn:uuid:``-insensitive. Base and size are
+   compared numerically, so historical values with leading zeroes are the
+   same range. Malformed, zero-sized, or overflowing stored ranges make the
+   query fail instead of being interpreted as absent. The request also
+   rejects a zero-sized or overflowing uint32 range.
+3. **The exact result is authoritative for its database snapshot.** Nova
+   calls the API immediately before retiring the local claim or completing a
+   release.
+   It validates the response shape and retains on any foreign match. The
+   instance's own profile is the only allowed match, under the existing
+   project/name rule. No TTL result or local inventory cache authorizes a
+   release. The response is not a linearizable reservation: it does not
+   include Incus in-memory transient or node-local migration-attempt
+   reservations and it cannot cover an unmanaged Incus mutation after the
+   response. Production therefore keeps Incus management dedicated and
+   serializes Nova allocation actors through the external registry. This API
+   must not be used to authorize releases while arbitrary actors can mutate
+   Incus concurrently.
+4. **Rolling upgrades fail closed without weakening old nodes.** When the
+   extension is absent, Nova retains the old fresh recursive all-project
+   instance/profile scan as the final proof. A shared immutable snapshot may
+   screen a legacy periodic batch, but snapshot absence never authorizes a
+   release; each actual retirement repeats a fresh scan.
 
-Amortized cost drops from O(batch × N) per cycle to O(N) per cycle plus
-O(N) per actual retirement. No registry schema, claim state, or proof
-digest changes are required.
+The recovery loops also avoid generating candidates unnecessarily. Host
+claim reconciliation performs one ``hosts/<host_id>/`` prefix read and one
+Nova ``InstanceList.get_by_host`` read, removes all live local owners, then
+rotates and truncates the stale candidate list to 100. Thus 1,000 live claims
+and no stale claim perform no Incus inventory or exact absence query. The
+filter is deliberately before truncation, so a stale claim behind a large
+live prefix is handled in the same cycle. If the Nova bulk read fails, the
+loop falls back to the previous exact per-claim checks.
 
-Two implementation notes that the draft did not anticipate. A screening
-fetch that *fails* must leave every candidate to its own exact proof rather
-than resolve either way, so a snapshot outage can neither release nor
-wedge anything. And a release intent that no host has claimed reaches the
-range release without passing through the claimed branch, so that path
-carries its own exact proof; before this work both paths shared one, and
-splitting screen from proof would silently have left the unclaimed path
-with only a screen.
+Release replay starts from that same host index and fetches the corresponding
+release intents by exact keys in one etcd transaction. It never scans the
+global release prefix. Only intents that actually exist enter the bounded
+100-candidate lifecycle path. Those pending candidates still require exact
+Nova ownership, allocator-generation, cleanup-proof, and CAS checks one by
+one; this bounded O(K), ``K <= 100``, work is the safety-authoritative state
+transition itself and cannot be replaced by a non-transactional cache or
+ordinary bulk read.
 
-Hotspot 2 (fixed): the full registry audit was O(hosts × N) per minute
------------------------------------------------------------------------
+For a normal destroy on an Incus server with ``idmap_usage``, the final
+cross-project proof is one indexed query instead of two O(N) recursive
+listings. With the production 65536-wide allocator geometry its cost is
+O(log N + matches). Resources that explicitly configure another width are
+kept in covering partial indexes and add O(C + F), where C is the number of
+custom-size configuration entries and F is their attached-profile fan-out;
+this preserves arbitrary interval-overlap correctness without slowing the
+normal fixed-width path. A legacy server remains O(N) for that final proof.
+Periodic active-claim screening is O(claims-on-host + live-instances-on-host)
+with no per-live-claim Incus request.
 
-``_audit_incus_idmap_allocator`` reads the entire registry namespace
-(instances, slots, releases, host claims) through one linearizable
-``get_prefix`` every ``idmap_allocator_audit_interval`` (default 60 s) on
-**every** compute. Fleet-wide this is O(hosts × N) etcd reads and JSON
-parses per minute, all of it steady-state overhead on a healthy registry.
+Hotspot 2 (fixed): the full registry audit was O(hosts * N) per minute
+------------------------------------------------------------------------
+
+``_audit_incus_idmap_allocator`` used to read the entire registry namespace
+(instances, slots, releases, host claims) on every compute. It also discovered
+a coordinator by listing Nova compute services from every host. The first cost
+was O(hosts * N); the second approached O(hosts * hosts) control-plane work.
 
 Design
 ~~~~~~
 
-Keep the full audit as the integrity authority, but stop paying for it
-every cycle on every host:
+The allocator now elects one auditor with an etcd lease and makes that lease's
+exact value the fleet health generation:
 
-1. **Full audit stays at process start** (``init_host``) and remains the
-   fail-closed latch. Unchanged.
-2. **Cheap drift probe every cycle.** Between full audits each cycle runs a
-   count-only probe. All four family counts and the config compare travel
-   in **one** transaction, so every count comes from a single revision.
-   Cost is one request and an O(1) payload per cycle, independent of the
-   registry size.
+1. **Lease-backed election.** A process compare-and-swaps an absent
+   ``/openstack-incus/idmaps/v3-control/<namespace>/coordinator`` key to
+   ``pending`` under an etcd lease. The lease lifetime is three audit cycles.
+   There is no Nova service inventory query. An absent key after lease expiry
+   permits one caller to acquire it; every acquisition requires a complete
+   audit before the key may become ``healthy``.
+2. **Fail-closed audit transition.** Every audit receives a new UUID generation.
+   The owner atomically changes its exact ``healthy`` value and lease ID to
+   ``pending`` before a probe or full audit. Sensitive reads, instance start,
+   and all registry mutations reject ``pending``. They compare the exact healthy
+   value, its positive lease ID, and absence of the failure key in the same
+   transaction as their ownership CAS. A value restored without its lease must
+   be taken over as ``pending`` and fully re-audited. These comparisons prevent
+   an audit transition, lease replacement, or healthy-to-pending-to-healthy ABA
+   from admitting a mutation through a stale check.
+3. **Sticky fleet failure.** A content-level integrity error writes the first
+   failure to the sibling ``failure`` key without a lease. Every process reads
+   it before sensitive work and fails closed. If publishing that failure itself
+   fails, the coordinator remains ``pending``; its lease expiry lets another
+   process take over and repeat a full audit, never declare an ambiguous scan
+   healthy.
+4. **Coordinator-only probe and full scan.** Between full audits the owner runs
+   one count-only transaction over the four registry families. The response is
+   O(1), although etcd may do O(N) server work to count a prefix. A cardinality
+   mismatch escalates to a full scan rather than becoming failure evidence by
+   itself. Content relationships remain the full audit's job, bounded by
+   ``idmap_allocator_full_audit_interval`` (default 900 s).
+5. **Rolling upgrade compatibility.** The coordination keys deliberately live
+   outside ``/openstack-incus/idmaps/v3/<namespace>/``. An old binary therefore
+   does not encounter an unknown record in its strict audit. Deployments must
+   grant the new sibling prefix in etcd RBAC *before* starting a new binary.
+   Old computes continue their legacy per-process audits but cannot honor the
+   new sticky failure or lease generation. The first upgrade that introduces
+   this protocol must therefore freeze ownership-changing instance operations,
+   upgrade every compute in the migration domain, and unfreeze only after one
+   new coordinator publishes ``healthy``. Once every binary understands this
+   protocol, ordinary rolling updates retain the fleet generation and only the
+   lease owner scans.
 
-   The probe checks the cardinality relationships that are *exact* at
-   every revision: ``count(instances) == count(slots)``, because
-   allocation writes both records in one transaction and release deletes
-   both in one transaction; ``count(releases) <= count(instances)``,
-   because an intent cannot outlive its allocation; and no host claims
-   while no allocation exists. The originally drafted "host-claim count
-   equals the sum of ``host_ids`` lengths" invariant is **not**
-   implemented: that sum is only knowable by reading every allocation
-   record, which is the full scan this probe exists to avoid. Claims
-   without their allocation, and every content-level mismatch, therefore
-   remain the full audit's job, which is what item 3 bounds.
-3. **Full audit every K cycles with per-host jitter.** Default one full
-   audit per 15 minutes, through the option
-   ``idmap_allocator_full_audit_interval`` (minimum 300 s) introduced by this
-   work; previously every cycle was a full audit driven by the existing
-   ``idmap_allocator_audit_interval`` (default 60 s). A random per-process
-   phase offset is applied to the first deadline so a fleet restarted
-   together does not synchronize its scans. A drift-probe mismatch
-   escalates to a full audit immediately, and a scan that could not run
-   because etcd was unavailable retries on the next cycle instead of
-   waiting out the interval.
-
-   Registry *mutations* need no new escalation hook: the allocation and
-   release paths already run ``_audit_with_latch()`` inline on every
-   attempt, on every CAS conflict, and after success. The periodic full
-   audit is therefore the idle-state sweep only, which is exactly the cost
-   this item removes.
-4. **Latch semantics unchanged.** Integrity failure from either the probe
-   escalation or the periodic full audit permanently latches the process
-   closed exactly as today.
-
-Fleet-wide steady-state audit cost drops from O(hosts × N) per minute to
-O(hosts) per minute plus O(hosts × N) per 15 minutes, without weakening
-the integrity guarantee (every corruption class the full audit detects is
-still detected, at worst 15 minutes later, and every local mutation error
-still forces an immediate full audit).
+Followers pay one bounded exact etcd transaction per sensitive operation and
+one two-key health read per periodic cycle. Fleet-wide periodic work is one
+O(N) count pass per audit cycle and one O(N) full scan per full-audit interval;
+election itself is O(1) and no longer adds O(hosts * hosts) Nova queries. A
+failed owner is taken over after at most the lease TTL, and the takeover always
+performs a full audit before admitting work.
 
 Hotspot 3 (fixed): duplicate full profile listings per recovery cycle
 -----------------------------------------------------------------------
@@ -164,7 +196,8 @@ Performance baseline and regression gate
 The fail-closed scale runner (``tools/openstack-incus-scale-e2e.py``) is
 the measurement instrument; the release gate already refuses to run it
 without explicit SLO limits. The remaining work is to *record* the first
-approved baseline:
+approved baseline. Completing the code changes above does not make this
+evidence gate green:
 
 1. Run the gate's scale phase at per-compute checkpoints 100/500/1,000 on
    the three-node testbed with the candidate that contains the hotspot

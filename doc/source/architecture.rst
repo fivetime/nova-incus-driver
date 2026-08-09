@@ -227,23 +227,31 @@ file on every compute and rejects duplicate UUIDs.
 
 The allocator client enforces HTTPS, mutual TLS, and etcd username/password
 authentication by default. The etcd role grants read/write access only to the
-configured namespace prefix; the HTTP gateway cannot derive this authorization
-from the client certificate common name. Transport authentication and prefix
-authorization are both part of the isolation boundary, not optional
-deployment hardening. ``idmap_allocator_allow_insecure=true`` exists only for an
-isolated development testbed and fails the production preflight. If Nova
+configured allocation and sibling audit-control prefixes; the HTTP gateway
+cannot derive this authorization from the client certificate common name.
+Transport authentication and prefix authorization are both part of the
+isolation boundary, not optional deployment hardening.
+``idmap_allocator_allow_insecure=true`` exists only for an isolated development
+testbed and fails the production preflight. If Nova
 already has an allocation generation in ``system_metadata`` but either etcd
 record is absent, the driver does not create a replacement generation. It
 freezes spawn and migration until the registry is explicitly recovered from a
 complete Nova and Incus inventory. This prevents a stale etcd restore from
 silently authorizing reuse of a live container's host UID/GID range.
-The allocator audits the complete bidirectional registry before and after a
-slot-changing transaction, and every ownership transaction compares the
-immutable namespace configuration. A partial instance/slot pair therefore
-blocks admission instead of allowing a second instance to reuse its range.
-Normal operations use exact keys. A low-frequency full audit detects unrelated
-registry corruption and permanently latches that ``nova-compute`` process
-fail-closed; repair requires an operator audit followed by a compute restart.
+One lease-backed fleet coordinator audits the complete bidirectional registry.
+Before a scan it publishes ``pending``; after successful validation it publishes
+an exact ``healthy`` UUID generation under the same lease. The authoritative
+range read includes the key's positive lease ID, and every ownership transaction
+compares both the exact value and that lease ID, absence of the sticky fleet
+failure, and the immutable namespace configuration in the same etcd CAS. A
+canonical control value restored without its lease is never trusted: one caller
+must replace it with a newly leased ``pending`` generation and finish a complete
+audit before work resumes. A partial
+instance/slot pair therefore blocks admission instead of allowing a second
+instance to reuse its range. A low-frequency full audit detects unrelated
+content corruption. The first failure is persisted without a lease and blocks
+every compute; repair requires a frozen operator audit, clearing that exact
+failure key, lease expiry, and restart of all computes in the migration domain.
 The gateway listener keeps ``client-cert-auth=false`` while setting a dedicated
 ``trusted-ca-file``. etcd 3.4 through 3.6 still require and verify the client
 certificate in this combination; false disables only the unsupported gateway
@@ -582,12 +590,92 @@ replay. Host-kernel mounts that bypass this protocol are unsupported.
 
 Data-volume connect and disconnect operations use a host-persistent journal
 below ``instances_path``. The journal is written and fsync'd before os-brick
-changes host state, and retained until the matching Incus profile update and
-host cleanup have reached their commit points. It deliberately removes
+changes host state. Attach advances from ``connecting`` to ``connected`` only
+after os-brick and the Incus profile agree. The ``connected`` record remains
+after the virt driver returns: Nova must persist the BDM and Cinder must commit
+the attachment before the compute manager verifies the exact profile device
+and removes the record. Disconnect retains its record until the profile and
+host cleanup reach their commit points. The journal deliberately removes
 passwords, keys, keyrings, secrets, and tokens; neither Incus configuration nor
-the recovery journal is a credential store. An interrupted ``connecting``
-phase recovers the cleanup handle by repeating the same idempotent connector
-request.
+the recovery journal is a credential store.
+
+Periodic recovery joins three authorities: the exact Nova BDM, Cinder's
+attachment record, and the Incus profile/journal. ``attaching`` resumes the
+same idempotent connector request, persists connection information, completes
+the Cinder attachment, and then commits the journal. ``attached`` is never
+rolled back; it may only remove an exact matching ``connected`` journal.
+Explicit non-attached terminal/error states may roll back local state, but the
+journal first advances to ``rolled-back`` after host disconnect. Replaying
+that phase never invokes os-brick again; the record remains only until both
+the Cinder attachment and Nova BDM are gone. Normal attach/detach and recovery
+share an exact-generation manager intent and a transaction lock. Lock order is
+manager transaction, instance topology, then host-wide per-volume operation.
+Recovery re-reads the intent and journal after acquiring those locks and checks
+Cinder volume-wide ownership before a destructive host action. This prevents
+an old journal from disconnecting a volume newly mapped to another instance on
+the same compute. Volume-journal recovery always runs and is not controlled by
+the migration-only ``migration_auto_recovery`` option.
+Duplicate, contradictory, unavailable, or unknown state fails closed and
+retains all evidence for the next pass or operator review.
+
+Live migration publishes every source Cinder release intent before deleting
+the source Incus record. Data-volume intents retain their host disconnect
+journal until the old source attachment is gone. A BFV root carries the same
+exact source-attachment owner with ``boot_volume=true``, but is control-plane
+only: cephext transfers its RBD ownership and recovery must never pass that root
+through os-brick. The intent is retired only after the exact target BDM and
+attached target attachment are proven and the exact old source attachment is
+absent.
+
+Cold migration has a separate source-attachment rotation protocol. After the
+driver has stopped the source, disconnected every data-volume mapping, and
+published its exact rollback intents, the compute manager fsyncs a rotation
+record for *every* Cinder BDM before changing any attachment. Each record
+advances through ``prepared``, ``creating``, ``new-created``, ``old-deleted``
+and ``bdm-rotated``. The replacement UUID is durable before the old attachment
+can be deleted; old-attachment absence is durable before Nova switches the BDM.
+This ordering makes multi-volume partial progress replayable. A failed resize
+either preserves the still-attached old owner or promotes the known replacement
+back to the source. A completed target releases only the exact old attachment.
+BFV participates in the control-plane rotation but never enters os-brick.
+
+The only non-replayable point inside that protocol is a lost response to
+Cinder ``attachment_create``. Cinder assigns a random server-side UUID and the
+API has no client-supplied ID or idempotency token. The driver therefore fsyncs
+``creating`` before the request, but if it cannot persist the returned UUID it
+retains the old owner and refuses every automatic create, delete, or BDM switch.
+Even one newly visible attachment for the same server and volume is not proof
+that this request created it; another actor could have reserved it. Recovery is
+manual and exact at this boundary. On compute startup, any interrupted source
+rotation is resolved before Nova's generic ``RESIZE_MIGRATING`` recovery can
+clear ``task_state``. Ambiguous state fails compute initialization so the
+service manager retries without starting a partially owned source instance.
+
+This automatic contract starts only after the Incus driver has durably
+published its exact managed intent or host journal. Nova 2026.1 cold-migration
+target and cold-revert flows first reserve or replace a Cinder attachment and
+then invoke the virt driver through an asynchronous compute RPC. A compute
+process that exits after that Nova/Cinder update but before the driver entry
+has no Incus operation token, connection journal, or local side effect to
+replay. Reconstructing the remainder of that cast would require a Nova-level
+durable operation hook and coordinated replay of BDM, Cinder, migration and
+network state. The Incus reconciler deliberately does not synthesize a
+half-authorized intent from volume identity alone. Operators must treat this
+pre-driver window as a fail-closed manual reconciliation boundary; once the
+driver intent exists, the state machine above covers its connecting,
+connected, rollback and evidence-retirement crash windows.
+
+One rebuild window deliberately remains fail closed. Nova 2026.1 creates a
+replacement Cinder attachment in the rebuild caller, invokes
+``_detach_volume(..., destroy_bdm=False)``, and writes that replacement ID to
+the BDM only after detach returns. The replacement ID is not passed to the
+compute manager detach hook. If ``nova-compute`` exits after host detach starts
+but before the caller persists that ID, recovery cannot distinguish or
+reconstruct the replacement generation. It therefore retains the managed
+detach intent and journal without deleting a Cinder attachment or BDM. An
+operator must reconcile the old attachment ID in the intent, the replacement
+attachment, the Nova BDM, the Incus profile, and the host RBD mapping before
+resuming or reverting rebuild. Guessing by volume or instance ID is forbidden.
 
 That recovery contract is production-supported for the tested Ceph RBD
 connector, whose scoped CephX identity remains available from the compute

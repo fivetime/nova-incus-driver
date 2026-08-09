@@ -118,7 +118,7 @@
       "driver_hooks": ["destroy", "spawn"],
       "applicability": "container",
       "status": "supported",
-      "evidence": "Nova _rebuild_default_impl and tools/openstack-incus-bfv-reimage-e2e.sh"
+      "evidence": "Nova _rebuild_default_impl and tools/openstack-incus-bfv-reimage-e2e.sh. A nova-compute crash inside a destroy_bdm=False data-volume detach retains exact recovery evidence and requires operator reconciliation because Nova does not expose the caller-owned replacement attachment ID to the detach hook."
     },
     {
       "id": "shelve-unshelve",
@@ -150,7 +150,7 @@
       "driver_hooks": ["migrate_disk_and_power_off", "finish_migration", "confirm_migration", "finish_revert_migration"],
       "applicability": "container",
       "status": "supported",
-      "evidence": "tools/openstack-incus-resize-e2e.sh and tools/openstack-incus-bfv-migration-matrix.sh"
+      "evidence": "tools/openstack-incus-resize-e2e.sh and tools/openstack-incus-bfv-migration-matrix.sh. Cold-source Cinder attachment rotation persists the complete volume generation before side effects and recovers process-restart windows before generic RESIZE_MIGRATING startup handling. A lost attachment_create response remains fail closed because Cinder exposes no client idempotency token. Nova 2026.1 cold target/revert attachment updates that occur before virt-driver entry remain a separate documented manual reconciliation boundary."
     },
     {
       "id": "live-migration",
