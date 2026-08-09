@@ -428,11 +428,13 @@ class IDMapAllocator:
         try:
             session = self._client.session
             headers = session.headers
-            # Never present an invalid or expired token to Authenticate.
-            headers.pop("Authorization", None)
             self._authenticated = False
             result = self._client.post(
                 self._client.get_url("/auth/authenticate"),
+                # A per-request None removes the shared Authorization header
+                # from this request without exposing an unauthenticated
+                # window to concurrent registry operations.
+                headers={"Authorization": None},
                 json={
                     "name": self.username,
                     "password": self._read_password(),
@@ -489,6 +491,14 @@ class IDMapAllocator:
 
     @classmethod
     def _is_invalid_auth_token(cls, exc):
+        detail = getattr(exc, "detail_text", None)
+        if isinstance(detail, dict):
+            code = detail.get("code")
+            try:
+                if int(code) == 16:
+                    return True
+            except (TypeError, ValueError):
+                pass
         return _INVALID_AUTH_TOKEN in cls._gateway_error_text(exc).lower()
 
     def _refresh_authentication(self, failed_generation):
@@ -505,8 +515,8 @@ class IDMapAllocator:
         def call():
             result = callback()
             if (isinstance(result, dict) and
-                    _INVALID_AUTH_TOKEN in self._gateway_error_text(
-                        _GatewayResponseError(result)).lower()):
+                    self._is_invalid_auth_token(
+                        _GatewayResponseError(result))):
                 # etcd3gw raises gateway errors for range requests, but its
                 # transaction method can return the same JSON error body as
                 # an ordinary result. Normalize both forms before applying

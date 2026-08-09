@@ -237,7 +237,9 @@ class _AuthenticatedFakeEtcd(_FakeEtcd):
     def get_url(path):
         return "https://etcd.example:2379/v3/{}".format(path.lstrip("/"))
 
-    def post(self, url, json):
+    def post(self, url, json, headers=None):
+        if headers != {"Authorization": None}:
+            raise AssertionError("authentication must omit the shared token")
         self.authentication_requests.append((url, json))
         count = len(self.authentication_requests)
         token = (
@@ -439,6 +441,39 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
 
         self.assertIsNone(
             allocator.get("00000000-0000-0000-0000-000000000001"))
+
+        self.assertEqual(2, len(etcd.authentication_requests))
+        self.assertEqual(
+            "allocator-token-2", etcd.session.headers["Authorization"])
+
+    def test_reauthenticates_after_transaction_returns_code_16(self):
+        directory = self.useFixture(fixtures.TempDir()).path
+        password_file = os.path.join(directory, "etcd-password")
+        with open(password_file, "w", encoding="utf-8") as stream:
+            stream.write("password\n")
+        os.chmod(password_file, 0o600)
+        etcd = _AuthenticatedFakeEtcd()
+        allocator = idmap.IDMapAllocator(
+            endpoint="https://etcd.example:2379",
+            namespace="cell1",
+            base=500000000,
+            size=65536,
+            count=8,
+            ca_cert="ca.crt",
+            cert_cert="client.crt",
+            cert_key="client.key",
+            username="nova-incus",
+            password_file=password_file,
+            client=etcd,
+        )
+        allocator.bootstrap()
+        etcd.next_transaction_error = {
+            "code": 16,
+            "message": "etcdserver: user name is empty",
+        }
+
+        self.assertIsNone(
+            allocator.get("00000000-0000-0000-0000-000000000002"))
 
         self.assertEqual(2, len(etcd.authentication_requests))
         self.assertEqual(
