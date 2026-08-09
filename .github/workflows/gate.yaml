@@ -33,7 +33,7 @@ jobs:
         with:
           repository: fivetime/incus-python-sdk
           ref: main
-          path: incus-python-sdk
+          path: incus-python-sdk-src
           persist-credentials: false
 
       - name: Set up Python 3.12
@@ -44,7 +44,7 @@ jobs:
           cache-dependency-path: |
             openstack-incus/requirements.txt
             openstack-incus/test-requirements.txt
-            incus-python-sdk/pyproject.toml
+            incus-python-sdk-src/pyproject.toml
 
       - name: Install tox
         run: python -m pip install 'tox>=4.28.0' build
