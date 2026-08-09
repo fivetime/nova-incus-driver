@@ -5908,6 +5908,22 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         incus_driver.client.instances.get.assert_not_called()
 
+    def test_destroy_accepts_retiring_target_migration_uuid(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_NOVA_UUID_KEY:
+                '30000000-0000-0000-0000-000000000003',
+        }
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver._assert_destroy_volume_transactions_settled(instance)
+
     def test_prune_orphan_volume_recovery_directory_removes_empty(self):
         instance = mock.Mock(uuid=str(uuid.uuid4()))
         journal_dir = driver._volume_journal_directory(instance)

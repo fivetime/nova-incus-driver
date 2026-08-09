@@ -9143,7 +9143,7 @@ class IncusDriver(driver.ComputeDriver):
         cleanup_token = config.get(MIGRATION_CLEANUP_TOKEN_KEY)
         rollback_token = config.get(MIGRATION_ROLLBACK_COMPLETE_KEY)
         migration_uuid = config.get(MIGRATION_NOVA_UUID_KEY)
-        if (rollback_token is not None or migration_uuid is not None):
+        if rollback_token is not None:
             if (not uuidutils.is_uuid_like(cleanup_token) or
                     rollback_token != cleanup_token or
                     not uuidutils.is_uuid_like(migration_uuid)):
