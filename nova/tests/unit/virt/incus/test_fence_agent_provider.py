@@ -12,10 +12,10 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 import contextlib
-import json
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import stat
@@ -277,7 +277,7 @@ class FenceComputeBindingTest(test.NoDBTestCase):
                 json.dump(config, handle)
             os.chmod(path, 0o600)
             with mock.patch.object(
-                    provider.os, 'stat', return_value=secure_stat()):
+                    provider.os, 'fstat', return_value=secure_stat()):
                 unused_binary, parameters = provider.load_config(
                     provider.Path(config_dir), 'compute-1')
 

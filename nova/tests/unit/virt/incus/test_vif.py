@@ -388,4 +388,3 @@ class MiscHelpersTest(test.NoDBTestCase):
         self.assertTrue(vif._is_ovs_vif_port(OVS_VIF))
         self.assertFalse(vif._is_ovs_vif_port(OVS_HYBRID_VIF))
         self.assertFalse(vif._is_ovs_vif_port(TAP_VIF))
-

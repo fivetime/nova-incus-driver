@@ -42,7 +42,7 @@ override should be deleted. Prefer deleting.
 Overridden private methods
 --------------------------
 
-Thirteen. These are the ones with no contract.
+Eighteen. These are the ones with no contract.
 
 Failed-build ownership barrier
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -113,6 +113,31 @@ recorded; with it disabled, confirm no delay is paid.
 Migration
 ~~~~~~~~~
 
+``_terminate_volume_connections``
+
+**For**: journalling each cold-migration Cinder attachment rotation before
+Nova creates the replacement attachment, and replaying every acknowledged
+phase without guessing after an ambiguous create response.
+
+**Depends on**: Nova calling this on the source after the driver has stopped
+and detached the guest, while the instance and migration still identify the
+source host.
+
+**Re-verify**: the cold attachment-rotation unit matrix, then cold migrate a
+multi-volume instance and interrupt the source compute at each rotation phase.
+
+``_post_live_migration_remove_source_vol_connections``
+
+**For**: retiring the source attachment only after the driver has durably
+recorded local release, without deleting the BDM that now names the target
+attachment.
+
+**Depends on**: Nova passing the old source BDMs after the destination BDM
+and attachment are already authoritative.
+
+**Re-verify**: live migrate local and BFV guests with data volumes, inject a
+source attachment-delete failure, and require periodic recovery to converge.
+
 ``_live_migration_cleanup_flags``
 
 **For**: Nova's base implementation recognises only libvirt and Hyper-V
@@ -157,6 +182,38 @@ guest restarts.
 has been torn down.
 
 **Re-verify**: revert a cold migration of an instance with a share.
+
+Volume transactions and startup recovery
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``_attach_volume``, ``_detach_volume``
+
+**For**: wrapping Nova's Cinder/BDM transaction in durable Incus intent and
+journal generations, and retiring those records only after the framework's
+formal attachment or detachment commit.
+
+**Depends on**: Nova saving the BDM and completing or deleting the Cinder
+attachment inside these methods, after the driver call returns. The wrapper
+also depends on the existing per-instance operation serialization.
+
+**Re-verify**: the volume-journal crash matrix and
+``tools/openstack-incus-rollback-idempotency-e2e.sh`` with nova-compute killed
+at every attach and detach commit boundary.
+
+``_init_instance``
+
+**For**: completing a durable cold-source rollback before Nova's generic
+startup path can power the guest with partially rotated attachments. It also
+restores storage ownership, Placement allocations, Neutron bindings and the
+instance migration fields in that order.
+
+**Depends on**: ``init_host`` invoking this method before normal per-instance
+recovery, and propagating an exception so systemd retries rather than running
+later recovery against an unresolved generation.
+
+**Re-verify**: restart nova-compute with a two-volume source rotation stopped
+at each durable phase; the first startup must either converge completely or
+fail without clearing ``task_state`` or the generation marker.
 
 Manila shares
 ~~~~~~~~~~~~~
