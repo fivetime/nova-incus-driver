@@ -1,0 +1,20 @@
+---
+sources:
+  - name: incus_compute
+    interval: 300
+    meters:
+      - cpu
+      - power.state
+      - vcpus
+      - memory
+      - memory.available
+      - memory.usage
+      - memory.resident
+      - network.incoming.bytes
+      - network.incoming.packets
+      - network.incoming.packets.drop
+      - network.incoming.packets.error
+      - network.outgoing.bytes
+      - network.outgoing.packets
+      - network.outgoing.packets.drop
+      - network.outgoing.packets.error

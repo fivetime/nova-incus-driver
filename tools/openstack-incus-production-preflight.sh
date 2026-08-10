@@ -454,12 +454,12 @@ https_address=$(podman exec "$INCUS_CONTAINER" incus config get \
 https_bind_host=${https_address%:*}
 https_bind_port=${https_address##*:}
 if [[ "$https_address" == "$https_bind_host:$https_bind_port" ]] &&
-        is_ipv4 "$https_bind_host" &&
+        { [[ -z "$https_bind_host" ]] || is_ipv4 "$https_bind_host"; } &&
         is_tcp_port "$https_bind_port"; then
     pass "Incus HTTPS bind" "$https_address"
 else
     fail "Incus HTTPS bind" \
-        "must use 0.0.0.0:PORT or an explicit IPv4:PORT, actual=$https_address"
+        "must use :PORT, 0.0.0.0:PORT or an explicit IPv4:PORT, actual=$https_address"
 fi
 trust_json=$(podman exec "$INCUS_CONTAINER" incus config trust list \
     --format json 2>/dev/null)

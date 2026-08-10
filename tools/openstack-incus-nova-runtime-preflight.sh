@@ -14,8 +14,11 @@ case "$ROLE" in
     compute)
         RUNTIME_PROCESS_REGEX=${RUNTIME_PROCESS_REGEX:-'(nova-incus-compute|nova\.virt\.incus\.cmd\.compute)'}
         ;;
+    conductor)
+        RUNTIME_PROCESS_REGEX=${RUNTIME_PROCESS_REGEX:-'(nova-conductor)'}
+        ;;
     *)
-        echo "Usage: $0 {api|compute}" >&2
+        echo "Usage: $0 {api|compute|conductor}" >&2
         exit 2
         ;;
 esac
@@ -78,6 +81,14 @@ def code_names(callable_object):
 
 
 from nova.compute import manager as nova_manager
+from nova.objects import base as nova_object_base
+from nova.objects import register_all
+
+register_all()
+require(
+    "IncusLiveMigrateData" in nova_object_base.NovaObjectRegistry.obj_classes(),
+    "Nova runtime registers IncusLiveMigrateData",
+)
 
 core_hooks = (
     "_pre_deny_share",
@@ -126,7 +137,11 @@ if role == "api":
         ),
         "Nova API rejects share mutation during an instance task",
     )
-else:
+elif role == "compute":
+    from glanceclient.common import http as glance_http
+    from nova.image import glance as nova_glance
+    from os_brick.initiator.connectors import rbd
+    from pylxd import client as pylxd_client
     from nova.virt.incus import driver as incus_driver
     from nova.virt.incus import manager as incus_manager
     from nova.virt.incus.cmd import compute as incus_compute
@@ -166,6 +181,24 @@ else:
             symbol in provider_names,
             "Incus provider-tree update uses {}".format(symbol),
         )
+    require(
+        "image_size" in code_names(nova_glance.GlanceImageServiceV2._upload_data),
+        "Nova sends seekable Glance upload size",
+    )
+    require(
+        "IterableWithLength" in code_names(glance_http._BaseHTTPClient._chunk_body),
+        "python-glanceclient preserves seekable upload length",
+    )
+    rbd_source = code_names(rbd.RBDConnector._local_attach_volume)
+    require("noudev" in rbd_source, "os-brick maps RBD without udev waits")
+    require(
+        "_find_root_device" in rbd_source,
+        "os-brick resolves the kernel RBD path without udev links",
+    )
+    require(
+        callable(getattr(pylxd_client, "_UnixAdapter", None)),
+        "Incus Python SDK supports Unix socket endpoints",
+    )
 
 print(json.dumps({
     "role": role,

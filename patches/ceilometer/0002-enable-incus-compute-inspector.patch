@@ -1,0 +1,12 @@
+diff --git a/ceilometer/compute/virt/inspector.py b/ceilometer/compute/virt/inspector.py
+--- a/ceilometer/compute/virt/inspector.py
++++ b/ceilometer/compute/virt/inspector.py
+@@ -26,7 +26,5 @@ OPTS = [
+     cfg.StrOpt('hypervisor_inspector',
+                default='libvirt',
+-               choices=['libvirt'],
+-               deprecated_for_removal=True,
+-               deprecated_reason='libvirt is the only supported hypervisor',
++               choices=['libvirt', 'incus'],
+                help='Inspector to use for inspecting the hypervisor layer.')
+ ]

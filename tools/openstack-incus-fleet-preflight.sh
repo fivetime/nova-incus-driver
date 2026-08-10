@@ -14,12 +14,17 @@ REMOTE_NOVA_CONFIG=${REMOTE_NOVA_CONFIG:-/etc/nova/nova-cpu.conf}
 CONTROLLER_SSH=${CONTROLLER_SSH:-}
 CONTROLLER_OPENRC=${CONTROLLER_OPENRC:-/opt/stack/devstack/openrc admin admin}
 NOVA_API_NODES=${NOVA_API_NODES:-}
+NOVA_CONDUCTOR_NODES=${NOVA_CONDUCTOR_NODES:-$NOVA_API_NODES}
 REQUIRE_MANILA_MIGRATION_RUNTIME=${REQUIRE_MANILA_MIGRATION_RUNTIME:-false}
+REQUIRE_CEILOMETER_RUNTIME=${REQUIRE_CEILOMETER_RUNTIME:-false}
+CEILOMETER_COMPUTE_NODES=${CEILOMETER_COMPUTE_NODES:-$COMPUTE_NODES}
+CEILOMETER_NOTIFICATION_NODES=${CEILOMETER_NOTIFICATION_NODES:-$NOVA_API_NODES}
 NOVA_API_RUNTIME_PYTHON=${NOVA_API_RUNTIME_PYTHON:-}
 NOVA_COMPUTE_RUNTIME_PYTHON=${NOVA_COMPUTE_RUNTIME_PYTHON:-}
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 HOST_PREFLIGHT=${HOST_PREFLIGHT:-$SCRIPT_DIR/openstack-incus-production-preflight.sh}
 RUNTIME_PREFLIGHT=${RUNTIME_PREFLIGHT:-$SCRIPT_DIR/openstack-incus-nova-runtime-preflight.sh}
+CEILOMETER_PREFLIGHT=${CEILOMETER_PREFLIGHT:-$SCRIPT_DIR/openstack-incus-ceilometer-runtime-preflight.sh}
 RELEASE_DRIVER=${RELEASE_DRIVER:-$SCRIPT_DIR/../nova/virt/incus}
 
 [[ -f "$SSH_IDENTITY" && -r "$SSH_IDENTITY" ]] || {
@@ -50,6 +55,13 @@ case "$REQUIRE_MANILA_MIGRATION_RUNTIME" in
         exit 2
         ;;
 esac
+case "$REQUIRE_CEILOMETER_RUNTIME" in
+    true|false) ;;
+    *)
+        echo "REQUIRE_CEILOMETER_RUNTIME must be true or false" >&2
+        exit 2
+        ;;
+esac
 
 if [[ ! -r "$HOST_PREFLIGHT" ]]; then
     echo "FAIL host preflight script is not readable: $HOST_PREFLIGHT" >&2
@@ -57,6 +69,11 @@ if [[ ! -r "$HOST_PREFLIGHT" ]]; then
 fi
 if [[ ! -r "$RUNTIME_PREFLIGHT" ]]; then
     echo "FAIL runtime preflight script is not readable: $RUNTIME_PREFLIGHT" >&2
+    exit 1
+fi
+if [[ "$REQUIRE_CEILOMETER_RUNTIME" == true && \
+      ! -r "$CEILOMETER_PREFLIGHT" ]]; then
+    echo "FAIL Ceilometer preflight is not readable: $CEILOMETER_PREFLIGHT" >&2
     exit 1
 fi
 if [[ ! -d "$RELEASE_DRIVER" ]]; then
@@ -123,6 +140,27 @@ openstack() {
         "source $CONTROLLER_OPENRC >/dev/null 2>&1; openstack $command_line"
 }
 
+if [[ "$REQUIRE_CEILOMETER_RUNTIME" == true ]]; then
+    if [[ -z "$CEILOMETER_NOTIFICATION_NODES" ]]; then
+        fail "ceilometer notification mappings" \
+            "CEILOMETER_NOTIFICATION_NODES must enumerate every host"
+    else
+        IFS=, read -ra notification_nodes \
+            <<<"$CEILOMETER_NOTIFICATION_NODES"
+        for node in "${notification_nodes[@]}"; do
+            role_name=${node%%=*}
+            role_target=${node#*=}
+            if remote "$role_target" "bash -s -- notification" \
+                    <"$CEILOMETER_PREFLIGHT"; then
+                pass "$role_name Ceilometer notification" "volume meters"
+            else
+                fail "$role_name Ceilometer notification" \
+                    "runtime contract failed"
+            fi
+        done
+    fi
+fi
+
 if [[ "$REQUIRE_MANILA_MIGRATION_RUNTIME" == true && \
       -z "$NOVA_API_NODES" ]]; then
     fail "nova-api runtime mappings" \
@@ -155,10 +193,55 @@ elif [[ "$REQUIRE_MANILA_MIGRATION_RUNTIME" == true ]]; then
     done
 fi
 
+if [[ "$REQUIRE_MANILA_MIGRATION_RUNTIME" == true && \
+      -z "$NOVA_CONDUCTOR_NODES" ]]; then
+    fail "nova-conductor runtime mappings" \
+        "NOVA_CONDUCTOR_NODES must enumerate every running conductor host"
+elif [[ "$REQUIRE_MANILA_MIGRATION_RUNTIME" == true ]]; then
+    IFS=, read -ra conductor_nodes <<<"$NOVA_CONDUCTOR_NODES"
+    declare -A seen_conductor_nodes=()
+    for node in "${conductor_nodes[@]}"; do
+        conductor_name=${node%%=*}
+        conductor_target=${node#*=}
+        if [[ -z "$conductor_name" || -z "$conductor_target" || \
+              "$conductor_name" == "$conductor_target" ]]; then
+            fail "nova-conductor runtime mapping" "invalid entry: $node"
+            continue
+        fi
+        if [[ -n "${seen_conductor_nodes[$conductor_name]:-}" ]]; then
+            fail "nova-conductor runtime mapping" \
+                "duplicate name: $conductor_name"
+            continue
+        fi
+        seen_conductor_nodes[$conductor_name]=1
+        printf -v runtime_python_q '%q' "$NOVA_API_RUNTIME_PYTHON"
+        if remote "$conductor_target" \
+                "RUNTIME_PYTHON=$runtime_python_q bash -s -- conductor" \
+                <"$RUNTIME_PREFLIGHT"; then
+            pass "$conductor_name nova-conductor runtime" \
+                "Incus migration object registry"
+        else
+            fail "$conductor_name nova-conductor runtime" \
+                "running conductor cannot deserialize Incus migration data"
+        fi
+    done
+fi
+
 IFS=, read -ra nodes <<<"$COMPUTE_NODES"
 for node in "${nodes[@]}"; do
     host=${node%%=*}
     target=${node#*=}
+
+    if [[ "$REQUIRE_CEILOMETER_RUNTIME" == true ]] && \
+            grep -Eq "(^|,)$host=$target(,|$)" \
+                <<<"$CEILOMETER_COMPUTE_NODES"; then
+        if remote "$target" "bash -s -- compute" \
+                <"$CEILOMETER_PREFLIGHT"; then
+            pass "$host Ceilometer compute" "Incus polling contract"
+        else
+            fail "$host Ceilometer compute" "runtime contract failed"
+        fi
+    fi
     if [[ -z "$host" || -z "$target" || "$host" == "$target" ]]; then
         fail "node declaration" "invalid entry: $node"
         continue

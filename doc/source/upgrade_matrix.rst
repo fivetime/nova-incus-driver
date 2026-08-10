@@ -290,3 +290,36 @@ Two items here exist only because Nova has no representation for Incus:
   same reason.
 
 Any upstream movement on those removes coupling rather than adding it.
+
+Cross-project patches
+---------------------
+
+Four additional patches are runtime dependencies and must be delivered with
+the same release. DevStack applies them to the imported Python environment or
+the Ceilometer checkout and the runtime preflight scripts inspect the running
+processes rather than trusting files in this repository.
+
+``0001-gnocchi-map-nova-volume-usage-metrics``
+    Adds the four Nova ``volume.usage`` metrics, their rate-enabled archive
+    policy. Run ``ceilometer-upgrade`` after deploying the mapping so Gnocchi
+    has the required ``instance``, ``instance_network_interface`` and
+    ``volume`` resource types. **Re-verify**: run the Ceilometer notification
+    runtime preflight and observe all four volume metrics in Gnocchi.
+
+``0002-enable-incus-compute-inspector``
+    Permits the external Incus compute inspector registered by this package.
+    **Re-verify**: run the Ceilometer compute runtime preflight and observe a
+    CPU, memory and vNIC sample in Gnocchi.
+
+``0001-rbd-fallback-to-kernel-device-path``
+    Makes os-brick RBD map/unmap independent of udev links and returns the
+    exact kernel device discovered by ``rbd showmapped``. **Re-verify**: the
+    compute runtime preflight must find both ``noudev`` and
+    ``_find_root_device`` and a data-volume attach/detach must leave no map.
+
+``0001-preserve-seekable-upload-length``
+    Keeps the remaining length of a seekable upload body visible to the HTTP
+    client. It complements Nova's ``0004`` image-size header patch.
+    **Re-verify**: the compute runtime preflight must find
+    ``IterableWithLength`` and a concurrent server snapshot must reach
+    ``active`` within the Tempest timeout.

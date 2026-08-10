@@ -1,0 +1,18 @@
+[Unit]
+Description=Ceilometer polling agent for Incus compute metrics
+After=network-online.target incus-podman.service
+Wants=network-online.target
+Requires=incus-podman.service
+
+[Service]
+Type=simple
+User=stack
+Group=stack
+SupplementaryGroups=incus-admin
+ExecStart=/opt/stack/data/venv/bin/ceilometer-polling --polling-namespaces compute --config-file /etc/ceilometer/ceilometer.conf
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target

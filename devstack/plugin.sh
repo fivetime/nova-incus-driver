@@ -125,6 +125,20 @@ function install_nova_incus {
     setup_pyproject_develop "${INCUS_PYTHON_SDK_DIR}"
     setup_develop "${NOVA_INCUS_DIR}"
 
+    # DevStack normally installs these libraries from wheels into its shared
+    # virtualenv. Patch the imported runtime rather than an unused checkout.
+    local python_site_packages
+    python_site_packages=$("${PYTHON:-python3}" -c \
+        'import site; print(site.getsitepackages()[0])')
+    _apply_runtime_python_patch \
+        "${python_site_packages}" \
+        "${NOVA_INCUS_DIR}/patches/os-brick/0001-rbd-fallback-to-kernel-device-path.patch" \
+        "os-brick RBD mapping"
+    _apply_runtime_python_patch \
+        "${python_site_packages}" \
+        "${NOVA_INCUS_DIR}/patches/python-glanceclient/0001-preserve-seekable-upload-length.patch" \
+        "python-glanceclient upload length"
+
     local failed_build_allocation_patch
     failed_build_allocation_patch="${NOVA_INCUS_DIR}/patches/nova/0005-compute-add-failed-build-allocation-policy.patch"
     if git -C "${NOVA_DIR}" apply --reverse --check \
@@ -198,11 +212,67 @@ function install_nova_incus {
 }
 
 
+function _apply_runtime_python_patch {
+    local target_dir=$1
+    local patch_file=$2
+    local description=$3
+
+    command -v patch >/dev/null || die $LINENO \
+        "patch is required to install ${description} support"
+    if patch --batch --dry-run --silent --reverse --strip=1 \
+            --directory="${target_dir}" <"${patch_file}"; then
+        echo "Runtime already provides ${description} support"
+    elif patch --batch --dry-run --silent --forward --strip=1 \
+            --directory="${target_dir}" <"${patch_file}"; then
+        sudo patch --batch --silent --forward --strip=1 \
+            --directory="${target_dir}" <"${patch_file}"
+    else
+        die $LINENO "Unable to apply ${description} patch"
+    fi
+}
+
+
 function configure_nova_incus_ceilometer {
     local ceilometer_patch
     local meter_source
     local meter_target_dir
     local pipeline_file
+
+    if ! is_service_enabled ceilometer-anotification ceilometer-acompute; then
+        return
+    fi
+
+    if [[ ! -d "${CEILOMETER_DIR:-}/.git" ]]; then
+        die $LINENO "Ceilometer is enabled but CEILOMETER_DIR is unavailable"
+    fi
+    for ceilometer_patch in \
+            "${NOVA_INCUS_DIR}/patches/ceilometer/0001-gnocchi-map-nova-volume-usage-metrics.patch" \
+            "${NOVA_INCUS_DIR}/patches/ceilometer/0002-enable-incus-compute-inspector.patch"; do
+        if git -C "${CEILOMETER_DIR}" apply --reverse --check \
+                "${ceilometer_patch}" >/dev/null 2>&1; then
+            echo "Ceilometer already carries $(basename "${ceilometer_patch}")"
+        elif git -C "${CEILOMETER_DIR}" apply --check \
+                "${ceilometer_patch}"; then
+            git -C "${CEILOMETER_DIR}" apply "${ceilometer_patch}"
+        else
+            die $LINENO \
+                "Ceilometer patch does not apply: ${ceilometer_patch}"
+        fi
+    done
+
+    if is_service_enabled ceilometer-acompute; then
+        iniset "${CEILOMETER_CONF_DIR}/ceilometer.conf" DEFAULT \
+            hypervisor_inspector incus
+        iniset "${CEILOMETER_CONF_DIR}/ceilometer.conf" compute \
+            instance_discovery_method naive
+        iniset "${CEILOMETER_CONF_DIR}/ceilometer.conf" incus \
+            project "${INCUS_PROJECT}"
+        iniset "${CEILOMETER_CONF_DIR}/ceilometer.conf" polling \
+            cfg_file "${CEILOMETER_CONF_DIR}/polling-incus.yaml"
+        install -m 0644 \
+            "${NOVA_INCUS_DIR}/etc/ceilometer/polling-incus.yaml" \
+            "${CEILOMETER_CONF_DIR}/polling-incus.yaml"
+    fi
 
     if ! is_service_enabled ceilometer-anotification; then
         return
@@ -228,20 +298,6 @@ function configure_nova_incus_ceilometer {
         fi
     done
 
-    ceilometer_patch="${NOVA_INCUS_DIR}/patches/ceilometer/0001-gnocchi-map-nova-volume-usage-metrics.patch"
-    if [[ ! -d "${CEILOMETER_DIR:-}/.git" ]]; then
-        die $LINENO \
-            "ceilometer-anotification is enabled but CEILOMETER_DIR is unavailable"
-    fi
-    if git -C "${CEILOMETER_DIR}" apply --reverse --check \
-            "${ceilometer_patch}" >/dev/null 2>&1; then
-        echo "Ceilometer already maps Nova volume usage metrics"
-    elif git -C "${CEILOMETER_DIR}" apply --check "${ceilometer_patch}"; then
-        git -C "${CEILOMETER_DIR}" apply "${ceilometer_patch}"
-    else
-        die $LINENO \
-            "Ceilometer volume usage resource mapping patch does not apply cleanly"
-    fi
 }
 
 
