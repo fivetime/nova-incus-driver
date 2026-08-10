@@ -134,15 +134,17 @@ exact value the fleet health generation:
    There is no Nova service inventory query. An absent key after lease expiry
    permits one caller to acquire it; every acquisition requires a complete
    audit before the key may become ``healthy``.
-2. **Fail-closed audit transition.** Every audit receives a new UUID generation.
-   The owner atomically changes its exact ``healthy`` value and lease ID to
-   ``pending`` before a probe or full audit. Sensitive reads, instance start,
-   and all registry mutations reject ``pending``. They compare the exact healthy
-   value, its positive lease ID, and absence of the failure key in the same
-   transaction as their ownership CAS. A value restored without its lease must
-   be taken over as ``pending`` and fully re-audited. These comparisons prevent
-   an audit transition, lease replacement, or healthy-to-pending-to-healthy ABA
-   from admitting a mutation through a stale check.
+2. **Available, fail-closed audit transition.** Every audit receives a new UUID
+   generation. Initial acquisition and lease takeover publish ``pending`` and
+   reject sensitive work until a complete audit succeeds. A routine audit by
+   the existing owner retains the previous leased ``healthy`` generation while
+   scanning, so an O(G) scan does not stop fleet lifecycle operations. Those
+   operations still compare that exact value, its positive lease ID, absence of
+   the failure key, and their exact ownership records in one transaction. Audit
+   success atomically rotates to a new healthy generation. An ambiguous audit
+   atomically replaces the old generation with ``pending``; a content error
+   publishes the sticky failure. A value restored without its lease must also
+   be taken over as ``pending`` and fully re-audited.
 3. **Sticky fleet failure.** A content-level integrity error writes the first
    failure to the sibling ``failure`` key without a lease. Every process reads
    it before sensitive work and fails closed. If publishing that failure itself

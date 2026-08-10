@@ -479,6 +479,36 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
         self.assertEqual(
             "allocator-token-2", etcd.session.headers["Authorization"])
 
+    def test_reauthenticates_after_transaction_returns_empty_body(self):
+        directory = self.useFixture(fixtures.TempDir()).path
+        password_file = os.path.join(directory, "etcd-password")
+        with open(password_file, "w", encoding="utf-8") as stream:
+            stream.write("password\n")
+        os.chmod(password_file, 0o600)
+        etcd = _AuthenticatedFakeEtcd()
+        allocator = idmap.IDMapAllocator(
+            endpoint="https://etcd.example:2379",
+            namespace="cell1",
+            base=500000000,
+            size=65536,
+            count=8,
+            ca_cert="ca.crt",
+            cert_cert="client.crt",
+            cert_key="client.key",
+            username="nova-incus",
+            password_file=password_file,
+            client=etcd,
+        )
+        allocator.bootstrap()
+        etcd.next_transaction_error = {}
+
+        self.assertIsNone(
+            allocator.get("00000000-0000-0000-0000-000000000003"))
+
+        self.assertEqual(2, len(etcd.authentication_requests))
+        self.assertEqual(
+            "allocator-token-2", etcd.session.headers["Authorization"])
+
     def test_concurrent_invalid_token_refresh_authenticates_once(self):
         directory = self.useFixture(fixtures.TempDir()).path
         password_file = os.path.join(directory, "etcd-password")
@@ -1652,6 +1682,29 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
         self.assertRaisesRegex(
             idmap.IDMapBackendError, 'audit is in progress',
             self.allocator.get, self._uuid(70))
+
+    def test_routine_full_audit_keeps_previous_generation_available(self):
+        assignment = self.allocator.allocate(self._uuid(78))
+        follower = self._allocator(client=self.etcd)
+        follower.initialize()
+        original = self.allocator._audit_with_latch
+
+        def audit_while_reading():
+            self.assertEqual(assignment, follower.get(
+                assignment.instance_uuid))
+            coordinator = self.allocator._parse_audit_coordinator(
+                self.etcd.values[
+                    self.allocator.audit_coordinator_key.encode()])
+            self.assertEqual('healthy', coordinator['state'])
+            return original()
+
+        with mock.patch.object(
+                self.allocator, '_audit_with_latch',
+                side_effect=audit_while_reading):
+            owner, snapshot = self.allocator.run_coordinated_audit(full=True)
+
+        self.assertTrue(owner)
+        self.assertIsNotNone(snapshot)
 
     def test_sticky_audit_failure_propagates_to_another_process(self):
         assignment = self.allocator.allocate(self._uuid(71))

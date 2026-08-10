@@ -848,17 +848,29 @@ class IDMapAllocator:
         }
 
     def _transaction_response(self, transaction):
-        try:
-            result = self._call_with_auth_retry(
-                lambda: self._client.transaction(transaction))
-        except Exception as exc:
+        for attempt in range(2):
+            try:
+                result = self._call_with_auth_retry(
+                    lambda: self._client.transaction(transaction))
+            except Exception as exc:
+                raise IDMapBackendError(
+                    reason="etcd transaction failed: %s" %
+                    self._gateway_error_text(exc))
+            if isinstance(result, dict) and "succeeded" in result:
+                return result
+            if attempt == 0 and self.username:
+                # Under a large concurrent burst etcd's gRPC gateway can
+                # return an empty/noncanonical JSON body for an expired auth
+                # generation instead of its usual code=16 body.  Every
+                # allocator transaction is CAS-guarded and callers already
+                # resolve a lost response by exact reread, so one
+                # generation-serialized replay is safe and bounded.
+                generation = self._authentication_generation
+                self._refresh_authentication(generation)
+                continue
             raise IDMapBackendError(
-                reason="etcd transaction failed: %s" %
-                self._gateway_error_text(exc))
-        if not isinstance(result, dict) or "succeeded" not in result:
-            raise IDMapBackendError(
-                reason="etcd returned an invalid transaction response")
-        return result
+                reason="etcd returned an invalid transaction response: %r" %
+                result)
 
     def _transaction(self, transaction):
         return bool(self._transaction_response(transaction)["succeeded"])
@@ -1186,25 +1198,26 @@ class IDMapAllocator:
             raise IDMapBackendError(
                 reason="local audit coordinator lost its owning lease")
 
-        generation = str(uuid.uuid4())
-        pending_raw = self._audit_coordinator_raw(
-            self._coordinator_token, "pending", generation)
-        if not self._replace_audit_coordinator(
-                coordinator_raw, coordinator_lease_id,
-                pending_raw, self._audit_lease):
-            self._fleet_health_raw = None
-            self._fleet_health_lease_id = None
-            return False, None, False
-        self._fleet_health_raw = None
-        self._fleet_health_lease_id = None
+        if coordinator["state"] != "healthy":
+            raise IDMapBackendError(
+                reason="local audit coordinator is already pending")
+
+        # A routine audit must not stop every lifecycle operation for the
+        # duration of an O(G) registry scan.  Mutations remain guarded by the
+        # previous healthy generation and their normal exact-record CAS
+        # checks.  Audit success rotates that generation atomically; audit
+        # failure below replaces it with pending (or publishes a sticky
+        # integrity failure) before returning control.
+        self._fleet_health_raw = coordinator_raw
+        self._fleet_health_lease_id = coordinator_lease_id
         self._refresh_audit_lease(self._audit_lease)
-        return True, pending_raw, newly_acquired
+        return True, coordinator_raw, newly_acquired
 
     def run_coordinated_audit(self, full=False):
         """Heartbeat one fleet auditor and return a full snapshot if run."""
         self._raise_if_integrity_latched()
         try:
-            owner, pending_raw, newly_acquired = (
+            owner, expected_raw, newly_acquired = (
                 self._begin_coordinated_audit())
         except IDMapIntegrityError as exc:
             try:
@@ -1227,17 +1240,33 @@ class IDMapAllocator:
                     # for a sticky fleet failure by themselves.
                     snapshot = self._audit_with_latch()
         except Exception:
-            # The key was switched to pending before the scan. Never restore
-            # healthy from an ambiguous result; lease expiry permits a new
-            # process to acquire and run a complete audit.
+            # A newly acquired coordinator is already pending.  A routine
+            # audit retains the previous healthy generation while scanning;
+            # replace it on any ambiguous result so no later sensitive caller
+            # can keep using that generation.  A published sticky failure
+            # makes this CAS fail harmlessly because it compares absence.
+            expected = self._parse_audit_coordinator(expected_raw)
+            if expected["state"] == "healthy":
+                pending_raw = self._audit_coordinator_raw(
+                    self._coordinator_token, "pending",
+                    str(uuid.uuid4()))
+                lease_id = getattr(self._audit_lease, "id", None)
+                try:
+                    self._replace_audit_coordinator(
+                        expected_raw, lease_id, pending_raw,
+                        self._audit_lease)
+                except IDMapBackendError:
+                    pass
+            self._fleet_health_raw = None
+            self._fleet_health_lease_id = None
             raise
 
         healthy_raw = self._audit_coordinator_raw(
             self._coordinator_token, "healthy",
-            self._parse_audit_coordinator(pending_raw)["generation"])
+            str(uuid.uuid4()))
         lease_id = getattr(self._audit_lease, "id", None)
         if not self._replace_audit_coordinator(
-                pending_raw, lease_id, healthy_raw, self._audit_lease):
+                expected_raw, lease_id, healthy_raw, self._audit_lease):
             raise IDMapBackendError(
                 reason="audit coordinator lost ownership before commit")
         self._fleet_health_raw = healthy_raw

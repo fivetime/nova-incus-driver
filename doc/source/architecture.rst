@@ -239,14 +239,18 @@ freezes spawn and migration until the registry is explicitly recovered from a
 complete Nova and Incus inventory. This prevents a stale etcd restore from
 silently authorizing reuse of a live container's host UID/GID range.
 One lease-backed fleet coordinator audits the complete bidirectional registry.
-Before a scan it publishes ``pending``; after successful validation it publishes
-an exact ``healthy`` UUID generation under the same lease. The authoritative
-range read includes the key's positive lease ID, and every ownership transaction
-compares both the exact value and that lease ID, absence of the sticky fleet
-failure, and the immutable namespace configuration in the same etcd CAS. A
-canonical control value restored without its lease is never trusted: one caller
-must replace it with a newly leased ``pending`` generation and finish a complete
-audit before work resumes. A partial
+Initial acquisition publishes ``pending``; successful validation publishes an
+exact ``healthy`` UUID generation under the same lease. Routine audits retain
+the previous healthy generation while scanning and atomically rotate it only
+after success, allowing exact CAS-guarded lifecycle work to continue during an
+O(G) scan. An ambiguous scan replaces the old generation with ``pending`` and a
+content error publishes the sticky failure. The authoritative range read
+includes the key's positive lease ID, and every ownership transaction compares
+both the exact value and that lease ID, absence of the sticky fleet failure, and
+the immutable namespace configuration in the same etcd CAS. A canonical control
+value restored without its lease is never trusted: one caller must replace it
+with a newly leased ``pending`` generation and finish a complete audit before
+work resumes. A partial
 instance/slot pair therefore blocks admission instead of allowing a second
 instance to reuse its range. A low-frequency full audit detects unrelated
 content corruption. The first failure is persisted without a lease and blocks
