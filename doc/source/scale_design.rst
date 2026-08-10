@@ -1,11 +1,14 @@
 Scale hotspot elimination design
 ================================
 
-Status: **code-level hotspot elimination implemented**. The current
-100/500/1,000-instance production baseline and release gate are still
-deferred; ``TEST_STATUS.md`` remains authoritative for that incomplete
-evidence. This chapter records the implemented design for removing the
-super-linear driver and periodic audit costs before that gate is rerun.
+Status: **code-level hotspot elimination implemented**.  The current
+100/500-per-compute production gate has now run; 500 per compute reached
+``ACTIVE`` on all three computes, but the create-to-ACTIVE latency SLO failed.
+The former 1,000-per-compute checkpoint exceeds this testbed's physical
+memory and is no longer required.  ``TEST_STATUS.md`` remains authoritative
+for the NO-GO evidence. This chapter records the implemented design for
+removing the super-linear driver and periodic audit costs before that gate is
+rerun.
 It complements :doc:`architecture` (which documents behavior that already
 exists) and :doc:`production_readiness` (which defines the release evidence).
 
@@ -201,9 +204,10 @@ without explicit SLO limits. The remaining work is to *record* the first
 approved baseline. Completing the code changes above does not make this
 evidence gate green:
 
-1. Run the gate's scale phase at per-compute checkpoints 100/500/1,000 on
-   the three-node testbed with the candidate that contains the hotspot
-   fixes above.
+1. Run the gate's scale phase at per-compute checkpoints 100/500 on the
+   three-node testbed with the candidate that contains the hotspot fixes
+   above.  The former 1,000-per-compute target exceeds the physical memory
+   available to this testbed and is no longer a release requirement.
 2. Record in ``TEST_STATUS.md``: the seven latency SLO observations
    (p50/p95/p99 as reported), both throughput figures, per-audit-phase
    timings, idle-soak inventory query percentiles, and the telemetry

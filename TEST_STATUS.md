@@ -11,6 +11,47 @@ Entries are append-mostly and are release evidence, not permanent
 configuration. Each release must re-validate against its own approved
 digest/revision pair.
 
+## 2026-08-10 500-per-compute scale and full Tempest gate: NO-GO
+
+The physical-resource ceiling for this testbed is now **500 Incus system
+containers per compute**, not 1,000.  The three-compute release target is
+therefore 1,500 instances.  Commit ``908f78f`` reached that target with every
+instance ``ACTIVE`` and no Nova instance faults.  The final checkpoint was
+balanced across ``incus-node-02``, ``incus-node-03`` and ``incus-node-07``;
+the API submission rate was 0.914838 instances/s and the all-active rate was
+0.132841 instances/s.
+
+Capacity passed, but the performance SLO did not.  Create API latency was
+p50/p95/p99 14.85/30.56/50.78 s.  Create-to-ACTIVE latency was
+p50/p95/p99 4,955.62/8,914.69/9,582.82 s, against p95/p99 maxima of
+7,200/7,800 s.  Control-plane inventory remained within its independent SLO:
+Nova list p95 48.32 s and Neutron list 9.74 s.  The checkpoint audit took
+43.71 s, including Incus inventory 10.20 s, Placement consumers 14.65 s,
+Neutron ports 9.74 s and idmap etcd inventory 0.63 s.  This is a functional
+1,500-container result and a **performance NO-GO**, not an approved baseline.
+
+The exact artifact is
+``/opt/stack/openstack-incus-release-evidence/scale-908f78f-pc500-a6e55f15-1f0b-4bc7-94bc-09b4bef2d63d.json``.
+Its cleanup-only replay passed after periodic ID-map retirement converged:
+Nova, all three Incus projects, Ceph RBD, OVN and the fleet ID-map registry
+returned to their pre-run baselines.  The controller VM required 64 GiB RAM;
+at 32 GiB Redis and MySQL were OOM-killed during earlier attempts.
+
+The current full supported Tempest selection also remains NO-GO.  With
+concurrency 4 it executed 514 tests: 468 passed, 45 skipped and one failed.
+The failure was
+``ImagesOneServerNegativeTestJSON.test_create_second_image_when_first_image_is_being_saved``.
+Nova correctly returned 202 for the first snapshot and the expected 409 for
+the second; teardown then timed out because the first snapshot stayed in
+``image_pending_upload``.  Compute logs show entry into snapshot at 11:27:55,
+no transition to Glance upload, and cancellation only after instance deletion
+at 11:32:23.  This isolates the remaining failure to the Incus snapshot
+create/publish stage or its concurrency behavior; it is not an API-status
+expectation failure.  An immediate concurrency-1 rerun passed, but took
+191.84 s.  The full-suite failure is therefore a reproducible snapshot
+publish performance-margin problem: a small amount of concurrent backend
+load pushes the same operation beyond Tempest teardown's wait budget.
+
 ## 2026-08-07 Evacuation unblocked, and the fixes that took
 
 **Evacuation was structurally impossible, now proven working.** A running
@@ -77,11 +118,9 @@ are libvirt computes belonging to separate testing; `m1.tiny` carries no trait
 requirement and can schedule there, so Incus test instances must pin their
 host or use a flavor with `trait:CUSTOM_INCUS_SYSTEM_CONTAINER=required`.
 
-**Still open.** The formal performance baseline has not been recorded. The
-physical virsh host has 278 GiB against 608 GiB allocated across seven VMs and
-only ~52 GiB free, with incus-node-03 alone holding 99 GiB resident while
-nearly idle; the previous attempt died of host OOM at ~2600 instances under
-less pressure than this.
+**Superseded by the 2026-08-10 result above.** The approved physical target is
+now 500 instances per compute.  That capacity was reached and cleaned, but its
+latency SLO failed, so a formal approved performance baseline is still open.
 
 ## 2026-08-03 Failed-build idmap claims were never released
 
