@@ -6132,6 +6132,7 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         events.attach_mock(
             self.compute.driver.stage_share_for_live_migration, 'stage')
         data = migrate_data.IncusLiveMigrateData(
+            full_checkpoint_verified=True,
             cleanup_token='10000000-0000-0000-0000-000000000001')
 
         with mock.patch.object(
@@ -6162,6 +6163,7 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         self.compute._get_share_info = mock.Mock(
             return_value=[first, second])
         data = migrate_data.IncusLiveMigrateData(
+            full_checkpoint_verified=True,
             cleanup_token='10000000-0000-0000-0000-000000000001')
 
         self.assertRaises(
@@ -6288,6 +6290,33 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         mark_error.assert_called_once_with(instance, share)
 
     @mock.patch.object(manager.manager.safe_utils, 'get_wrapped_function')
+    def test_pre_live_rejects_unattested_source_before_side_effects(
+            self, get_wrapped):
+        ctxt = context.get_admin_context()
+        instance = mock.MagicMock(
+            uuid='00000000-0000-0000-0000-000000000001')
+        self.compute._get_share_info = mock.Mock()
+
+        for attestation in (None, False):
+            data = migrate_data.IncusLiveMigrateData()
+            if attestation is not None:
+                data.full_checkpoint_verified = attestation
+
+            with self.subTest(attestation=attestation):
+                self.assertRaisesRegex(
+                    manager.exception.MigrationError, 'did not attest',
+                    self.compute._pre_live_migration_locked,
+                    ctxt, instance, mock.sentinel.disk, data)
+
+        self.compute._get_share_info.assert_not_called()
+        self.compute.driver.get_share_mount_table.assert_not_called()
+        self.compute.driver.stage_share_for_live_migration.assert_not_called()
+        get_wrapped.assert_not_called()
+        cleanup = (
+            self.compute.driver.cleanup_pre_live_migration_destination)
+        cleanup.assert_not_called()
+
+    @mock.patch.object(manager.manager.safe_utils, 'get_wrapped_function')
     def test_pre_live_migration_mounts_destination_shares(
             self, get_wrapped):
         ctxt = context.get_admin_context()
@@ -6305,6 +6334,7 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         base_pre = mock.Mock(return_value=mock.sentinel.migrate_data)
         get_wrapped.return_value = base_pre
         data = migrate_data.IncusLiveMigrateData(
+            full_checkpoint_verified=True,
             cleanup_token='10000000-0000-0000-0000-000000000001')
 
         result = self.compute._pre_live_migration_locked(
@@ -6327,6 +6357,46 @@ class IncusComputeManagerTest(test.NoDBTestCase):
             self.compute, ctxt, instance, mock.sentinel.disk,
             data)
 
+    @mock.patch.object(manager.manager.safe_utils, 'get_wrapped_function')
+    def test_pre_live_base_rejection_unstages_all_destination_shares(
+            self, get_wrapped):
+        ctxt = context.get_admin_context()
+        instance = mock.MagicMock(
+            uuid='00000000-0000-0000-0000-000000000001')
+        instance.__getitem__.side_effect = (
+            lambda key: getattr(instance, key))
+        shares = [
+            mock.Mock(share_id='share-1', status='active'),
+            mock.Mock(share_id='share-2', status='active'),
+        ]
+        self.compute._get_share_info = mock.Mock(return_value=shares)
+        base_pre = mock.Mock(side_effect=manager.exception.MigrationError(
+            reason='incremental source rejected'))
+        get_wrapped.return_value = base_pre
+        data = migrate_data.IncusLiveMigrateData(
+            full_checkpoint_verified=True,
+            cleanup_token='10000000-0000-0000-0000-000000000001')
+
+        self.assertRaisesRegex(
+            manager.exception.MigrationError, 'incremental source rejected',
+            self.compute._pre_live_migration_locked,
+            ctxt, instance, mock.sentinel.disk, data)
+
+        unstage = self.compute.driver.unstage_share_for_live_migration
+        self.assertEqual([
+            mock.call(
+                ctxt, instance, shares[1],
+                '10000000-0000-0000-0000-000000000001',
+                mount_table=self.mount_table),
+            mock.call(
+                ctxt, instance, shares[0],
+                '10000000-0000-0000-0000-000000000001',
+                mount_table=self.mount_table),
+        ], unstage.call_args_list)
+        cleanup = (
+            self.compute.driver.cleanup_pre_live_migration_destination)
+        cleanup.assert_called_once_with(ctxt, instance, data)
+
     @mock.patch.object(
         manager.manager.ComputeManager, 'pre_live_migration')
     def test_pre_live_migration_rolls_back_mounted_shares(self, base_pre):
@@ -6343,6 +6413,7 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         self.compute.driver.stage_share_for_live_migration.side_effect = [
             True, RuntimeError('mount failed')]
         data = migrate_data.IncusLiveMigrateData(
+            full_checkpoint_verified=True,
             cleanup_token='10000000-0000-0000-0000-000000000001')
 
         self.assertRaises(
@@ -6381,6 +6452,7 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         self.compute.driver.stage_share_for_live_migration.side_effect = (
             RuntimeError('first mount failed'))
         data = migrate_data.IncusLiveMigrateData(
+            full_checkpoint_verified=True,
             cleanup_token='10000000-0000-0000-0000-000000000001')
 
         self.assertRaises(

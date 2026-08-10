@@ -3,11 +3,27 @@
 
 set -uo pipefail
 
-COMPUTE_NODES=${COMPUTE_NODES:?Set host=ssh-target comma-separated nodes}
+NOVA_CONTROLLER_RUNTIME_ONLY=false
+if (($# > 1)); then
+    echo "Usage: $0 [--controller-runtime-only]" >&2
+    exit 2
+fi
+case ${1:-} in
+    '') ;;
+    --controller-runtime-only)
+        NOVA_CONTROLLER_RUNTIME_ONLY=true
+        ;;
+    *)
+        echo "Usage: $0 [--controller-runtime-only]" >&2
+        exit 2
+        ;;
+esac
+
+COMPUTE_NODES=${COMPUTE_NODES:-}
 SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute audit key}
 SSH_KNOWN_HOSTS_FILE=${SSH_KNOWN_HOSTS_FILE:-$HOME/.ssh/known_hosts}
-EXPECTED_INCUS_IMAGE_DIGEST=${EXPECTED_INCUS_IMAGE_DIGEST:?Set approved digest}
-EXPECTED_INCUS_REVISION=${EXPECTED_INCUS_REVISION:?Set approved source revision}
+EXPECTED_INCUS_IMAGE_DIGEST=${EXPECTED_INCUS_IMAGE_DIGEST:-}
+EXPECTED_INCUS_REVISION=${EXPECTED_INCUS_REVISION:-}
 EXPECTED_HYPERVISOR_TYPE=${EXPECTED_HYPERVISOR_TYPE:-lxd}
 REMOTE_DRIVER=${REMOTE_DRIVER:-/opt/stack/nova/nova/virt/incus}
 REMOTE_NOVA_CONFIG=${REMOTE_NOVA_CONFIG:-/etc/nova/nova-cpu.conf}
@@ -62,8 +78,32 @@ case "$REQUIRE_CEILOMETER_RUNTIME" in
         exit 2
         ;;
 esac
+if [[ "$NOVA_CONTROLLER_RUNTIME_ONLY" == true ]]; then
+    if [[ "$REQUIRE_MANILA_MIGRATION_RUNTIME" != true ]]; then
+        echo "NOVA_CONTROLLER_RUNTIME_ONLY requires " \
+            "REQUIRE_MANILA_MIGRATION_RUNTIME=true" >&2
+        exit 2
+    fi
+    if [[ "$REQUIRE_CEILOMETER_RUNTIME" == true ]]; then
+        echo "NOVA_CONTROLLER_RUNTIME_ONLY does not audit Ceilometer" >&2
+        exit 2
+    fi
+else
+    [[ -n "$COMPUTE_NODES" ]] || {
+        echo "Set COMPUTE_NODES to host=ssh-target comma-separated nodes" >&2
+        exit 2
+    }
+    [[ -n "$EXPECTED_INCUS_IMAGE_DIGEST" ]] || {
+        echo "Set EXPECTED_INCUS_IMAGE_DIGEST to the approved digest" >&2
+        exit 2
+    }
+    [[ -n "$EXPECTED_INCUS_REVISION" ]] || {
+        echo "Set EXPECTED_INCUS_REVISION to the approved source revision" >&2
+        exit 2
+    }
+fi
 
-if [[ ! -r "$HOST_PREFLIGHT" ]]; then
+if [[ "$NOVA_CONTROLLER_RUNTIME_ONLY" != true && ! -r "$HOST_PREFLIGHT" ]]; then
     echo "FAIL host preflight script is not readable: $HOST_PREFLIGHT" >&2
     exit 1
 fi
@@ -71,12 +111,13 @@ if [[ ! -r "$RUNTIME_PREFLIGHT" ]]; then
     echo "FAIL runtime preflight script is not readable: $RUNTIME_PREFLIGHT" >&2
     exit 1
 fi
-if [[ "$REQUIRE_CEILOMETER_RUNTIME" == true && \
+if [[ "$NOVA_CONTROLLER_RUNTIME_ONLY" != true && \
+      "$REQUIRE_CEILOMETER_RUNTIME" == true && \
       ! -r "$CEILOMETER_PREFLIGHT" ]]; then
     echo "FAIL Ceilometer preflight is not readable: $CEILOMETER_PREFLIGHT" >&2
     exit 1
 fi
-if [[ ! -d "$RELEASE_DRIVER" ]]; then
+if [[ "$NOVA_CONTROLLER_RUNTIME_ONLY" != true && ! -d "$RELEASE_DRIVER" ]]; then
     echo "FAIL release driver tree is not a directory: $RELEASE_DRIVER" >&2
     exit 1
 fi
@@ -89,7 +130,10 @@ driver_tree_hash() {
         sha256sum | awk '{print $1}'
 }
 
-expected_driver_hash=$(driver_tree_hash "$RELEASE_DRIVER")
+expected_driver_hash=
+if [[ "$NOVA_CONTROLLER_RUNTIME_ONLY" != true ]]; then
+    expected_driver_hash=$(driver_tree_hash "$RELEASE_DRIVER")
+fi
 
 pass() {
     printf 'PASS %-38s %s\n' "$1" "${2:-}"
@@ -183,7 +227,8 @@ elif [[ "$REQUIRE_MANILA_MIGRATION_RUNTIME" == true ]]; then
         seen_api_nodes[$api_name]=1
         printf -v runtime_python_q '%q' "$NOVA_API_RUNTIME_PYTHON"
         if remote "$api_target" \
-                "RUNTIME_PYTHON=$runtime_python_q bash -s -- api" \
+                "MIN_INCUS_MIGRATE_DATA_VERSION=1.6 \
+                 RUNTIME_PYTHON=$runtime_python_q bash -s -- api" \
                 <"$RUNTIME_PREFLIGHT"; then
             pass "$api_name nova-api runtime" "patched API and core hooks"
         else
@@ -216,7 +261,8 @@ elif [[ "$REQUIRE_MANILA_MIGRATION_RUNTIME" == true ]]; then
         seen_conductor_nodes[$conductor_name]=1
         printf -v runtime_python_q '%q' "$NOVA_API_RUNTIME_PYTHON"
         if remote "$conductor_target" \
-                "RUNTIME_PYTHON=$runtime_python_q bash -s -- conductor" \
+                "MIN_INCUS_MIGRATE_DATA_VERSION=1.6 \
+                 RUNTIME_PYTHON=$runtime_python_q bash -s -- conductor" \
                 <"$RUNTIME_PREFLIGHT"; then
             pass "$conductor_name nova-conductor runtime" \
                 "Incus migration object registry"
@@ -225,6 +271,16 @@ elif [[ "$REQUIRE_MANILA_MIGRATION_RUNTIME" == true ]]; then
                 "running conductor cannot deserialize Incus migration data"
         fi
     done
+fi
+
+if [[ "$NOVA_CONTROLLER_RUNTIME_ONLY" == true ]]; then
+    if ((failures > 0)); then
+        echo "NO-GO: Nova controller runtime validation failed " \
+            "($failures failures)" >&2
+        exit 1
+    fi
+    echo "PASS Nova controller runtime barrier"
+    exit 0
 fi
 
 IFS=, read -ra nodes <<<"$COMPUTE_NODES"
@@ -260,7 +316,8 @@ for node in "${nodes[@]}"; do
     if [[ "$REQUIRE_MANILA_MIGRATION_RUNTIME" == true ]]; then
         printf -v runtime_python_q '%q' "$NOVA_COMPUTE_RUNTIME_PYTHON"
         if remote "$target" \
-                "RUNTIME_PYTHON=$runtime_python_q bash -s -- compute" \
+                "MIN_INCUS_MIGRATE_DATA_VERSION=1.6 \
+                 RUNTIME_PYTHON=$runtime_python_q bash -s -- compute" \
                 <"$RUNTIME_PREFLIGHT"; then
             pass "$host nova-compute runtime" \
                 "Incus entry point, manager hooks, and trait code"

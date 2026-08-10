@@ -140,6 +140,53 @@ class ManilaReleaseGateContractTest(unittest.TestCase):
                       self.readiness)
         self.assertIn('These checks have not yet run', self.test_status)
 
+    def test_upgrade_orders_control_plane_before_compute_roll(self):
+        readiness = ' '.join(self.readiness.split())
+        incus = readiness.index('Upgrade Incus on every compute first')
+        control = readiness.index(
+            'upgrade and restart every ``nova-api`` and ``nova-conductor``')
+        compute = readiness.index(
+            'Only after that controller-only barrier is green may the Nova '
+            'computes be rolled')
+        final_gate = readiness.index(
+            'This final full-fleet gate, including every compute runtime')
+
+        self.assertLess(incus, control)
+        self.assertLess(control, compute)
+        self.assertLess(compute, final_gate)
+        self.assertIn(
+            'Every API and conductor runtime must register '
+            '``IncusLiveMigrateData`` version 1.6 or newer', readiness)
+        self.assertIn(
+            'MIN_INCUS_MIGRATE_DATA_VERSION=1.6', readiness)
+        self.assertIn(
+            'without the controller-only flag', readiness)
+
+    def test_controller_barrier_is_an_explicit_non_inheritable_mode(self):
+        self.assertIn('NOVA_CONTROLLER_RUNTIME_ONLY=false', self.fleet)
+        self.assertNotIn(
+            '${NOVA_CONTROLLER_RUNTIME_ONLY:-', self.fleet)
+        self.assertIn('--controller-runtime-only)', self.fleet)
+        self.assertEqual(
+            2, self.fleet.count('Usage: $0 [--controller-runtime-only]'))
+        self.assertLess(
+            self.fleet.index('case ${1:-} in'),
+            self.fleet.index('SSH_IDENTITY=${SSH_IDENTITY:?'))
+
+        controller_exit = self.fleet.index(
+            'PASS Nova controller runtime barrier')
+        compute_loop = self.fleet.index(
+            'IFS=, read -ra nodes <<<"$COMPUTE_NODES"')
+        self.assertLess(controller_exit, compute_loop)
+        self.assertGreaterEqual(
+            self.fleet.count('MIN_INCUS_MIGRATE_DATA_VERSION=1.6'), 3)
+        for relative in (
+                'tools/openstack-incus-release-gate.sh',
+                'tools/openstack-incus-bfv-migration-matrix.sh',
+                'tools/openstack-incus-monitoring-audit.sh'):
+            caller = (REPO_ROOT / relative).read_text(encoding='utf-8')
+            self.assertNotIn('--controller-runtime-only', caller, relative)
+
 
 if __name__ == '__main__':
     unittest.main()

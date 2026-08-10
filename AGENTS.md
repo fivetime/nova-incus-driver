@@ -32,6 +32,7 @@ baselines when developing and testing this project:
 - Incus Python SDK: `C:\MyProjects\IaasProjects\Incus\incus-python-sdk`
 - Incus server: `C:\MyProjects\IaasProjects\Incus\incus`
 - etcd client: `C:\MyProjects\OpenSource\openstack\etcd3gw`
+- ceilometer: `C:\MyProjects\OpenSource\openstack\ceilometer`
 
 The former ovsdbapp checkout at
 `C:\MyProjects\IaasProjects\OpenStack\openstack-ovsdbapp` was deleted because
@@ -308,10 +309,17 @@ in `TEST_STATUS.md`; this section keeps only the rules.
   remainder across the network; a failure after that switch leaves memory
   split across two hosts and destroys the workload. That trade is not
   available to this driver, whatever the convergence pressure.
-- Iterative pre-copy (CRIU pre-dump) is currently not enabled, so downtime
-  grows with the guest's memory rather than with its write rate. Enabling
-  pre-dump later to shorten downtime is acceptable because it stays within
-  the pre-copy family; switching to demand paging is not.
+- Iterative pre-copy (CRIU pre-dump) is explicitly disabled with
+  ``migration.incremental.memory=false`` in both the dedicated profile and
+  instance-local configuration; the latter wins in ``ExpandedConfig()``. The
+  source pre-check first requires exact profile/local Nova ownership, an exact
+  one-profile chain, effective ``migration.stateful=true``, and an unprivileged
+  guest; it then normalizes older incremental-memory values and re-reads all
+  three layers. Downtime therefore grows with the guest's memory rather than
+  its write rate. Pre-dump may be enabled only after Incus and CRIU can prove
+  that a failed generation is never reused and the complete parent-chain and
+  migration-protocol failure matrix passes. Merely remaining in the pre-copy
+  family is not sufficient. Switching to demand paging remains prohibited.
 - **Live migratability is universal, not a flavor feature.** Every instance
   is created with `migration.stateful=true` (and therefore a shifted
   on-disk rootfs) because hardware retirement makes every instance migrate
@@ -355,6 +363,16 @@ in `TEST_STATUS.md`; this section keeps only the rules.
   `rpc_response_timeout` and every candidate host is skipped with a timeout
   until the request fails with `NoValidHost`. Cold migration does not nest
   synchronous RPCs this way.
+- The full-checkpoint attestation uses ``IncusLiveMigrateData`` version 1.6.
+  After upgrading Incus fleet-wide, upgrade and restart every API and conductor
+  and run the fleet gate with `--controller-runtime-only` to prove every
+  API/conductor runtime registers version 1.6 or newer before rolling any
+  compute. Restart and gate each upgraded compute with
+  `MIN_INCUS_MIGRATE_DATA_VERSION=1.6`, then run the normal full-fleet gate after
+  all computes are current. Keep live migration frozen until that final gate is
+  green and while conductors are mixed; new-source to old-destination
+  compatibility depends on a new conductor backporting the object for the old
+  destination.
 
 ### Guest interface naming
 

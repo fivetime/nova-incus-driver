@@ -6,6 +6,12 @@ set -euo pipefail
 ROLE=${1:-${ROLE:-}}
 RUNTIME_PROCESS_REGEX=${RUNTIME_PROCESS_REGEX:-}
 RUNTIME_PYTHON=${RUNTIME_PYTHON:-}
+MIN_INCUS_MIGRATE_DATA_VERSION=${MIN_INCUS_MIGRATE_DATA_VERSION:-1.6}
+
+if [[ ! "$MIN_INCUS_MIGRATE_DATA_VERSION" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+    echo "MIN_INCUS_MIGRATE_DATA_VERSION must be a numeric object version" >&2
+    exit 2
+fi
 
 case "$ROLE" in
     api)
@@ -52,7 +58,7 @@ import sys
 import types
 
 
-role, pid, cmdline = sys.argv[1:]
+role, pid, cmdline, minimum_migrate_data_version = sys.argv[1:]
 checks = []
 
 
@@ -83,11 +89,29 @@ def code_names(callable_object):
 from nova.compute import manager as nova_manager
 from nova.objects import base as nova_object_base
 from nova.objects import register_all
+from oslo_utils import versionutils
 
 register_all()
+registered_migrate_data = nova_object_base.NovaObjectRegistry.obj_classes().get(
+    "IncusLiveMigrateData", []
+)
 require(
-    "IncusLiveMigrateData" in nova_object_base.NovaObjectRegistry.obj_classes(),
+    bool(registered_migrate_data),
     "Nova runtime registers IncusLiveMigrateData",
+)
+registered_migrate_versions = [
+    versionutils.convert_version_to_tuple(candidate.VERSION)
+    for candidate in registered_migrate_data
+]
+minimum_migrate_data_version_tuple = versionutils.convert_version_to_tuple(
+    minimum_migrate_data_version
+)
+require(
+    max(registered_migrate_versions, default=(0, 0))
+    >= minimum_migrate_data_version_tuple,
+    "Nova runtime registers IncusLiveMigrateData version {} or newer".format(
+        minimum_migrate_data_version
+    ),
 )
 
 core_hooks = (
@@ -270,7 +294,8 @@ for pid in "${runtime_pids[@]}"; do
 
     if printf '%s\n' "$CONTRACT" | nsenter --target "$pid" --mount -- \
             env -i PATH="$proc_path" PYTHONPATH="$proc_pythonpath" \
-            HOME=/tmp "$runtime_python" - "$ROLE" "$pid" "$cmdline"; then
+            HOME=/tmp "$runtime_python" - "$ROLE" "$pid" "$cmdline" \
+            "$MIN_INCUS_MIGRATE_DATA_VERSION"; then
         validated=$((validated + 1))
     else
         echo "NO-GO: Nova $ROLE runtime contract failed for pid=$pid cmd=$cmdline" >&2

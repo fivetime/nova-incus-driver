@@ -43,7 +43,7 @@ class MigrationAddressPreflightContractTest(unittest.TestCase):
 
     def test_host_allows_wildcard_or_explicit_ipv4_bind(self):
         self.assertIn(
-            'must use 0.0.0.0:PORT or an explicit IPv4:PORT',
+            'must use :PORT, 0.0.0.0:PORT or an explicit IPv4:PORT',
             self.host)
         self.assertIn('is_ipv4 "$https_bind_host"', self.host)
         self.assertIn('is_tcp_port "$https_bind_port"', self.host)
@@ -142,9 +142,12 @@ class SplitRuntimePreflightContractTest(unittest.TestCase):
             'unsupported on Neutron nodes', self.host)
 
     def test_checks_every_running_nova_guest(self):
+        running_block = self.host[
+            self.host.index('if running_inventory=$('):
+            self.host.index('for instance_name in "${running_nova_instances')]
         self.assertIn(
-            'select(.config["user.openstack.uuid"] != null)',
-            self.host)
+            'select(.status == "Running")', running_block)
+        self.assertNotIn('user.openstack.uuid', running_block)
         self.assertIn(
             'runtime_config="$INCUS_RUNTIME_ROOT/'
             '${INCUS_PROJECT}_${instance_name}/lxc.conf"',
@@ -330,6 +333,125 @@ class BfvCommandTimeoutContractTest(unittest.TestCase):
         self.assertIn('guest_iface="nic${port_id//-/}"', self.e2e)
         self.assertIn('guest_iface=${guest_iface:0:15}', self.e2e)
         self.assertNotIn('ip -4 -o addr show eth0', self.e2e)
+
+
+class FullCheckpointMigrationContractTest(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.host = HOST_PREFLIGHT.read_text(encoding='utf-8')
+        cls.e2e = LIVE_E2E.read_text(encoding='utf-8')
+
+    def test_host_validates_inventories_before_clean_state_assertions(self):
+        self.assertIn(
+            '"/1.0/instances?project=$incus_project_query&recursion=2"',
+            self.host)
+        self.assertIn(
+            '"/1.0/profiles?project=$incus_project_query&recursion=1"',
+            self.host)
+        self.assertNotIn(
+            '--project "$INCUS_PROJECT" query', self.host)
+        self.assertGreaterEqual(
+            self.host.count(
+                "type == \"array\" and all(.[]; type == \"object\")"),
+            2)
+        inventory = self.host.index('nova_instance_inventory=$(')
+        running = self.host.index('pass "running guest LXCFS audit"')
+        autostart = self.host.index('pass "Nova instance autostart"')
+        self.assertLess(inventory, running)
+        self.assertLess(inventory, autostart)
+        self.assertIn('inventory_valid=false', self.host)
+        self.assertIn('profile_inventory_valid=false', self.host)
+
+    def test_host_binds_inventory_to_explicit_nova_project_authority(self):
+        authority = self.host.index(
+            'configured_incus_project=$(crudini --get "$NOVA_CONFIG" '
+            'incus project')
+        instance_inventory = self.host.index('nova_instance_inventory=')
+        profile_inventory = self.host.index('nova_profile_inventory=')
+        self.assertLess(authority, instance_inventory)
+        self.assertLess(authority, profile_inventory)
+        self.assertIn(
+            '[[ -z "$configured_incus_project" ]]', self.host)
+        self.assertIn(
+            '[[ "$configured_incus_project" != "$INCUS_PROJECT" ]]',
+            self.host)
+        self.assertIn('incus_project_valid=false', self.host)
+        self.assertGreaterEqual(
+            self.host.count('[[ "$incus_project_valid" != true ]]'), 2)
+        self.assertIn(
+            '"/1.0/projects/$incus_project_query"', self.host)
+        self.assertIn('$value | @uri', self.host)
+
+    def test_host_requires_profile_local_and_expanded_false(self):
+        compact = ' '.join(self.host.split())
+        self.assertIn(
+            '.profiles != [.name]', self.host)
+        self.assertIn(
+            '.config["migration.incremental.memory"] != "false"', compact)
+        self.assertIn(
+            '.expanded_config["migration.incremental.memory"] != "false"',
+            compact)
+        self.assertIn(
+            '$named[0].config["migration.incremental.memory"] != "false"',
+            compact)
+        self.assertIn('Nova CRIU full checkpoint', self.host)
+
+    def test_host_missing_named_profile_is_always_unsafe(self):
+        self.assertIn(
+            'if ($named | length) != 1 then', self.host)
+        self.assertIn(
+            'Nova instance ownership', self.host)
+        self.assertIn('invalid records:', self.host)
+
+    def test_host_audits_every_dedicated_project_instance_owner(self):
+        self.assertIn(
+            '.config["user.openstack.uuid"] as $owner', self.host)
+        self.assertIn(
+            '$named[0].config["user.openstack.uuid"] != $owner', self.host)
+        self.assertIn(
+            '.expanded_config["user.openstack.uuid"] != $owner', self.host)
+
+    def test_live_e2e_checks_every_effective_configuration_layer(self):
+        self.assertIn('verify_full_checkpoint_policy()', self.e2e)
+        self.assertIn(
+            '"/1.0/instances/$instance_name"', self.e2e)
+        self.assertIn(
+            '"/1.0/profiles/$instance_name"', self.e2e)
+        self.assertIn(
+            '"${path}?project=${INCUS_PROJECT}"', self.e2e)
+        self.assertNotIn('incus_remote "$host" query', self.e2e)
+        self.assertGreaterEqual(
+            self.e2e.count('type == "object"'), 2)
+        self.assertIn(
+            '.expanded_config["migration.incremental.memory"] == "false"',
+            self.e2e)
+        self.assertGreaterEqual(self.e2e.count('== $nova_uuid'), 3)
+        self.assertGreaterEqual(
+            self.e2e.count('--arg nova_uuid "$server_id"'), 2)
+        for layer in (
+                '$named[0].config["security.privileged"]',
+                '.config["security.privileged"]',
+                '.expanded_config["security.privileged"]'):
+            self.assertIn(layer, self.host)
+        self.assertGreaterEqual(
+            self.e2e.count('.config["security.privileged"]'), 2)
+        self.assertIn(
+            '.expanded_config["security.privileged"]', self.e2e)
+        for token in ('true', '1', 'yes', 'on'):
+            expected = '$value == "{}"'.format(token)
+            self.assertIn(expected, self.e2e)
+            self.assertIn(expected, self.host)
+        self.assertGreaterEqual(
+            self.e2e.count('verify_full_checkpoint_policy'), 5)
+
+    def test_restore_injection_uses_persistent_marker_not_outer_journal(self):
+        self.assertIn(
+            'openstack-incus-e2e-criu-${server_id}.marker', self.e2e)
+        self.assertIn(
+            'request reached target restore without depending on stdout',
+            self.e2e)
+        self.assertNotIn('journalctl', self.e2e)
 
 
 if __name__ == '__main__':

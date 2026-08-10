@@ -316,8 +316,13 @@ non-empty tmpfs mounts.
 Run the maximum BFV + two Cinder data volumes + Manila combination once more
 with target CRIU restore failure injection. The source must resume with
 continuous process state, all destination ownership must be removed, and an
-immediate retry must succeed. A failed optional CRIU pre-dump must degrade to a
-full final checkpoint rather than aborting the migration stream.
+immediate retry must succeed. Verify the source and destination profiles carry
+``migration.incremental.memory=false``. The source instance-local and expanded
+configuration must also carry exactly ``false``, expanded
+``migration.stateful`` must be exactly ``true``, effective privilege must not
+be enabled by any Incus true token in the profile, instance-local, or expanded
+configuration, and the dedicated instance profile must be its only attached
+profile. Both profile and instance-local ownership UUIDs must match Nova.
 
 Run ``tools/openstack-incus-live-migration-cardinality-matrix.sh`` with at
 least three independent Manila shares. The release inputs must identify a
@@ -420,11 +425,55 @@ separately.
 6. Upgrade and rollback
 -----------------------
 
+The release that introduces the full-checkpoint live-migration invariant has a
+fleet-wide order. First disable new live migrations and prove that Nova has no
+in-progress migration record and that no Incus daemon has a live migration
+operation. Do not drain an old compute by live migration during this freeze.
+Upgrade Incus on every compute first, so even an old Nova driver uses the
+server's corrected full-dump behavior. Next upgrade and restart every
+``nova-api`` and ``nova-conductor`` process while migration remains frozen.
+Run ``tools/openstack-incus-fleet-preflight.sh --controller-runtime-only`` with
+``REQUIRE_MANILA_MIGRATION_RUNTIME=true`` and complete ``NOVA_API_NODES`` and
+``NOVA_CONDUCTOR_NODES`` inventories. This controller-only barrier exits before
+the compute, host, release-hash, Placement, and instance-integrity checks; it is
+valid only for this intermediate upgrade step. Every API and conductor runtime
+must register ``IncusLiveMigrateData`` version 1.6 or newer before any compute
+is upgraded. Only after that controller-only barrier is green may the Nova
+computes be rolled.
+
+After every conductor has crossed that version barrier, the source attestation
+makes the compute rolling window fail closed: a new source can migrate safely
+to an old destination (the old object version drops the attestation, while the
+source still enforces the invariant); an old source is rejected by a new
+destination manager before Manila staging or upstream Cinder attachment
+creation. The destination driver repeats the check before its Incus, VIF, and
+host-side Cinder preparation. A mixed conductor fleet is not a supported
+window because a 1.5 conductor cannot reliably backport the 1.6 payload.
+Old-source to old-destination live migration remains unsafe during this window
+and must stay frozen.
+
 Validate one compute at a time: disable scheduling, drain or stop workloads,
-quarantine the service, upgrade the driver and immutable Incus image, run the
-host preflight, explicitly admit it, and re-enable scheduling. Test local-root
-development instances, BFV roots, attached data volumes, OVN ports, and
-recovery markers across the upgrade.
+quarantine the service, roll its Nova driver, verify that the immutable Incus
+image is already the fleet-wide version installed before the controller
+barrier, and restart ``nova-compute``. In that process namespace run
+``tools/openstack-incus-nova-runtime-preflight.sh compute`` with
+``MIN_INCUS_MIGRATE_DATA_VERSION=1.6``, then run the host preflight, explicitly
+admit it, and re-enable scheduling. Test local-root development instances, BFV
+roots, attached data volumes, OVN ports, and recovery markers across the
+upgrade.
+
+Before lifting the freeze, restore the exact Nova UUID in both the named
+profile and instance-local config, and set
+``migration.incremental.memory=false`` in both layers for every Nova instance.
+Verify that each instance has only its named profile, that its expanded value
+is exactly lowercase ``false``, and that expanded ``migration.stateful`` is
+exactly ``true`` for live-migratable instances. After every compute has been
+upgraded and restarted, run the normal
+``tools/openstack-incus-fleet-preflight.sh`` without the controller-only flag,
+with ``REQUIRE_MANILA_MIGRATION_RUNTIME=true``, the complete
+compute/API/conductor inventories, and the approved Incus digest and revision.
+This final full-fleet gate, including every compute runtime and host preflight,
+must be green before live migration is enabled again.
 
 After a fenced host returns, keep scheduling disabled while the ownership
 audit removes stale instance records. Admit and start ``nova-compute``, wait

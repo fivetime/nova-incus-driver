@@ -328,16 +328,123 @@ else
     fi
 fi
 
-mapfile -t running_nova_instances < <(
-    podman exec "$INCUS_CONTAINER" incus --project "$INCUS_PROJECT" \
-        list --format json 2>/dev/null |
-        jq -r '.[] |
-          select(.status == "Running") |
-          select(.config["user.openstack.uuid"] != null) |
-          .name'
-)
-if ((${#running_nova_instances[@]} == 0)); then
-    pass "running guest LXCFS audit" "no running Nova instances"
+configured_incus_project=
+incus_project_query=
+incus_project_valid=false
+if ! configured_incus_project=$(crudini --get "$NOVA_CONFIG" incus project \
+        2>/dev/null) || [[ -z "$configured_incus_project" ]]; then
+    fail "Nova Incus project authority" \
+        "[incus] project must be explicitly configured in $NOVA_CONFIG"
+elif [[ "$configured_incus_project" != "$INCUS_PROJECT" ]]; then
+    fail "Nova Incus project authority" \
+        "config=$configured_incus_project audit=$INCUS_PROJECT"
+elif ! incus_project_query=$(jq -nr --arg value "$configured_incus_project" \
+        '$value | @uri') || [[ -z "$incus_project_query" ]]; then
+    fail "Nova Incus project authority" \
+        "failed to encode configured project $configured_incus_project"
+elif configured_project_json=$(podman exec "$INCUS_CONTAINER" incus query \
+        "/1.0/projects/$incus_project_query" 2>/dev/null) &&
+        jq -e 'type == "object"' <<<"$configured_project_json" >/dev/null; then
+    incus_project_valid=true
+    pass "Nova Incus project authority" "$configured_incus_project"
+else
+    fail "Nova Incus project authority" \
+        "configured project $configured_incus_project is unavailable"
+fi
+
+nova_instance_inventory=
+inventory_valid=false
+if [[ "$incus_project_valid" != true ]]; then
+    fail "Nova instance inventory" \
+        "skipped because the configured Incus project is invalid"
+elif nova_instance_inventory=$(podman exec "$INCUS_CONTAINER" incus query \
+        "/1.0/instances?project=$incus_project_query&recursion=2" \
+        2>/dev/null) &&
+        jq -e 'type == "array" and all(.[]; type == "object")' \
+            <<<"$nova_instance_inventory" >/dev/null; then
+    inventory_valid=true
+    pass "Nova instance inventory" "valid JSON object array"
+else
+    fail "Nova instance inventory" \
+        "Incus query failed or returned a malformed JSON array"
+fi
+
+nova_profile_inventory=
+profile_inventory_valid=false
+if [[ "$incus_project_valid" != true ]]; then
+    fail "Nova profile inventory" \
+        "skipped because the configured Incus project is invalid"
+elif nova_profile_inventory=$(podman exec "$INCUS_CONTAINER" incus query \
+        "/1.0/profiles?project=$incus_project_query&recursion=1" \
+        2>/dev/null) &&
+        jq -e 'type == "array" and all(.[]; type == "object")' \
+            <<<"$nova_profile_inventory" >/dev/null; then
+    profile_inventory_valid=true
+    pass "Nova profile inventory" "valid JSON object array"
+else
+    fail "Nova profile inventory" \
+        "Incus query failed or returned a malformed JSON array"
+fi
+
+# The Nova Incus project is dedicated. Every instance must therefore carry a
+# complete local/profile/expanded ownership chain; an absent marker is an
+# integrity failure, not evidence that the record can be ignored.
+if [[ "$inventory_valid" == true &&
+      "$profile_inventory_valid" == true ]]; then
+    if unsafe_owners=$(jq -r --slurpfile profiles \
+        <(printf '%s\n' "$nova_profile_inventory") '
+        .[] |
+        . as $instance |
+        .config["user.openstack.uuid"] as $owner |
+        ($profiles[0] |
+            map(select(.name == $instance.name))) as $named |
+        select(
+            if ($owner | type) != "string" then
+                true
+            elif ($owner | test(
+                "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$") |
+                not) then
+                true
+            elif ($named | length) != 1 then
+                true
+            else
+                $named[0].config["environment.product_name"] !=
+                    "OpenStack Nova" or
+                $named[0].config["user.openstack.uuid"] != $owner or
+                .expanded_config["environment.product_name"] !=
+                    "OpenStack Nova" or
+                .expanded_config["user.openstack.uuid"] != $owner
+            end
+        ) |
+        .name
+    ' <<<"$nova_instance_inventory"); then
+        if [[ -z "$unsafe_owners" ]]; then
+            pass "Nova instance ownership" "local/profile/expanded match"
+        else
+            fail "Nova instance ownership" \
+                "invalid records: $(tr '\n' ',' <<<"$unsafe_owners")"
+        fi
+    else
+        fail "Nova instance ownership" \
+            "failed to evaluate instance/profile inventories"
+    fi
+fi
+
+running_nova_instances=()
+if [[ "$inventory_valid" == true ]]; then
+    if running_inventory=$(jq -r '.[] |
+        select(.status == "Running") |
+        .name
+    ' <<<"$nova_instance_inventory"); then
+        if [[ -n "$running_inventory" ]]; then
+            mapfile -t running_nova_instances <<<"$running_inventory"
+        else
+            pass "running guest LXCFS audit" "no running Nova instances"
+        fi
+    else
+        fail "running guest LXCFS audit" \
+            "failed to evaluate the validated Incus inventory"
+    fi
 fi
 for instance_name in "${running_nova_instances[@]}"; do
     runtime_config="$INCUS_RUNTIME_ROOT/${INCUS_PROJECT}_${instance_name}/lxc.conf"
@@ -776,15 +883,88 @@ if /usr/local/sbin/openstack-incus-compute-admission check 2>/dev/null; then
 else
     fail "compute admission token" "active compute is not admitted"
 fi
-unsafe_autostart=$(podman exec "$INCUS_CONTAINER" incus \
-    --project nova list --format json 2>/dev/null |
-    jq -r '.[] | select(.config["user.openstack.uuid"] != null) |
-        select(.config["boot.autostart"] != "false") | .name')
-if [[ -z "$unsafe_autostart" ]]; then
-    pass "Nova instance autostart" disabled
+if [[ "$inventory_valid" == true ]]; then
+    if unsafe_autostart=$(jq -r '
+        .[] |
+        select(.config["boot.autostart"] != "false") | .name
+    ' <<<"$nova_instance_inventory"); then
+        if [[ -z "$unsafe_autostart" ]]; then
+            pass "Nova instance autostart" disabled
+        else
+            fail "Nova instance autostart" \
+                "must be false: $(tr '\n' ',' <<<"$unsafe_autostart")"
+        fi
+    else
+        fail "Nova instance autostart" "failed to evaluate inventory"
+    fi
+fi
+
+live_migration_enabled=invalid
+if configured_live_migration=$(crudini --get "$NOVA_CONFIG" incus \
+        allow_live_migration 2>/dev/null); then
+    configured_live_migration=${configured_live_migration,,}
+    if [[ "$configured_live_migration" == true ||
+          "$configured_live_migration" == false ]]; then
+        live_migration_enabled=$configured_live_migration
+        pass "Nova live migration setting" "$live_migration_enabled"
+    else
+        fail "Nova live migration setting" \
+            "allow_live_migration must be true or false"
+    fi
 else
-    fail "Nova instance autostart" \
-        "must be false: $(tr '\n' ',' <<<"$unsafe_autostart")"
+    fail "Nova live migration setting" \
+        "cannot read [incus] allow_live_migration"
+fi
+
+if [[ "$inventory_valid" == true &&
+      "$profile_inventory_valid" == true ]]; then
+    if unsafe_incremental=$(jq -r \
+        --arg live_migration_enabled "$live_migration_enabled" \
+        --slurpfile profiles \
+        <(printf '%s\n' "$nova_profile_inventory") '
+        def incus_true:
+            (tostring | ascii_downcase) as $value |
+            $value == "true" or $value == "1" or
+            $value == "yes" or $value == "on";
+        .[] |
+        . as $instance |
+        ($profiles[0] |
+            map(select(.name == $instance.name))) as $named |
+        select(
+            if ($named | length) != 1 then
+                true
+            else
+                .profiles != [.name] or
+                .config["migration.incremental.memory"] != "false" or
+                .expanded_config["migration.incremental.memory"] !=
+                    "false" or
+                $named[0].config["migration.incremental.memory"] !=
+                    "false" or
+                (($named[0].config["security.privileged"] // "false") |
+                    incus_true) or
+                ((.config["security.privileged"] // "false") |
+                    incus_true) or
+                ((.expanded_config["security.privileged"] // "false") |
+                    incus_true) or
+                ($live_migration_enabled == "true" and
+                    ($named[0].config["migration.stateful"] != "true" or
+                     .expanded_config["migration.stateful"] != "true"))
+            end
+        ) |
+        .name
+    ' <<<"$nova_instance_inventory"); then
+        if [[ -z "$unsafe_incremental" ]]; then
+            pass "Nova CRIU full checkpoint" \
+                "profile/local/expanded config are false"
+        else
+            fail "Nova CRIU full checkpoint" \
+                "unsafe Nova instances: $(tr '\n' ',' \
+                    <<<"$unsafe_incremental")"
+        fi
+    else
+        fail "Nova CRIU full checkpoint" \
+            "failed to evaluate instance/profile inventories"
+    fi
 fi
 
 incus_group_members=$(getent group incus-admin | awk -F: '{print $4}' |

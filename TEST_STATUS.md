@@ -2243,3 +2243,38 @@ at this scale -- the queueing is concurrency alone.
 image, so all 3000 contend on one lock. `EnsureImage` holds it across a
 cluster database transaction and the volume config comparisons even when the
 image volume already exists, and that cluster pool has a single connection.
+
+## 2026-08-11 CRIU incremental-memory safety correction
+
+- The 2026-07-19 statement that failed CRIU pre-dumps safely fall back to a
+  full final checkpoint is historical evidence for the then-tested Incus fork,
+  not the current safety contract. A failed pre-dump can clear soft-dirty state
+  before its image generation is durable, so reusing an older parent may
+  restore stale memory.
+- New Nova-managed instances explicitly set
+  ``migration.incremental.memory=false`` in both their dedicated profile and
+  instance-local configuration even while live migration is disabled. Source
+  pre-check requires exact profile/local Nova ownership, effective
+  ``migration.stateful=true``, and an unprivileged guest before it normalizes
+  older instances under the profile lock, re-reads profile/local/expanded
+  configuration, and requires the dedicated profile to be the only attached
+  profile.
+- The source emits a versioned full-checkpoint attestation only after its
+  locked validation succeeds. A new destination rejects old-source migration
+  data without that attestation in the custom compute manager before Manila
+  staging or upstream Cinder attachment creation. The driver repeats the gate
+  before Incus idmap/profile, VIF, or host-side Cinder preparation, and also
+  rejects a serialized source profile without the explicit ``false`` value.
+- ``live_migration`` re-checks the complete source profile plus fresh local and
+  expanded configuration under the profile lock, and re-checks the staged
+  destination profile immediately before generating migration data.
+- Rolling upgrade keeps migration frozen through an Incus fleet update, then
+  upgrades and restarts every API and conductor. The controller-only fleet gate
+  must find ``IncusLiveMigrateData`` version 1.6 or newer before computes roll;
+  each restarted compute is then gated at 1.6, and a normal full-fleet gate is
+  required after all computes are current and before migration is unfrozen.
+  New-source to old-destination compatibility is not claimed while conductors
+  are mixed.
+- Focused unit, contract, lint, documentation, and real three-node migration
+  results for this correction must be recorded before it becomes release
+  evidence.

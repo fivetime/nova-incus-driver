@@ -908,6 +908,23 @@ def _live_migration_cleanup_token(migrate_data):
     return migrate_data.cleanup_token
 
 
+def _require_full_checkpoint_attestation(migrate_data):
+    if (not isinstance(
+            migrate_data, incus_migrate_data.IncusLiveMigrateData) or
+            not migrate_data.obj_attr_is_set('full_checkpoint_verified') or
+            migrate_data.full_checkpoint_verified is not True):
+        raise exception.MigrationError(
+            reason='Incus live migration source did not attest a locked '
+                   'full-checkpoint configuration')
+
+
+def _require_full_checkpoint_profile_config(config):
+    if config.get('migration.incremental.memory') != 'false':
+        raise exception.MigrationError(
+            reason='Incus live migration requires source profile '
+                   'migration.incremental.memory=false')
+
+
 def _live_migration_uuid(migrate_data):
     if not isinstance(
             migrate_data, incus_migrate_data.IncusLiveMigrateData):
@@ -2315,13 +2332,18 @@ def _validate_migration_share_mappings(context, instance, profile):
 
 def _live_migration_profile_check(client, context, instance):
     profile = client.profiles.get(instance.name)
-    if profile.config.get('migration.stateful') != 'true':
+    config = profile.config if isinstance(profile.config, dict) else {}
+    if config.get('migration.stateful') != 'true':
         raise exception.MigrationPreCheckError(
             reason='Instance was not created with migration.stateful=true')
-    if profile.config.get('security.privileged', 'false').lower() == 'true':
+    if _is_explicit_true(config.get('security.privileged', 'false')):
         raise exception.MigrationPreCheckError(
             reason='Privileged Incus containers cannot use Nova live '
                    'migration')
+    profile_uuid = config.get('user.openstack.uuid')
+    if profile_uuid != instance.uuid:
+        raise exception.MigrationPreCheckError(
+            reason='Incus source profile has a missing or different Nova UUID')
 
     _validate_migration_share_mappings(context, instance, profile)
     unsupported = []
@@ -2339,6 +2361,124 @@ def _live_migration_profile_check(client, context, instance):
             reason='Incus live migration does not support profile devices: '
             '%s' % ', '.join(sorted(unsupported)))
     return profile
+
+
+def _validate_live_migration_source_instance(
+        instance, container, profile, require_incremental=False,
+        error_class=exception.MigrationPreCheckError):
+    """Validate effective source state that is not profile-only."""
+    profiles = (
+        list(container.profiles)
+        if isinstance(container.profiles, (list, tuple)) else [])
+    if profiles != [instance.name]:
+        raise error_class(
+            reason='Incus live migration requires the dedicated instance '
+                   'profile to be the only attached profile')
+    config = container.config if isinstance(container.config, dict) else {}
+    if config.get('user.openstack.uuid') != instance.uuid:
+        raise error_class(
+            reason='Incus source instance has a missing or different Nova '
+                   'UUID')
+    if _is_explicit_true(config.get('security.privileged', 'false')):
+        raise error_class(
+            reason='Privileged Incus containers cannot use Nova live '
+                   'migration')
+    expanded_config = (
+        container.expanded_config
+        if isinstance(container.expanded_config, dict) else {})
+    if expanded_config.get('migration.stateful') != 'true':
+        raise error_class(
+            reason='Incus source expanded config must set '
+                   'migration.stateful=true')
+    if _is_explicit_true(expanded_config.get(
+            'security.privileged', 'false')):
+        raise error_class(
+            reason='Privileged Incus containers cannot use Nova live '
+                   'migration')
+    if require_incremental and (
+            (profile.config if isinstance(profile.config, dict) else {}).get(
+                'migration.incremental.memory') != 'false' or
+            config.get('migration.incremental.memory') != 'false' or
+            expanded_config.get(
+                'migration.incremental.memory') != 'false'):
+        raise error_class(
+            reason='Incus source profile, local config, and expanded config '
+                   'must set migration.incremental.memory=false')
+    return config, expanded_config
+
+
+def _full_checkpoint_live_migration_source(
+        client, context, instance, block_device_info,
+        normalize_incremental_memory=False):
+    """Read and validate one locked source snapshot for live migration."""
+    profile = _live_migration_profile_check(client, context, instance)
+    container = client.instances.get(instance.name)
+    config, expanded_config = _validate_live_migration_source_instance(
+        instance, container, profile)
+    profile_incremental = profile.config.get(
+        'migration.incremental.memory')
+    local_incremental = config.get('migration.incremental.memory')
+    expanded_incremental = expanded_config.get(
+        'migration.incremental.memory')
+    if (profile_incremental != 'false' or
+            local_incremental != 'false' or
+            expanded_incremental != 'false'):
+        if not normalize_incremental_memory:
+            raise exception.MigrationPreCheckError(
+                reason='Incus source profile, local config, and expanded '
+                       'config must set migration.incremental.memory=false')
+        if profile.config.get('migration.incremental.memory') != 'false':
+            profile.config['migration.incremental.memory'] = 'false'
+            try:
+                profile.save(wait=True)
+            except Exception as exc:
+                raise exception.MigrationPreCheckError(
+                    reason='Failed to disable CRIU incremental memory '
+                           'migration on the source profile: %s' % exc
+                ) from exc
+        if config.get('migration.incremental.memory') != 'false':
+            container.config['migration.incremental.memory'] = 'false'
+            try:
+                container.save(wait=True)
+            except Exception as exc:
+                raise exception.MigrationPreCheckError(
+                    reason='Failed to disable CRIU incremental memory '
+                           'migration on the source instance: %s' % exc
+                ) from exc
+        # Re-read and repeat the complete profile validation after both
+        # writes. This closes the interval in which another driver operation
+        # could have changed devices, ownership, or migration markers.
+        profile = _live_migration_profile_check(client, context, instance)
+        container = client.instances.get(instance.name)
+        try:
+            config, expanded_config = _validate_live_migration_source_instance(
+                instance, container, profile, require_incremental=True)
+        except exception.MigrationPreCheckError as exc:
+            raise exception.MigrationPreCheckError(
+                reason='Incus source profile, local config, and expanded '
+                       'config did not converge to '
+                       'the required live-migration state: %s' % exc)
+        LOG.info(
+            'Disabled CRIU incremental memory migration on an existing '
+            'Incus instance before live migration', instance=instance)
+
+    _validate_live_migration_data_volumes(profile, block_device_info)
+    if container.status != 'Running':
+        raise exception.MigrationPreCheckError(
+            reason='Incus CRIU live migration requires a running instance')
+    if profile.config.get(CLEANUP_RECOVERY_KEY):
+        raise exception.MigrationPreCheckError(
+            reason='Incus source profile has unresolved cleanup work')
+    if any(profile.config.get(key) for key in (
+            MIGRATION_CLEANUP_TOKEN_KEY,
+            MIGRATION_ROLLBACK_COMPLETE_KEY,
+            MIGRATION_NOVA_UUID_KEY,
+            MIGRATION_DESTINATION_KEY,
+            MIGRATION_OPERATION_KEY)):
+        raise exception.MigrationPreCheckError(
+            reason='Incus source profile has an unresolved migration '
+                   'generation')
+    return container, profile
 
 
 def _validate_live_migration_data_volumes(profile, block_device_info):
@@ -2495,7 +2635,26 @@ def _stateful_migration_profile_config(container, profile):
 
 def _live_migration_source_profile(container, profile):
     """Serialize the source profile without host-specific block paths."""
+    expanded_config = (
+        container.expanded_config
+        if isinstance(container.expanded_config, dict) else {})
+    if expanded_config.get('migration.incremental.memory') != 'false':
+        raise exception.MigrationPreCheckError(
+            reason='Incus source expanded config must set '
+                   'migration.incremental.memory=false')
+    if expanded_config.get('migration.stateful') != 'true':
+        raise exception.MigrationPreCheckError(
+            reason='Incus source expanded config must set '
+                   'migration.stateful=true')
+    if _is_explicit_true(expanded_config.get(
+            'security.privileged', 'false')):
+        raise exception.MigrationPreCheckError(
+            reason='Privileged Incus containers cannot use Nova live '
+                   'migration')
     config = _stateful_migration_profile_config(container, profile)
+    # The target must receive the same full-checkpoint policy even when this
+    # is an older profile normalized through instance-local configuration.
+    config['migration.incremental.memory'] = 'false'
     for key in list(config):
         if key.startswith((
                 'user.openstack.volume.',
@@ -8678,6 +8837,10 @@ class IncusDriver(driver.ComputeDriver):
                 # Nova must reconcile ownership before a workload resumes
                 # after a fenced compute returns.
                 'boot.autostart': 'false',
+                # Instance-local configuration wins over every attached
+                # profile in Incus's ExpandedConfig(). Keep CRIU on one full
+                # final checkpoint even if an extra profile requests pre-copy.
+                'migration.incremental.memory': 'false',
             },
             'source': ({'type': 'none'} if root_volume else {
                 'type': 'image', 'alias': instance.image_ref}),
@@ -14928,10 +15091,18 @@ class IncusDriver(driver.ComputeDriver):
             raise exception.MigrationError(
                 reason='Missing Incus live migration destination data')
 
+        # This versioned attestation distinguishes a source that validated
+        # profile/local/expanded state from an older source that only happened
+        # to serialize a profile value of false. Reject it before target idmap,
+        # Incus profile/idmap/VIF and host-side Cinder driver preparation. The
+        # custom compute manager repeats this check before its Manila staging
+        # and before the upstream manager creates Cinder attachments.
+        _require_full_checkpoint_attestation(migrate_data)
         cleanup_token = _live_migration_cleanup_token(migrate_data)
         migration_uuid = _live_migration_uuid(migrate_data)
         idmap_base, idmap_size = _live_migration_idmap(migrate_data)
         config, devices = _live_migration_profile_data(migrate_data)
+        _require_full_checkpoint_profile_config(config)
         if (config.get('user.openstack.uuid') != instance.uuid or
                 config.get(MIGRATION_CLEANUP_TOKEN_KEY) != cleanup_token):
             raise exception.MigrationError(
@@ -15280,6 +15451,19 @@ class IncusDriver(driver.ComputeDriver):
                 raise exception.MigrationError(
                     reason='Incus live migration destination profile is not '
                            'an unused OpenStack Nova staging profile')
+            with lockutils.lock(_profile_lock_name(instance)):
+                source_profile = _live_migration_profile_check(
+                    self.client, context, instance)
+                container = self.client.instances.get(instance.name)
+                _validate_live_migration_source_instance(
+                    instance, container, source_profile,
+                    require_incremental=True,
+                    error_class=exception.MigrationError)
+            if profile_config.get(
+                    'migration.incremental.memory') != 'false':
+                raise exception.MigrationError(
+                    reason='Incus live migration destination profile must set '
+                           'migration.incremental.memory=false')
             unused_assignment, destination_claim = (
                 self._idmap_claim_from_local_config(
                     instance, profile_config))
@@ -15304,7 +15488,28 @@ class IncusDriver(driver.ComputeDriver):
                     reason='Incus live migration source and destination must '
                            'use distinct materialization tokens')
 
-            migration_data = container.generate_migration_data(live=True)
+            destination_profile = remote.profiles.get(instance.name)
+            destination_config = (
+                destination_profile.config
+                if isinstance(destination_profile.config, dict) else {})
+            if destination_config.get(
+                    'migration.incremental.memory') != 'false':
+                raise exception.MigrationError(
+                    reason='Incus live migration destination profile must set '
+                           'migration.incremental.memory=false')
+            # Re-read the complete source profile and instance at the exact
+            # execution boundary. Hold the local profile lock through source
+            # operation creation so another driver operation cannot mutate the
+            # validated profile between the checks and CRIU startup.
+            with lockutils.lock(_profile_lock_name(instance)):
+                source_profile = _live_migration_profile_check(
+                    self.client, context, instance)
+                container = self.client.instances.get(instance.name)
+                _validate_live_migration_source_instance(
+                    instance, container, source_profile,
+                    require_incremental=True,
+                    error_class=exception.MigrationError)
+                migration_data = container.generate_migration_data(live=True)
             migration_data.pop('default', None)
             migration_data['profiles'] = [instance.name]
             _bind_migration_instance_local_owner(
@@ -16174,9 +16379,10 @@ class IncusDriver(driver.ComputeDriver):
 
         _require_stateful_migration_extension(self.client)
         _require_live_ceph_migration_extension(self.client)
-        _live_migration_profile_check(self.client, context, instance)
-        container = self.client.instances.get(instance.name)
-        profile = self.client.profiles.get(instance.name)
+        with lockutils.lock(_profile_lock_name(instance)):
+            container, profile = _full_checkpoint_live_migration_source(
+                self.client, context, instance, block_device_info,
+                normalize_incremental_memory=True)
         idmap_base, idmap_size = _instance_migration_idmap(
             container, profile)
         try:
@@ -16187,32 +16393,6 @@ class IncusDriver(driver.ComputeDriver):
             raise exception.MigrationPreCheckError(
                 reason='Incus source idmap is not globally reserved: '
                        '{}'.format(exc)) from exc
-        _validate_live_migration_data_volumes(profile, block_device_info)
-        profile_uuid = (
-            profile.config.get('user.openstack.uuid')
-            if isinstance(profile.config, dict) else None)
-        if profile_uuid not in (None, instance.uuid):
-            raise exception.MigrationPreCheckError(
-                reason='Incus source profile belongs to another Nova UUID')
-        if container.status != 'Running':
-            raise exception.MigrationPreCheckError(
-                reason='Incus CRIU live migration requires a running '
-                'instance')
-        if (isinstance(profile.config, dict) and
-                profile.config.get(CLEANUP_RECOVERY_KEY)):
-            raise exception.MigrationPreCheckError(
-                reason='Incus source profile has unresolved cleanup work')
-        if (isinstance(profile.config, dict) and any(
-                profile.config.get(key) for key in (
-                    MIGRATION_CLEANUP_TOKEN_KEY,
-                    MIGRATION_ROLLBACK_COMPLETE_KEY,
-                    MIGRATION_NOVA_UUID_KEY,
-                    MIGRATION_DESTINATION_KEY,
-                    MIGRATION_OPERATION_KEY))):
-            raise exception.MigrationPreCheckError(
-                reason='Incus source profile has an unresolved migration '
-                       'generation')
-
         source_facts = _migration_host_facts(self.client)
         comparisons = (
             ('architecture', source_facts['architecture'],
@@ -16241,7 +16421,13 @@ class IncusDriver(driver.ComputeDriver):
                 exc) from exc
         try:
             with lockutils.lock(_profile_lock_name(instance)):
-                profile = self.client.profiles.get(instance.name)
+                container, profile = _full_checkpoint_live_migration_source(
+                    self.client, context, instance, block_device_info)
+                current_idmap = _instance_migration_idmap(container, profile)
+                if current_idmap != (idmap_base, idmap_size):
+                    raise exception.MigrationPreCheckError(
+                        reason='Incus source idmap changed during live '
+                               'migration pre-check')
                 profile.config['user.openstack.uuid'] = instance.uuid
                 profile.config[MIGRATION_DESTINATION_KEY] = (
                     dest_check_data.destination_address)
@@ -16249,10 +16435,15 @@ class IncusDriver(driver.ComputeDriver):
                 profile.config.pop(MIGRATION_CLEANUP_COMPLETE_KEY, None)
                 profile.config.pop(MIGRATION_ROLLBACK_COMPLETE_KEY, None)
                 profile.save(wait=True)
-                dest_check_data.source_profile = (
-                    _live_migration_source_profile(container, profile))
+                source_profile = _live_migration_source_profile(
+                    container, profile)
+                dest_check_data.source_profile = source_profile
                 dest_check_data.idmap_base = idmap_base
                 dest_check_data.idmap_size = idmap_size
+                # Set only after the locked second validation and successful
+                # source-profile serialization. Object compatibility strips
+                # this field for a pre-1.6 destination.
+                dest_check_data.full_checkpoint_verified = True
         except Exception:
             with excutils.save_and_reraise_exception():
                 attempt = _abort_migration_attempt(

@@ -69,6 +69,7 @@ class ToProfileTest(test.NoDBTestCase):
             self, instance, expected_config, expected_devices):
         expected_config.update({
             'limits.processes': '1024',
+            'migration.incremental.memory': 'false',
             'security.idmap.isolated': 'True',
             'security.privileged': 'False',
             'user.openstack.uuid': instance.uuid,
@@ -398,6 +399,19 @@ class ToProfileTest(test.NoDBTestCase):
 
         config = self.client.profiles.create.call_args.args[1]
         self.assertEqual('true', config['migration.stateful'])
+        self.assertEqual('false', config['migration.incremental.memory'])
+
+    def test_to_profile_disables_incremental_memory_when_live_is_disabled(
+            self):
+        ctx = context.get_admin_context()
+        instance = self._fake_instance(
+            ctx, name='test', memory_mb=1024)
+
+        flavor.to_profile(self.client, instance, [], [])
+
+        config = self.client.profiles.create.call_args.args[1]
+        self.assertEqual('false', config['migration.incremental.memory'])
+        self.assertNotIn('migration.stateful', config)
 
     def test_to_profile_maps_flavor_swap_to_cgroup_limit(self):
         self.CONF2.incus.allow_instance_swap = True

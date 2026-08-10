@@ -204,9 +204,12 @@ incus_opts = [
         help=(
             "Enable best-effort CRIU live migration for explicitly supported "
             "Incus system containers. New instances are created with "
-            "migration.stateful=true, which uses a shifted on-disk rootfs "
-            "instead of an idmapped root mount. Existing instances must be "
-            "stopped and converted before they can pass migration prechecks."
+            "migration.stateful=true and migration.incremental.memory=false. "
+            "The former uses a shifted on-disk rootfs instead of an idmapped "
+            "root mount; the latter requires one complete final checkpoint "
+            "instead of CRIU pre-dumps. Existing instances must be stopped "
+            "and converted, with matching profile/local Nova UUIDs, before "
+            "they can pass migration prechecks."
         ),
     ),
     cfg.BoolOpt(

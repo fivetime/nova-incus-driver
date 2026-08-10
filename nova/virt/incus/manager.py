@@ -2779,6 +2779,10 @@ class IncusComputeManager(manager.ComputeManager):
     def _pre_live_migration_locked(
             self, context, instance, disk, migrate_data):
         """Mount active Manila shares on the migration destination."""
+        # Reject an older or unverified source before Manila staging and
+        # before Nova's base manager creates Cinder attachments. The driver
+        # repeats this check at its own host-side preparation boundary.
+        incus_driver._require_full_checkpoint_attestation(migrate_data)
         share_info = [
             mapping
             for mapping in self._get_share_info(context, instance)

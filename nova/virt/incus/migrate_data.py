@@ -22,7 +22,7 @@ from oslo_utils import versionutils
 class IncusLiveMigrateData(migrate_data.LiveMigrateData):
     """Incus destination facts carried through Nova's migration RPCs."""
 
-    VERSION = '1.5'
+    VERSION = '1.6'
 
     fields = {
         'destination_address': fields.StringField(),
@@ -45,6 +45,11 @@ class IncusLiveMigrateData(migrate_data.LiveMigrateData):
         # Fixed isolated idmap reserved by the target-side migration fence.
         'idmap_base': fields.IntegerField(),
         'idmap_size': fields.IntegerField(),
+        # Set only after the source driver has checked its dedicated profile,
+        # instance-local config, and expanded config under the profile lock.
+        # A new destination rejects migration data from an older source that
+        # cannot make this attestation.
+        'full_checkpoint_verified': fields.BooleanField(),
     }
 
     def obj_make_compatible(self, primitive, target_version):
@@ -61,3 +66,5 @@ class IncusLiveMigrateData(migrate_data.LiveMigrateData):
             primitive.pop('idmap_size', None)
         if versionutils.convert_version_to_tuple(target_version) < (1, 5):
             primitive.pop('migration_uuid', None)
+        if versionutils.convert_version_to_tuple(target_version) < (1, 6):
+            primitive.pop('full_checkpoint_verified', None)

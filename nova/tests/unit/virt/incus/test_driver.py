@@ -47,6 +47,7 @@ from nova.compute import manager
 from nova.compute import power_state
 from nova.compute import task_states
 from nova.compute import vm_states
+from nova.conductor import manager as conductor_manager
 from nova.network import model as network_model
 from nova.objects import migrate_data as nova_migrate_data
 from nova.tests.unit import fake_block_device
@@ -4412,6 +4413,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                 **driver._incus_cloud_init_config(instance),
                 'user.openstack.uuid': instance.uuid,
                 'boot.autostart': 'false',
+                'migration.incremental.memory': 'false',
             },
             'source': {
                 'type': 'image',
@@ -4533,6 +4535,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'config': {
                 **driver._incus_cloud_init_config(instance),
                 'boot.autostart': 'false',
+                'migration.incremental.memory': 'false',
             },
             'source': {'type': 'none'},
         }, wait=True)
@@ -16423,6 +16426,33 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertEqual('6.8.0-test', data.destination_kernel_version)
         self.assertEqual('7.2', data.destination_server_version)
         self.assertEqual(migration_uuid, data.migration_uuid)
+        self.assertFalse(data.obj_attr_is_set('full_checkpoint_verified'))
+
+    def test_live_migrate_data_full_checkpoint_compatibility(self):
+        data = migrate_data.IncusLiveMigrateData(
+            full_checkpoint_verified=True)
+
+        current = data.obj_to_primitive(target_version='1.6')
+        legacy = data.obj_to_primitive(target_version='1.5')
+
+        self.assertIs(
+            True,
+            current['nova_object.data']['full_checkpoint_verified'])
+        self.assertNotIn(
+            'full_checkpoint_verified', legacy['nova_object.data'])
+
+    def test_conductor_backports_full_checkpoint_attestation_for_1_5(self):
+        data = migrate_data.IncusLiveMigrateData(
+            full_checkpoint_verified=True)
+        conductor = conductor_manager.ConductorManager.__new__(
+            conductor_manager.ConductorManager)
+
+        primitive = conductor.object_backport_versions(
+            None, data, {'IncusLiveMigrateData': '1.5'})
+
+        self.assertEqual('1.5', primitive['nova_object.version'])
+        self.assertNotIn(
+            'full_checkpoint_verified', primitive['nova_object.data'])
 
     def test_live_migrate_destination_rejects_old_ceph_handover(self):
         ctx = context.get_admin_context()
@@ -16485,7 +16515,11 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         instance.config_drive = ''
         self.CONF.incus.allow_live_migration = True
         profile = mock.Mock()
-        profile.config = {'migration.stateful': 'true'}
+        profile.config = {
+            'migration.incremental.memory': 'false',
+            'migration.stateful': 'true',
+            'user.openstack.uuid': instance.uuid,
+        }
         profile.devices = {
             'root': {'type': 'disk', 'path': '/'},
             'eth0': {'type': 'nic'},
@@ -16493,7 +16527,13 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.client.profiles.get.return_value = profile
         self.client.instances.get.return_value.status = 'Running'
         self.client.instances.get.return_value.config = {
+            'migration.incremental.memory': 'false',
+            'user.openstack.uuid': instance.uuid,
             'volatile.idmap.base': '1065536'}
+        self.client.instances.get.return_value.expanded_config = {
+            'migration.incremental.memory': 'false',
+            'migration.stateful': 'true'}
+        self.client.instances.get.return_value.profiles = [instance.name]
         data = migrate_data.IncusLiveMigrateData(
             destination_address='https://192.0.2.20:8443',
             destination_architecture='x86_64',
@@ -16507,13 +16547,431 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             ctx, instance, data, {'block_device_mapping': []})
 
         self.assertIs(data, result)
-        self.share_mappings.assert_called_once_with(ctx, instance.uuid)
+        self.assertIs(True, result.full_checkpoint_verified)
+        self.assertEqual([
+            mock.call(ctx, instance.uuid),
+            mock.call(ctx, instance.uuid),
+        ], self.share_mappings.call_args_list)
         source_profile = jsonutils.loads(result.source_profile)
         self.assertEqual('1065536',
                          source_profile['config']['security.idmap.base'])
         self.assertEqual(profile.devices, source_profile['devices'])
         migration_client.assert_called_once_with(
             'https://192.0.2.20:8443')
+
+    def test_live_migration_source_normalizes_expanded_incremental_config(
+            self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        profile = mock.Mock(
+            config={
+                'migration.stateful': 'true',
+                'user.openstack.uuid': instance.uuid,
+            },
+            devices={'root': {'type': 'disk', 'path': '/'}})
+        container = mock.Mock(
+            config={'user.openstack.uuid': instance.uuid},
+            expanded_config={
+                'migration.incremental.memory': 'true',
+                'migration.stateful': 'true',
+            },
+            profiles=[instance.name],
+            status='Running')
+
+        def persist_config(wait):
+            container.expanded_config = dict(profile.config)
+            container.expanded_config.update(container.config)
+
+        container.save.side_effect = persist_config
+        self.client.profiles.get.return_value = profile
+        self.client.instances.get.return_value = container
+
+        observed_container, observed_profile = (
+            driver._full_checkpoint_live_migration_source(
+                self.client, ctx, instance, {'block_device_mapping': []},
+                normalize_incremental_memory=True))
+
+        self.assertIs(container, observed_container)
+        self.assertIs(profile, observed_profile)
+        self.assertEqual(
+            'false', container.config['migration.incremental.memory'])
+        self.assertEqual(
+            'false', container.expanded_config[
+                'migration.incremental.memory'])
+        profile.save.assert_called_once_with(wait=True)
+        container.save.assert_called_once_with(wait=True)
+
+    def test_live_migration_source_profile_normalization_failure_is_fatal(
+            self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        profile = mock.Mock(
+            config={
+                'migration.stateful': 'true',
+                'user.openstack.uuid': instance.uuid,
+            },
+            devices={'root': {'type': 'disk', 'path': '/'}})
+        profile.save.side_effect = RuntimeError('profile write failed')
+        container = mock.Mock(
+            config={'user.openstack.uuid': instance.uuid},
+            expanded_config={'migration.stateful': 'true'},
+            profiles=[instance.name],
+            status='Running')
+        self.client.profiles.get.return_value = profile
+        self.client.instances.get.return_value = container
+
+        self.assertRaisesRegex(
+            exception.MigrationPreCheckError, 'source profile',
+            driver._full_checkpoint_live_migration_source,
+            self.client, ctx, instance, {'block_device_mapping': []}, True)
+
+        profile.save.assert_called_once_with(wait=True)
+        container.save.assert_not_called()
+
+    @mock.patch.object(driver, '_migration_client')
+    def test_source_normalization_failure_does_not_register_target_attempt(
+            self, migration_client):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', config_drive=False)
+        instance.config_drive = ''
+        self.CONF.incus.allow_live_migration = True
+        profile = mock.Mock(
+            config={
+                'migration.stateful': 'true',
+                'user.openstack.uuid': instance.uuid,
+            },
+            devices={'root': {'type': 'disk', 'path': '/'}})
+        profile.save.side_effect = RuntimeError('profile write failed')
+        container = mock.Mock(
+            config={'user.openstack.uuid': instance.uuid},
+            expanded_config={
+                'migration.incremental.memory': 'true',
+                'migration.stateful': 'true',
+            },
+            profiles=[instance.name],
+            status='Running')
+        self.client.profiles.get.return_value = profile
+        self.client.instances.get.return_value = container
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            destination_architecture='x86_64',
+            destination_kernel_version='6.8.0-test',
+            destination_server_version='7.2',
+            cleanup_token='10000000-0000-0000-0000-000000000001')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaisesRegex(
+            exception.MigrationPreCheckError, 'source profile',
+            incus_driver.check_can_live_migrate_source,
+            ctx, instance, data, {'block_device_mapping': []})
+
+        migration_client.assert_not_called()
+        profile.save.assert_called_once_with(wait=True)
+        container.save.assert_not_called()
+
+    def test_live_migration_source_local_normalization_failure_is_fatal(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        profile = mock.Mock(
+            config={
+                'migration.stateful': 'true',
+                'user.openstack.uuid': instance.uuid,
+            },
+            devices={'root': {'type': 'disk', 'path': '/'}})
+        container = mock.Mock(
+            config={'user.openstack.uuid': instance.uuid},
+            expanded_config={'migration.stateful': 'true'},
+            profiles=[instance.name],
+            status='Running')
+        container.save.side_effect = RuntimeError('instance write failed')
+        self.client.profiles.get.return_value = profile
+        self.client.instances.get.return_value = container
+
+        self.assertRaisesRegex(
+            exception.MigrationPreCheckError, 'source instance',
+            driver._full_checkpoint_live_migration_source,
+            self.client, ctx, instance, {'block_device_mapping': []}, True)
+
+        profile.save.assert_called_once_with(wait=True)
+        container.save.assert_called_once_with(wait=True)
+
+    def test_live_migration_source_rejects_foreign_local_owner_without_writes(
+            self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        profile = mock.Mock(
+            config={
+                'migration.incremental.memory': 'false',
+                'migration.stateful': 'true',
+                'user.openstack.uuid': instance.uuid,
+            },
+            devices={'root': {'type': 'disk', 'path': '/'}})
+        container = mock.Mock(
+            config={
+                'migration.incremental.memory': 'false',
+                'user.openstack.uuid':
+                    '10000000-0000-0000-0000-000000000001',
+            },
+            expanded_config={
+                'migration.incremental.memory': 'false',
+                'migration.stateful': 'true',
+            },
+            profiles=[instance.name],
+            status='Running')
+        self.client.profiles.get.return_value = profile
+        self.client.instances.get.return_value = container
+
+        self.assertRaisesRegex(
+            exception.MigrationPreCheckError, 'different Nova UUID',
+            driver._full_checkpoint_live_migration_source,
+            self.client, ctx, instance, {'block_device_mapping': []}, True)
+
+        profile.save.assert_not_called()
+        container.save.assert_not_called()
+
+    def test_live_migration_source_rejects_missing_profile_owner(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        profile = mock.Mock(
+            config={
+                'migration.incremental.memory': 'false',
+                'migration.stateful': 'true',
+            },
+            devices={'root': {'type': 'disk', 'path': '/'}})
+        self.client.profiles.get.return_value = profile
+
+        self.assertRaisesRegex(
+            exception.MigrationPreCheckError, 'missing or different Nova UUID',
+            driver._full_checkpoint_live_migration_source,
+            self.client, ctx, instance, {'block_device_mapping': []}, True)
+
+        self.client.instances.get.assert_not_called()
+        profile.save.assert_not_called()
+
+    def test_live_migration_source_rejects_missing_local_owner(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        profile = mock.Mock(
+            config={
+                'migration.incremental.memory': 'false',
+                'migration.stateful': 'true',
+                'user.openstack.uuid': instance.uuid,
+            },
+            devices={'root': {'type': 'disk', 'path': '/'}})
+        container = mock.Mock(
+            config={'migration.incremental.memory': 'false'},
+            expanded_config={
+                'migration.incremental.memory': 'false',
+                'migration.stateful': 'true',
+            },
+            profiles=[instance.name],
+            status='Running')
+        self.client.profiles.get.return_value = profile
+        self.client.instances.get.return_value = container
+
+        self.assertRaisesRegex(
+            exception.MigrationPreCheckError, 'missing or different Nova UUID',
+            driver._full_checkpoint_live_migration_source,
+            self.client, ctx, instance, {'block_device_mapping': []}, True)
+
+        profile.save.assert_not_called()
+        container.save.assert_not_called()
+
+    def test_live_migration_source_rejects_effective_stateful_override(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        profile = mock.Mock(
+            config={
+                'migration.incremental.memory': 'false',
+                'migration.stateful': 'true',
+                'user.openstack.uuid': instance.uuid,
+            },
+            devices={'root': {'type': 'disk', 'path': '/'}})
+        container = mock.Mock(
+            config={
+                'migration.incremental.memory': 'false',
+                'migration.stateful': 'false',
+                'user.openstack.uuid': instance.uuid,
+            },
+            expanded_config={
+                'migration.incremental.memory': 'false',
+                'migration.stateful': 'false',
+            },
+            profiles=[instance.name],
+            status='Running')
+        self.client.profiles.get.return_value = profile
+        self.client.instances.get.return_value = container
+
+        self.assertRaisesRegex(
+            exception.MigrationPreCheckError, 'expanded config.*stateful=true',
+            driver._full_checkpoint_live_migration_source,
+            self.client, ctx, instance, {'block_device_mapping': []}, True)
+
+        profile.save.assert_not_called()
+        container.save.assert_not_called()
+
+    def test_live_migration_source_rejects_profile_privileged_tokens(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+
+        for value in ('true', '1', 'yes', 'on'):
+            profile = mock.Mock(
+                config={
+                    'migration.incremental.memory': 'false',
+                    'migration.stateful': 'true',
+                    'security.privileged': value,
+                    'user.openstack.uuid': instance.uuid,
+                },
+                devices={'root': {'type': 'disk', 'path': '/'}})
+            self.client.profiles.get.return_value = profile
+
+            with self.subTest(value=value):
+                self.assertRaisesRegex(
+                    exception.MigrationPreCheckError, 'Privileged',
+                    driver._full_checkpoint_live_migration_source,
+                    self.client, ctx, instance,
+                    {'block_device_mapping': []}, True)
+
+        self.client.instances.get.assert_not_called()
+
+    def test_live_migration_source_rejects_local_privileged_tokens(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        profile = mock.Mock(
+            config={
+                'migration.incremental.memory': 'false',
+                'migration.stateful': 'true',
+                'user.openstack.uuid': instance.uuid,
+            },
+            devices={'root': {'type': 'disk', 'path': '/'}})
+        self.client.profiles.get.return_value = profile
+
+        for value in ('true', '1', 'yes', 'on'):
+            container = mock.Mock(
+                config={
+                    'migration.incremental.memory': 'false',
+                    'security.privileged': value,
+                    'user.openstack.uuid': instance.uuid,
+                },
+                expanded_config={
+                    'migration.incremental.memory': 'false',
+                    'migration.stateful': 'true',
+                    'security.privileged': 'false',
+                },
+                profiles=[instance.name],
+                status='Running')
+            self.client.instances.get.return_value = container
+
+            with self.subTest(value=value):
+                self.assertRaisesRegex(
+                    exception.MigrationPreCheckError, 'Privileged',
+                    driver._full_checkpoint_live_migration_source,
+                    self.client, ctx, instance,
+                    {'block_device_mapping': []}, True)
+
+            profile.save.assert_not_called()
+            container.save.assert_not_called()
+
+    def test_live_migration_source_rejects_expanded_privileged_tokens(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        profile = mock.Mock(
+            config={
+                'migration.incremental.memory': 'false',
+                'migration.stateful': 'true',
+                'user.openstack.uuid': instance.uuid,
+            },
+            devices={'root': {'type': 'disk', 'path': '/'}})
+        self.client.profiles.get.return_value = profile
+
+        for value in ('true', '1', 'yes', 'on'):
+            container = mock.Mock(
+                config={
+                    'migration.incremental.memory': 'false',
+                    'security.privileged': 'false',
+                    'user.openstack.uuid': instance.uuid,
+                },
+                expanded_config={
+                    'migration.incremental.memory': 'false',
+                    'migration.stateful': 'true',
+                    'security.privileged': value,
+                },
+                profiles=[instance.name],
+                status='Running')
+            self.client.instances.get.return_value = container
+
+            with self.subTest(value=value):
+                self.assertRaisesRegex(
+                    exception.MigrationPreCheckError, 'Privileged',
+                    driver._full_checkpoint_live_migration_source,
+                    self.client, ctx, instance,
+                    {'block_device_mapping': []}, True)
+
+            profile.save.assert_not_called()
+            container.save.assert_not_called()
+
+    def test_live_migration_source_rejects_non_dedicated_profile_chain(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        profile = mock.Mock(
+            config={
+                'migration.incremental.memory': 'false',
+                'migration.stateful': 'true',
+                'user.openstack.uuid': instance.uuid,
+            },
+            devices={'root': {'type': 'disk', 'path': '/'}})
+        self.client.profiles.get.return_value = profile
+
+        for profiles in (
+                [], [instance.name, 'extra'], ['extra', instance.name]):
+            container = mock.Mock(
+                config={
+                    'migration.incremental.memory': 'false',
+                    'migration.stateful': 'true',
+                    'user.openstack.uuid': instance.uuid,
+                },
+                expanded_config={
+                    'migration.incremental.memory': 'false',
+                },
+                profiles=profiles,
+                status='Running')
+            self.client.instances.get.return_value = container
+
+            self.assertRaisesRegex(
+                exception.MigrationPreCheckError,
+                'only attached profile',
+                driver._full_checkpoint_live_migration_source,
+                self.client, ctx, instance, {'block_device_mapping': []},
+                True)
+            container.save.assert_not_called()
+
+    def test_source_expanded_config_must_converge(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        self.client.profiles.get.return_value = mock.Mock(
+            config={
+                'migration.stateful': 'true',
+                'user.openstack.uuid': instance.uuid,
+            },
+            devices={'root': {'type': 'disk', 'path': '/'}})
+        container = mock.Mock(
+            config={'user.openstack.uuid': instance.uuid},
+            expanded_config={
+                'migration.incremental.memory': 'true',
+                'migration.stateful': 'true',
+            },
+            profiles=[instance.name],
+            status='Running')
+        self.client.instances.get.return_value = container
+
+        self.assertRaisesRegex(
+            exception.MigrationPreCheckError, 'did not converge',
+            driver._full_checkpoint_live_migration_source,
+            self.client, ctx, instance, {'block_device_mapping': []}, True)
+
+        container.save.assert_called_once_with(wait=True)
 
     @mock.patch.object(driver, '_migration_client')
     def test_check_can_live_migrate_source_accepts_manila_share(
@@ -16540,7 +16998,11 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'recursive': 'true',
         }
         profile = mock.Mock(
-            config={'migration.stateful': 'true'},
+            config={
+                'migration.incremental.memory': 'false',
+                'migration.stateful': 'true',
+                'user.openstack.uuid': instance.uuid,
+            },
             devices={
                 'root': {'type': 'disk', 'path': '/'},
                 'manila-' + share_id: share_device,
@@ -16548,7 +17010,13 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.client.profiles.get.return_value = profile
         self.client.instances.get.return_value.status = 'Running'
         self.client.instances.get.return_value.config = {
+            'migration.incremental.memory': 'false',
+            'user.openstack.uuid': instance.uuid,
             'volatile.idmap.base': '1065536'}
+        self.client.instances.get.return_value.expanded_config = {
+            'migration.incremental.memory': 'false',
+            'migration.stateful': 'true'}
+        self.client.instances.get.return_value.profiles = [instance.name]
         data = migrate_data.IncusLiveMigrateData(
             destination_address='https://192.0.2.20:8443',
             destination_architecture='x86_64',
@@ -16583,7 +17051,11 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             tag='project-data',
             status=driver.obj_fields.ShareMappingStatus.ACTIVE)]
         profile = mock.Mock(
-            config={'migration.stateful': 'true'},
+            config={
+                'migration.incremental.memory': 'false',
+                'migration.stateful': 'true',
+                'user.openstack.uuid': instance.uuid,
+            },
             devices={'root': {'type': 'disk', 'path': '/'}},
         )
         container = self.client.instances.get.return_value
@@ -16618,7 +17090,10 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.CONF.incus.allow_live_migration = True
         self.share_mappings.return_value = []
         profile = mock.Mock(
-            config={'migration.stateful': 'true'},
+            config={
+                'migration.stateful': 'true',
+                'user.openstack.uuid': instance.uuid,
+            },
             devices={
                 'root': {'type': 'disk', 'path': '/'},
                 'manila-10000000-0000-0000-0000-000000000001': {
@@ -16655,11 +17130,22 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         instance.config_drive = ''
         self.CONF.incus.allow_live_migration = True
         profile = mock.Mock(
-            config={'migration.stateful': 'true'},
+            config={
+                'migration.incremental.memory': 'false',
+                'migration.stateful': 'true',
+                'user.openstack.uuid': instance.uuid,
+            },
             devices={'root': {'type': 'disk', 'path': '/', 'pool': 'cinder'}})
         container = self.client.instances.get.return_value
         container.status = 'Running'
-        container.config = {'volatile.idmap.base': '1065536'}
+        container.config = {
+            'migration.incremental.memory': 'false',
+            'user.openstack.uuid': instance.uuid,
+            'volatile.idmap.base': '1065536'}
+        container.expanded_config = {
+            'migration.incremental.memory': 'false',
+            'migration.stateful': 'true'}
+        container.profiles = [instance.name]
         self.client.profiles.get.return_value = profile
         data = migrate_data.IncusLiveMigrateData(
             destination_address='https://192.0.2.20:8443',
@@ -16728,7 +17214,11 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         instance.config_drive = ''
         self.CONF.incus.allow_live_migration = True
         profile = mock.Mock(
-            config={'migration.stateful': 'true'},
+            config={
+                'migration.incremental.memory': 'false',
+                'migration.stateful': 'true',
+                'user.openstack.uuid': instance.uuid,
+            },
             devices={
                 'root': {'type': 'disk', 'path': '/'},
                 'volume-id': {
@@ -16739,7 +17229,14 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             })
         container = self.client.instances.get.return_value
         container.status = 'Running'
-        container.config = {'volatile.idmap.base': '1065536'}
+        container.config = {
+            'migration.incremental.memory': 'false',
+            'user.openstack.uuid': instance.uuid,
+            'volatile.idmap.base': '1065536'}
+        container.expanded_config = {
+            'migration.incremental.memory': 'false',
+            'migration.stateful': 'true'}
+        container.profiles = [instance.name]
         self.client.profiles.get.return_value = profile
         data = migrate_data.IncusLiveMigrateData(
             destination_address='https://192.0.2.20:8443',
@@ -16774,12 +17271,22 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         instance.config_drive = ''
         self.CONF.incus.allow_live_migration = True
         profile = mock.Mock()
-        profile.config = {'migration.stateful': 'true'}
+        profile.config = {
+            'migration.incremental.memory': 'false',
+            'migration.stateful': 'true',
+            'user.openstack.uuid': instance.uuid,
+        }
         profile.devices = {'root': {'type': 'disk', 'path': '/'}}
         self.client.profiles.get.return_value = profile
         self.client.instances.get.return_value.status = 'Running'
         self.client.instances.get.return_value.config = {
+            'migration.incremental.memory': 'false',
+            'user.openstack.uuid': instance.uuid,
             'volatile.idmap.base': '1065536'}
+        self.client.instances.get.return_value.expanded_config = {
+            'migration.incremental.memory': 'false',
+            'migration.stateful': 'true'}
+        self.client.instances.get.return_value.profiles = [instance.name]
         data = migrate_data.IncusLiveMigrateData(
             destination_address='https://192.0.2.20:8443',
             destination_architecture='x86_64',
@@ -16811,9 +17318,11 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             migration_uuid='40000000-0000-0000-0000-000000000004',
             idmap_base=1065536,
             idmap_size=65536,
+            full_checkpoint_verified=True,
             source_profile=jsonutils.dumps({
                 'config': {
                     'migration.stateful': 'true',
+                    'migration.incremental.memory': 'false',
                     'security.idmap.base': '1065536',
                     'security.idmap.size': '65536',
                     'user.openstack.uuid': instance.uuid,
@@ -16847,6 +17356,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             instance.name,
             {
                 'migration.stateful': 'true',
+                'migration.incremental.memory': 'false',
                 'security.idmap.base': '1065536',
                 'security.idmap.size': '65536',
                 'user.openstack.uuid': instance.uuid,
@@ -16861,6 +17371,80 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             ctx, connection_info, instance, '/dev/vdb',
             '30000000-0000-0000-0000-000000000003', cleanup_token,
             '40000000-0000-0000-0000-000000000004')
+
+    def test_pre_live_migration_rejects_incremental_source_before_side_effects(
+            self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        cleanup_token = '10000000-0000-0000-0000-000000000001'
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        for value in (None, 'true'):
+            config = {
+                'migration.stateful': 'true',
+                'security.idmap.base': '1065536',
+                'security.idmap.size': '65536',
+                'user.openstack.uuid': instance.uuid,
+                driver.MIGRATION_CLEANUP_TOKEN_KEY: cleanup_token,
+            }
+            if value is not None:
+                config['migration.incremental.memory'] = value
+            data = migrate_data.IncusLiveMigrateData(
+                destination_address='https://192.0.2.20:8443',
+                destination_architecture='x86_64',
+                destination_kernel_version='6.8.0-test',
+                destination_server_version='7.2',
+                cleanup_token=cleanup_token,
+                migration_uuid='40000000-0000-0000-0000-000000000004',
+                idmap_base=1065536,
+                idmap_size=65536,
+                full_checkpoint_verified=True,
+                source_profile=jsonutils.dumps({
+                    'config': config,
+                    'devices': {'root': {'type': 'disk', 'path': '/'}},
+                }))
+
+            self.assertRaisesRegex(
+                exception.MigrationError,
+                'migration.incremental.memory=false',
+                incus_driver.pre_live_migration,
+                ctx, instance, {'block_device_mapping': []}, [], None, data)
+
+        self.begin_idmap_materialization.assert_not_called()
+        self.client.profiles.create.assert_not_called()
+        self.vif_driver.plug.assert_not_called()
+
+    def test_pre_live_migration_rejects_old_source_attestation_first(
+            self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        for attestation in (None, False):
+            data = migrate_data.IncusLiveMigrateData(
+                cleanup_token='10000000-0000-0000-0000-000000000001',
+                source_profile=jsonutils.dumps({
+                    'config': {
+                        'migration.incremental.memory': 'false',
+                        'user.openstack.uuid': instance.uuid,
+                    },
+                    'devices': {},
+                }))
+            if attestation is not None:
+                data.full_checkpoint_verified = attestation
+
+            with self.subTest(attestation=attestation):
+                self.assertRaisesRegex(
+                    exception.MigrationError, 'did not attest',
+                    incus_driver.pre_live_migration,
+                    ctx, instance, {'block_device_mapping': []}, [], None,
+                    data)
+
+        self.begin_idmap_materialization.assert_not_called()
+        self.client.profiles.create.assert_not_called()
+        self.vif_driver.plug.assert_not_called()
 
     @mock.patch.object(driver.os.path, 'ismount', return_value=True)
     @mock.patch.object(driver.os, 'chmod')
@@ -16910,9 +17494,11 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             migration_uuid='40000000-0000-0000-0000-000000000004',
             idmap_base=1065536,
             idmap_size=65536,
+            full_checkpoint_verified=True,
             source_profile=jsonutils.dumps({
                 'config': {
                     'migration.stateful': 'true',
+                    'migration.incremental.memory': 'false',
                     'security.idmap.base': '1065536',
                     'security.idmap.size': '65536',
                     'user.openstack.uuid': instance.uuid,
@@ -16966,9 +17552,11 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             migration_uuid='40000000-0000-0000-0000-000000000004',
             idmap_base=1065536,
             idmap_size=65536,
+            full_checkpoint_verified=True,
             source_profile=jsonutils.dumps({
                 'config': {
                     'migration.stateful': 'true',
+                    'migration.incremental.memory': 'false',
                     'security.idmap.base': '1065536',
                     'security.idmap.size': '65536',
                     'user.openstack.uuid': instance.uuid,
@@ -17054,9 +17642,11 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             migration_uuid='40000000-0000-0000-0000-000000000004',
             idmap_base=1065536,
             idmap_size=65536,
+            full_checkpoint_verified=True,
             source_profile=jsonutils.dumps({
                 'config': {
                     'migration.stateful': 'true',
+                    'migration.incremental.memory': 'false',
                     'security.idmap.base': '1065536',
                     'security.idmap.size': '65536',
                     'user.openstack.uuid': instance.uuid,
@@ -17104,9 +17694,11 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             migration_uuid='40000000-0000-0000-0000-000000000004',
             idmap_base=1065536,
             idmap_size=65536,
+            full_checkpoint_verified=True,
             source_profile=jsonutils.dumps({
                 'config': {
                     'migration.stateful': 'true',
+                    'migration.incremental.memory': 'false',
                     'security.idmap.base': '1065536',
                     'security.idmap.size': '65536',
                     'user.openstack.uuid': instance.uuid,
@@ -17162,9 +17754,11 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             migration_uuid='40000000-0000-0000-0000-000000000004',
             idmap_base=1065536,
             idmap_size=65536,
+            full_checkpoint_verified=True,
             source_profile=jsonutils.dumps({
                 'config': {
                     'migration.stateful': 'true',
+                    'migration.incremental.memory': 'false',
                     'security.idmap.base': '1065536',
                     'security.idmap.size': '65536',
                     'user.openstack.uuid': instance.uuid,
@@ -17261,9 +17855,11 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             migration_uuid='40000000-0000-0000-0000-000000000004',
             idmap_base=1065536,
             idmap_size=65536,
+            full_checkpoint_verified=True,
             source_profile=jsonutils.dumps({
                 'config': {
                     'migration.stateful': 'true',
+                    'migration.incremental.memory': 'false',
                     'security.idmap.base': '1065536',
                     'security.idmap.size': '65536',
                     'user.openstack.uuid': instance.uuid,
@@ -17432,14 +18028,24 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         remote.operations.wait_for_operation.assert_not_called()
 
     @mock.patch('nova.virt.incus.driver._migration_client')
-    def test_live_migration_restores_target_then_calls_post(self, get_remote):
+    def test_live_migration_accepts_legacy_destination_round_trip(
+            self, get_remote):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         self.CONF.incus.migration_address = 'https://192.0.2.10:8443'
         self.CONF.incus.project = 'nova'
         container = mock.Mock()
         container.status = 'Stopped'
-        container.config = {'volatile.idmap.base': '1065536'}
+        container.config = {
+            'migration.incremental.memory': 'false',
+            'user.openstack.uuid': instance.uuid,
+            'volatile.idmap.base': '1065536',
+        }
+        container.expanded_config = {
+            'migration.incremental.memory': 'false',
+            'migration.stateful': 'true',
+        }
+        container.profiles = [instance.name]
         container.generate_migration_data.return_value = {
             'default': ['test'],
             'source': {
@@ -17450,27 +18056,37 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         }
         self.client.instances.get.return_value = container
         profile = mock.Mock()
-        profile.config = {'migration.stateful': 'true'}
+        profile.config = {
+            'migration.incremental.memory': 'false',
+            'migration.stateful': 'true',
+            'user.openstack.uuid': instance.uuid,
+        }
         profile.devices = {'root': {'type': 'disk', 'path': '/'}}
         self.client.profiles.get.return_value = profile
         remote = get_remote.return_value
         remote.profiles.get.return_value = mock.Mock(
             config={
                 'environment.product_name': 'OpenStack Nova',
+                'migration.incremental.memory': 'false',
                 driver.MIGRATION_CLEANUP_TOKEN_KEY:
                     '10000000-0000-0000-0000-000000000001',
             },
             used_by=[])
         post = mock.Mock()
         recover = mock.Mock()
-        data = migrate_data.IncusLiveMigrateData(
+        source_data = migrate_data.IncusLiveMigrateData(
             destination_address='https://192.0.2.20:8443',
             destination_architecture='x86_64',
             destination_kernel_version='6.8.0-test',
             destination_server_version='7.2',
             cleanup_token='10000000-0000-0000-0000-000000000001',
             idmap_base=1065536,
-            idmap_size=65536)
+            idmap_size=65536,
+            full_checkpoint_verified=True)
+        legacy_primitive = source_data.obj_to_primitive(target_version='1.5')
+        data = migrate_data.IncusLiveMigrateData(
+            **legacy_primitive['nova_object.data'])
+        self.assertFalse(data.obj_attr_is_set('full_checkpoint_verified'))
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
         destination_claim = mock.Mock(
@@ -17508,6 +18124,87 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             ctx, instance, 'destination', False, data)
         recover.assert_not_called()
 
+    @mock.patch.object(driver, '_settle_instance_migration_operations')
+    @mock.patch.object(
+        driver, '_abort_migration_attempt',
+        return_value={'state': 'aborted'})
+    @mock.patch('nova.virt.incus.driver._migration_client')
+    def test_live_migration_rechecks_full_checkpoint_before_generate(
+            self, get_remote, abort_attempt, settle_operations):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        container = mock.Mock(
+            config={
+                'migration.incremental.memory': 'false',
+                'user.openstack.uuid': instance.uuid,
+                'volatile.idmap.base': '1065536',
+            },
+            expanded_config={
+                'migration.incremental.memory': 'false',
+                'migration.stateful': 'true',
+            },
+            profiles=[instance.name])
+        self.client.instances.get.return_value = container
+        valid_profile = mock.Mock(
+            config={
+                'migration.incremental.memory': 'false',
+                'migration.stateful': 'true',
+                'user.openstack.uuid': instance.uuid,
+            },
+            devices={'root': {'type': 'disk', 'path': '/'}})
+        mutated_profile = mock.Mock(
+            config={
+                'migration.incremental.memory': 'true',
+                'migration.stateful': 'true',
+                'user.openstack.uuid': instance.uuid,
+            },
+            devices={'root': {'type': 'disk', 'path': '/'}})
+        self.client.profiles.get.side_effect = [
+            valid_profile, mutated_profile]
+        remote = get_remote.return_value
+        remote.profiles.get.return_value = mock.Mock(
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                'migration.incremental.memory': 'false',
+            },
+            used_by=[])
+        post = mock.Mock()
+        recover = mock.Mock()
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            cleanup_token='10000000-0000-0000-0000-000000000001',
+            idmap_base=1065536,
+            idmap_size=65536)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        destination_claim = mock.Mock(
+            host_id='30000000-0000-0000-0000-000000000003',
+            materialization_id=data.cleanup_token)
+        source_claim = mock.Mock(
+            materialization_id='40000000-0000-0000-0000-000000000004')
+        incus_driver._idmap_claim_from_local_config = mock.Mock(
+            return_value=(mock.sentinel.assignment, destination_claim))
+        incus_driver._instance_local_idmap_claim = mock.Mock(
+            return_value=(mock.sentinel.assignment, source_claim))
+        incus_driver._resume_idmap_materialization = mock.Mock(
+            return_value=None)
+
+        incus_driver.live_migration(
+            ctx, instance, 'destination', post, recover, migrate_data=data)
+
+        self.assertEqual([
+            mock.call(instance.name),
+            mock.call(instance.name),
+        ], self.client.profiles.get.call_args_list)
+        incus_driver._resume_idmap_materialization.assert_called_once()
+        container.generate_migration_data.assert_not_called()
+        abort_attempt.assert_called_once()
+        settle_operations.assert_called_once_with(
+            self.client, instance, operation_ids=(None,))
+        recover.assert_called_once_with(
+            ctx, instance, 'destination', data)
+        post.assert_not_called()
+
     def test_stateful_migration_profile_config_requires_idmap_base(self):
         container = mock.Mock(config={})
         profile = mock.Mock(config={'migration.stateful': 'true'})
@@ -17525,7 +18222,16 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         self.CONF.incus.migration_address = 'https://192.0.2.10:8443'
         container = mock.Mock()
-        container.config = {'volatile.idmap.base': '1065536'}
+        container.config = {
+            'migration.incremental.memory': 'false',
+            'user.openstack.uuid': instance.uuid,
+            'volatile.idmap.base': '1065536',
+        }
+        container.expanded_config = {
+            'migration.incremental.memory': 'false',
+            'migration.stateful': 'true',
+        }
+        container.profiles = [instance.name]
         container.generate_migration_data.return_value = {
             'source': {
                 'operation': (
@@ -17534,6 +18240,13 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             },
         }
         self.client.instances.get.return_value = container
+        self.client.profiles.get.return_value = mock.Mock(
+            config={
+                'migration.incremental.memory': 'false',
+                'migration.stateful': 'true',
+                'user.openstack.uuid': instance.uuid,
+            },
+            devices={'root': {'type': 'disk', 'path': '/'}})
         profile = mock.Mock()
         profile.config = {'migration.stateful': 'true'}
         profile.devices = {'root': {'type': 'disk', 'path': '/'}}
@@ -17572,7 +18285,16 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         instance = fake_instance.fake_instance_obj(ctx, name='test')
         self.CONF.incus.migration_address = 'https://192.0.2.10:8443'
         container = mock.Mock()
-        container.config = {'volatile.idmap.base': '1065536'}
+        container.config = {
+            'migration.incremental.memory': 'false',
+            'user.openstack.uuid': instance.uuid,
+            'volatile.idmap.base': '1065536',
+        }
+        container.expanded_config = {
+            'migration.incremental.memory': 'false',
+            'migration.stateful': 'true',
+        }
+        container.profiles = [instance.name]
         container.generate_migration_data.return_value = {
             'source': {
                 'operation': (
@@ -17581,10 +18303,18 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             },
         }
         self.client.instances.get.return_value = container
+        self.client.profiles.get.return_value = mock.Mock(
+            config={
+                'migration.incremental.memory': 'false',
+                'migration.stateful': 'true',
+                'user.openstack.uuid': instance.uuid,
+            },
+            devices={'root': {'type': 'disk', 'path': '/'}})
         remote = get_remote.return_value
         remote.profiles.get.return_value = mock.Mock(
             config={
                 'environment.product_name': 'OpenStack Nova',
+                'migration.incremental.memory': 'false',
                 driver.MIGRATION_CLEANUP_TOKEN_KEY:
                     '10000000-0000-0000-0000-000000000001',
             },
@@ -17612,12 +18342,24 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             idmap_size=65536)
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
+        destination_claim = mock.Mock(
+            host_id='30000000-0000-0000-0000-000000000003',
+            materialization_id=data.cleanup_token)
+        source_claim = mock.Mock(
+            materialization_id='40000000-0000-0000-0000-000000000004')
+        incus_driver._idmap_claim_from_local_config = mock.Mock(
+            return_value=(mock.sentinel.assignment, destination_claim))
+        incus_driver._instance_local_idmap_claim = mock.Mock(
+            return_value=(mock.sentinel.assignment, source_claim))
+        incus_driver._resume_idmap_materialization = mock.Mock(
+            return_value=None)
 
         incus_driver.live_migration(
             ctx, instance, 'destination', post, recover,
             migrate_data=data)
 
         remote.profiles.create.assert_not_called()
+        remote.instances.create.assert_called_once()
         recover.assert_called_once_with(
             ctx, instance, 'destination', data)
         post.assert_not_called()

@@ -83,6 +83,7 @@ share_markers=()
 manila_marker_paths=()
 share_mounts=()
 restore_failpoint_ssh=
+restore_failpoint_marker=
 managed_root_pool=
 managed_root_driver=
 managed_root_ceph_pool=
@@ -148,11 +149,16 @@ remote() {
 
 clear_restore_failpoint() {
     local host=$1
+    local detach_rc
     local _
     for _ in {1..10}; do
         if remote "$host" \
                 "podman exec incus umount /usr/local/sbin/criu" \
                 >/dev/null 2>&1; then
+            remote "$host" \
+                "podman exec incus rm -f \
+                 /run/openstack-incus-e2e-criu-failpoint" \
+                >/dev/null 2>&1 || true
             return 0
         fi
         sleep 1
@@ -160,9 +166,18 @@ clear_restore_failpoint() {
     # A failed CRIU exec can retain a transient executable reference. A lazy
     # detach removes the test mount from the namespace immediately and lets
     # the kernel release the old reference when that process exits.
+    if remote "$host" \
+            "podman exec incus umount -l /usr/local/sbin/criu" \
+            >/dev/null 2>&1; then
+        detach_rc=0
+    else
+        detach_rc=$?
+    fi
     remote "$host" \
-        "podman exec incus umount -l /usr/local/sbin/criu" \
-        >/dev/null 2>&1
+        "podman exec incus rm -f \
+         /run/openstack-incus-e2e-criu-failpoint" \
+        >/dev/null 2>&1 || true
+    return "$detach_rc"
 }
 
 assert_fails() {
@@ -188,6 +203,13 @@ incus_remote() {
     shift
     local command_line
     printf -v command_line '%q ' incus --project "$INCUS_PROJECT" "$@"
+    "${SSH[@]}" "$host" "$command_line"
+}
+
+incus_query_remote() {
+    local host=$1 path=$2 command_line
+    printf -v command_line '%q ' incus query \
+        "${path}?project=${INCUS_PROJECT}"
     "${SSH[@]}" "$host" "$command_line"
 }
 
@@ -416,7 +438,12 @@ cleanup() {
     set +e
     if [[ -n "$restore_failpoint_ssh" ]]; then
         clear_restore_failpoint "$restore_failpoint_ssh" || true
+        if [[ -n "$restore_failpoint_marker" ]]; then
+            remote "$restore_failpoint_ssh" \
+                "podman exec incus rm -f '$restore_failpoint_marker'" || true
+        fi
         restore_failpoint_ssh=
+        restore_failpoint_marker=
     fi
     if [[ -n "$user_data" ]]; then
         rm -f "$user_data"
@@ -802,6 +829,48 @@ source_counter=$(incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
 [[ "$source_pid" =~ ^[0-9]+$ ]]
 [[ "$source_counter" =~ ^[0-9]+$ ]]
 
+verify_full_checkpoint_policy() {
+    local host=$1 instance_json profile_json
+
+    instance_json=$(incus_query_remote "$host" \
+        "/1.0/instances/$instance_name")
+    profile_json=$(incus_query_remote "$host" \
+        "/1.0/profiles/$instance_name")
+    jq -e 'type == "object"' <<<"$instance_json" >/dev/null
+    jq -e 'type == "object"' <<<"$profile_json" >/dev/null
+    jq -e --arg name "$instance_name" --arg nova_uuid "$server_id" '
+        def incus_true:
+            (tostring | ascii_downcase) as $value |
+            $value == "true" or $value == "1" or
+            $value == "yes" or $value == "on";
+        .profiles == [$name] and
+        .config["user.openstack.uuid"] == $nova_uuid and
+        .expanded_config["user.openstack.uuid"] == $nova_uuid and
+        .config["migration.incremental.memory"] == "false" and
+        .expanded_config["migration.incremental.memory"] == "false" and
+        .expanded_config["migration.stateful"] == "true" and
+        (((.config["security.privileged"] // "false") | incus_true) |
+            not) and
+        (((.expanded_config["security.privileged"] // "false") |
+            incus_true) | not)
+    ' <<<"$instance_json" >/dev/null
+    jq -e --arg nova_uuid "$server_id" '
+        def incus_true:
+            (tostring | ascii_downcase) as $value |
+            $value == "true" or $value == "1" or
+            $value == "yes" or $value == "on";
+        .config["environment.product_name"] == "OpenStack Nova" and
+        .config["user.openstack.uuid"] == $nova_uuid and
+        .config["migration.incremental.memory"] == "false" and
+        .config["migration.stateful"] == "true" and
+        (((.config["security.privileged"] // "false") | incus_true) | not)
+    ' <<<"$profile_json" >/dev/null
+}
+
+if [[ "$MIGRATION_MODE" == live ]]; then
+    verify_full_checkpoint_policy "$SOURCE_SSH"
+fi
+
 current_host=$SOURCE_HOST
 current_ssh=$SOURCE_SSH
 current_counter=$source_counter
@@ -810,20 +879,22 @@ later_counter=$source_counter
 inject_and_verify_restore_rollback() {
     local target_host=$1 target_ssh=$2
     local rollback_pid rollback_counter index volume_id image_name
-    local deadline status share_id share_mount injection_since
-    local source_migration_log target_migration_log
+    local deadline status share_id share_mount
+    local failpoint_script=/run/openstack-incus-e2e-criu-failpoint
 
-    injection_since=$(( $(date +%s) - 2 ))
     restore_failpoint_ssh=$target_ssh
+    restore_failpoint_marker="/var/log/incus/openstack-incus-e2e-criu-${server_id}.marker"
     remote "$target_ssh" \
-        "podman exec incus mount --bind /bin/false /usr/local/sbin/criu"
+        "podman exec incus sh -c \"rm -f '$restore_failpoint_marker'; \
+         printf '%s\\n' '#!/bin/sh' ': > $restore_failpoint_marker' \
+         'exit 1' > '$failpoint_script'; chmod 700 '$failpoint_script'; \
+         mount --bind '$failpoint_script' /usr/local/sbin/criu\""
     # OSC can return zero when Nova accepted the request and subsequently
     # rolled it back. The migration record, not the client exit status, is
     # authoritative for the injected failure.
     openstack server migrate --live-migration --host "$target_host" \
         --wait "$server_id" || true
     clear_restore_failpoint "$target_ssh"
-    restore_failpoint_ssh=
     deadline=$((SECONDS + TIMEOUT))
     while ((SECONDS < deadline)); do
         status=$(openstack server migration list --server "$server_id" \
@@ -833,21 +904,16 @@ inject_and_verify_restore_rollback() {
     done
     [[ "${status,,}" == failed || "${status,,}" == error ]]
 
-    source_migration_log=$(remote "$current_ssh" journalctl \
-        -u incus-podman.service --since "@$injection_since" --no-pager)
-    target_migration_log=$(remote "$target_ssh" journalctl \
-        -u incus-podman.service --since "@$injection_since" --no-pager)
-    grep -Fq "Failed migration on target" <<<"$target_migration_log"
-    # The source logs the target's restore failure after it is propagated over
-    # the migration control channel.  This is expected and proves that the
-    # source did not independently fail before the target attempted restore.
-    grep -F "Failed migration on source" <<<"$source_migration_log" |
-        grep -Fq "Error from migration control target"
-    if grep -Fq "Failed reading migration index header" \
-            <<<"$target_migration_log"; then
-        echo "Failure injection did not reach target CRIU restore" >&2
-        return 1
-    fi
+    # Podman LogDriver=none intentionally leaves the outer daemon journal
+    # empty. The injected target-side CRIU executable writes this marker to
+    # Incus's persistent log bind before returning failure, which proves the
+    # request reached target restore without depending on stdout logging.
+    remote "$target_ssh" \
+        "podman exec incus test -f '$restore_failpoint_marker'"
+    remote "$target_ssh" \
+        "podman exec incus rm -f '$restore_failpoint_marker'"
+    restore_failpoint_marker=
+    restore_failpoint_ssh=
 
     wait_status ACTIVE
     wait_host "$current_host"
@@ -907,6 +973,7 @@ inject_and_verify_restore_rollback() {
             remote "$target_ssh" findmnt -rn "$share_mount" >/dev/null
     done
     assert_managed_root_owner "$current_ssh" "$target_ssh"
+    verify_full_checkpoint_policy "$current_ssh"
     echo "PASS injected live-restore failure rolled back to $current_host"
 }
 
@@ -1146,6 +1213,7 @@ migrate_and_verify() {
     local dest_pid dest_counter rollback_counter root_image volume_id
 
     if [[ "$MIGRATION_MODE" == live ]]; then
+        verify_full_checkpoint_policy "$current_ssh"
         openstack server migrate --live-migration --host "$target_host" \
             --wait "$server_id"
         wait_migration
@@ -1165,6 +1233,9 @@ migrate_and_verify() {
     fi
     [[ "$(incus_remote "$target_ssh" list "$instance_name" \
         --format csv -c s)" == RUNNING ]]
+    if [[ "$MIGRATION_MODE" == live ]]; then
+        verify_full_checkpoint_policy "$target_ssh"
+    fi
     dest_pid=$(incus_remote "$target_ssh" exec "$instance_name" -- \
         cat /run/criu-counter.pid)
     dest_counter=$(incus_remote "$target_ssh" exec "$instance_name" -- \

@@ -131,8 +131,19 @@ def _processes(instance, _):
 
 
 def _stateful_migration(instance, _):
+    config = {
+        # Pin this even while live migration is disabled. New instances remain
+        # ready for the same integrity gate during a migration freeze, and
+        # enabling the feature cannot expose older Incus pre-dump defaults.
+        'migration.incremental.memory': 'false',
+    }
     if CONF.incus.allow_live_migration:
-        return {'migration.stateful': 'true'}
+        # Older Incus releases enabled CRIU pre-dumps by default when the host
+        # supported dirty-memory tracking. Keep both explicit layers during a
+        # rolling upgrade and as defense in depth, until incremental
+        # generations can be recovered without reusing an invalid parent.
+        config['migration.stateful'] = 'true'
+    return config
 
 
 def data_volume_fuse_binaries():

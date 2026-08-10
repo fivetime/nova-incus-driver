@@ -1,5 +1,16 @@
 # Copyright 2026 OpenStack Incus contributors
-# Licensed under the Apache License, Version 2.0 (the "License").
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
+# not use this file except in compliance with the License. You may obtain
+# a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations
+# under the License.
 
 from pathlib import Path
 import unittest
@@ -37,6 +48,12 @@ class PatchDeliveryContractTest(unittest.TestCase):
                 'IncusLiveMigrateData', 'IterableWithLength', 'noudev',
                 '_find_root_device', 'image_size', '_UnixAdapter'):
             self.assertIn(symbol, nova_gate)
+        self.assertIn('registered_migrate_versions', nova_gate)
+        self.assertIn('MIN_INCUS_MIGRATE_DATA_VERSION', nova_gate)
+        self.assertIn('minimum_migrate_data_version_tuple', nova_gate)
+        self.assertIn('max(registered_migrate_versions', nova_gate)
+        self.assertIn(
+            'IncusLiveMigrateData version {} or newer', nova_gate)
         for symbol in (
                 'ceilometer-acompute', 'hypervisor_inspector',
                 'instance_discovery_method', 'polling_file',

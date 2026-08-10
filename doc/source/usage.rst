@@ -1493,12 +1493,36 @@ checkpoint. Failure is recoverable, but successful migration is never
 guaranteed merely because pre-checks passed.
 
 CRIU pre-copy is an optimization, not a correctness requirement. The approved
-Incus fork terminates pre-copy cleanly and falls back to a full final
-checkpoint when a CRIU pre-dump fails. It also retries an incremental final
-checkpoint once without a parent image when the source is still running.
-These fallbacks increase the stop interval for that migration but prevent a
-transient pre-copy failure from corrupting the migration protocol or making an
-immediate retry fail.
+Nova-managed profiles and instance-local configuration explicitly set
+``migration.incremental.memory=false`` even while live migration is disabled.
+The instance-local value takes precedence over every attached profile in
+Incus's expanded configuration.
+This disables CRIU pre-dumps and parent image chains, so each live migration
+uses one complete final checkpoint. Instances created by an older driver are
+normalized under the profile lock during source pre-check; their named profile
+and instance-local ownership UUIDs must already match Nova. The driver re-reads
+the instance and requires the named profile, local value, and expanded value to
+be exactly ``false``, the expanded ``migration.stateful`` value to be exactly
+``true``, and all profile, instance-local, and expanded privilege values to
+remain disabled under Incus's ``true/1/yes/on`` boolean syntax. A failed save
+or failed convergence aborts before CRIU runs. The trade-off is a longer stop
+interval proportional to guest memory and checkpoint throughput. Do not enable
+incremental memory migration until CRIU/Incus can identify and recover
+parent-chain failures without reusing a failed generation.
+
+The full-checkpoint attestation is carried by
+``IncusLiveMigrateData`` version 1.6. During an upgrade, keep live migration
+frozen after upgrading Incus, then upgrade and restart every ``nova-api`` and
+``nova-conductor``. Run the fleet preflight with
+``--controller-runtime-only`` and prove that every API and conductor runtime
+registers version 1.6 or newer. Roll computes only after that controller-only
+barrier passes, restart and validate each compute with
+``MIN_INCUS_MIGRATE_DATA_VERSION=1.6`` as it is upgraded, then run the normal
+full-fleet preflight after all computes are current. Do not unfreeze live
+migration until that final gate is green. A new source can interoperate with an
+old destination through object backporting, while a new destination rejects an
+old unattested source. Do not run either direction while old and new conductors
+are mixed.
 
 Configure a dedicated TLS client certificate trusted by every Incus server
 and restricted to the ``nova`` project. Do not reuse the read-only
@@ -1558,8 +1582,9 @@ CRIU restore helper. Otherwise CRIU can restore and resume every process while
 the Incus API looks up a different monitor name and incorrectly reports the
 instance as stopped. The approved fork must include Incus commits
 ``826c25cd9`` (normalize mixed CRIU image ownership) and ``20c12bce3``
-(project-qualified restore monitor name), plus revision ``80ba579c2`` or later
-for CRIU pre-copy/full-final fallback, or equivalent upstream fixes.
+(project-qualified restore monitor name), or equivalent upstream fixes. The
+Nova driver, rather than an Incus fallback, disables CRIU pre-copy and verifies
+the effective setting before migration.
 
 Run the Nova API and Neutron/OVN regression in both directions::
 
