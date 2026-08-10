@@ -31,6 +31,7 @@ baselines when developing and testing this project:
 - DevStack: `C:\MyProjects\OpenSource\openstack\devstack`
 - Incus Python SDK: `C:\MyProjects\IaasProjects\Incus\incus-python-sdk`
 - Incus server: `C:\MyProjects\IaasProjects\Incus\incus`
+- etcd client: `C:\MyProjects\OpenSource\openstack\etcd3gw`
 
 The former ovsdbapp checkout at
 `C:\MyProjects\IaasProjects\OpenStack\openstack-ovsdbapp` was deleted because

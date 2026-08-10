@@ -856,8 +856,20 @@ class IDMapAllocator:
                 raise IDMapBackendError(
                     reason="etcd transaction failed: %s" %
                     self._gateway_error_text(exc))
-            if isinstance(result, dict) and "succeeded" in result:
-                return result
+            if (isinstance(result, dict) and
+                    isinstance(result.get("header"), dict)):
+                # etcd3gw intentionally models the gateway's proto3 JSON:
+                # ``succeeded`` is optional because false is the protobuf
+                # default, and ``responses`` is optional when empty.  Make
+                # those defaults explicit before the strict callers parse
+                # the selected transaction branch.
+                succeeded = result.get("succeeded", False)
+                responses = result.get("responses", [])
+                if isinstance(succeeded, bool) and isinstance(responses, list):
+                    normalized = dict(result)
+                    normalized["succeeded"] = succeeded
+                    normalized["responses"] = responses
+                    return normalized
             if attempt == 0 and self.username:
                 # Under a large concurrent burst etcd's gRPC gateway can
                 # return an empty/noncanonical JSON body for an expired auth

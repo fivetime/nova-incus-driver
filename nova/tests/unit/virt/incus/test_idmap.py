@@ -211,7 +211,11 @@ class _FakeEtcd:
             if self.fail_transaction_after and mutating:
                 self.fail_transaction_after -= 1
                 raise OSError("response unavailable")
-            return {"succeeded": succeeded, "responses": responses}
+            return {
+                "header": {"revision": "1"},
+                "succeeded": succeeded,
+                "responses": responses,
+            }
 
 
 class _AuthenticatedFakeEtcd(_FakeEtcd):
@@ -508,6 +512,19 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
         self.assertEqual(2, len(etcd.authentication_requests))
         self.assertEqual(
             "allocator-token-2", etcd.session.headers["Authorization"])
+
+    def test_transaction_normalizes_omitted_proto3_defaults(self):
+        response = {
+            "header": {"revision": "2"},
+            "responses": [],
+        }
+        with mock.patch.object(
+                self.allocator._client, "transaction",
+                return_value=response):
+            normalized = self.allocator._transaction_response({})
+
+        self.assertFalse(normalized["succeeded"])
+        self.assertEqual([], normalized["responses"])
 
     def test_concurrent_invalid_token_refresh_authenticates_once(self):
         directory = self.useFixture(fixtures.TempDir()).path
