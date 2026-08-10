@@ -710,6 +710,8 @@ class IncusIDMapDriverTest(test.NoDBTestCase):
         self.driver.idmap_allocator.get_release_intent.return_value = (
             self._release_intent())
 
+        self.assertEqual(
+            attempt, driver._read_spawn_attempt_journal(self.instance))
         self.assertTrue(self.driver._consume_spawn_preflight_noop(
             self.instance))
         self.assertIsNone(driver._read_spawn_attempt_journal(self.instance))
