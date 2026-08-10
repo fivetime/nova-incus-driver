@@ -700,6 +700,37 @@ class IncusIDMapDriverTest(test.NoDBTestCase):
         self.assertIsNone(driver._read_spawn_attempt_journal(self.instance))
         self.driver.idmap_allocator.retire_claim.assert_not_called()
 
+    def test_preflight_spawn_attempt_allows_exact_release_destroy(self):
+        self._set_instance_idmap_metadata()
+        assignment = dataclasses.replace(self.assignment, host_ids=())
+        self.driver.idmap_allocator.get.return_value = assignment
+        self.driver.idmap_allocator.get_host_claim.return_value = None
+        attempt = self.driver._create_spawn_preflight_attempt(
+            self.instance, self.materialization_id)
+        self.driver.idmap_allocator.get_release_intent.return_value = (
+            self._release_intent())
+
+        self.assertTrue(self.driver._consume_spawn_preflight_noop(
+            self.instance))
+        self.assertIsNone(driver._read_spawn_attempt_journal(self.instance))
+
+    def test_preflight_spawn_attempt_rejects_other_release_generation(self):
+        self._set_instance_idmap_metadata()
+        assignment = dataclasses.replace(self.assignment, host_ids=())
+        self.driver.idmap_allocator.get.return_value = assignment
+        self.driver.idmap_allocator.get_host_claim.return_value = None
+        attempt = self.driver._create_spawn_preflight_attempt(
+            self.instance, self.materialization_id)
+        self.driver.idmap_allocator.get_release_intent.return_value = (
+            dataclasses.replace(
+                self._release_intent(), allocation_id=str(uuid.uuid4())))
+
+        self.assertRaises(
+            driver.incus_idmap.IDMapIntegrityError,
+            self.driver._consume_spawn_preflight_noop, self.instance)
+        self.assertEqual(
+            attempt, driver._read_spawn_attempt_journal(self.instance))
+
     def test_opening_spawn_attempt_without_claim_fails_closed(self):
         self.driver.idmap_allocator.get.return_value = None
         attempt = self.driver._create_spawn_preflight_attempt(

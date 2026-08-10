@@ -6662,9 +6662,13 @@ class IncusDriver(driver.ComputeDriver):
                            'without an exact host claim; refusing destroy')
             release_intent = self.idmap_allocator.get_release_intent(
                 instance.uuid)
-            if release_intent is not None:
+            if (release_intent is not None and
+                    (assignment is None or
+                     release_intent.instance_name != instance.name or
+                     not _same_idmap_generation(
+                         release_intent, assignment))):
                 raise incus_idmap.IDMapIntegrityError(
-                    'Incus spawn preflight unexpectedly has a release intent')
+                    'Incus spawn preflight has another release generation')
             stored = _instance_idmap_metadata(instance)
             if _spawn_attempt_has_generation(attempt):
                 if (assignment is None or
