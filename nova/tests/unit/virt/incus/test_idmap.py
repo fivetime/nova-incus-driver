@@ -1690,6 +1690,25 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
             self.allocator._read_exact,
             (self.allocator.instance_key(self._uuid(76)),))
 
+    def test_exact_read_refreshes_completed_audit_generation_once(self):
+        follower = self._allocator(client=self.etcd)
+        follower.initialize()
+        follower._ensure_fleet_healthy()
+        stale_raw = follower._fleet_health_raw
+
+        owner, unused_snapshot = self.allocator.run_coordinated_audit(
+            full=False)
+
+        self.assertTrue(owner)
+        self.assertNotEqual(stale_raw, self.allocator._fleet_health_raw)
+        key = follower.instance_key(self._uuid(77))
+        self.assertEqual({key: None}, follower._read_exact((key,)))
+        self.assertEqual(
+            self.allocator._fleet_health_raw, follower._fleet_health_raw)
+        self.assertEqual(
+            self.allocator._fleet_health_lease_id,
+            follower._fleet_health_lease_id)
+
     def test_pending_coordinator_fails_sensitive_reads_closed(self):
         token = str(uuid.uuid4())
         self.etcd.values[self.allocator.audit_coordinator_key.encode()] = (

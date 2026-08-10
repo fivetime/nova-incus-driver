@@ -1016,17 +1016,27 @@ class IDMapAllocator:
         if len(set(keys)) != len(keys):
             raise IDMapConfigurationError(
                 reason="exact allocator read contains duplicate keys")
-        transaction = {
-            "compare": self._guard_compares(),
-            "success": [self._range(key) for key in keys],
-            "failure": [self._range(self.configuration_key)],
-        }
-        result = self._transaction_response(transaction)
-        responses = result.get("responses")
-        if not isinstance(responses, list):
-            raise IDMapBackendError(
-                reason="etcd transaction omitted range responses")
-        if not result["succeeded"]:
+        for attempt in range(2):
+            transaction = {
+                "compare": self._guard_compares(),
+                "success": [self._range(key) for key in keys],
+                "failure": [self._range(self.configuration_key)],
+            }
+            result = self._transaction_response(transaction)
+            responses = result.get("responses")
+            if not isinstance(responses, list):
+                raise IDMapBackendError(
+                    reason="etcd transaction omitted range responses")
+            if result["succeeded"]:
+                if len(responses) != len(keys):
+                    raise IDMapBackendError(
+                        reason=(
+                            "etcd exact read returned the wrong response "
+                            "count"))
+                return {
+                    key: self._parse_transaction_range(response, key)
+                    for key, response in zip(keys, responses)
+                }
             if len(responses) != 1:
                 raise IDMapBackendError(
                     reason="etcd configuration check returned invalid state")
@@ -1036,15 +1046,29 @@ class IDMapAllocator:
                 raise IDMapIntegrityError(
                     reason="allocator configuration record is missing")
             self._validate_configuration(raw)
+            if attempt == 0 and self._refresh_fleet_read_guard():
+                continue
             raise IDMapBackendError(
                 reason="allocator configuration compare failed unexpectedly")
-        if len(responses) != len(keys):
+
+    def _refresh_fleet_read_guard(self):
+        """Refresh a read guard after a completed fleet audit generation."""
+        (coordinator_raw, coordinator_lease_id), (
+            failure_raw, failure_lease_id) = self._read_audit_control()
+        if failure_raw is not None:
+            self._latch_fleet_failure(failure_raw, failure_lease_id)
+        if coordinator_raw is None or coordinator_lease_id <= 0:
             raise IDMapBackendError(
-                reason="etcd exact read returned the wrong response count")
-        return {
-            key: self._parse_transaction_range(response, key)
-            for key, response in zip(keys, responses)
-        }
+                reason="fleet ID-map auditor has no live lease")
+        coordinator = self._parse_audit_coordinator(coordinator_raw)
+        if coordinator["state"] != "healthy":
+            raise IDMapBackendError(
+                reason="fleet ID-map audit is in progress")
+        if coordinator_raw == self._fleet_health_raw:
+            return False
+        self._fleet_health_raw = coordinator_raw
+        self._fleet_health_lease_id = coordinator_lease_id
+        return True
 
     def _read_audit_control(self):
         """Read lease health and sticky failure at one etcd revision."""
