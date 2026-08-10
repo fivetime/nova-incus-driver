@@ -6646,6 +6646,13 @@ class IncusDriver(driver.ComputeDriver):
             if attempt['phase'] == 'opening':
                 claim = self.idmap_allocator.get_host_claim(
                     instance.uuid, host_id)
+                if (assignment is None and claim is None and
+                        not _spawn_attempt_has_generation(attempt)):
+                    # The opening marker is durable before the allocator is
+                    # touched. An exact empty registry state proves that the
+                    # first allocation attempt made no shared-state change.
+                    _remove_spawn_attempt_journal(instance, attempt)
+                    return True
                 if (assignment is not None and claim is not None and
                         claim.materialization_id == attempt['attempt_uuid'] and
                         _same_idmap_generation(assignment, claim) and

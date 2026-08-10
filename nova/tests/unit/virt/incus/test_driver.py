@@ -733,8 +733,21 @@ class IncusIDMapDriverTest(test.NoDBTestCase):
         self.assertEqual(
             attempt, driver._read_spawn_attempt_journal(self.instance))
 
-    def test_opening_spawn_attempt_without_claim_fails_closed(self):
+    def test_opening_spawn_attempt_without_allocator_state_is_empty(self):
         self.driver.idmap_allocator.get.return_value = None
+        self.driver.idmap_allocator.get_host_claim.return_value = None
+        attempt = self.driver._create_spawn_preflight_attempt(
+            self.instance, self.materialization_id)
+        self.driver._open_spawn_attempt(self.instance, attempt)
+
+        self.assertTrue(self.driver._consume_spawn_preflight_noop(
+            self.instance))
+        self.assertIsNone(driver._read_spawn_attempt_journal(self.instance))
+
+    def test_opening_spawn_attempt_with_partial_claim_fails_closed(self):
+        self.driver.idmap_allocator.get.return_value = None
+        self.driver.idmap_allocator.get_host_claim.return_value = (
+            self._claim(state='unmaterialized'))
         attempt = self.driver._create_spawn_preflight_attempt(
             self.instance, self.materialization_id)
         opened = self.driver._open_spawn_attempt(self.instance, attempt)
