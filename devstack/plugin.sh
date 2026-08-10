@@ -301,13 +301,6 @@ function configure_nova_incus_storage {
                     storage_args+=("ceph.osd.force_reuse=true")
                 fi
                 ;;
-            linstor)
-                if [[ -z "${INCUS_STORAGE_SOURCE}" ]]; then
-                    die $LINENO \
-                        "INCUS_STORAGE_SOURCE is required for LINSTOR"
-                fi
-                storage_args+=("source=${INCUS_STORAGE_SOURCE}")
-                ;;
             dir)
                 if [[ -n "${INCUS_STORAGE_SOURCE}" ]]; then
                     storage_args+=("source=${INCUS_STORAGE_SOURCE}")
@@ -625,50 +618,6 @@ function bootstrap_nova_incus_idmap_allocator {
 }
 
 
-function configure_cinder_linstor {
-    if [[ -n "${INCUS_CINDER_LINSTOR_CONTROLLER}" ]] && \
-            [[ -n "${INCUS_CINDER_CEPH_POOL}" ]]; then
-        die $LINENO "Configure exactly one Cinder backend: LINSTOR or Ceph"
-    fi
-
-    if [[ -z "${INCUS_CINDER_LINSTOR_CONTROLLER}" ]] || \
-            ! is_service_enabled c-vol; then
-        return
-    fi
-
-    echo_summary "Configuring the Cinder LINSTOR backend"
-
-    local driver_file="${CINDER_DIR}/cinder/volume/drivers/linstordrv.py"
-    local missing='linstor.Resource(str(rsc_name))'
-    local fixed='linstor.Resource(str(rsc_name), uri=self.default_uri)'
-    local count
-
-    count=$(grep -Fxc "            ${missing}" "${driver_file}" || true)
-    if [[ "${count}" -eq 2 ]]; then
-        sudo sed -i "s/${missing}/${fixed}/g" "${driver_file}"
-    elif grep -Fq "${missing}" "${driver_file}"; then
-        die $LINENO "Unexpected Cinder LINSTOR URI call count"
-    fi
-
-    iniset "${CINDER_CONF}" DEFAULT enabled_backends linstor
-    iniset "${CINDER_CONF}" linstor volume_driver \
-        cinder.volume.drivers.linstordrv.LinstorDrbdDriver
-    iniset "${CINDER_CONF}" linstor volume_backend_name linstor
-    # Cinder registers these driver options in the shared backend group.
-    iniset "${CINDER_CONF}" backend_defaults linstor_default_uri \
-        "linstor://${INCUS_CINDER_LINSTOR_CONTROLLER}"
-    iniset "${CINDER_CONF}" backend_defaults \
-        linstor_default_storage_pool_name \
-        "${INCUS_CINDER_LINSTOR_STORAGE_POOL}"
-    iniset "${CINDER_CONF}" backend_defaults linstor_autoplace_count \
-        "${INCUS_CINDER_LINSTOR_REPLICA_COUNT}"
-    iniset "${CINDER_CONF}" backend_defaults linstor_volume_downsize_factor \
-        "${INCUS_CINDER_LINSTOR_DOWNSIZE_FACTOR}"
-    iniset "${CINDER_CONF}" backend_defaults \
-        linstor_controller_diskless False
-}
-
-
 function configure_cinder_ceph {
     if [[ -z "${INCUS_CINDER_CEPH_POOL}" ]] || \
             ! is_service_enabled c-vol; then
@@ -934,7 +883,6 @@ if is_service_enabled nova-incus; then
         configure_nova_incus
         bootstrap_nova_incus_idmap_allocator
         configure_nova_incus_ceilometer
-        configure_cinder_linstor
         configure_cinder_ceph
         configure_cinder_ceph_backup
     elif [[ "$1" == "stack" && "$2" == "extra" ]]; then

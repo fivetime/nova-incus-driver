@@ -17,7 +17,7 @@ apt/dnf/yum 安装软件),数据在实例重启、Incus 重启、宿主重启后
   - *本地/临时根盘*:根盘由 Nova 管理,大小取自 Flavor `root_gb`,不进入 Cinder。
   - *引导卷(Boot-from-Volume)*:根盘是 Cinder RBD 卷,通过 Incus fork 的 `cephext` 驱动"认领"而非拷贝;卷的生命周期归 Cinder,Nova 管理其 BDM 与挂载状态。
 - **共享 Ceph 池零拷贝迁移**:两个独立(非集群)Incus 节点共享同一 RBD 池时,冷迁移以"所有权交接"方式转移同一个卷,不拷贝根盘数据,停机为秒级。
-- **数据卷**:通过宿主侧 os-brick 挂载 Cinder 卷(RBD/LINSTOR),支持在线扩容;非特权容器内以 `fuse2fs` 用户态挂载,避免宿主内核解析租户文件系统。
+- **数据卷**:通过宿主侧 os-brick 挂载 Cinder RBD 卷,支持在线扩容;非特权容器内以 `fuse2fs` 用户态挂载,避免宿主内核解析租户文件系统。
 - **磁盘 QoS**:Flavor `quota:disk_*` 与 Cinder front-end QoS 映射为 Incus `unix-block` 的 `limits.read/write`(cgroup v2 `io.max`)。
 - **网络**:Neutron ML2/OVN 拥有租户网络;驱动与 os-vif 准备宿主侧 veth 和 OVS `br-int` 端口,Incus 仅接收容器侧接口。
 - **Placement**:上报 VCPU/MEMORY_MB/DISK_GB 与 `CUSTOM_INCUS_SYSTEM_CONTAINER` 特征。
@@ -57,7 +57,7 @@ enable_plugin nova-incus https://github.com/fivetime/openstack-incus
 ```
 
 如需使用本地代码树,可将其同步到 `/opt/openstack-incus-src` 后从该处开发。可选的 Cinder
-Ceph/LINSTOR 后端、Ceph 备份服务等 DevStack 变量见 `devstack/` 与
+Ceph 后端、Ceph 备份服务等 DevStack 变量见 `devstack/` 与
 [`doc/source/usage.rst`](doc/source/usage.rst)。
 
 ## 当前状态

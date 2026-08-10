@@ -14,7 +14,7 @@ SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute test key}
 NAME=${NAME:-incus-volume-e2e-$RANDOM}
 DEVICE=${DEVICE:-/dev/vdb}
 EXTENDED_SIZE_GIB=${EXTENDED_SIZE_GIB:-2}
-VOLUME_TYPE=${VOLUME_TYPE:-linstor}
+VOLUME_TYPE=${VOLUME_TYPE:-ceph}
 TIMEOUT=${TIMEOUT:-360}
 
 SSH=(ssh -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=no)

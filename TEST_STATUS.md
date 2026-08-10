@@ -694,10 +694,6 @@ Test-bed configuration requirement discovered by this run:
 
 ### Current storage substrate
 
-- The current Noble test nodes do not have `/dev/vdb`; the earlier
-  LINSTOR/DRBD topology was removed when `incus-node-01` and `incus-node-03`
-  were reinstalled. LINSTOR results later in this file are historical
-  evidence only.
 - The external Rook cluster supplies `glance-images-rbd-pool`,
   `cinder-volumes-rbd-pool`, `nvme-rep3-rbd-pool`,
   `cinder-backups-rbd-pool`, and the Incus rootfs pool. Glance, both Cinder
@@ -1080,11 +1076,6 @@ hardening.
   `fuse2fs`. DevStack reproduces these settings with `INCUS_TEMPEST_BUILD_IMAGE=True`,
   `INCUS_TEMPEST_MIN_COMPUTE_NODES=2`, `INCUS_TEMPEST_FLAVOR_REF=d1`, and
   `INCUS_ALLOW_COLD_MIGRATION=True`.
-- The Cinder/LINSTOR attach and cold-migration E2E passed on 2026-07-16: a
-  three-copy volume was attached to an unprivileged Ubuntu Noble container on
-  `.16`, formatted and mounted through container-side `fuse2fs`, extended
-  online from 1 GiB to 2 GiB, migrated to `.17`, read back with the original
-  marker, detached, and cleaned.
 - A 2026-07-16 Cinder Ceph public-API smoke created a 1 GiB Ceph volume,
   attached it to an unprivileged Ceph-rootfs container as `/dev/sdb`, formatted
   and mounted it through `fuse2fs`, persisted a marker, extended it online to
@@ -1102,13 +1093,6 @@ hardening.
   restore into a new Ceph volume preserved the updated tenant marker. Cinder
   used native RBD differential export/import. Same-cluster backups are
   operational backups, not an independent disaster-recovery failure domain.
-- The one-replica outage E2E in `tools/openstack-incus-linstor-outage-e2e.sh`
-  passed on 2026-07-16. While a three-copy Cinder volume remained FUSE-mounted
-  on `.16`, the `.18` LINSTOR satellite was stopped but its controller remained
-  online. The two remaining `UpToDate` replicas sustained marker reads and a
-  16 MiB `fsync` write under majority quorum. After `.18` returned, its replica
-  resynchronized and the data was read again.
-
 ## Current test-environment state notes
 
 ## BFV failed-host evacuation

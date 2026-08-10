@@ -12373,7 +12373,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             },
             _TEST_VOLUME_ID: {
                 'path': '/dev/sdc',
-                'source': '/dev/drbd1000',
+                'source': '/dev/rbd0',
                 'type': 'unix-block'
             },
         }
@@ -12418,7 +12418,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             [mock.call(wait=True), mock.call(wait=True)],
             profile.save.call_args_list)
         volume_connector.disconnect_volume.assert_called_once_with(
-            connection_info['data'], {'path': '/dev/drbd1000'})
+            connection_info['data'], {'path': '/dev/rbd0'})
 
     def test_detach_volume_accepts_persisted_profile_change(self):
         device = {
@@ -12666,7 +12666,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     def test_detach_volume_restores_profile_on_disconnect_failure(self):
         device = {
             'path': '/dev/sdc',
-            'source': '/dev/drbd1000',
+            'source': '/dev/rbd0',
             'type': 'unix-block',
         }
         profile = mock.Mock()

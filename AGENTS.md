@@ -221,7 +221,7 @@ implementing changes.
 5. Validate Incus-managed Ceph RBD rootfs persistence, quotas, host-disk
    containment, and cross-node migration. In parallel, modernize Cinder data
    volume attachment through os-brick and validate attachment movement with
-   LINSTOR/DRBD before testing the production Cinder Ceph backend.
+   the production Cinder Ceph backend.
 6. Add optional restricted-project defense in depth without redefining Nova
    tenancy.
 7. Implement advanced features such as snapshot, resize, migration, and Cinder
@@ -416,8 +416,6 @@ in `TEST_STATUS.md`; this section keeps only the rules.
   `hw_incus_data_volume_fuse=true`. Treat it as a fail-closed image admission
   contract; do not infer support merely from an image name. Online attachment
   additionally probes the configured FUSE helper inside a running guest.
-- Keep `linstor_volume_downsize_factor=0` so Cinder's advertised size is not
-  smaller than Nova's requested byte count.
 - Keep `swap_volume` explicitly unsupported. Cinder attached-volume retype
   creates an empty target and expects the Nova driver to copy and pivot the
   active block device. Replacing an Incus `unix-block` profile entry does not
@@ -453,9 +451,8 @@ in `TEST_STATUS.md`; this section keeps only the rules.
   and `INCUS_CINDER_CEPH_CLUSTER_NAME`, and the Ceph backup service through
   `INCUS_CINDER_BACKUP_CEPH_POOL`, `INCUS_CINDER_BACKUP_CEPH_USER`, and
   `INCUS_CINDER_BACKUP_CEPH_CONF` when `c-bak` is enabled. These require
-  pre-provisioned Ceph configuration and CephX keyrings, must not create or
-  reuse the Incus rootfs pool, and LINSTOR/Ceph backend variables are mutually
-  exclusive.
+  pre-provisioned Ceph configuration and CephX keyrings, and must not create
+  or reuse the Incus rootfs pool.
 
 ### Image admission and preflight gates
 

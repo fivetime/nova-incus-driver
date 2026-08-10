@@ -82,12 +82,7 @@ disable_service cinder c-sch c-api c-vol
 # Enable c-vol only after configuring Cinder Ceph or another production-like
 # backend. Never use a loop-backed LVM volume group on a compute system disk
 # as evidence of tenant storage isolation or migration support.
-# For an already deployed LINSTOR cluster, enable c-vol and set:
-# INCUS_CINDER_LINSTOR_CONTROLLER=10.224.0.18
-# INCUS_CINDER_LINSTOR_STORAGE_POOL=linstor-pool
-# INCUS_CINDER_LINSTOR_REPLICA_COUNT=3
-# INCUS_CINDER_LINSTOR_DOWNSIZE_FACTOR=0
-# For an existing production-like Ceph cluster, configure Cinder instead with
+# For an existing production-like Ceph cluster, configure Cinder with
 # a dedicated pool and a pre-provisioned /etc/ceph/ceph.client.cinder.keyring:
 # INCUS_CINDER_CEPH_POOL=cinder-volumes
 # INCUS_CINDER_CEPH_USER=cinder

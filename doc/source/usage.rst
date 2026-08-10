@@ -679,9 +679,8 @@ and VM limits and cannot be used as a tenant API.
 
 Production nodes should use dedicated partitions or LVs with monitoring and
 alerts for Incus state and logs. The development topology uses preallocated
-8 GiB and 2 GiB loop-backed ext4 files to prove hard capacity isolation where
-its only dedicated disk is already owned by LINSTOR. That is a bounded test
-substitute, not a production storage recommendation.
+8 GiB and 2 GiB loop-backed ext4 files to prove hard capacity isolation. That
+is a bounded test substitute, not a production storage recommendation.
 
 The legacy image-backed Incus pull path copies rootfs data and does not satisfy
 the production persistence requirement. Cinder BFV is the production model:
@@ -1060,8 +1059,7 @@ Provision ``ceph.conf`` and
 stacking, and provision the client configuration and credentials required by
 os-brick on every compute. The plugin consumes an existing cluster; it does not
 create pools, CephX users, monitors, or OSDs. The Cinder pool must not be the
-Incus rootfs pool. Configure either the LINSTOR variables or the Ceph variables,
-never both.
+Incus rootfs pool.
 
 The keyring must be readable by the Cinder service account without being
 world-readable. A packaged deployment normally uses ``root:cinder 0640``; this
