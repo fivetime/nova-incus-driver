@@ -14855,10 +14855,9 @@ class IncusDriver(driver.ComputeDriver):
                     }
                     profile.save(wait=True)
 
-            for bdm in driver.block_device_info_get_mapping(
-                    block_device_info):
-                if _is_boot_volume(bdm):
-                    continue
+            for bdm in _reboot_data_volume_bdms(
+                    block_device_info,
+                    root_device_name=instance.root_device_name):
                 connection_info = bdm.get('connection_info')
                 mountpoint = bdm.get('mount_device')
                 if connection_info and mountpoint:
@@ -15182,10 +15181,9 @@ class IncusDriver(driver.ComputeDriver):
             'reverted source shared-storage ownership', instance)
         source_ownership_restored = True
         try:
-            for bdm in driver.block_device_info_get_mapping(
-                    block_device_info):
-                if _is_boot_volume(bdm):
-                    continue
+            for bdm in _reboot_data_volume_bdms(
+                    block_device_info,
+                    root_device_name=instance.root_device_name):
                 connection_info = bdm.get('connection_info')
                 mountpoint = bdm.get('mount_device')
                 if connection_info and mountpoint:

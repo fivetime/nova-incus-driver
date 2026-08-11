@@ -16079,7 +16079,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             self, get_mapping, boot_from_volume, require_bfv,
             migration_client):
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', root_device_name='/dev/sda')
         container = mock.Mock(status='Stopped')
         self.client.instances.get.return_value = container
         self._prepare_cold_revert_protocol(
@@ -16088,13 +16089,15 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             uuid='40000000-0000-0000-0000-000000000004',
             source_compute='source', dest_compute='destination')
         root_bdm = {
-            'boot_index': 0,
+            'boot_index': None,
             'connection_info': mock.sentinel.root_connection,
             'mount_device': '/dev/sda',
         }
         data_connection = {'driver_volume_type': 'local'}
         data_bdm = {
             'boot_index': 1,
+            'volume_id':
+                '50000000-0000-0000-0000-000000000005',
             'attachment_id':
                 '30000000-0000-0000-0000-000000000003',
             'connection_info': data_connection,
@@ -16674,14 +16677,15 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             self, to_profile, get_mapping, boot_from_volume, require_bfv):
         self._configure_bfv_pool()
         ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', root_device_name='/dev/sda')
         migration = mock.Mock(
             uuid='40000000-0000-0000-0000-000000000004',
             source_compute='source', dest_compute='destination')
         container = self.client.instances.create.return_value
         volume_id = '8231d2e8-1111-4222-8333-123456789abc'
         root_bdm = {
-            'boot_index': 0,
+            'boot_index': None,
             'connection_info': {
                 'driver_volume_type': 'rbd',
                 'serial': volume_id,
@@ -16694,6 +16698,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         data_connection = {'driver_volume_type': 'local'}
         data_bdm = {
             'boot_index': 1,
+            'volume_id':
+                '50000000-0000-0000-0000-000000000005',
             'attachment_id':
                 '30000000-0000-0000-0000-000000000003',
             'connection_info': data_connection,
