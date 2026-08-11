@@ -8984,6 +8984,31 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             instance, _TEST_VOLUME_ID, connection_info,
             expected_mountpoint='/dev/sdd')
 
+    def test_internal_attach_connection_rehydrates_instance_identity(self):
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test-journal-identity',
+            memory_mb=0)
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'},
+            '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        driver._write_volume_journal(
+            instance, _TEST_VOLUME_ID, connection_info,
+            {'path': '/dev/sdc'}, '/dev/sdd', 'disconnected')
+        self.client.profiles.get.return_value = mock.Mock(
+            devices={}, config={
+                'environment.product_name': 'OpenStack Nova',
+                'user.openstack.uuid': instance.uuid,
+            })
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        recovered = incus_driver.get_internal_volume_attach_connection_info(
+            instance, _TEST_VOLUME_ID, '/dev/sdd')
+
+        self.assertEqual(instance.uuid, recovered['instance'])
+        self.assertEqual(_TEST_VOLUME_ID, recovered['serial'])
+
     def test_immediate_internal_attach_republishes_intent_after_fsync_error(
             self):
         ctx = context.get_admin_context()

@@ -10399,6 +10399,10 @@ class IncusDriver(driver.ComputeDriver):
                        'local connection metadata')
         return {
             'serial': volume_id,
+            # The journal path and payload are already bound to this exact
+            # Nova instance. Rehydrate the outer Cinder identity that is not
+            # duplicated inside the credential-free connection_data record.
+            'instance': instance.uuid,
             'driver_volume_type': protocol,
             'data': copy.deepcopy(connection_data),
         }
