@@ -5157,9 +5157,15 @@ class IncusComputeManager(manager.ComputeManager):
             source_attachment, migration):
         """Retire only a proven obsolete source-host volume mapping."""
         direction = intent['operation_direction']
+        live_source_post_commit = (
+            direction == 'live-source-release' and
+            getattr(migration, 'migration_type', None) ==
+            'live-migration' and migration.status == 'running' and
+            instance.host == migration.source_compute)
         if (migration.source_compute != self.host or
                 migration.dest_compute == self.host or
-                instance.host != migration.dest_compute):
+                (instance.host != migration.dest_compute and
+                 not live_source_post_commit)):
             raise exception.InvalidVolume(
                 reason='Migration source release has no authoritative target')
         if (direction == 'live-source-release' and

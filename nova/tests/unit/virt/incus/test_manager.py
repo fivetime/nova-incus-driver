@@ -4077,7 +4077,10 @@ class IncusComputeManagerTest(test.NoDBTestCase):
     def test_live_source_release_disconnects_then_deletes_exact_attachment(
             self, get_bdms, get_migrations):
         instance = self._volume_recovery_instance()
-        instance.host = 'compute-2'
+        # Nova calls the source-volume cleanup hook before persisting the new
+        # instance.host. The exact target BDM/attachment and absent source
+        # container below are the post-commit authority in this window.
+        instance.host = self.compute.host
         volume_id = '50000000-0000-0000-0000-000000000005'
         source_attachment_id = '40000000-0000-0000-0000-000000000004'
         target_attachment_id = '41000000-0000-0000-0000-000000000004'
@@ -4107,7 +4110,7 @@ class IncusComputeManagerTest(test.NoDBTestCase):
             intent)
         get_migrations.return_value = [mock.Mock(
             uuid=migration_uuid, source_compute=self.compute.host,
-            dest_compute='compute-2', status='completed',
+            dest_compute='compute-2', status='running',
             migration_type='live-migration')]
         not_found = mock.Mock(status_code=404)
         not_found.json.return_value = {'error': 'not found'}
