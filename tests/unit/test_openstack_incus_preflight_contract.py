@@ -453,6 +453,17 @@ class FullCheckpointMigrationContractTest(unittest.TestCase):
             self.e2e)
         self.assertNotIn('journalctl', self.e2e)
 
+    def test_live_e2e_waits_for_a_stable_guest_boot_before_pid_baseline(self):
+        ready = self.e2e.index('test -f /root/criu-e2e-ready')
+        cloud_init = self.e2e.index('cloud-init status 2>/dev/null')
+        stable_pid = self.e2e.index('stable_pid=$(incus_remote')
+        baseline = self.e2e.index('source_pid=$(incus_remote')
+        self.assertLess(ready, cloud_init)
+        self.assertLess(cloud_init, stable_pid)
+        self.assertLess(stable_pid, baseline)
+        self.assertIn('kill -0 "$pid"', self.e2e)
+        self.assertIn('"$observed_pid" == "$stable_pid"', self.e2e)
+
 
 if __name__ == '__main__':
     unittest.main()

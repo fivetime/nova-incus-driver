@@ -650,6 +650,47 @@ until incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
     sleep 2
 done
 
+# The user-data marker is written from cloud-final before its OpenRC service
+# wrapper has necessarily returned. Migrating in that window can preserve the
+# guest exactly and still observe OpenRC restart the counter after the first
+# hop. Require cloud-init and the test workload itself to reach a stable boot
+# state before taking the PID baseline.
+while true; do
+    cloud_init_status=$(incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
+        sh -c 'if command -v cloud-init >/dev/null 2>&1; then
+                   cloud-init status 2>/dev/null || true
+               else
+                   echo "status: done"
+               fi')
+    [[ "$cloud_init_status" == *"status: done"* ]] && break
+    [[ "$cloud_init_status" != *"status: error"* ]] || {
+        echo "Guest cloud-init failed: $cloud_init_status" >&2
+        exit 1
+    }
+    ((SECONDS < deadline)) || {
+        echo "Guest cloud-init did not finish after bootstrap" >&2
+        exit 1
+    }
+    sleep 2
+done
+
+while true; do
+    stable_pid=$(incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
+        sh -c 'pid=$(cat /run/criu-counter.pid 2>/dev/null) &&
+               kill -0 "$pid" 2>/dev/null && printf "%s" "$pid"') || true
+    sleep 5
+    observed_pid=$(incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
+        sh -c 'pid=$(cat /run/criu-counter.pid 2>/dev/null) &&
+               kill -0 "$pid" 2>/dev/null && printf "%s" "$pid"') || true
+    if [[ "$stable_pid" =~ ^[0-9]+$ && "$observed_pid" == "$stable_pid" ]]; then
+        break
+    fi
+    ((SECONDS < deadline)) || {
+        echo "CRIU counter PID did not become stable after guest boot" >&2
+        exit 1
+    }
+done
+
 root_marker="INCUS_${MIGRATION_MODE^^}_ROOT_${RANDOM}_$(date +%s)"
 incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
     sh -c "printf '%s' '$root_marker' >/root/incus-migration-e2e-marker; sync"
