@@ -1026,6 +1026,24 @@ class IncusComputeManager(manager.ComputeManager):
                                 self.driver.
                                 get_volume_journal_recovery_phase(
                                     instance, volume_id))
+                            intent = (
+                                self.driver.
+                                get_managed_volume_attach_intent(
+                                    instance, volume_id))
+                            if phase is None and intent is None:
+                                attachment = (
+                                    self._get_exact_cinder_attachment(
+                                        context, bdm.attachment_id,
+                                        volume_id, instance.uuid))
+                                if attachment is None:
+                                    # Periodic recovery already retired the
+                                    # exact source attachment and its local
+                                    # evidence before this callback arrived.
+                                    continue
+                                raise exception.InvalidVolume(
+                                    reason='Live migration source attachment '
+                                           'remains without durable local '
+                                           'release evidence')
                             self._recover_incus_connecting_volume_journal(
                                 context, instance, volume_id,
                                 journal_phase=(phase or 'attach-pending'))

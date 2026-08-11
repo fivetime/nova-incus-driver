@@ -3727,6 +3727,8 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         ]
         self.compute.driver.get_volume_journal_recovery_phase.side_effect = [
             None, 'attach-disconnected']
+        self.compute.driver.get_managed_volume_attach_intent.side_effect = [
+            {'boot_volume': True}, {'boot_volume': False}]
         self.compute._recover_incus_connecting_volume_journal = mock.Mock()
         self.compute.volume_api = mock.Mock()
 
@@ -3745,6 +3747,53 @@ class IncusComputeManagerTest(test.NoDBTestCase):
             self.compute._recover_incus_connecting_volume_journal.
             call_args_list)
         self.compute.volume_api.attachment_delete.assert_not_called()
+
+    def test_post_live_source_volume_accepts_periodic_convergence(self):
+        instance = self._volume_recovery_instance()
+        volume_id = '53000000-0000-0000-0000-000000000005'
+        attachment_id = '45000000-0000-0000-0000-000000000004'
+        source_bdm = mock.Mock(
+            is_volume=True, volume_id=volume_id,
+            attachment_id=attachment_id)
+        self.compute.driver.get_volume_journal_recovery_phase.return_value = (
+            None)
+        self.compute.driver.get_managed_volume_attach_intent.return_value = (
+            None)
+        self.compute._get_exact_cinder_attachment = mock.Mock(
+            return_value=None)
+        self.compute._recover_incus_connecting_volume_journal = mock.Mock()
+
+        self.compute._post_live_migration_remove_source_vol_connections(
+            context.get_admin_context(), instance, [source_bdm])
+
+        self.compute._get_exact_cinder_attachment.assert_called_once_with(
+            mock.ANY, attachment_id, volume_id, instance.uuid)
+        recover = self.compute._recover_incus_connecting_volume_journal
+        recover.assert_not_called()
+
+    @mock.patch.object(manager.LOG, 'critical')
+    def test_post_live_source_volume_rejects_attachment_without_evidence(
+            self, critical):
+        instance = self._volume_recovery_instance()
+        volume_id = '53000000-0000-0000-0000-000000000005'
+        attachment_id = '45000000-0000-0000-0000-000000000004'
+        source_bdm = mock.Mock(
+            is_volume=True, volume_id=volume_id,
+            attachment_id=attachment_id)
+        self.compute.driver.get_volume_journal_recovery_phase.return_value = (
+            None)
+        self.compute.driver.get_managed_volume_attach_intent.return_value = (
+            None)
+        self.compute._get_exact_cinder_attachment = mock.Mock(
+            return_value={'id': attachment_id})
+        self.compute._recover_incus_connecting_volume_journal = mock.Mock()
+
+        self.compute._post_live_migration_remove_source_vol_connections(
+            context.get_admin_context(), instance, [source_bdm])
+
+        critical.assert_called_once()
+        recover = self.compute._recover_incus_connecting_volume_journal
+        recover.assert_not_called()
 
     @mock.patch.object(
         manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')

@@ -19266,6 +19266,55 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         mapped_rbd_device.assert_called_once_with(
             data_connection['data'], mapping_cache=None)
 
+    def test_live_source_disconnect_accepts_periodic_convergence(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-source-periodic-convergence', memory_mb=0)
+        volume_id = '20000000-0000-0000-0000-000000000002'
+        connection_info = {
+            'driver_volume_type': 'rbd',
+            'serial': volume_id,
+            'data': {'volume_id': volume_id},
+        }
+        intent = {'volume_id': volume_id, 'operation_kind': 'migration'}
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver.get_managed_volume_attach_intent = mock.Mock(
+            return_value=None)
+        incus_driver.get_volume_journal_phase = mock.Mock(return_value=None)
+        incus_driver._detach_volume = mock.Mock()
+
+        incus_driver._disconnect_live_source_volume(
+            ctx, instance, volume_id, connection_info, '/dev/sdb', intent)
+
+        incus_driver._detach_volume.assert_not_called()
+
+    def test_live_source_disconnect_rejects_partial_periodic_evidence(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-source-partial-convergence', memory_mb=0)
+        volume_id = '20000000-0000-0000-0000-000000000002'
+        connection_info = {
+            'driver_volume_type': 'rbd',
+            'serial': volume_id,
+            'data': {'volume_id': volume_id},
+        }
+        intent = {'volume_id': volume_id, 'operation_kind': 'migration'}
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver.get_managed_volume_attach_intent = mock.Mock(
+            return_value=None)
+        incus_driver.get_volume_journal_phase = mock.Mock(
+            return_value='disconnected')
+        incus_driver._detach_volume = mock.Mock()
+
+        self.assertRaises(
+            exception.InvalidVolume,
+            incus_driver._disconnect_live_source_volume,
+            ctx, instance, volume_id, connection_info, '/dev/sdb', intent)
+
+        incus_driver._detach_volume.assert_not_called()
+
     def test_post_live_migration_rejects_incomplete_volume_before_delete(self):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(

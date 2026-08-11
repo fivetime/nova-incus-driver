@@ -15901,20 +15901,9 @@ class IncusDriver(driver.ComputeDriver):
                 # Cinder attachment; it must never enter os-brick.
                 continue
             try:
-                with lockutils.lock(
-                        _volume_manager_transaction_lock_name(
-                            instance.uuid, volume_id),
-                        external=True,
-                        lock_path=_volume_operation_lock_path()):
-                    current = self.get_managed_volume_attach_intent(
-                        instance, volume_id)
-                    if current != intent:
-                        raise exception.InvalidVolume(
-                            reason='Live migration source volume release '
-                                   'generation changed before disconnect')
-                    self._detach_volume(
-                        context, connection_info, instance, mountpoint,
-                        retain_journal=True)
+                self._disconnect_live_source_volume(
+                    context, instance, volume_id, connection_info,
+                    mountpoint, intent)
             except Exception:
                 # Match Nova's libvirt contract: the instance is already
                 # running on the destination and cannot be rolled back here.
@@ -15924,6 +15913,33 @@ class IncusDriver(driver.ComputeDriver):
                     'Retaining source volume connection after live migration '
                     'disconnect failed for volume %s',
                     _volume_id(connection_info), instance=instance)
+
+    def _disconnect_live_source_volume(
+            self, context, instance, volume_id, connection_info,
+            mountpoint, intent):
+        """Disconnect one source mapping unless recovery already did so."""
+        with lockutils.lock(
+                _volume_manager_transaction_lock_name(
+                    instance.uuid, volume_id),
+                external=True,
+                lock_path=_volume_operation_lock_path()):
+            current = self.get_managed_volume_attach_intent(
+                instance, volume_id)
+            if current != intent:
+                journal_phase = self.get_volume_journal_phase(
+                    instance, volume_id)
+                if current is None and journal_phase is None:
+                    # Periodic recovery may finish the exact source release
+                    # while CRIU handover is returning to this hook. It
+                    # removes the intent only after local disconnect and the
+                    # exact Cinder source attachment deletion both converge.
+                    return
+                raise exception.InvalidVolume(
+                    reason='Live migration source volume release generation '
+                           'changed before disconnect')
+            self._detach_volume(
+                context, connection_info, instance, mountpoint,
+                retain_journal=True)
 
     @_invalidates_instance_inventory
     def post_live_migration_at_source(self, context, instance, network_info):
