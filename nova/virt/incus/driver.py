@@ -16256,13 +16256,6 @@ class IncusDriver(driver.ComputeDriver):
                 for vif in network_info:
                     self.vif_driver.reassert(instance, vif)
 
-            # os-vif unplug completion precedes OVN's asynchronous DOWN event.
-            # Observe that event before reasserting source wiring so a late
-            # destination update cannot overwrite the restored source state.
-            _wait_migration_finish_condition(
-                lambda: _vifs_have_active_state(False),
-                'live migration destination VIF deactivation', instance)
-
         container = self.client.instances.get(instance.name)
         container.sync()
         if container.status != 'Running':

@@ -18675,15 +18675,11 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         source_profile = mock.Mock(config={}, devices={})
         self.client.profiles.get.return_value = source_profile
         self.client.instances.get.return_value = mock.Mock(status='Running')
-        inactive_vif = network_model.VIF(id='test-vif', active=False)
         active_vif = network_model.VIF(id='test-vif', active=True)
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
         incus_driver.network_api.get_instance_nw_info = mock.Mock(
-            side_effect=[
-                network_model.NetworkInfo([inactive_vif]),
-                network_model.NetworkInfo([active_vif]),
-            ])
+            return_value=network_model.NetworkInfo([active_vif]))
         incus_driver.vif_driver.reassert = mock.Mock()
         incus_driver.unplug_vifs = mock.Mock()
         incus_driver._validate_remote_cleanup_acknowledgement = mock.Mock()
@@ -18735,13 +18731,11 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.client.profiles.get.return_value = source_profile
         container = mock.Mock(status='Stopped')
         self.client.instances.get.return_value = container
-        inactive_vif = network_model.VIF(id='test-vif', active=False)
         active_vif = network_model.VIF(id='test-vif', active=True)
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
         incus_driver.network_api.get_instance_nw_info = mock.Mock(
-            side_effect=[network_model.NetworkInfo([inactive_vif]),
-                         network_model.NetworkInfo([active_vif])])
+            return_value=network_model.NetworkInfo([active_vif]))
         calls = []
         incus_driver._refresh_vifs = mock.Mock(
             side_effect=lambda *args: calls.append('refresh'))
