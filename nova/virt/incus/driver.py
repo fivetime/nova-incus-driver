@@ -16311,6 +16311,10 @@ class IncusDriver(driver.ComputeDriver):
         # and VIF restoration had already completed.
         with lockutils.lock(_profile_lock_name(instance)):
             source_profile = self.client.profiles.get(instance.name)
+            source_profile.config[MIGRATION_CLEANUP_TOKEN_KEY] = (
+                cleanup_token)
+            source_profile.config[MIGRATION_DESTINATION_KEY] = (
+                destination_address)
             source_profile.config[MIGRATION_ROLLBACK_COMPLETE_KEY] = (
                 cleanup_token)
             source_profile.config[MIGRATION_NOVA_UUID_KEY] = (

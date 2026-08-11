@@ -18699,6 +18699,12 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             incus_driver._validate_remote_cleanup_acknowledgement.call_count)
         source_profile.save.assert_called_once_with(wait=True)
         self.assertEqual(
+            cleanup_token,
+            source_profile.config[driver.MIGRATION_CLEANUP_TOKEN_KEY])
+        self.assertEqual(
+            data.destination_address,
+            source_profile.config[driver.MIGRATION_DESTINATION_KEY])
+        self.assertEqual(
             2, remote.profiles.get.call_count)
 
     @mock.patch.object(driver, '_restore_source_storage_ownership')
