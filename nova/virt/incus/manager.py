@@ -4458,6 +4458,13 @@ class IncusComputeManager(manager.ComputeManager):
             self.driver.restart_internal_volume_attach(
                 context, instance, volume_id, connection_info,
                 expected_mountpoint=intent['mountpoint'])
+        elif journal_phase == 'connecting' and status == 'attached':
+            # Nova can formally complete the Cinder attachment after the
+            # destination driver failed while connecting the local device.
+            # Finish that exact host-side attach before retiring its journal.
+            self.driver.resume_connecting_volume_journal(
+                context, instance, volume_id, connection_info,
+                expected_mountpoint=intent['mountpoint'])
 
         if status == 'attaching':
             if journal_phase not in restart_phases:

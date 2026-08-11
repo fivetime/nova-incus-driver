@@ -4127,6 +4127,42 @@ class IncusComputeManagerTest(test.NoDBTestCase):
     @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
     @mock.patch.object(
         manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_committed_cold_target_resumes_attached_connecting_owner(
+            self, get_bdms, get_migrations):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        token = '60000000-0000-0000-0000-000000000006'
+        migration_uuid = '70000000-0000-0000-0000-000000000007'
+        bdm = self._configure_internal_volume_recovery(
+            instance, volume_id, 'migration', token, 'cold-target',
+            operation_migration_uuid=migration_uuid)
+        get_bdms.return_value = [bdm]
+        self.compute.driver.get_volume_journal_phase.return_value = (
+            'connecting')
+        self._configure_cinder_recovery_attachment(
+            instance, volume_id, 'attached')
+        get_migrations.return_value = [mock.Mock(
+            uuid=migration_uuid, source_compute='incus-source',
+            dest_compute=self.compute.host, status='finished')]
+        self.compute.driver.internal_migration_attach_disposition.\
+            return_value = 'committed'
+
+        self.compute._recover_incus_connecting_volume_journal(
+            context.get_admin_context(), instance, volume_id,
+            journal_phase='connecting')
+
+        self.compute.driver.resume_connecting_volume_journal.\
+            assert_called_once_with(
+                mock.ANY, instance, volume_id, mock.ANY,
+                expected_mountpoint='/dev/vdb')
+        self.compute.volume_api.attachment_complete.assert_not_called()
+        self.compute.driver.confirm_connected_volume_journal.\
+            assert_called_once()
+        self.compute.driver.cancel_managed_volume_attach.assert_called_once()
+
+    @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
     def test_live_source_release_disconnects_then_deletes_exact_attachment(
             self, get_bdms, get_migrations):
         instance = self._volume_recovery_instance()
