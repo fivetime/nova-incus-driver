@@ -7434,6 +7434,46 @@ class IncusComputeManagerTest(test.NoDBTestCase):
 
     @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
     @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_source_volume_generation_recovery_resumes_live_rollback(
+            self, get_by_uuid, get_migrations):
+        instance = mock.Mock(
+            uuid='10000000-0000-0000-0000-000000000001',
+            host=self.compute.host, task_state=None, deleted=False)
+        instance.name = 'instance-source'
+        instance.obj_attr_is_set.return_value = True
+        token = '20000000-0000-0000-0000-000000000002'
+        migration_uuid = '30000000-0000-0000-0000-000000000003'
+        candidate = {
+            'name': instance.name,
+            'uuid': instance.uuid,
+            'operation_token': token,
+            'migration_uuid': migration_uuid,
+            'rollback_complete': False,
+        }
+        self.compute.driver.\
+            list_source_volume_generation_recovery_candidates.return_value = [
+                candidate]
+        get_by_uuid.return_value = instance
+        get_migrations.return_value = [mock.Mock(
+            uuid=migration_uuid, source_compute=self.compute.host,
+            dest_compute='compute-2', status='error',
+            migration_type='live-migration')]
+        self.compute.driver.\
+            finalize_remote_source_volume_generation.return_value = True
+        network_info = (
+            self.compute.network_api.get_instance_nw_info.return_value)
+
+        self.compute._recover_incus_source_volume_generations(
+            context.get_admin_context())
+
+        self.compute.driver.recover_live_migration_rollback.\
+            assert_called_once_with(
+                mock.ANY, instance, token, migration_uuid, network_info)
+        self.compute.driver.finalize_remote_source_volume_generation.\
+            assert_called_once_with(instance, token)
+
+    @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
     def test_source_volume_generation_recovery_rejects_target_owner(
             self, get_by_uuid, get_migrations):
         instance = mock.Mock(

@@ -54,6 +54,7 @@ from nova.image import glance
 from nova.network import neutron
 from nova.network import model as network_model
 from nova import objects
+from nova.objects import migrate_data as nova_migrate_data
 from nova.privsep import path as privsep_path
 from nova.virt import driver
 from nova.volume import cinder
@@ -9954,7 +9955,7 @@ class IncusDriver(driver.ComputeDriver):
         return sorted(candidates, key=lambda item: item['name'])
 
     def list_source_volume_generation_recovery_candidates(self):
-        """Return exact source rollback generations awaiting retirement."""
+        """Return exact source rollback generations awaiting convergence."""
         candidates = []
         for profile in self._get_profile_inventory_snapshot():
             config = profile.get('config')
@@ -9969,15 +9970,17 @@ class IncusDriver(driver.ComputeDriver):
             migration_uuid = config.get(MIGRATION_NOVA_UUID_KEY)
             if (not uuidutils.is_uuid_like(instance_uuid) or
                     not uuidutils.is_uuid_like(operation_token) or
-                    not uuidutils.is_uuid_like(migration_uuid) or
-                    config.get(MIGRATION_ROLLBACK_COMPLETE_KEY) !=
-                    operation_token):
+                    not uuidutils.is_uuid_like(migration_uuid)):
+                continue
+            rollback_token = config.get(MIGRATION_ROLLBACK_COMPLETE_KEY)
+            if rollback_token not in (None, operation_token):
                 continue
             candidates.append({
                 'name': name,
                 'uuid': instance_uuid,
                 'operation_token': operation_token,
                 'migration_uuid': migration_uuid,
+                'rollback_complete': rollback_token == operation_token,
             })
         return sorted(candidates, key=lambda item: item['name'])
 
@@ -15603,6 +15606,19 @@ class IncusDriver(driver.ComputeDriver):
                     instance, container, source_profile,
                     require_incremental=True,
                     error_class=exception.MigrationError)
+                source_config = (
+                    source_profile.config
+                    if isinstance(source_profile.config, dict) else {})
+                migration_uuid = _live_migration_uuid(migrate_data)
+                existing_migration_uuid = source_config.get(
+                    MIGRATION_NOVA_UUID_KEY)
+                if existing_migration_uuid not in (None, migration_uuid):
+                    raise exception.MigrationError(
+                        reason='Incus live migration source generation '
+                               'changed')
+                source_config[MIGRATION_NOVA_UUID_KEY] = migration_uuid
+                source_profile.config = source_config
+                source_profile.save(wait=True)
                 migration_data = container.generate_migration_data(live=True)
             migration_data.pop('default', None)
             migration_data['profiles'] = [instance.name]
@@ -16214,14 +16230,6 @@ class IncusDriver(driver.ComputeDriver):
                 self.client, instance),
             'rolled-back source shared-storage ownership', instance)
 
-        container = self.client.instances.get(instance.name)
-        container.sync()
-        if container.status != 'Running':
-            _retry_migration_finish_action(
-                lambda: self._start_instance_with_idmap(
-                    instance, container),
-                'rolled-back source container start', instance)
-
         network_info = network_model.NetworkInfo()
         if ('vifs' in migrate_data and migrate_data.vifs):
             network_info = network_model.NetworkInfo([
@@ -16255,11 +16263,23 @@ class IncusDriver(driver.ComputeDriver):
                 lambda: _vifs_have_active_state(False),
                 'live migration destination VIF deactivation', instance)
 
+        container = self.client.instances.get(instance.name)
+        container.sync()
+        if container.status != 'Running':
+            # A failed target restore can remove one side of the retained veth
+            # pair. Rebuild the complete source wiring while the container is
+            # stopped; Incus otherwise fails its start on the missing parent.
+            self._refresh_vifs(instance, network_info)
+            _retry_migration_finish_action(
+                lambda: self._start_instance_with_idmap(
+                    instance, container),
+                'rolled-back source container start', instance)
+
+        if network_info:
             # CRIU rollback has already resumed the source container with its
-            # original veth peer. Unplugging here would delete the host end and
-            # leave the running container attached to an orphaned peer. Rebuild
-            # only the OVS Port row so ovn-controller sees an unambiguous new
-            # ownership event while the veth pair remains intact.
+            # original veth peer when it never stopped. Rebuild only the OVS
+            # Port row in that case; the stopped case recreated the whole pair
+            # above before the container start.
             _retry_migration_finish_action(
                 _reassert_vifs,
                 'live migration rollback VIF wiring', instance)
@@ -16299,6 +16319,41 @@ class IncusDriver(driver.ComputeDriver):
         _retire_migration_attempt(
             remote, instance, cleanup_token,
             idmap_base, idmap_size)
+
+    def recover_live_migration_rollback(
+            self, context, instance, operation_token, migration_uuid,
+            network_info):
+        """Resume an exact failed live rollback from its source profile."""
+        with lockutils.lock(_profile_lock_name(instance)):
+            profile = self.client.profiles.get(instance.name)
+            _validate_profile_volume_owner(profile, instance)
+            config = profile.config if isinstance(profile.config, dict) else {}
+            if (config.get(MIGRATION_CLEANUP_TOKEN_KEY) != operation_token or
+                    config.get(MIGRATION_NOVA_UUID_KEY) != migration_uuid or
+                    config.get(MIGRATION_ROLLBACK_COMPLETE_KEY) is not None):
+                raise exception.MigrationError(
+                    reason='Incus live rollback generation changed')
+            destination_address = config.get(MIGRATION_DESTINATION_KEY)
+            if not destination_address:
+                raise exception.MigrationError(
+                    reason='Incus live rollback has no destination address')
+            idmap_base, idmap_size = _instance_migration_idmap(None, profile)
+            source_operation_id = config.get(MIGRATION_OPERATION_KEY)
+
+        vifs = [
+            nova_migrate_data.VIFMigrateData(source_vif=vif)
+            for vif in network_info or []
+        ]
+        data = incus_migrate_data.IncusLiveMigrateData(
+            destination_address=destination_address,
+            cleanup_token=operation_token,
+            migration_uuid=migration_uuid,
+            source_operation_id=source_operation_id,
+            idmap_base=idmap_base,
+            idmap_size=idmap_size,
+            vifs=vifs)
+        self.finalize_live_migration_rollback(context, instance, data)
+        return True
 
     @_invalidates_instance_inventory
     def rollback_live_migration_at_destination(

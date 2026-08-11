@@ -7209,6 +7209,32 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             'uuid': instance_uuid,
             'operation_token': token,
             'migration_uuid': migration_uuid,
+            'rollback_complete': True,
+        }], incus_driver.list_source_volume_generation_recovery_candidates())
+
+    def test_lists_incomplete_live_source_rollback_generation(self):
+        token = '20000000-0000-0000-0000-000000000002'
+        migration_uuid = '30000000-0000-0000-0000-000000000003'
+        instance_uuid = '10000000-0000-0000-0000-000000000001'
+        response = self.client.api.profiles.get.return_value
+        response.json.return_value = {'metadata': [{
+            'name': 'instance-source',
+            'config': {
+                'environment.product_name': 'OpenStack Nova',
+                'user.openstack.uuid': instance_uuid,
+                driver.MIGRATION_CLEANUP_TOKEN_KEY: token,
+                driver.MIGRATION_NOVA_UUID_KEY: migration_uuid,
+            },
+        }]}
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertEqual([{
+            'name': 'instance-source',
+            'uuid': instance_uuid,
+            'operation_token': token,
+            'migration_uuid': migration_uuid,
+            'rollback_complete': False,
         }], incus_driver.list_source_volume_generation_recovery_candidates())
 
     def test_failed_spawn_owner_allows_exact_missing_container_recovery(self):
@@ -18255,6 +18281,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             destination_kernel_version='6.8.0-test',
             destination_server_version='7.2',
             cleanup_token='10000000-0000-0000-0000-000000000001',
+            migration_uuid='50000000-0000-0000-0000-000000000005',
             idmap_base=1065536,
             idmap_size=65536,
             full_checkpoint_verified=True)
@@ -18440,6 +18467,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             destination_kernel_version='6.8.0-test',
             destination_server_version='7.2',
             cleanup_token='10000000-0000-0000-0000-000000000001',
+            migration_uuid='50000000-0000-0000-0000-000000000005',
             idmap_base=1065536,
             idmap_size=65536)
         incus_driver = driver.IncusDriver(None)
@@ -18513,6 +18541,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             destination_kernel_version='6.8.0-test',
             destination_server_version='7.2',
             cleanup_token='10000000-0000-0000-0000-000000000001',
+            migration_uuid='50000000-0000-0000-0000-000000000005',
             idmap_base=1065536,
             idmap_size=65536)
         incus_driver = driver.IncusDriver(None)
@@ -18675,6 +18704,58 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         source_profile.save.assert_called_once_with(wait=True)
         self.assertEqual(
             2, remote.profiles.get.call_count)
+
+    @mock.patch.object(driver, '_restore_source_storage_ownership')
+    @mock.patch.object(driver, '_settle_instance_migration_operations')
+    @mock.patch('nova.virt.incus.driver._migration_client')
+    def test_finalize_live_rollback_rebuilds_veth_before_stopped_start(
+            self, get_remote, settle_operations, restore_ownership):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(ctx, name='test')
+        cleanup_token = '10000000-0000-0000-0000-000000000001'
+        source_vif = network_model.VIF(id='test-vif')
+        data = migrate_data.IncusLiveMigrateData(
+            destination_address='https://192.0.2.20:8443',
+            cleanup_token=cleanup_token,
+            migration_uuid='40000000-0000-0000-0000-000000000004',
+            source_operation_id=None, idmap_base=1065536, idmap_size=65536,
+            vifs=[nova_migrate_data.VIFMigrateData(source_vif=source_vif)])
+        remote = get_remote.return_value
+        remote.instances.get.side_effect = incuscore_exceptions.NotFound(
+            MockResponse(404))
+        cleanup_profile = mock.Mock(
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                'user.openstack.uuid': instance.uuid,
+                driver.MIGRATION_CLEANUP_TOKEN_KEY: cleanup_token,
+                driver.MIGRATION_CLEANUP_COMPLETE_KEY: cleanup_token,
+            }, devices={}, used_by=[])
+        remote.profiles.get.return_value = cleanup_profile
+        source_profile = mock.Mock(config={}, devices={})
+        self.client.profiles.get.return_value = source_profile
+        container = mock.Mock(status='Stopped')
+        self.client.instances.get.return_value = container
+        inactive_vif = network_model.VIF(id='test-vif', active=False)
+        active_vif = network_model.VIF(id='test-vif', active=True)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver.network_api.get_instance_nw_info = mock.Mock(
+            side_effect=[network_model.NetworkInfo([inactive_vif]),
+                         network_model.NetworkInfo([active_vif])])
+        calls = []
+        incus_driver._refresh_vifs = mock.Mock(
+            side_effect=lambda *args: calls.append('refresh'))
+        incus_driver._start_instance_with_idmap = mock.Mock(
+            side_effect=lambda *args: calls.append('start'))
+        incus_driver.vif_driver.reassert = mock.Mock(
+            side_effect=lambda *args: calls.append('reassert'))
+        incus_driver._validate_remote_cleanup_acknowledgement = mock.Mock()
+
+        incus_driver.finalize_live_migration_rollback(ctx, instance, data)
+
+        self.assertEqual(['refresh', 'start', 'reassert'], calls)
+        incus_driver._refresh_vifs.assert_called_once_with(
+            instance, network_model.NetworkInfo([source_vif]))
 
     @mock.patch.object(driver, '_restore_source_storage_ownership')
     @mock.patch.object(driver, '_settle_instance_migration_operations')

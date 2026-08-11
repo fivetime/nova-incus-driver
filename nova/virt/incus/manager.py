@@ -3447,13 +3447,25 @@ class IncusComputeManager(manager.ComputeManager):
                     migration = exact[0]
                     if (migration.source_compute != self.host or
                             migration.status not in (
-                                'cancelled', 'error', 'failed', 'reverted')):
+                                 'cancelled', 'error', 'failed', 'reverted')):
                         raise exception.MigrationError(
                             reason='Nova has not committed source ownership '
                                    'for the Incus rollback generation')
-                    if (getattr(migration, 'migration_type', None) ==
-                            'live-migration' or
-                            migration.status == 'reverted'):
+                    is_live = (
+                        getattr(migration, 'migration_type', None) ==
+                        'live-migration')
+                    if not candidate.get('rollback_complete', True):
+                        if not is_live:
+                            raise exception.MigrationError(
+                                reason='Incomplete Incus source rollback is '
+                                       'not a live migration')
+                        network_info = self.network_api.get_instance_nw_info(
+                            context, instance)
+                        self.driver.recover_live_migration_rollback(
+                            context, instance,
+                            candidate['operation_token'],
+                            candidate['migration_uuid'], network_info)
+                    if is_live or migration.status == 'reverted':
                         finalized = (
                             self.driver.
                             finalize_remote_source_volume_generation(
