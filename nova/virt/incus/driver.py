@@ -16136,6 +16136,17 @@ class IncusDriver(driver.ComputeDriver):
         idmap_base, idmap_size = _live_migration_idmap(migrate_data)
         remote = _migration_client(destination_address)
 
+        release_pending = False
+        if self.idmap_allocator is not None:
+            release_intent = self.idmap_allocator.get_release_intent(
+                instance.uuid)
+            if release_intent is not None:
+                if release_intent.instance_name != instance.name:
+                    raise exception.MigrationError(
+                        reason='Incus live rollback idmap release owner '
+                               'changed')
+                release_pending = True
+
         attempt = _get_migration_attempt(
             remote, instance, cleanup_token, idmap_base, idmap_size)
         if attempt['state'] == 'active':
@@ -16169,7 +16180,9 @@ class IncusDriver(driver.ComputeDriver):
                 cleanup_token)
         if rollback_already_complete:
             container = self.client.instances.get(instance.name)
-            if container.status != 'Running':
+            if (container.status != 'Running' and
+                    not (release_pending and
+                         container.status == 'Stopped')):
                 raise exception.MigrationError(
                     reason='Incus rollback completion marker exists but the '
                            'source instance is not running')
@@ -16236,7 +16249,7 @@ class IncusDriver(driver.ComputeDriver):
                 vif.source_vif for vif in migrate_data.vifs
                 if ('source_vif' in vif and vif.source_vif)
             ])
-        if network_info:
+        if network_info and not release_pending:
             vif_ids = {vif['id'] for vif in network_info}
 
             def _vifs_have_active_state(expected):
@@ -16258,7 +16271,7 @@ class IncusDriver(driver.ComputeDriver):
 
         container = self.client.instances.get(instance.name)
         container.sync()
-        if container.status != 'Running':
+        if container.status != 'Running' and not release_pending:
             # A failed target restore can remove one side of the retained veth
             # pair. Rebuild the complete source wiring while the container is
             # stopped; Incus otherwise fails its start on the missing parent.
@@ -16268,7 +16281,7 @@ class IncusDriver(driver.ComputeDriver):
                     instance, container),
                 'rolled-back source container start', instance)
 
-        if network_info:
+        if network_info and not release_pending:
             # CRIU rollback has already resumed the source container with its
             # original veth peer when it never stopped. Rebuild only the OVS
             # Port row in that case; the stopped case recreated the whole pair
