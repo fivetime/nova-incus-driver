@@ -3167,7 +3167,8 @@ def _validate_managed_attach_operation(
     if (boot_volume and
             (operation_kind != 'migration' or
              operation_direction not in (
-                 'cold-source-restore', 'live-source-release'))):
+                 'cold-source-restore', 'cold-revert-source',
+                 'live-source-release'))):
         raise exception.InvalidVolume(
             reason='A boot-volume owner is valid only on a migration source')
     if operation_kind == 'hot-attach':

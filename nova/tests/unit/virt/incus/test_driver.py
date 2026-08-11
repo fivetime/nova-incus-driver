@@ -9411,6 +9411,32 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertFalse(os.path.exists(
             driver._managed_attach_intent_path(instance, _TEST_VOLUME_ID)))
 
+    def test_boot_volume_owner_handoffs_to_cold_revert_source(self):
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='test-boot-revert-intent',
+            memory_mb=0)
+        attachment_id = '40000000-0000-0000-0000-000000000004'
+        replacement_id = '50000000-0000-0000-0000-000000000005'
+        token = '60000000-0000-0000-0000-000000000006'
+        intent = driver._write_managed_attach_intent(
+            instance, _TEST_VOLUME_ID, attachment_id, '/dev/sda',
+            operation_kind='migration', operation_token=token,
+            operation_direction='cold-source-restore',
+            operation_migration_uuid=token, boot_volume=True)
+
+        replacement = driver._replace_managed_attach_intent(
+            instance, _TEST_VOLUME_ID, intent, replacement_id,
+            operation_direction='cold-revert-source')
+
+        self.assertTrue(replacement['boot_volume'])
+        self.assertEqual(replacement_id, replacement['attachment_id'])
+        self.assertEqual(
+            'cold-revert-source', replacement['operation_direction'])
+        self.assertEqual(
+            replacement,
+            driver._read_managed_attach_intent(
+                instance, _TEST_VOLUME_ID))
+
     def test_periodic_attach_resume_rejects_bdm_target_mismatch(self):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
