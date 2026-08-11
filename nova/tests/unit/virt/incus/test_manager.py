@@ -4319,6 +4319,9 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         target_info['serial'] = volume_id
         bdm = self._volume_recovery_bdm(
             volume_id, connection_info=target_info)
+        bdm_info = jsonutils.loads(bdm.connection_info)
+        bdm_info['data']['device_path'] = '/dev/source-host-rbd'
+        bdm.connection_info = jsonutils.dumps(bdm_info)
         bdm.attachment_id = target_attachment_id
         bdm.device_name = '/dev/sda'
         get_bdms.return_value = [bdm]

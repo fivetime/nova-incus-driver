@@ -5276,11 +5276,20 @@ class IncusComputeManager(manager.ComputeManager):
                 reason='Migration source release has no attached target')
         target_info = _attachment_connection_info(target_attachment)
         bdm_info = _optional_bdm_connection_info(bdm)
-        if (not target_info.get('driver_volume_type') or bdm_info is None or
-                _canonical_attachment_connection_info(
-                    target_info, volume_id, instance.uuid) !=
-                _canonical_attachment_connection_info(
-                    bdm_info, volume_id, instance.uuid)):
+        if not target_info.get('driver_volume_type') or bdm_info is None:
+            raise exception.InvalidVolume(
+                reason='Migration target BDM and Cinder attachment disagree')
+        target_canonical = _canonical_attachment_connection_info(
+            target_info, volume_id, instance.uuid)
+        bdm_canonical = _canonical_attachment_connection_info(
+            bdm_info, volume_id, instance.uuid)
+        # BFV root I/O is transferred by Incus' fenced Ceph handover, not
+        # os-brick. Nova may retain the source host connector in the BDM even
+        # after switching attachment_id, so require exact identity but do not
+        # compare host-specific transport fields. Data volumes still require
+        # byte-for-byte canonical connector agreement before source release.
+        if (not intent.get('boot_volume') and
+                target_canonical != bdm_canonical):
             raise exception.InvalidVolume(
                 reason='Migration target BDM and Cinder attachment disagree')
         volume = self.volume_api.get(context, volume_id)
