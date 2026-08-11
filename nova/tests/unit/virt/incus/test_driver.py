@@ -9347,6 +9347,11 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         incus_driver.init_host(None)
 
         def disconnect(*_args, **_kwargs):
+            profile.devices.pop(_TEST_VOLUME_ID)
+            profile.config[driver._volume_device_info_key(
+                _TEST_VOLUME_ID)] = driver._serialize_volume_attachment(
+                    connection_info, {'path': '/dev/sdc'}, '/dev/sdd',
+                    phase='disconnecting')
             driver._write_volume_journal(
                 instance, _TEST_VOLUME_ID, connection_info,
                 {'path': '/dev/sdc'}, '/dev/sdd', phase='disconnected')
@@ -9610,9 +9615,13 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                 ctx, instance, _TEST_VOLUME_ID, connection_info,
                 expected_mountpoint='/dev/sdd')
 
-        profile.save.assert_called_once_with(wait=True)
+        self.assertEqual(
+            [mock.call(wait=True), mock.call(wait=True)],
+            profile.save.call_args_list)
         connector.disconnect_volume.assert_called_once_with(
             connection_info['data'], {'path': '/dev/sdc'})
+        self.assertNotIn(
+            driver._volume_device_info_key(_TEST_VOLUME_ID), profile.config)
         self.assertEqual(
             'rolled-back',
             driver._read_volume_journal(instance, _TEST_VOLUME_ID)['phase'])
