@@ -334,6 +334,10 @@ class BfvCommandTimeoutContractTest(unittest.TestCase):
         self.assertIn('guest_iface=${guest_iface:0:15}', self.e2e)
         self.assertNotIn('ip -4 -o addr show eth0', self.e2e)
 
+    def test_bfv_start_failpoint_reads_the_nova_project_profile(self):
+        self.assertIn(
+            "'/1.0/profiles/$instance_name?project=nova'", self.e2e)
+
 
 class FullCheckpointMigrationContractTest(unittest.TestCase):
 

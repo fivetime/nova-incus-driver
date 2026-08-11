@@ -394,7 +394,7 @@ if [[ "$INJECT_POST_CLAIM_FAILURE" == true ]]; then
         start)
             vif_source=$(remote "$SOURCE_SSH" \
                 "podman exec incus incus query \
-                 '/1.0/profiles/$instance_name' |
+                 '/1.0/profiles/$instance_name?project=nova' |
                  jq -r '(.metadata.devices // .devices)[] |
                    select(.type == \"nic\" and .nictype == \"physical\") |
                    .parent'")
