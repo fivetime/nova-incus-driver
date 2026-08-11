@@ -3127,6 +3127,11 @@ class IncusComputeManager(manager.ComputeManager):
                                 'Migration volume %s committed but its local '
                                 'journal intent could not be retired',
                                 volume_id, instance=instance, exc_info=True)
+        if not self.driver.publish_migration_target_volumes_complete(
+                instance, cleanup_token, migration_uuid):
+            raise exception.MigrationError(
+                reason='Incus migration target retains a local Cinder '
+                       'volume transaction after Nova committed attachments')
 
     def _finish_revert_resize(
             self, context, instance, migration, request_spec=None):
@@ -4398,6 +4403,9 @@ class IncusComputeManager(manager.ComputeManager):
             expected_mountpoint=intent['mountpoint'])
         self.driver.cancel_managed_volume_attach(
             instance, volume_id, intent)
+        self.driver.publish_migration_target_volumes_complete(
+            instance, intent['operation_token'],
+            intent['operation_migration_uuid'])
 
     def _recover_incus_failed_migration_target_attach_locked(
             self, context, instance, volume_id, journal_phase, intent, bdm,

@@ -152,6 +152,8 @@ MIGRATION_RECEIVE_COMPLETE_KEY = (
 MIGRATION_CLEANUP_TOKEN_KEY = 'user.openstack.migration_cleanup_token'
 MIGRATION_CLEANUP_COMPLETE_KEY = (
     'user.openstack.migration_cleanup_complete')
+MIGRATION_TARGET_VOLUMES_COMPLETE_KEY = (
+    'user.openstack.migration_target_volumes_complete')
 MIGRATION_DESTINATION_PREPARED_KEY = (
     'user.openstack.migration_destination_prepared')
 MIGRATION_OPERATION_KEY = 'user.openstack.migration_operation_id'
@@ -1470,10 +1472,10 @@ def _finalize_committed_migration_attempt(
         raise exception.MigrationError(
             reason='Incus migration target profile changed before attempt '
                    'retirement')
-    if os.path.lexists(_volume_journal_directory(instance)):
+    if config.get(MIGRATION_TARGET_VOLUMES_COMPLETE_KEY) != token:
         raise exception.MigrationError(
-            reason='Incus migration target still has a local Cinder volume '
-                   'transaction')
+            reason='Incus migration target has no durable proof that its '
+                   'Cinder volume transactions completed')
     original_config = dict(profile.config)
     updated_config = dict(profile.config)
     updated_config.pop(MIGRATION_CLEANUP_TOKEN_KEY, None)
@@ -1481,6 +1483,7 @@ def _finalize_committed_migration_attempt(
     updated_config.pop(MIGRATION_DESTINATION_PREPARED_KEY, None)
     updated_config.pop(MIGRATION_NOVA_UUID_KEY, None)
     updated_config.pop(MIGRATION_TARGET_OPERATION_KEY, None)
+    updated_config.pop(MIGRATION_TARGET_VOLUMES_COMPLETE_KEY, None)
     profile.config = updated_config
     try:
         profile.save(wait=True)
@@ -2162,7 +2165,7 @@ def _storage_handover_is_owned(client, instance_name, container=None):
 
 
 def _converge_migration_target_ownership(
-        client, instance, desired_state=None):
+        client, instance, desired_state=None, local_volume_evidence=False):
     """Commit or verify target ownership after a lost Nova callback."""
     container = client.instances.get(instance.name)
     if desired_state is None:
@@ -2183,6 +2186,17 @@ def _converge_migration_target_ownership(
                    'the Nova instance')
 
     cleanup_token = profile_config.get(MIGRATION_CLEANUP_TOKEN_KEY)
+
+    def publish_local_volume_proof():
+        if not local_volume_evidence:
+            return
+        migration_uuid = profile_config.get(MIGRATION_NOVA_UUID_KEY)
+        if not _publish_migration_target_volumes_complete(
+                client, instance, cleanup_token, migration_uuid):
+            raise exception.MigrationError(
+                reason='Incus migration target retains a local Cinder '
+                       'volume transaction')
+
     if _storage_handover_is_owned(
             client, instance.name, container=container):
         # The ownership transition precedes profile/attempt retirement. A
@@ -2191,6 +2205,7 @@ def _converge_migration_target_ownership(
             idmap_base, idmap_size = _instance_migration_idmap(
                 container, profile)
             try:
+                publish_local_volume_proof()
                 _finalize_committed_migration_attempt(
                     client, instance, cleanup_token,
                     idmap_base, idmap_size)
@@ -2238,6 +2253,7 @@ def _converge_migration_target_ownership(
         return
 
     try:
+        publish_local_volume_proof()
         _finalize_committed_migration_attempt(
             client, instance, cleanup_token, idmap_base, idmap_size)
     except Exception:
@@ -3713,6 +3729,58 @@ def _remove_volume_journal(instance, volume_id):
             raise
     else:
         _fsync_directory(os.path.dirname(journal_dir))
+
+
+def _publish_migration_target_volumes_complete(
+        client, instance, operation_token, migration_uuid):
+    """Publish target-local proof after every volume record is retired."""
+    if (not uuidutils.is_uuid_like(operation_token) or
+            not uuidutils.is_uuid_like(migration_uuid)):
+        raise exception.MigrationError(
+            reason='Incus migration target volume proof is invalid')
+
+    def volume_evidence_absent():
+        journal_dir = _volume_journal_directory(instance)
+        try:
+            entries = os.listdir(journal_dir)
+        except FileNotFoundError:
+            return True
+        if entries:
+            return False
+        try:
+            os.rmdir(journal_dir)
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
+                return False
+            raise
+        _fsync_directory(os.path.dirname(journal_dir))
+        return True
+
+    if not volume_evidence_absent():
+        return False
+    with lockutils.lock(_profile_lock_name(instance)):
+        profile = client.profiles.get(instance.name)
+        _validate_profile_volume_owner(profile, instance)
+        config = profile.config if isinstance(profile.config, dict) else {}
+        if (config.get(MIGRATION_CLEANUP_TOKEN_KEY) != operation_token or
+                config.get(MIGRATION_NOVA_UUID_KEY) != migration_uuid):
+            raise exception.MigrationError(
+                reason='Incus migration target volume proof owner changed')
+        # Recheck after acquiring the profile serialization fence. Migration
+        # volume writers validate this same profile generation before they
+        # can publish local evidence.
+        if not volume_evidence_absent():
+            return False
+        existing = config.get(MIGRATION_TARGET_VOLUMES_COMPLETE_KEY)
+        if existing not in (None, operation_token):
+            raise exception.MigrationError(
+                reason='Incus migration target volume proof changed')
+        profile.config[MIGRATION_TARGET_VOLUMES_COMPLETE_KEY] = (
+            operation_token)
+        profile.save(wait=True)
+    return True
 
 
 def _profile_volume_record(profile, volume_id, device=None):
@@ -9467,7 +9535,7 @@ class IncusDriver(driver.ComputeDriver):
                 # token. Converge the committed attempt, then require both
                 # Incus ownership and token retirement before final delete.
                 _converge_migration_target_ownership(
-                    self.client, instance)
+                    self.client, instance, local_volume_evidence=True)
                 current = self.client.instances.get(instance.name)
                 if not _storage_handover_is_owned(
                         self.client, instance.name, container=current):
@@ -10067,7 +10135,8 @@ class IncusDriver(driver.ComputeDriver):
             raise exception.MigrationError(
                 reason='Committed Incus migration target is not the Nova '
                        'instance owner; refusing automatic cleanup')
-        _converge_migration_target_ownership(self.client, instance)
+        _converge_migration_target_ownership(
+            self.client, instance, local_volume_evidence=True)
         return True
 
     def list_share_journal_recovery_candidates(self):
@@ -10116,6 +10185,11 @@ class IncusDriver(driver.ComputeDriver):
 
     def get_managed_volume_attach_intent(self, instance, volume_id):
         return _read_managed_attach_intent(instance, volume_id)
+
+    def publish_migration_target_volumes_complete(
+            self, instance, operation_token, migration_uuid):
+        return _publish_migration_target_volumes_complete(
+            self.client, instance, operation_token, migration_uuid)
 
     def get_cold_source_migration_token(self, instance):
         """Return the exact source-profile generation for a cold migration."""
@@ -11137,6 +11211,13 @@ class IncusDriver(driver.ComputeDriver):
                     raise exception.MigrationError(
                         reason='Marked migration owner has a non-committed '
                                'local attempt')
+                migration_uuid = profile.config.get(MIGRATION_NOVA_UUID_KEY)
+                if not _publish_migration_target_volumes_complete(
+                        self.client, instance, cleanup_token,
+                        migration_uuid):
+                    raise exception.MigrationError(
+                        reason='Marked migration owner retains a local '
+                               'Cinder volume transaction')
                 _finalize_committed_migration_attempt(
                     self.client, instance, cleanup_token,
                     idmap_base, idmap_size)
@@ -15904,7 +15985,8 @@ class IncusDriver(driver.ComputeDriver):
         # retired. Verify the already-owned state, or finish a protected target
         # left by a lost source callback and persist recovery on uncertainty.
         _converge_migration_target_ownership(
-            self.client, instance, desired_state='running')
+            self.client, instance, desired_state='running',
+            local_volume_evidence=True)
 
     def rollback_live_migration_at_source(
             self, context, instance, migrate_data):

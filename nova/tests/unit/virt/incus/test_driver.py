@@ -427,6 +427,46 @@ class MigrationAttemptProtocolTest(test.NoDBTestCase):
         self.assertIs(mock.sentinel.result, result)
         self.assertEqual(2, action.call_count)
 
+    def test_publishes_target_volume_completion_after_local_evidence_gone(
+            self):
+        migration_uuid = '20000000-0000-0000-0000-000000000002'
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': self.instance.uuid,
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: self.token,
+            driver.MIGRATION_NOVA_UUID_KEY: migration_uuid,
+        }
+
+        self.assertTrue(driver._publish_migration_target_volumes_complete(
+            self.client, self.instance, self.token, migration_uuid))
+
+        self.assertEqual(
+            self.token,
+            profile.config[driver.MIGRATION_TARGET_VOLUMES_COMPLETE_KEY])
+        profile.save.assert_called_once_with(wait=True)
+
+    def test_target_volume_completion_waits_for_local_evidence(self):
+        migration_uuid = '20000000-0000-0000-0000-000000000002'
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': self.instance.uuid,
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: self.token,
+            driver.MIGRATION_NOVA_UUID_KEY: migration_uuid,
+        }
+        journal_dir = driver._volume_journal_directory(self.instance)
+        os.makedirs(journal_dir)
+        with open(
+                os.path.join(journal_dir, 'pending.attach-intent'), 'w',
+                encoding='utf-8'):
+            pass
+
+        self.assertFalse(driver._publish_migration_target_volumes_complete(
+            self.client, self.instance, self.token, migration_uuid))
+
+        profile.save.assert_not_called()
+
     def test_finalize_marker_save_failure_remains_retryable(self):
         profile = self.client.profiles.get.return_value
         profile.config = {
@@ -434,6 +474,7 @@ class MigrationAttemptProtocolTest(test.NoDBTestCase):
             'user.openstack.uuid': self.instance.uuid,
             driver.MIGRATION_CLEANUP_TOKEN_KEY: self.token,
             driver.MIGRATION_DESTINATION_PREPARED_KEY: self.token,
+            driver.MIGRATION_TARGET_VOLUMES_COMPLETE_KEY: self.token,
         }
         profile.save.side_effect = RuntimeError('database unavailable')
         attempt = {'state': 'committed', 'finished': True}
@@ -453,7 +494,7 @@ class MigrationAttemptProtocolTest(test.NoDBTestCase):
             profile.config[driver.MIGRATION_DESTINATION_PREPARED_KEY])
         retire.assert_not_called()
 
-    def test_finalize_committed_attempt_waits_for_volume_transaction(self):
+    def test_finalize_committed_attempt_requires_target_volume_proof(self):
         profile = self.client.profiles.get.return_value
         profile.config = {
             'environment.product_name': 'OpenStack Nova',
@@ -483,6 +524,34 @@ class MigrationAttemptProtocolTest(test.NoDBTestCase):
             self.token, profile.config[driver.MIGRATION_CLEANUP_TOKEN_KEY])
         profile.save.assert_not_called()
         retire.assert_not_called()
+
+    def test_finalize_remote_attempt_ignores_source_volume_journal(self):
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': self.instance.uuid,
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: self.token,
+            driver.MIGRATION_DESTINATION_PREPARED_KEY: self.token,
+            driver.MIGRATION_TARGET_VOLUMES_COMPLETE_KEY: self.token,
+        }
+        journal_dir = driver._volume_journal_directory(self.instance)
+        os.makedirs(journal_dir)
+        with open(
+                os.path.join(journal_dir, 'source-release.attach-intent'),
+                'w', encoding='utf-8'):
+            pass
+        attempt = {'state': 'committed', 'finished': True}
+
+        with mock.patch.object(
+                driver, '_get_migration_attempt', return_value=attempt):
+            with mock.patch.object(
+                    driver, '_retire_migration_attempt') as retire:
+                driver._finalize_committed_migration_attempt(
+                    self.client, self.instance, self.token, 1065536, 65536)
+
+        profile.save.assert_called_once_with(wait=True)
+        retire.assert_called_once_with(
+            self.client, self.instance, self.token, 1065536, 65536)
 
 
 class IncusIDMapDriverTest(test.NoDBTestCase):
@@ -6106,7 +6175,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         incus_driver.destroy(ctx, instance, [_VIF], destroy_disks=True)
 
-        converge.assert_called_once_with(self.client, instance)
+        converge.assert_called_once_with(
+            self.client, instance, local_volume_evidence=True)
         is_owned.assert_called_once_with(
             self.client, instance.name, container=container)
         container.delete.assert_called_once_with(wait=True)
@@ -6142,7 +6212,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             incus_driver.destroy, ctx, instance, [_VIF],
             destroy_disks=True)
 
-        converge.assert_called_once_with(self.client, instance)
+        converge.assert_called_once_with(
+            self.client, instance, local_volume_evidence=True)
         container.delete.assert_not_called()
         incus_driver.cleanup.assert_not_called()
         incus_driver._acknowledge_cleanup_profile.assert_not_called()
@@ -7382,7 +7453,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             mock.sentinel.context, instance, candidate, migration,
             mock.sentinel.network_info))
 
-        converge.assert_called_once_with(self.client, instance)
+        converge.assert_called_once_with(
+            self.client, instance, local_volume_evidence=True)
         cleanup.assert_not_called()
         acknowledge.assert_not_called()
 

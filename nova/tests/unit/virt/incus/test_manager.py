@@ -4848,6 +4848,8 @@ class IncusComputeManagerTest(test.NoDBTestCase):
                 operation_kind='migration', operation_token=token,
                 operation_direction='cold-target',
                 operation_migration_uuid=migration_uuid)
+        self.compute.driver.publish_migration_target_volumes_complete.\
+            assert_called_once_with(instance, token, migration_uuid)
 
     @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
     @mock.patch.object(
