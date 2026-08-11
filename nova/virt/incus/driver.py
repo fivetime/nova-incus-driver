@@ -559,8 +559,20 @@ def _reboot_data_volume_bdms(block_device_info, root_device_name=None):
     volume_ids = set()
     mountpoints = _boot_volume_mountpoints(
         volume_bdms, root_device_name=root_device_name)
+    explicit_boot = [bdm for bdm in volume_bdms if _is_boot_volume(bdm)]
+    inferred_boot = None
+    if not explicit_boot and root_device_name is not None:
+        authoritative_root = _validate_volume_mountpoint(root_device_name)
+        root_candidates = [
+            bdm for bdm in volume_bdms
+            if bdm.get('mount_device') == authoritative_root]
+        if len(root_candidates) > 1:
+            raise exception.DevicePathInUse(path=authoritative_root)
+        if root_candidates:
+            inferred_boot = root_candidates[0]
+            mountpoints.add(authoritative_root)
     for bdm in volume_bdms:
-        if _is_boot_volume(bdm):
+        if _is_boot_volume(bdm) or bdm is inferred_boot:
             continue
         connection_info = bdm.get('connection_info')
         if not connection_info:

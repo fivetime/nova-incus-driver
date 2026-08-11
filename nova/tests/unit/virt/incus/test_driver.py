@@ -5263,6 +5263,32 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             driver._reboot_data_volume_bdms, block_device_info,
             root_device_name='/dev/vda')
 
+    def test_reboot_data_volumes_infer_bfv_root_from_authoritative_path(self):
+        root_bdm = {
+            'boot_index': None,
+            'mount_device': '/dev/vda',
+            'connection_info': {
+                'driver_volume_type': 'rbd',
+                'serial': 'root-volume',
+                'data': {},
+            },
+        }
+        data_bdm = {
+            'boot_index': None,
+            'mount_device': '/dev/vdb',
+            'connection_info': {
+                'driver_volume_type': 'rbd',
+                'serial': 'data-volume',
+                'data': {},
+            },
+        }
+
+        result = driver._reboot_data_volume_bdms(
+            {'block_device_mapping': [root_bdm, data_bdm]},
+            root_device_name='/dev/vda')
+
+        self.assertEqual([data_bdm], result)
+
     def test_spawn_rejects_bfv_root_data_mountpoint_collision_first(self):
         root_connection = fake_connection_info(
             {'id': 1, 'name': 'volume-00000001'}, '10.0.2.15:3260',
