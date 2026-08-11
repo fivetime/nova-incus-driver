@@ -1080,7 +1080,7 @@ verify_guest_persistent_state() {
     local target_volume_source manila_marker_path manila_marker share_mount
     local restored_manila_marker
 
-    [[ "$(incus_remote "$host" exec "$instance_name" -- \
+    [[ "$(incus_exec_read "$host" "$instance_name" \
         cat /root/incus-migration-e2e-marker)" == "$root_marker" ]]
     for index in "${!volume_ids[@]}"; do
         volume_id=${volume_ids[index]}
@@ -1088,8 +1088,9 @@ verify_guest_persistent_state() {
         volume_marker=${volume_markers[index]}
         [[ "$(openstack volume show "$volume_id" -f value -c status)" == \
             "in-use" ]]
-        incus_remote "$host" exec "$instance_name" -- test -b "$data_device"
-        restored_marker=$(incus_remote "$host" exec "$instance_name" -- \
+        incus_exec_read "$host" "$instance_name" \
+            test -b "$data_device" >/dev/null
+        restored_marker=$(incus_exec_read "$host" "$instance_name" \
             dd if="$data_device" bs=1 count="${#volume_marker}" status=none)
         [[ "$restored_marker" == "$volume_marker" ]]
         target_volume_source=$(incus_remote "$host" profile device get \
@@ -1101,8 +1102,8 @@ verify_guest_persistent_state() {
         manila_marker_path=${manila_marker_paths[index]}
         manila_marker=${share_markers[index]}
         share_mount=${share_mounts[index]}
-        restored_manila_marker=$(incus_remote "$host" \
-            exec "$instance_name" -- cat "$manila_marker_path")
+        restored_manila_marker=$(incus_exec_read "$host" "$instance_name" \
+            cat "$manila_marker_path")
         [[ "$restored_manila_marker" == "$manila_marker" ]]
         remote "$host" findmnt -rn "$share_mount" >/dev/null
     done
@@ -1203,9 +1204,9 @@ verify_active_network() {
     guest_iface="nic${port_id//-/}"
     guest_iface=${guest_iface:0:15}
     [[ -n "$guest_iface" ]]
-    incus_remote "$active_ssh" exec "$instance_name" -- \
+    incus_exec_read "$active_ssh" "$instance_name" \
         ip link show "$guest_iface" >/dev/null
-    incus_remote "$active_ssh" exec "$instance_name" -- \
+    incus_exec_read "$active_ssh" "$instance_name" \
         ip -o addr show "$guest_iface" | grep -Fq "$fixed_ip"
     ovs_iface=$(remote "$active_ssh" \
         "ovs-vsctl --data=bare --no-heading --columns=name find Interface \
@@ -1261,7 +1262,13 @@ migrate_and_verify() {
     [[ "$dest_pid" =~ ^[0-9]+$ ]]
     [[ "$dest_counter" =~ ^[0-9]+$ ]]
     if [[ "$MIGRATION_MODE" == live ]]; then
-        [[ "$dest_pid" == "$source_pid" ]]
+        if [[ "$dest_pid" != "$source_pid" ]]; then
+            echo "Guest PID changed across live migration: " \
+                "source=$source_pid destination=$dest_pid" >&2
+            incus_remote "$target_ssh" exec "$instance_name" -- \
+                ps -ef >&2 || true
+            return 1
+        fi
         ((dest_counter > current_counter))
     else
         ((dest_counter >= current_counter))
