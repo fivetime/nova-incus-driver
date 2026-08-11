@@ -16147,9 +16147,19 @@ class IncusDriver(driver.ComputeDriver):
                                'changed')
                 release_pending = True
 
-        attempt = _get_migration_attempt(
-            remote, instance, cleanup_token, idmap_base, idmap_size)
-        if attempt['state'] == 'active':
+        try:
+            attempt = _get_migration_attempt(
+                remote, instance, cleanup_token, idmap_base, idmap_size)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+            # Destination rollback retires its terminal attempt after it has
+            # fenced and cleaned the target.  Its asynchronous RPC can win
+            # that race before the source finalizer starts.  Absence alone
+            # does not authorize source recovery; the target/profile barrier
+            # below still has to prove destination cleanup.
+            attempt = None
+        if attempt is not None and attempt['state'] == 'active':
             attempt = _abort_migration_attempt(
                 remote, instance, cleanup_token,
                 idmap_base, idmap_size,
@@ -16157,11 +16167,13 @@ class IncusDriver(driver.ComputeDriver):
                     lambda: self._delete_migration_target_with_idmap(
                         remote, instance),
                     'aborted live migration target deletion', instance))
-        elif attempt['state'] in ('aborted', 'failed'):
+        elif (attempt is not None and
+              attempt['state'] in ('aborted', 'failed')):
             attempt = _wait_migration_attempt_finished(
                 remote, instance, cleanup_token,
                 idmap_base, idmap_size, ('aborted', 'failed'))
-        elif attempt['state'] != 'committed':
+        elif (attempt is not None and
+              attempt['state'] != 'committed'):
             raise exception.MigrationError(
                 reason='Unsupported live rollback attempt state %s' %
                 attempt['state'])
@@ -16216,7 +16228,8 @@ class IncusDriver(driver.ComputeDriver):
             except incus_exceptions.LXDAPIException as exc:
                 if not _is_incus_not_found(exc):
                     raise
-                if attempt['state'] == 'committed':
+                if (attempt is not None and
+                        attempt['state'] == 'committed'):
                     raise exception.MigrationError(
                         reason='Committed Incus live migration destination '
                                'cleanup has no positive acknowledgement')
