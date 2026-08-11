@@ -9724,6 +9724,45 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertIsNone(
             driver._read_volume_journal(instance, _TEST_VOLUME_ID))
 
+    def test_rolled_back_replay_retires_legacy_terminal_metadata(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-legacy-rolled-back-metadata', memory_mb=0)
+        connection_info = fake_connection_info(
+            {'id': 1, 'name': 'volume-00000001'},
+            '10.0.2.15:3260',
+            'iqn.2010-10.org.openstack:volume-00000001')
+        terminal = driver._serialize_volume_attachment(
+            connection_info, {'path': '/dev/sdc'}, '/dev/sdd',
+            phase='disconnecting')
+        profile = mock.Mock(
+            devices={},
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                'user.openstack.uuid': instance.uuid,
+                driver._volume_device_info_key(_TEST_VOLUME_ID): terminal,
+            })
+        self.client.profiles.get.return_value = profile
+        driver._write_volume_journal(
+            instance, _TEST_VOLUME_ID, connection_info,
+            {'path': '/dev/sdc'}, '/dev/sdd', phase='rolled-back')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        with mock.patch.object(driver, 'brick_get_connector') as connector:
+            incus_driver.rollback_connecting_volume_journal(
+                ctx, instance, _TEST_VOLUME_ID, connection_info,
+                expected_mountpoint='/dev/sdd')
+
+        connector.assert_not_called()
+        profile.save.assert_called_once_with(wait=True)
+        self.assertNotIn(
+            driver._volume_device_info_key(_TEST_VOLUME_ID), profile.config)
+        self.assertEqual(
+            'rolled-back',
+            driver._read_volume_journal(
+                instance, _TEST_VOLUME_ID)['phase'])
+
     def test_power_on_cleans_proven_stale_volume_journal(self):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(

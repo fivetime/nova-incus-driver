@@ -10793,13 +10793,9 @@ class IncusDriver(driver.ComputeDriver):
                 reason='Nova BDM target for volume %s does not match the '
                        'rollback journal' % volume_id)
         phase = record.get('phase')
-        if phase == 'rolled-back':
-            # Host ownership was already removed and Cinder may have exposed
-            # the volume to a new attachment. Never reconnect or disconnect
-            # it again; only manager-side Cinder/BDM finalization remains.
-            return
         if phase not in (
-                'connecting', 'connected', 'disconnecting', 'disconnected'):
+                'connecting', 'connected', 'disconnecting', 'disconnected',
+                'rolled-back'):
             raise exception.InvalidVolume(
                 reason='Cinder volume %s is not in attach rollback' %
                        volume_id)
@@ -10817,6 +10813,42 @@ class IncusDriver(driver.ComputeDriver):
         _validate_recoverable_data_volume(effective, volume_id)
         _validate_volume_recovery_record(
             record, volume_id, mountpoint, effective)
+
+        if phase == 'rolled-back':
+            # Older code could persist the journal commit before removing the
+            # matching terminal profile metadata. Retire only that exact
+            # metadata on replay; host ownership is already gone, so never
+            # reconnect or disconnect the volume in this phase.
+            with lockutils.lock(_profile_lock_name(instance)):
+                try:
+                    profile = self.client.profiles.get(instance.name)
+                except incus_exceptions.LXDAPIException as exc:
+                    if not _is_incus_not_found(exc):
+                        raise
+                    profile = None
+                if profile is not None:
+                    _validate_profile_volume_owner(profile, instance)
+                    if profile.devices.get(volume_id) is not None:
+                        raise exception.InvalidVolume(
+                            reason='Rolled-back Cinder volume still has an '
+                                   'Incus guest device')
+                    metadata_keys = [
+                        key for key in _volume_device_info_keys(volume_id)
+                        if key in profile.config]
+                    if metadata_keys:
+                        profile_record = _profile_volume_record(
+                            profile, volume_id)
+                        profile_phase = _validate_volume_recovery_record(
+                            profile_record, volume_id, mountpoint, effective)
+                        if profile_phase not in (
+                                'disconnecting', 'disconnected'):
+                            raise exception.InvalidVolume(
+                                reason='Rolled-back Cinder volume has '
+                                       'non-terminal Incus metadata')
+                        for metadata_key in metadata_keys:
+                            profile.config.pop(metadata_key, None)
+                        profile.save(wait=True)
+            return
 
         # attach_volume() uses the normal detach implementation to undo a
         # failed host connect. A crash in that cleanup therefore leaves a
