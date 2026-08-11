@@ -2112,17 +2112,20 @@ class IncusComputeManagerTest(test.NoDBTestCase):
 
     @mock.patch.object(
         manager.manager.ComputeManager, '_rollback_live_migration')
-    def test_rollback_live_migration_pre_live_skips_finalize(
+    def test_rollback_live_migration_pre_live_retires_source_generation(
             self, base_rollback):
         data = migrate_data.IncusLiveMigrateData()
+        instance = mock.Mock(host=self.compute.host)
 
         self.compute._rollback_live_migration(
-            mock.sentinel.context, mock.sentinel.instance, 'dest-host',
+            mock.sentinel.context, instance, 'dest-host',
             migrate_data=data, pre_live_migration=True)
 
         base_rollback.assert_called_once()
         finalize = self.compute.driver.finalize_live_migration_rollback
         finalize.assert_not_called()
+        retire = self.compute.driver.finalize_pre_live_migration_rollback
+        retire.assert_called_once_with(instance, data)
 
     @mock.patch.object(manager.objects.BlockDeviceMappingList,
                        'get_by_instance_uuid')
@@ -6092,15 +6095,18 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         self.compute.driver.cancel_cold_attachment_rotation.\
             assert_not_called()
 
-    def test_pre_live_migration_rollback_does_not_reassert_network(self):
+    def test_pre_live_migration_rollback_retires_source_generation(self):
         data = migrate_data.IncusLiveMigrateData()
+        instance = mock.Mock(host=self.compute.host)
 
         self.compute._complete_live_migration_rollback(
-            mock.sentinel.context, mock.sentinel.instance, data,
+            mock.sentinel.context, instance, data,
             pre_live_migration=True)
 
         finalize = self.compute.driver.finalize_live_migration_rollback
         finalize.assert_not_called()
+        retire = self.compute.driver.finalize_pre_live_migration_rollback
+        retire.assert_called_once_with(instance, data)
 
     def test_live_migration_check_data_uses_exact_nova_migration_uuid(self):
         token = '10000000-0000-0000-0000-000000000001'

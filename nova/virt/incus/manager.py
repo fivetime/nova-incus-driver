@@ -2653,6 +2653,25 @@ class IncusComputeManager(manager.ComputeManager):
             pre_live_migration=False, migration_status='failed'):
         """Prove target cleanup before Nova reports rollback complete."""
         if (
+            pre_live_migration and
+            isinstance(migrate_data, incus_migrate_data.IncusLiveMigrateData)
+        ):
+            try:
+                if (migration_status not in (
+                        'cancelled', 'error', 'failed') or
+                        instance.host != self.host):
+                    raise exception.MigrationError(
+                        reason='Nova has not retained source ownership after '
+                               'pre-live migration rollback')
+                self.driver.finalize_pre_live_migration_rollback(
+                    instance, migrate_data)
+            except Exception:
+                LOG.critical(
+                    'Pre-live migration rollback committed but its source '
+                    'generation token could not be retired; periodic cleanup '
+                    'will retry', instance=instance, exc_info=True)
+            return
+        if (
             not pre_live_migration and
             isinstance(migrate_data, incus_migrate_data.IncusLiveMigrateData)
         ):

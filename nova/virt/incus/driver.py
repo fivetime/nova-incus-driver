@@ -12021,6 +12021,15 @@ class IncusDriver(driver.ComputeDriver):
 
         remote = _migration_client(destination_address)
         try:
+            remote.instances.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if not _is_incus_not_found(exc):
+                raise
+        else:
+            raise exception.MigrationError(
+                reason='Reverted source generation still has an Incus '
+                       'instance on the migration destination')
+        try:
             acknowledgement = remote.profiles.get(instance.name)
         except incus_exceptions.LXDAPIException as exc:
             if not _is_incus_not_found(exc):
@@ -12034,6 +12043,28 @@ class IncusDriver(driver.ComputeDriver):
             remote, instance, operation_token, idmap_base, idmap_size)
         return self.finalize_source_volume_generation(
             instance, operation_token, require_rollback_complete=True)
+
+    def finalize_pre_live_migration_rollback(
+            self, instance, migrate_data):
+        """Retire source preparation after destination pre-live aborts."""
+        cleanup_token = _live_migration_cleanup_token(migrate_data)
+        migration_uuid = _live_migration_uuid(migrate_data)
+        source_operation_id = (
+            migrate_data.source_operation_id
+            if migrate_data.obj_attr_is_set('source_operation_id') else None)
+        destination_operation_id = (
+            migrate_data.destination_operation_id
+            if migrate_data.obj_attr_is_set(
+                'destination_operation_id') else None)
+        if (source_operation_id is not None or
+                destination_operation_id is not None):
+            raise exception.MigrationError(
+                reason='Pre-live rollback contains a started Incus '
+                       'migration operation')
+        self.mark_source_volume_generation_rollback_complete(
+            instance, cleanup_token, migration_uuid)
+        return self.finalize_remote_source_volume_generation(
+            instance, cleanup_token)
 
     def _stage_volume_for_live_migration(
             self, context, connection_info, instance, mountpoint,

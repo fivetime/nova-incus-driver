@@ -7288,6 +7288,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         profile.devices = {}
         intents.return_value = {}
         response = MockResponse(404)
+        migration_client.return_value.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(response))
         migration_client.return_value.profiles.get.side_effect = (
             incuscore_exceptions.NotFound(response))
         retire_attempt.side_effect = [
@@ -7307,6 +7309,85 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                 instance, token))
         self.assertNotIn(driver.MIGRATION_CLEANUP_TOKEN_KEY, profile.config)
         self.assertEqual(2, retire_attempt.call_count)
+
+    @mock.patch.object(driver, '_migration_client')
+    @mock.patch.object(driver, '_managed_attach_intents_by_uuid')
+    def test_pre_live_rollback_marks_before_remote_retirement(
+            self, intents, migration_client):
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='instance-pre-live-source')
+        token = '20000000-0000-0000-0000-000000000002'
+        migration_uuid = '30000000-0000-0000-0000-000000000003'
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: token,
+            driver.MIGRATION_DESTINATION_KEY: 'https://192.0.2.20:8443',
+            'security.idmap.base': '1065536',
+            'security.idmap.size': '65536',
+        }
+        profile.devices = {}
+        intents.return_value = {}
+        response = MockResponse(404)
+        migration_client.return_value.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(response))
+        migration_client.return_value.profiles.get.side_effect = (
+            incuscore_exceptions.NotFound(response))
+        migration_client.return_value.api.__getitem__.return_value.\
+            __getitem__.return_value.delete.return_value = None
+        data = migrate_data.IncusLiveMigrateData(
+            cleanup_token=token, migration_uuid=migration_uuid,
+            destination_address='https://192.0.2.20:8443',
+            idmap_base=1065536, idmap_size=65536)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertTrue(incus_driver.finalize_pre_live_migration_rollback(
+            instance, data))
+
+        self.assertNotIn(driver.MIGRATION_CLEANUP_TOKEN_KEY, profile.config)
+        self.assertNotIn(
+            driver.MIGRATION_ROLLBACK_COMPLETE_KEY, profile.config)
+
+    @mock.patch.object(driver, '_migration_client')
+    @mock.patch.object(driver, '_managed_attach_intents_by_uuid')
+    def test_pre_live_rollback_retains_generation_while_target_exists(
+            self, intents, migration_client):
+        instance = fake_instance.fake_instance_obj(
+            context.get_admin_context(), name='instance-pre-live-source')
+        token = '20000000-0000-0000-0000-000000000002'
+        migration_uuid = '30000000-0000-0000-0000-000000000003'
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: token,
+            driver.MIGRATION_DESTINATION_KEY: 'https://192.0.2.20:8443',
+            'security.idmap.base': '1065536',
+            'security.idmap.size': '65536',
+        }
+        profile.devices = {}
+        intents.return_value = {}
+        migration_client.return_value.instances.get.return_value = mock.Mock()
+        data = migrate_data.IncusLiveMigrateData(
+            cleanup_token=token, migration_uuid=migration_uuid,
+            destination_address='https://192.0.2.20:8443',
+            idmap_base=1065536, idmap_size=65536)
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaises(
+            exception.MigrationError,
+            incus_driver.finalize_pre_live_migration_rollback,
+            instance, data)
+
+        self.assertEqual(
+            token, profile.config[driver.MIGRATION_CLEANUP_TOKEN_KEY])
+        self.assertEqual(
+            token, profile.config[driver.MIGRATION_ROLLBACK_COMPLETE_KEY])
+        self.assertEqual(
+            migration_uuid, profile.config[driver.MIGRATION_NOVA_UUID_KEY])
 
     def test_host_wide_locks_are_named_per_instance(self):
         """The lock NAME keys the in-process semaphore, nothing else.
