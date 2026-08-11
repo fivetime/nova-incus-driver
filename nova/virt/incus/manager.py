@@ -3551,7 +3551,8 @@ class IncusComputeManager(manager.ComputeManager):
                     external=True, lock_path=CONF.state_path):
                 try:
                     instance = objects.Instance.get_by_uuid(
-                        context, candidate['uuid'])
+                        context, candidate['uuid'],
+                        expected_attrs=['system_metadata'])
                     deleted = (
                         instance.obj_attr_is_set('deleted') and
                         instance.deleted)

@@ -7642,6 +7642,9 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         self.compute._recover_incus_source_volume_generations(
             context.get_admin_context())
 
+        get_by_uuid.assert_called_once_with(
+            mock.ANY, instance.uuid,
+            expected_attrs=['system_metadata'])
         get_migrations.assert_called_once_with(
             mock.ANY, {'instance_uuid': instance.uuid})
         self.compute.driver.finalize_remote_source_volume_generation.\
