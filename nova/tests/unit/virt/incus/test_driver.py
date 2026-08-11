@@ -16401,9 +16401,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.client.instances.get.assert_not_called()
         self.client.profiles.get.assert_not_called()
 
-    @mock.patch.object(driver.objects.MigrationList, 'get_by_filters')
     def test_check_can_live_migrate_destination_returns_host_facts(
-            self, get_migrations):
+            self):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
@@ -16411,13 +16410,10 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.CONF.incus.migration_address = 'https://192.0.2.20:8443'
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
-        migration_uuid = '20000000-0000-0000-0000-000000000002'
-        get_migrations.return_value = [mock.Mock(
-            uuid=migration_uuid, migration_type='live-migration',
-            dest_compute=self.CONF.host, status='preparing')]
-
-        data = incus_driver.check_can_live_migrate_destination(
-            ctx, instance, mock.Mock(), mock.Mock())
+        with mock.patch.object(
+                driver.objects.MigrationList, 'get_by_filters') as get:
+            data = incus_driver.check_can_live_migrate_destination(
+                ctx, instance, mock.Mock(), mock.Mock())
 
         self.assertIsInstance(data, migrate_data.IncusLiveMigrateData)
         self.assertEqual(
@@ -16425,7 +16421,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertEqual('x86_64', data.destination_architecture)
         self.assertEqual('6.8.0-test', data.destination_kernel_version)
         self.assertEqual('7.2', data.destination_server_version)
-        self.assertEqual(migration_uuid, data.migration_uuid)
+        self.assertEqual(data.cleanup_token, data.migration_uuid)
+        get.assert_not_called()
         self.assertFalse(data.obj_attr_is_set('full_checkpoint_verified'))
 
     def test_live_migrate_data_full_checkpoint_compatibility(self):

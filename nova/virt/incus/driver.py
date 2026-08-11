@@ -937,28 +937,6 @@ def _live_migration_uuid(migrate_data):
     return migrate_data.migration_uuid
 
 
-def _active_live_migration_uuid(context, instance, destination_host):
-    """Resolve exactly one Nova live migration targeting this compute."""
-    migrations = objects.MigrationList.get_by_filters(
-        context, {'instance_uuid': instance.uuid})
-    terminal = {
-        'cancelled', 'completed', 'confirmed', 'done', 'error', 'failed',
-        'reverted',
-    }
-    candidates = [
-        migration for migration in migrations
-        if (getattr(migration, 'migration_type', None) == 'live-migration' and
-            getattr(migration, 'dest_compute', None) == destination_host and
-            getattr(migration, 'status', None) not in terminal and
-            uuidutils.is_uuid_like(getattr(migration, 'uuid', None)))
-    ]
-    if len(candidates) != 1:
-        raise exception.MigrationPreCheckError(
-            reason='Incus live migration destination cannot identify exactly '
-                   'one active Nova Migration')
-    return candidates[0].uuid
-
-
 def _cold_migration_cleanup_token(context, instance):
     """Return the canonical Nova Migration UUID for a cold migration."""
     migration_context = getattr(instance, 'migration_context', None)
@@ -16309,15 +16287,17 @@ class IncusDriver(driver.ComputeDriver):
         except exception.MigrationError as exc:
             raise exception.MigrationPreCheckError(reason=str(exc))
         facts = _migration_host_facts(self.client)
-        migration_uuid = _active_live_migration_uuid(
-            context, instance, CONF.host)
+        cleanup_token = uuidutils.generate_uuid()
         return incus_migrate_data.IncusLiveMigrateData(
             destination_address=address,
             destination_architecture=facts['architecture'],
             destination_kernel_version=facts['kernel_version'],
             destination_server_version=facts['server_version'],
-            cleanup_token=uuidutils.generate_uuid(),
-            migration_uuid=migration_uuid,
+            cleanup_token=cleanup_token,
+            # Nova does not persist dest_compute until after this driver hook.
+            # The manager hook replaces this placeholder with the authoritative
+            # Migration.uuid before the result leaves the destination compute.
+            migration_uuid=cleanup_token,
             source_operation_id=None,
             destination_operation_id=None)
 
