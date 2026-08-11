@@ -256,6 +256,15 @@ def _canonical_attachment_connection_info(
 
     canonical = dict(connection_info)
     canonical['data'] = dict(data)
+    # Cinder adds the exact attachment UUID after connector initialization;
+    # the journal is intentionally written before that lifecycle transition.
+    # Ownership is validated separately against the exact attachment record.
+    canonical['data'].pop('attachment_id', None)
+    # os-brick's durable journal sanitizer omits null values. A null QoS
+    # payload is therefore equivalent to the field being absent, while a
+    # non-empty QoS contract remains part of the transport identity.
+    if canonical['data'].get('qos_specs') is None:
+        canonical['data'].pop('qos_specs', None)
     for key in ('status', 'attached_at', 'detached_at'):
         canonical.pop(key, None)
     canonical.pop('volume_id', None)

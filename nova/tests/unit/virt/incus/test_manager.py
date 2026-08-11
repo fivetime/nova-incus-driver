@@ -13,6 +13,7 @@
 # under the License.
 
 import contextlib
+import copy
 import dataclasses
 import os
 import threading
@@ -4177,6 +4178,30 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         self.compute.driver.cancel_managed_volume_attach.\
             assert_called_once_with(instance, volume_id, intent)
         bdm.destroy.assert_not_called()
+
+    def test_attachment_identity_ignores_post_connect_lifecycle_fields(self):
+        instance_uuid = '10000000-0000-0000-0000-000000000001'
+        volume_id = '20000000-0000-0000-0000-000000000002'
+        journal = {
+            'serial': volume_id,
+            'instance': instance_uuid,
+            'driver_volume_type': 'rbd',
+            'data': {
+                'volume_id': volume_id,
+                'name': 'pool/volume-' + volume_id,
+                'hosts': ['192.0.2.10'],
+            },
+        }
+        completed = copy.deepcopy(journal)
+        completed['data']['attachment_id'] = (
+            '30000000-0000-0000-0000-000000000003')
+        completed['data']['qos_specs'] = None
+
+        self.assertEqual(
+            manager._canonical_attachment_connection_info(
+                journal, volume_id, instance_uuid),
+            manager._canonical_attachment_connection_info(
+                completed, volume_id, instance_uuid))
 
     @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
     @mock.patch.object(
