@@ -206,6 +206,24 @@ incus_remote() {
     "${SSH[@]}" "$host" "$command_line"
 }
 
+incus_exec_read() {
+    local host=$1 instance_name=$2
+    shift 2
+    local attempt output rc=1
+    for attempt in {1..10}; do
+        if output=$(incus_remote "$host" exec "$instance_name" -- "$@" \
+                2>&1); then
+            printf '%s\n' "$output"
+            return 0
+        else
+            rc=$?
+        fi
+        sleep 2
+    done
+    printf '%s\n' "$output" >&2
+    return "$rc"
+}
+
 incus_query_remote() {
     local host=$1 path=$2 command_line
     printf -v command_line '%q ' incus query \
@@ -1236,9 +1254,9 @@ migrate_and_verify() {
     if [[ "$MIGRATION_MODE" == live ]]; then
         verify_full_checkpoint_policy "$target_ssh"
     fi
-    dest_pid=$(incus_remote "$target_ssh" exec "$instance_name" -- \
+    dest_pid=$(incus_exec_read "$target_ssh" "$instance_name" \
         cat /run/criu-counter.pid)
-    dest_counter=$(incus_remote "$target_ssh" exec "$instance_name" -- \
+    dest_counter=$(incus_exec_read "$target_ssh" "$instance_name" \
         cat /root/criu-counter)
     [[ "$dest_pid" =~ ^[0-9]+$ ]]
     [[ "$dest_counter" =~ ^[0-9]+$ ]]
@@ -1267,7 +1285,7 @@ migrate_and_verify() {
     verify_openstack_volume_attachments
     verify_share_api_active
     sleep 3
-    later_counter=$(incus_remote "$target_ssh" exec "$instance_name" -- \
+    later_counter=$(incus_exec_read "$target_ssh" "$instance_name" \
         cat /root/criu-counter)
     ((later_counter > dest_counter))
     verify_active_network "$target_host" "$target_ssh"
