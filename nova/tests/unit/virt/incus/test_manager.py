@@ -3248,10 +3248,13 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         (instance, migration, volumes, unused_attachments, intents, rotations,
          unused_events) = self._configure_cold_rotation(volume_count=1)
         bdm = volumes[0]
-        bdm.boot_index = 0
+        bdm.boot_index = None
+        bdm.device_name = '/dev/sda'
+        instance.root_device_name = '/dev/sda'
         volume_id = bdm.volume_id
         old_intent = intents.pop(volume_id)
-        boot_intent = dict(old_intent, boot_volume=True)
+        boot_intent = dict(
+            old_intent, mountpoint='/dev/sda', boot_volume=True)
 
         def prepare_intent(unused_instance, requested_volume, *_args,
                            **kwargs):
@@ -4938,9 +4941,110 @@ class IncusComputeManagerTest(test.NoDBTestCase):
                 instance, volume_id, bdm.attachment_id, bdm.device_name,
                 operation_kind='migration', operation_token=token,
                 operation_direction='cold-target',
-                operation_migration_uuid=migration_uuid)
+                operation_migration_uuid=migration_uuid,
+                boot_volume=False)
         self.compute.driver.publish_migration_target_volumes_complete.\
             assert_called_once_with(instance, token, migration_uuid)
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_formal_cold_revert_bfv_retires_without_os_brick(
+            self, get_bdms):
+        instance = self._volume_recovery_instance()
+        instance.root_device_name = '/dev/sda'
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        token = '60000000-0000-0000-0000-000000000006'
+        migration_uuid = '70000000-0000-0000-0000-000000000007'
+        bdm = self._configure_internal_volume_recovery(
+            instance, volume_id, 'migration', token, 'cold-revert-source',
+            operation_migration_uuid=migration_uuid)
+        bdm.boot_index = None
+        bdm.device_name = '/dev/sda'
+        get_bdms.return_value = [bdm]
+        intent = self.compute.driver.get_managed_volume_attach_intent.\
+            return_value
+        intent.update({'mountpoint': '/dev/sda', 'boot_volume': True})
+        profile = mock.Mock(
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                'user.openstack.uuid': instance.uuid,
+            },
+            devices={
+                'root': {
+                    'type': 'disk',
+                    'path': '/',
+                    'initial.ceph.rbd.image_name': 'volume-%s' % volume_id,
+                },
+            })
+        self.compute.driver.client.profiles.get.side_effect = None
+        self.compute.driver.client.profiles.get.return_value = profile
+        self.compute.driver.get_volume_journal_phase.return_value = None
+        self.compute.driver.get_internal_volume_attach_connection_info.\
+            return_value = None
+
+        self.compute._commit_formal_internal_volume_intents(
+            context.get_admin_context(), instance, token, migration_uuid,
+            'cold-revert-source')
+
+        self.compute.driver.confirm_connected_volume_journal.\
+            assert_not_called()
+        self.compute.driver.cancel_managed_volume_attach.\
+            assert_called_once_with(instance, volume_id, intent)
+
+    @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
+    def test_periodic_cold_revert_bfv_retires_without_os_brick(
+            self, get_migrations):
+        instance = self._volume_recovery_instance()
+        instance.root_device_name = '/dev/sda'
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        token = '60000000-0000-0000-0000-000000000006'
+        migration_uuid = '70000000-0000-0000-0000-000000000007'
+        bdm = self._configure_internal_volume_recovery(
+            instance, volume_id, 'migration', token, 'cold-revert-source',
+            operation_migration_uuid=migration_uuid)
+        bdm.boot_index = None
+        bdm.device_name = '/dev/sda'
+        intent = self.compute.driver.get_managed_volume_attach_intent.\
+            return_value
+        intent.update({'mountpoint': '/dev/sda', 'boot_volume': True})
+        attachment = self._cinder_attachment(instance, volume_id, 'attached')
+        connection_info = dict(attachment['connection_info'])
+        connection_info['serial'] = volume_id
+        profile = mock.Mock(
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                'user.openstack.uuid': instance.uuid,
+            },
+            devices={
+                'root': {
+                    'type': 'disk',
+                    'path': '/',
+                    'initial.ceph.rbd.image_name': 'volume-%s' % volume_id,
+                },
+            })
+        self.compute.driver.client.profiles.get.side_effect = None
+        self.compute.driver.client.profiles.get.return_value = profile
+        self.compute.driver.get_volume_journal_phase.return_value = None
+        self.compute.driver.get_internal_volume_attach_connection_info.\
+            return_value = None
+        self.compute.driver.get_cold_attachment_rotation.return_value = None
+        get_migrations.return_value = [mock.Mock(
+            uuid=migration_uuid, source_compute=self.compute.host,
+            dest_compute='compute-2', status='reverted')]
+
+        self.compute._recover_incus_internal_attach_locked(
+            context.get_admin_context(), instance, volume_id,
+            'attach-pending', intent, bdm, attachment, 'attached',
+            connection_info)
+
+        self.compute.driver.resume_internal_volume_attach.assert_not_called()
+        self.compute.driver.restart_internal_volume_attach.assert_not_called()
+        self.compute.driver.confirm_connected_volume_journal.\
+            assert_not_called()
+        self.compute.driver.cancel_managed_volume_attach.\
+            assert_called_once_with(instance, volume_id, intent)
+        self.compute.driver.finalize_remote_source_volume_generation.\
+            assert_called_once_with(instance, token)
 
     @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
     @mock.patch.object(

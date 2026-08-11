@@ -753,11 +753,15 @@ class IncusComputeManager(manager.ComputeManager):
         return migration
 
     @staticmethod
-    def _cold_rotation_is_boot_volume(bdm):
+    def _cold_rotation_is_boot_volume(bdm, root_device_name=None):
         try:
-            return int(getattr(bdm, 'boot_index', -1)) == 0
+            if int(getattr(bdm, 'boot_index', -1)) == 0:
+                return True
         except (TypeError, ValueError):
-            return False
+            pass
+        return bool(
+            isinstance(root_device_name, str) and root_device_name and
+            getattr(bdm, 'device_name', None) == root_device_name)
 
     def _cold_rotation_attachment_inventory(
             self, context, instance, volume_id):
@@ -786,7 +790,8 @@ class IncusComputeManager(manager.ComputeManager):
         volume_id = getattr(bdm, 'volume_id', None)
         attachment_id = getattr(bdm, 'attachment_id', None)
         mountpoint = getattr(bdm, 'device_name', None)
-        boot_volume = self._cold_rotation_is_boot_volume(bdm)
+        boot_volume = self._cold_rotation_is_boot_volume(
+            bdm, instance.root_device_name)
         if (not getattr(bdm, 'is_volume', False) or
                 not uuidutils.is_uuid_like(volume_id) or
                 not uuidutils.is_uuid_like(attachment_id) or
@@ -3106,6 +3111,14 @@ class IncusComputeManager(manager.ComputeManager):
                             raise exception.InvalidVolume(
                                 reason='Migration Cinder intent '
                                        'changed before commit')
+                        boot_volume = intent.get('boot_volume', False)
+                        if (not isinstance(boot_volume, bool) or
+                                boot_volume !=
+                                self._cold_rotation_is_boot_volume(
+                                    candidate, instance.root_device_name)):
+                            raise exception.InvalidVolume(
+                                reason='Migration Cinder intent has an '
+                                       'invalid BFV root classification')
                         attachment = self._get_exact_cinder_attachment(
                             context, attachment_id, volume_id, instance.uuid)
                         if (attachment is None or
@@ -3130,9 +3143,13 @@ class IncusComputeManager(manager.ComputeManager):
                                 reason='Migration Nova BDM and '
                                        'Cinder attachment disagree')
                         try:
-                            self.driver.confirm_connected_volume_journal(
-                                instance, volume_id, connection_info,
-                                expected_mountpoint=mountpoint)
+                            if boot_volume:
+                                self._validate_formal_bfv_root_intent(
+                                    instance, volume_id, intent)
+                            else:
+                                self.driver.confirm_connected_volume_journal(
+                                    instance, volume_id, connection_info,
+                                    expected_mountpoint=mountpoint)
                             self.driver.cancel_managed_volume_attach(
                                 instance, volume_id, intent)
                         except OSError:
@@ -3152,7 +3169,8 @@ class IncusComputeManager(manager.ComputeManager):
                                         operation_direction=(
                                             operation_direction),
                                         operation_migration_uuid=(
-                                            migration_uuid)))
+                                            migration_uuid),
+                                        boot_volume=boot_volume))
                                 if recovered != intent:
                                     raise exception.InvalidVolume(
                                         reason='Migration recovery intent '
@@ -3174,6 +3192,63 @@ class IncusComputeManager(manager.ComputeManager):
             raise exception.MigrationError(
                 reason='Incus migration target retains a local Cinder '
                        'volume transaction after Nova committed attachments')
+
+    def _validate_formal_bfv_root_intent(
+            self, instance, volume_id, intent):
+        """Prove a BFV root generation without invoking os-brick."""
+        if (self.driver.get_volume_journal_phase(instance, volume_id) is not
+                None or
+                self.driver.get_internal_volume_attach_connection_info(
+                    instance, volume_id, intent['mountpoint']) is not None):
+            raise exception.InvalidVolume(
+                reason='BFV root intent unexpectedly has data-volume '
+                       'recovery evidence')
+        profile = self.driver.client.profiles.get(instance.name)
+        incus_driver._validate_profile_volume_owner(profile, instance)
+        devices = profile.devices if isinstance(profile.devices, dict) else {}
+        root = devices.get('root')
+        if (not isinstance(root, dict) or root.get('type') != 'disk' or
+                root.get('path') != '/' or
+                root.get('initial.ceph.rbd.image_name') !=
+                'volume-%s' % volume_id):
+            raise exception.InvalidVolume(
+                reason='BFV root intent has no exact Incus root device')
+        if (volume_id in devices or any(
+                isinstance(device, dict) and
+                device.get('type') == 'unix-block' and
+                device.get('path') == intent['mountpoint']
+                for device in devices.values())):
+            raise exception.InvalidVolume(
+                reason='BFV root intent unexpectedly has a guest block '
+                       'device')
+
+    def _recover_formal_bfv_root_intent_locked(
+            self, context, instance, volume_id, intent, bdm, attachment,
+            status, connection_info, bdm_connection_info):
+        """Complete a cold-revert BFV generation without using os-brick."""
+        if (intent.get('operation_kind') != 'migration' or
+                intent.get('operation_direction') != 'cold-revert-source' or
+                not self._cold_rotation_is_boot_volume(
+                    bdm, instance.root_device_name)):
+            raise exception.InvalidVolume(
+                reason='BFV root intent has an invalid recovery owner')
+        self._validate_formal_bfv_root_intent(instance, volume_id, intent)
+        if bdm_connection_info is None or status == 'attaching':
+            bdm.connection_info = jsonutils.dumps(connection_info)
+            bdm.save()
+        if status == 'attaching':
+            self.volume_api.attachment_complete(
+                context, intent['attachment_id'])
+            attachment = self._get_exact_cinder_attachment(
+                context, intent['attachment_id'], volume_id, instance.uuid)
+            if (attachment is None or
+                    _attachment_status(attachment) != 'attached'):
+                raise exception.InvalidVolume(
+                    reason='Cinder did not commit the BFV root attachment')
+        self.driver.cancel_managed_volume_attach(
+            instance, volume_id, intent)
+        self.driver.finalize_remote_source_volume_generation(
+            instance, intent['operation_token'])
 
     def _finish_revert_resize(
             self, context, instance, migration, request_spec=None):
@@ -3300,7 +3375,8 @@ class IncusComputeManager(manager.ComputeManager):
             self, context, instance, volume_id, intent, bdm, migration):
         """Validate a retry after the source rotation was retired."""
         attachment_id = getattr(bdm, 'attachment_id', None)
-        boot_volume = self._cold_rotation_is_boot_volume(bdm)
+        boot_volume = self._cold_rotation_is_boot_volume(
+            bdm, instance.root_device_name)
         expected = {
             'operation_kind': 'migration',
             'operation_token': migration.uuid,
@@ -4923,7 +4999,8 @@ class IncusComputeManager(manager.ComputeManager):
                 self.driver.get_volume_journal_phase(
                     instance, volume_id) is not None or
                 not intent.get('boot_volume') or
-                bdm is None or not self._cold_rotation_is_boot_volume(bdm) or
+                bdm is None or not self._cold_rotation_is_boot_volume(
+                    bdm, instance.root_device_name) or
                 getattr(bdm, 'attachment_id', None) !=
                 intent['attachment_id'] or
                 getattr(bdm, 'device_name', None) != intent['mountpoint']):
@@ -5171,6 +5248,12 @@ class IncusComputeManager(manager.ComputeManager):
             raise exception.InvalidVolume(
                 reason='Internal Cinder attachment and Nova BDM connection '
                        'information disagree')
+
+        if intent.get('boot_volume'):
+            self._recover_formal_bfv_root_intent_locked(
+                context, instance, volume_id, intent, bdm, attachment,
+                status, connection_info, bdm_connection_info)
+            return
 
         if (operation_kind == 'spawn' and
                 (self._is_failed_build_cleanup(instance) or
