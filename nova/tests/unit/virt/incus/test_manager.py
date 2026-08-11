@@ -6098,6 +6098,52 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         self.compute.driver.cancel_cold_attachment_rotation.\
             assert_not_called()
 
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    def test_cold_revert_handoff_accepts_completed_retry(self, get_bdms):
+        ctxt = context.get_admin_context()
+        instance = self._volume_recovery_instance()
+        instance.host = 'compute-2'
+        instance.task_state = manager.task_states.RESIZE_REVERTING
+        volume_id = '50000000-0000-0000-0000-000000000005'
+        source_id = '53000000-0000-0000-0000-000000000005'
+        token = '54000000-0000-0000-0000-000000000005'
+        bdm = self._volume_recovery_bdm(volume_id)
+        bdm.attachment_id = source_id
+        bdm.device_name = '/dev/sdb'
+        bdm.boot_index = None
+        get_bdms.return_value = [bdm]
+        migration = mock.Mock(
+            uuid=token, source_compute=self.compute.host,
+            dest_compute='compute-2')
+        intent = {
+            'attachment_id': source_id,
+            'mountpoint': '/dev/sdb',
+            'operation_kind': 'migration',
+            'operation_token': token,
+            'operation_direction': 'cold-revert-source',
+            'operation_migration_uuid': token,
+            'boot_volume': False,
+        }
+        self.compute.driver.get_managed_volume_attach_intent.return_value = (
+            intent)
+        self.compute.driver.get_cold_attachment_rotation.return_value = None
+        self.compute._get_exact_cinder_attachment = mock.Mock(
+            return_value=self._rotation_attachment(
+                instance, volume_id, source_id, status='attaching'))
+        self.compute.driver.get_volume_journal_phase.return_value = (
+            'disconnected')
+        self.compute.driver.get_internal_volume_attach_connection_info.\
+            return_value = None
+
+        self.compute._handoff_cold_source_rotations_for_revert(
+            ctxt, instance, migration)
+
+        self.compute.driver.replace_cold_source_volume_attach_intent.\
+            assert_not_called()
+        self.compute.driver.cancel_cold_attachment_rotation.\
+            assert_not_called()
+
     def test_pre_live_migration_rollback_retires_source_generation(self):
         data = migrate_data.IncusLiveMigrateData()
         instance = mock.Mock(host=self.compute.host)

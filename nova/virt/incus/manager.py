@@ -3225,6 +3225,10 @@ class IncusComputeManager(manager.ComputeManager):
                     instance, volume_id)
                 if intent is None and rotation is None:
                     continue
+                if rotation is None:
+                    self._validate_handed_off_cold_revert_intent_locked(
+                        context, instance, volume_id, intent, bdm, migration)
+                    continue
                 if intent is None or rotation is None:
                     raise exception.InvalidVolume(
                         reason='Cold revert source generation is incomplete')
@@ -3291,6 +3295,48 @@ class IncusComputeManager(manager.ComputeManager):
                 self._retire_handed_off_cold_rotation_locked(
                     context, instance, volume_id, replacement, bdm, rotation,
                     migration)
+
+    def _validate_handed_off_cold_revert_intent_locked(
+            self, context, instance, volume_id, intent, bdm, migration):
+        """Validate a retry after the source rotation was retired."""
+        attachment_id = getattr(bdm, 'attachment_id', None)
+        boot_volume = self._cold_rotation_is_boot_volume(bdm)
+        expected = {
+            'operation_kind': 'migration',
+            'operation_token': migration.uuid,
+            'operation_direction': 'cold-revert-source',
+            'operation_migration_uuid': migration.uuid,
+            'mountpoint': getattr(bdm, 'device_name', None),
+            'boot_volume': boot_volume,
+            'attachment_id': attachment_id,
+        }
+        if (not isinstance(intent, dict) or
+                not uuidutils.is_uuid_like(attachment_id) or
+                not isinstance(expected['mountpoint'], str) or
+                not expected['mountpoint'] or
+                any(intent.get(key) != value
+                    for key, value in expected.items())):
+            raise exception.InvalidVolume(
+                reason='Cold revert handed-off generation changed')
+        source_attachment = self._get_exact_cinder_attachment(
+            context, attachment_id, volume_id, instance.uuid)
+        if (source_attachment is None or
+                _attachment_status(source_attachment) not in (
+                    'reserved', 'attaching')):
+            raise exception.InvalidVolume(
+                reason='Cold revert handed-off source is invalid')
+        journal_phase = self.driver.get_volume_journal_phase(
+            instance, volume_id)
+        connection_info = (
+            self.driver.get_internal_volume_attach_connection_info(
+                instance, volume_id, expected['mountpoint']))
+        if boot_volume:
+            if journal_phase is not None or connection_info is not None:
+                raise exception.InvalidVolume(
+                    reason='Cold revert BFV has local data evidence')
+        elif journal_phase != 'disconnected':
+            raise exception.InvalidVolume(
+                reason='Cold revert data volume is not disconnected')
 
     def _retire_handed_off_cold_rotation_locked(
             self, context, instance, volume_id, intent, bdm, rotation,
