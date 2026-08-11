@@ -11222,9 +11222,14 @@ class IncusDriver(driver.ComputeDriver):
                     raise exception.MigrationError(
                         reason='Marked migration owner retains a local '
                                'Cinder volume transaction')
-                _finalize_committed_migration_attempt(
-                    self.client, instance, cleanup_token,
-                    idmap_base, idmap_size)
+                # A cold migration in VERIFY_RESIZE still needs this exact
+                # attempt for the source-side confirm/revert decision.  The
+                # recovery loop repairs only the destination runtime; it
+                # must not accept the resize on Nova's behalf.
+                if instance.vm_state != vm_states.RESIZED:
+                    _finalize_committed_migration_attempt(
+                        self.client, instance, cleanup_token,
+                        idmap_base, idmap_size)
         self._clear_migration_recovery_marker(instance)
         return should_run
 

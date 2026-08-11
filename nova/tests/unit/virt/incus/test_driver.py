@@ -8303,6 +8303,42 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         container.stop.assert_not_called()
         self.assertNotIn(driver.MIGRATION_RECOVERY_KEY, profile.config)
 
+    @mock.patch.object(
+        driver, '_publish_migration_target_volumes_complete',
+        return_value=True)
+    def test_recover_migration_target_preserves_resize_attempt(
+            self, publish_complete):
+        ctx = context.get_admin_context()
+        token = '10000000-0000-0000-0000-000000000001'
+        migration_uuid = '20000000-0000-0000-0000-000000000002'
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0, vm_state=vm_states.RESIZED)
+        container = self.client.instances.get.return_value
+        container.status = 'Running'
+        container.config = {'volatile.idmap.base': '1065536'}
+        container.expanded_config = {}
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            driver.MIGRATION_RECOVERY_KEY: 'running',
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: token,
+            driver.MIGRATION_NOVA_UUID_KEY: migration_uuid,
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+        }
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver._reconcile_reboot_data_volumes = mock.Mock()
+        incus_driver._validate_reboot_vifs = mock.Mock()
+
+        should_run = incus_driver.recover_migration_target(
+            ctx, instance, [], {'block_device_mapping': []})
+
+        self.assertTrue(should_run)
+        publish_complete.assert_called_once_with(
+            self.client, instance, token, migration_uuid)
+        self._finalize_committed_migration_attempt.assert_not_called()
+        self.assertNotIn(driver.MIGRATION_RECOVERY_KEY, profile.config)
+
     def test_recover_migration_target_refreshes_vif_before_restart(self):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
