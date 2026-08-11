@@ -1197,27 +1197,40 @@ assert_inactive_storage_absent() {
 
 verify_active_network() {
     local active_host=$1 active_ssh=$2
-    local guest_iface ovs_iface
+    local guest_iface guest_addresses ovs_iface
+    local deadline=$((SECONDS + TIMEOUT))
 
     # The driver names the guest NIC device nic<port-id-hex> truncated to
     # the kernel IFNAMSIZ budget; the in-guest interface carries that name.
     guest_iface="nic${port_id//-/}"
     guest_iface=${guest_iface:0:15}
     [[ -n "$guest_iface" ]]
-    incus_exec_read "$active_ssh" "$instance_name" \
-        ip link show "$guest_iface" >/dev/null
-    incus_exec_read "$active_ssh" "$instance_name" \
-        ip -o addr show "$guest_iface" | grep -Fq "$fixed_ip"
-    ovs_iface=$(remote "$active_ssh" \
-        "ovs-vsctl --data=bare --no-heading --columns=name find Interface \
-         external_ids:iface-id='$port_id'")
-    [[ -n "$ovs_iface" ]]
-    [[ "$(remote "$active_ssh" \
-        "ovs-vsctl get Interface '$ovs_iface' \
-         external_ids:ovn-installed")" == '"true"' ]]
-    [[ "$(openstack port show "$port_id" -f value -c binding_host_id)" == \
-        "$active_host" ]]
-    [[ "$(openstack port show "$port_id" -f value -c status)" == ACTIVE ]]
+    while true; do
+        guest_addresses=$(incus_exec_read \
+            "$active_ssh" "$instance_name" \
+            ip -o addr show "$guest_iface" 2>/dev/null || true)
+        ovs_iface=$(remote "$active_ssh" \
+            "ovs-vsctl --data=bare --no-heading --columns=name \
+             find Interface external_ids:iface-id='$port_id'" || true)
+        if grep -Fq "$fixed_ip" <<<"$guest_addresses" && \
+                [[ -n "$ovs_iface" ]] && \
+                [[ "$(remote "$active_ssh" \
+                    "ovs-vsctl get Interface '$ovs_iface' \
+                     external_ids:ovn-installed" 2>/dev/null || true)" == \
+                    '"true"' ]] && \
+                [[ "$(openstack port show "$port_id" -f value \
+                    -c binding_host_id 2>/dev/null || true)" == \
+                    "$active_host" ]] && \
+                [[ "$(openstack port show "$port_id" -f value \
+                    -c status 2>/dev/null || true)" == ACTIVE ]]; then
+            return 0
+        fi
+        ((SECONDS < deadline)) || {
+            echo "Network ownership did not converge on $active_host" >&2
+            return 1
+        }
+        sleep 2
+    done
 }
 
 verify_network_owner() {
