@@ -13702,6 +13702,58 @@ class IncusDriver(driver.ComputeDriver):
                 mount_table=mount_table)
             return mounted_now
 
+    def preflight_cold_migration_destination_profile(
+            self, instance, disk_info):
+        """Fence a conflicting target profile before Nova rotates volumes."""
+        (
+            _transfer, _migration_data, cleanup_token,
+            idmap_base, idmap_size, _expected_share_ids,
+        ) = _parse_cold_migration_transfer(disk_info)
+        try:
+            profile = self.client.profiles.get(instance.name)
+        except incus_exceptions.LXDAPIException as exc:
+            if _is_incus_not_found(exc):
+                return
+            raise
+
+        config = profile.config if isinstance(profile.config, dict) else {}
+
+        def reject_conflicting_profile(reason, owner_error=None):
+            # The source registered this exact target attempt before sending
+            # disk_info. Abort it while it is still unstarted, but never use
+            # that attempt as authority to alter an older same-name profile.
+            attempt = _abort_migration_attempt(
+                self.client, instance, cleanup_token,
+                idmap_base, idmap_size)
+            if (attempt['state'] == 'committed' or
+                    attempt.get('started')):
+                error = exception.MigrationError(
+                    reason='A conflicting Incus destination profile exists '
+                           'after the cold migration target started')
+            else:
+                error = exception.MigrationPreCheckError(reason=reason)
+            if owner_error is not None:
+                raise error from owner_error
+            raise error
+
+        try:
+            binding = _destination_prepared_profile_binding(config)
+        except exception.MigrationError as owner_error:
+            reject_conflicting_profile(
+                'Incus cold migration destination retains an unresolved '
+                'profile from another operation', owner_error=owner_error)
+
+        if (
+                binding['uuid'] != instance.uuid or
+                binding['operation_token'] != cleanup_token or
+                binding['migration_uuid'] != cleanup_token or
+                binding['idmap_base'] != idmap_base or
+                binding['idmap_size'] != idmap_size
+        ):
+            reject_conflicting_profile(
+                'Incus cold migration destination profile belongs to another '
+                'prepared transaction')
+
     def rollback_cold_migration_preparation(
             self, context, instance, disk_info):
         """Fail closed around a failed manager-side cold preparation."""

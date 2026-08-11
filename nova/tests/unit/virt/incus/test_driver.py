@@ -14734,6 +14734,82 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             None, instance, share, second_token)
         self.assertEqual([], driver._share_journal_records(instance))
 
+    def test_cold_destination_profile_preflight_accepts_absence(self):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-preflight')
+        cleanup_token = '20000000-0000-0000-0000-000000000002'
+        disk_info = migration_disk_info({
+            'format': 'incus-pull-v1',
+            'cleanup_token': cleanup_token,
+            'migration_data': {},
+        })
+        self.client.profiles.get.side_effect = incus_api_exception(
+            404, 'not found')
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        self.assertIsNone(
+            incus_driver.preflight_cold_migration_destination_profile(
+                instance, disk_info))
+
+    @mock.patch.object(
+        driver, '_abort_migration_attempt',
+        return_value={'state': 'aborted', 'finished': True, 'started': False})
+    def test_cold_destination_profile_preflight_fences_stale_source(
+            self, abort_attempt):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-preflight')
+        cleanup_token = '20000000-0000-0000-0000-000000000002'
+        disk_info = migration_disk_info({
+            'format': 'incus-pull-v1',
+            'cleanup_token': cleanup_token,
+            'migration_data': {},
+        })
+        self.client.profiles.get.return_value = mock.Mock(config={
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_CLEANUP_TOKEN_KEY:
+                '30000000-0000-0000-0000-000000000003',
+        })
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        self.assertRaises(
+            exception.MigrationPreCheckError,
+            incus_driver.preflight_cold_migration_destination_profile,
+            instance, disk_info)
+
+        abort_attempt.assert_called_once_with(
+            self.client, instance, cleanup_token, 1065536, 65536)
+
+    def test_cold_destination_profile_preflight_accepts_exact_retry(self):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-preflight')
+        cleanup_token = '20000000-0000-0000-0000-000000000002'
+        disk_info = migration_disk_info({
+            'format': 'incus-pull-v1',
+            'cleanup_token': cleanup_token,
+            'migration_data': {},
+        })
+        self.client.profiles.get.return_value = mock.Mock(config={
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_CLEANUP_TOKEN_KEY: cleanup_token,
+            driver.MIGRATION_DESTINATION_PREPARED_KEY: cleanup_token,
+            driver.MIGRATION_NOVA_UUID_KEY: cleanup_token,
+            'security.idmap.base': '1065536',
+            'security.idmap.size': '65536',
+        })
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        self.assertIsNone(
+            incus_driver.preflight_cold_migration_destination_profile(
+                instance, disk_info))
+
     @mock.patch.object(driver, '_retire_migration_attempt')
     @mock.patch.object(
         driver, '_abort_migration_attempt',

@@ -265,8 +265,10 @@ assert_owner() {
     local owner=$1 stale=$2 expected_host=$3
     [[ "$(incus "$owner" list "$instance_name" --format csv -c s)" == \
         RUNNING ]] || fail "owner instance is not running on $owner"
-    ! incus "$stale" info "$instance_name" >/dev/null 2>&1 || \
-        fail "stale instance still exists on $stale"
+    # A confirmed migration can retire the old container before its Cinder
+    # journal and profile.  A reverse migration must not race that durable
+    # source cleanup generation.
+    wait_incus_instance_absent "$stale"
     [[ "$(openstack server show "$server_id" -f value \
         -c OS-EXT-SRV-ATTR:host)" == "$expected_host" ]] || \
         fail "Nova host does not match Incus owner"

@@ -2970,6 +2970,11 @@ class IncusComputeManager(manager.ComputeManager):
             self, context, disk_info, image, instance, migration,
             request_spec):
         """Pre-stage active shares before the cold target profile exists."""
+        # Nova's base helper rotates Cinder attachments before it calls the
+        # driver's finish_migration().  Reject an older source-cleanup profile
+        # here, while the control-plane attachments still name their source.
+        self.driver.preflight_cold_migration_destination_profile(
+            instance, disk_info)
         staged = []
         finish_started = False
         cleanup_token = None

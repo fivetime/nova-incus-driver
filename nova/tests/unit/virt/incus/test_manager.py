@@ -6592,6 +6592,29 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         instance.save.assert_called_once_with(expected_task_state=[None])
 
     @mock.patch.object(
+        manager.manager.ComputeManager, '_finish_resize_helper')
+    def test_finish_resize_rejects_stale_profile_before_side_effects(
+            self, base_finish):
+        ctxt = context.get_admin_context()
+        instance = mock.Mock(uuid='instance')
+        preflight = (
+            self.compute.driver.preflight_cold_migration_destination_profile)
+        preflight.side_effect = exception.MigrationPreCheckError(
+            reason='stale profile')
+        self.compute._get_share_info = mock.Mock()
+
+        self.assertRaises(
+            exception.MigrationPreCheckError,
+            self.compute._finish_resize_helper,
+            ctxt, 'disk', mock.sentinel.image, instance,
+            mock.sentinel.migration, mock.sentinel.request_spec)
+
+        preflight.assert_called_once_with(instance, 'disk')
+        self.compute._get_share_info.assert_not_called()
+        self.compute.driver.stage_share_for_cold_migration.assert_not_called()
+        base_finish.assert_not_called()
+
+    @mock.patch.object(
         manager.manager.ComputeManager, '_finish_resize_helper',
         side_effect=RuntimeError('finish failed'))
     @mock.patch.object(
