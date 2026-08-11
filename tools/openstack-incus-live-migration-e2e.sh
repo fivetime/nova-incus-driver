@@ -3,7 +3,9 @@
 
 set -Eeuo pipefail
 
-IMAGE=${IMAGE:-alpine-3.21-criu-bfv-fuse}
+IMAGE=${IMAGE:-}
+LOCAL_ROOT_IMAGE=${LOCAL_ROOT_IMAGE:-alpine-3.21-cloud-incus-criu-fuse}
+BFV_ROOT_IMAGE=${BFV_ROOT_IMAGE:-alpine-3.21-criu-bfv-fuse}
 FLAVOR=${FLAVOR:-ds512M}
 NETWORK=${NETWORK:-public}
 SOURCE_HOST=${SOURCE_HOST:-incus-node-01}
@@ -45,6 +47,14 @@ MANILA_TAGS=${MANILA_TAGS:-}
 INJECT_RESTORE_FAILURE=${INJECT_RESTORE_FAILURE:-0}
 REQUIRE_MANAGED_CEPH_ROOT=${REQUIRE_MANAGED_CEPH_ROOT:-0}
 E2E_LOCK_FILE=${E2E_LOCK_FILE:-/run/lock/openstack-incus-live-migration-e2e.lock}
+
+if [[ -z "$IMAGE" ]]; then
+    if [[ "$BOOT_FROM_VOLUME" == "1" ]]; then
+        IMAGE=$BFV_ROOT_IMAGE
+    else
+        IMAGE=$LOCAL_ROOT_IMAGE
+    fi
+fi
 
 exec 9>"$E2E_LOCK_FILE"
 if ! flock -n 9; then

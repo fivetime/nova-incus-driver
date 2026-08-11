@@ -464,6 +464,19 @@ class FullCheckpointMigrationContractTest(unittest.TestCase):
         self.assertIn('kill -0 "$pid"', self.e2e)
         self.assertIn('"$observed_pid" == "$stable_pid"', self.e2e)
 
+    def test_live_e2e_selects_root_format_specific_default_image(self):
+        self.assertIn(
+            'LOCAL_ROOT_IMAGE=${LOCAL_ROOT_IMAGE:-alpine-3.21-cloud-incus-criu-fuse}',
+            self.e2e)
+        self.assertIn(
+            'BFV_ROOT_IMAGE=${BFV_ROOT_IMAGE:-alpine-3.21-criu-bfv-fuse}',
+            self.e2e)
+        selector = self.e2e.index('if [[ -z "$IMAGE" ]]')
+        boot = self.e2e.index('if [[ "$BOOT_FROM_VOLUME" == "1" ]]', selector)
+        self.assertLess(selector, boot)
+        self.assertIn('IMAGE=$BFV_ROOT_IMAGE', self.e2e[boot:])
+        self.assertIn('IMAGE=$LOCAL_ROOT_IMAGE', self.e2e[boot:])
+
 
 if __name__ == '__main__':
     unittest.main()
