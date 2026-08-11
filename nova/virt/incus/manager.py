@@ -3245,6 +3245,9 @@ class IncusComputeManager(manager.ComputeManager):
                     _attachment_status(attachment) != 'attached'):
                 raise exception.InvalidVolume(
                     reason='Cinder did not commit the BFV root attachment')
+        self.driver.mark_source_volume_generation_rollback_complete(
+            instance, intent['operation_token'],
+            intent['operation_migration_uuid'])
         self.driver.cancel_managed_volume_attach(
             instance, volume_id, intent)
         self.driver.finalize_remote_source_volume_generation(
@@ -5126,6 +5129,7 @@ class IncusComputeManager(manager.ComputeManager):
         self.driver.validate_internal_volume_attach_owner(instance, intent)
         operation_kind = intent['operation_kind']
         direction = intent['operation_direction']
+        migration = None
         if operation_kind == 'migration':
             migrations = objects.MigrationList.get_by_filters(
                 context, {'instance_uuid': instance.uuid})
@@ -5343,6 +5347,8 @@ class IncusComputeManager(manager.ComputeManager):
                 rotation = self.driver.transition_cold_attachment_rotation(
                     instance, volume_id, rotation,
                     'source-rollback-complete')
+        self._publish_cold_revert_source_generation(
+            instance, intent, migration)
 
         self.driver.cancel_managed_volume_attach(
             instance, volume_id, intent)
@@ -5358,6 +5364,19 @@ class IncusComputeManager(manager.ComputeManager):
         elif direction == 'cold-revert-source':
             self.driver.finalize_remote_source_volume_generation(
                 instance, intent['operation_token'])
+
+    def _publish_cold_revert_source_generation(
+            self, instance, intent, migration):
+        """Persist failed finish-revert ownership before intent removal."""
+        if intent.get('operation_direction') != 'cold-revert-source':
+            return
+        # A failed finish_revert can leave formal Cinder ownership and a
+        # recovery marker without reaching the driver's normal rollback
+        # generation commit. Publish that exact generation before the last
+        # filesystem intent is unlinked so periodic finalization remains
+        # discoverable and token-bound.
+        self.driver.mark_source_volume_generation_rollback_complete(
+            instance, intent['operation_token'], migration.uuid)
 
     def _recover_incus_migration_source_release_locked(
             self, context, instance, volume_id, journal_phase, intent, bdm,
@@ -5796,6 +5815,10 @@ class IncusComputeManager(manager.ComputeManager):
                 instance.power_state = (
                     power_state.RUNNING if should_run
                     else power_state.SHUTDOWN)
+                if instance.vm_state != vm_states.RESIZED:
+                    instance.vm_state = (
+                        vm_states.ACTIVE if should_run
+                        else vm_states.STOPPED)
                 instance.task_state = None
                 instance.save(
                     expected_task_state=task_states.REBOOTING_HARD)

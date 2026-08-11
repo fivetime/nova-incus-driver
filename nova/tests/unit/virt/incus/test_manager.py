@@ -4737,7 +4737,11 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         bdm.save.assert_called_once_with()
         self.compute.volume_api.attachment_complete.assert_called_once_with(
             mock.ANY, bdm.attachment_id)
+        self.compute.driver.mark_source_volume_generation_rollback_complete.\
+            assert_called_once_with(instance, token, migration_uuid)
         self.compute.driver.cancel_managed_volume_attach.assert_called_once()
+        self.compute.driver.finalize_remote_source_volume_generation.\
+            assert_called_once_with(instance, token)
 
     @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
     @mock.patch.object(
@@ -5043,6 +5047,8 @@ class IncusComputeManagerTest(test.NoDBTestCase):
             assert_not_called()
         self.compute.driver.cancel_managed_volume_attach.\
             assert_called_once_with(instance, volume_id, intent)
+        self.compute.driver.mark_source_volume_generation_rollback_complete.\
+            assert_called_once_with(instance, token, migration_uuid)
         self.compute.driver.finalize_remote_source_volume_generation.\
             assert_called_once_with(instance, token)
 
@@ -7820,11 +7826,37 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         }]
         self.compute.driver.needs_migration_recovery.return_value = True
         self.compute.driver.recover_migration_target.return_value = False
+        candidate.vm_state = vm_states.ACTIVE
 
         self.compute._recover_incus_bfv_migration_targets(
             context.get_admin_context())
 
         self.assertEqual(power_state.SHUTDOWN, candidate.power_state)
+        self.assertEqual(vm_states.STOPPED, candidate.vm_state)
+        self.assertIsNone(candidate.task_state)
+
+    @mock.patch.object(
+        manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
+    def test_recovery_restores_active_vm_state(
+            self, get_by_uuid, get_bdms):
+        candidate = mock.Mock(
+            task_state=None,
+            uuid='candidate',
+            host=self.compute.host,
+            vm_state=vm_states.STOPPED)
+        candidate.name = 'instance-candidate'
+        get_by_uuid.return_value = candidate
+        self.compute.driver.list_migration_recovery_candidates.return_value = [
+            {'name': candidate.name, 'uuid': candidate.uuid}]
+        self.compute.driver.needs_migration_recovery.return_value = True
+        self.compute.driver.recover_migration_target.return_value = True
+
+        self.compute._recover_incus_bfv_migration_targets(
+            context.get_admin_context())
+
+        self.assertEqual(power_state.RUNNING, candidate.power_state)
+        self.assertEqual(vm_states.ACTIVE, candidate.vm_state)
         self.assertIsNone(candidate.task_state)
 
     @mock.patch.object(manager.objects.Instance, 'get_by_uuid')
