@@ -1709,6 +1709,19 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
             self.allocator._fleet_health_lease_id,
             follower._fleet_health_lease_id)
 
+    def test_exact_read_retries_generation_rotated_by_same_allocator(self):
+        key = self.allocator.instance_key(self._uuid(79))
+
+        def rotate_after_transaction_is_built(client, unused_transaction):
+            client.before_transaction = None
+            owner, unused_snapshot = self.allocator.run_coordinated_audit(
+                full=False)
+            self.assertTrue(owner)
+
+        self.etcd.before_transaction = rotate_after_transaction_is_built
+
+        self.assertEqual({key: None}, self.allocator._read_exact((key,)))
+
     def test_pending_coordinator_fails_sensitive_reads_closed(self):
         token = str(uuid.uuid4())
         self.etcd.values[self.allocator.audit_coordinator_key.encode()] = (

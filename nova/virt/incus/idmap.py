@@ -1017,8 +1017,11 @@ class IDMapAllocator:
             raise IDMapConfigurationError(
                 reason="exact allocator read contains duplicate keys")
         for attempt in range(2):
+            guard_raw = self._fleet_health_raw
+            guard_lease_id = self._fleet_health_lease_id
             transaction = {
-                "compare": self._guard_compares(),
+                "compare": self._guard_compares_for(
+                    guard_raw, guard_lease_id),
                 "success": [self._range(key) for key in keys],
                 "failure": [self._range(self.configuration_key)],
             }
@@ -1046,12 +1049,13 @@ class IDMapAllocator:
                 raise IDMapIntegrityError(
                     reason="allocator configuration record is missing")
             self._validate_configuration(raw)
-            if attempt == 0 and self._refresh_fleet_read_guard():
+            if (attempt == 0 and
+                    self._refresh_fleet_read_guard(guard_raw)):
                 continue
             raise IDMapBackendError(
                 reason="allocator configuration compare failed unexpectedly")
 
-    def _refresh_fleet_read_guard(self):
+    def _refresh_fleet_read_guard(self, expected_raw):
         """Refresh a read guard after a completed fleet audit generation."""
         (coordinator_raw, coordinator_lease_id), (
             failure_raw, failure_lease_id) = self._read_audit_control()
@@ -1064,11 +1068,12 @@ class IDMapAllocator:
         if coordinator["state"] != "healthy":
             raise IDMapBackendError(
                 reason="fleet ID-map audit is in progress")
-        if coordinator_raw == self._fleet_health_raw:
-            return False
         self._fleet_health_raw = coordinator_raw
         self._fleet_health_lease_id = coordinator_lease_id
-        return True
+        # Compare with the generation carried by the failed transaction, not
+        # the mutable allocator field. The periodic auditor can rotate that
+        # field before the transaction response is processed by this thread.
+        return coordinator_raw != expected_raw
 
     def _read_audit_control(self):
         """Read lease health and sticky failure at one etcd revision."""
@@ -1344,19 +1349,23 @@ class IDMapAllocator:
         self._fleet_health_lease_id = coordinator_lease_id
 
     def _guard_compares(self):
-        if (self._fleet_health_raw is None or
-                not isinstance(self._fleet_health_lease_id, int) or
-                self._fleet_health_lease_id <= 0):
+        return self._guard_compares_for(
+            self._fleet_health_raw, self._fleet_health_lease_id)
+
+    def _guard_compares_for(self, health_raw, health_lease_id):
+        if (health_raw is None or
+                not isinstance(health_lease_id, int) or
+                health_lease_id <= 0):
             raise IDMapBackendError(
                 reason="no verified fleet audit generation")
         return [
             self._compare_config(),
             self._compare_absent(self.audit_failure_key),
             self._compare_value(
-                self.audit_coordinator_key, self._fleet_health_raw),
+                self.audit_coordinator_key, health_raw),
             self._compare_lease(
                 self.audit_coordinator_key,
-                self._fleet_health_lease_id),
+                health_lease_id),
         ]
 
     def _create_configuration(self):
