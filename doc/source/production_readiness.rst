@@ -131,6 +131,7 @@ compute inventory::
   PUBLIC_API_FLAVOR=<incus-flavor-uuid>
   PUBLIC_API_NETWORK=<tenant-network-uuid>
   PUBLIC_API_VOLUME_TYPE=<ceph-rbd-volume-type>
+  PUBLIC_API_CINDER_POOL=<cinder-rbd-pool>
   RUN_SCALE=true
   SCALE_IMAGE=<admitted-image-uuid>
   SCALE_FLAVOR=<scale-flavor-uuid>

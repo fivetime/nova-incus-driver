@@ -3,11 +3,13 @@
 #
 # Required: RUN_DESTRUCTIVE=true IMAGE=... FLAVOR=... NETWORK=...
 #           VOLUME_TYPE=...
-# Optional: VOLUME_SIZE=5 TIMEOUT=900 NAME=...
+#           HOST_SSH_MAP=host=user@address,... SSH_IDENTITY=...
+# Optional: VOLUME_SIZE=5 TIMEOUT=900 NAME=... INCUS_PROJECT=nova
 #
 # The guest image must provide cloud-init and either systemd or OpenRC local
-# services. Nova console output and Cinder volume snapshots must be enabled.
-# The selected Cinder type must map to an Incus cephext BFV pool.
+# services. The selected Cinder type must map to an Incus cephext BFV pool.
+# Stateful Incus guests need not expose /dev/console, so readiness and restored
+# data are read from the guest root through the owning compute's Incus API.
 
 set -Eeuo pipefail
 
@@ -24,9 +26,25 @@ VOLUME_TYPE=${VOLUME_TYPE:?Set VOLUME_TYPE to the Cinder backend under test}
 VOLUME_SIZE=${VOLUME_SIZE:-5}
 TIMEOUT=${TIMEOUT:-900}
 NAME=${NAME:-incus-bfv-snapshot-public-api-e2e-$RANDOM}
+HOST_SSH_MAP=${HOST_SSH_MAP:?Map every Incus compute as host=user@address}
+SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute audit key}
+SSH_KNOWN_HOSTS_FILE=${SSH_KNOWN_HOSTS_FILE:-$HOME/.ssh/known_hosts}
+INCUS_PROJECT=${INCUS_PROJECT:-nova}
 
 command -v openstack >/dev/null
 command -v python3 >/dev/null
+[[ -r "$SSH_IDENTITY" ]] || {
+    echo "SSH_IDENTITY is not readable: $SSH_IDENTITY" >&2
+    exit 2
+}
+[[ -r "$SSH_KNOWN_HOSTS_FILE" ]] || {
+    echo "SSH known_hosts is not readable: $SSH_KNOWN_HOSTS_FILE" >&2
+    exit 2
+}
+[[ "$INCUS_PROJECT" =~ ^[A-Za-z0-9_.-]+$ ]] || {
+    echo "INCUS_PROJECT contains unsupported characters" >&2
+    exit 2
+}
 [[ "$VOLUME_SIZE" =~ ^[1-9][0-9]*$ ]] || {
     echo "VOLUME_SIZE must be a positive integer in GiB" >&2
     exit 2
@@ -41,8 +59,6 @@ snapshot_ids=()
 pass_message=
 user_data=$(mktemp)
 token="bfv-snapshot-$(date +%s)-$RANDOM-$$"
-source_marker="OPENSTACK_INCUS_BFV_SOURCE_OK:$token"
-restore_marker="OPENSTACK_INCUS_BFV_RESTORE_OK:$token"
 
 wait_field() {
     local expected=$1
@@ -108,15 +124,49 @@ wait_absent() {
     return 1
 }
 
-wait_console_marker() {
-    local server=$1 marker=$2 deadline=$((SECONDS + TIMEOUT)) output=
+server_ssh_target() {
+    local server=$1 host= entry
+    host=$(openstack --os-compute-api-version 2.74 server show "$server" \
+        -f value -c 'OS-EXT-SRV-ATTR:host') || return 1
+    [[ -n "$host" ]] || return 1
+    for entry in ${HOST_SSH_MAP//,/ }; do
+        if [[ "${entry%%=*}" == "$host" ]]; then
+            [[ "${entry#*=}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*@[A-Za-z0-9_.:-]+$ ]] ||
+                return 1
+            printf '%s\n' "${entry#*=}"
+            return 0
+        fi
+    done
+    echo "No SSH mapping for Incus compute $host" >&2
+    return 1
+}
+
+guest_file() {
+    local server=$1 path=$2 target= instance_name=
+    target=$(server_ssh_target "$server") || return 1
+    instance_name=$(openstack --os-compute-api-version 2.74 \
+        server show "$server" -f value \
+        -c 'OS-EXT-SRV-ATTR:instance_name') || return 1
+    [[ "$instance_name" =~ ^instance-[0-9a-f]+$ ]] || return 1
+    ssh -n -i "$SSH_IDENTITY" -o BatchMode=yes \
+        -o StrictHostKeyChecking=yes \
+        -o "UserKnownHostsFile=$SSH_KNOWN_HOSTS_FILE" "$target" \
+        "podman exec incus incus --project '$INCUS_PROJECT' exec \
+         '$instance_name' -- cat '$path'" 2>/dev/null
+}
+
+wait_guest_value() {
+    local server=$1 path=$2 expected=$3
+    local deadline=$((SECONDS + TIMEOUT)) value= console=
     while ((SECONDS < deadline)); do
-        output=$(openstack console log show "$server" 2>/dev/null || true)
-        grep -Fqx "$marker" <<<"$output" && return 0
+        value=$(guest_file "$server" "$path" || true)
+        [[ "$value" == "$expected" ]] && return 0
         sleep 2
     done
-    printf '%s\n' "$output" >&2
-    echo "Console marker was not observed: $marker" >&2
+    console=$(openstack console log show "$server" 2>/dev/null || true)
+    printf 'guest file %s:\n%s\nconsole log (diagnostic only):\n%s\n' \
+        "$path" "$value" "$console" >&2
+    echo "Guest value was not observed: $expected" >&2
     return 1
 }
 
@@ -227,18 +277,22 @@ TOKEN='$token'
 MARKER=/root/openstack-incus-bfv-snapshot-marker
 
 emit() {
-    printf '%s\n' "\$1" >/dev/console
+    printf '%s\n' "\$1" >/dev/console 2>/dev/null || true
 }
 
+mkdir -p /usr/local/sbin
+chmod 0755 /usr/local/sbin
 cat > /usr/local/sbin/openstack-incus-bfv-restore-check <<'CHECK'
 #!/bin/sh
 set -eu
 TOKEN='$token'
 MARKER=/root/openstack-incus-bfv-snapshot-marker
+READY=/run/openstack-incus-bfv-restore-check.ok
 if [ "\$(cat "\$MARKER" 2>/dev/null || true)" = "\$TOKEN" ]; then
-    printf '%s\n' "OPENSTACK_INCUS_BFV_RESTORE_OK:\$TOKEN" >/dev/console
+    printf '%s\n' "\$TOKEN" >"\$READY"
+    printf '%s\n' "OPENSTACK_INCUS_BFV_RESTORE_OK:\$TOKEN" >/dev/console 2>/dev/null || true
 else
-    printf '%s\n' "OPENSTACK_INCUS_BFV_ERROR:marker-mismatch" >/dev/console
+    printf '%s\n' "OPENSTACK_INCUS_BFV_ERROR:marker-mismatch" >/dev/console 2>/dev/null || true
     exit 1
 fi
 CHECK
@@ -261,7 +315,8 @@ ExecStart=/usr/local/sbin/openstack-incus-bfv-restore-check
 WantedBy=multi-user.target
 UNIT
     systemctl enable openstack-incus-bfv-restore-check.service
-elif command -v rc-update >/dev/null 2>&1 && [ -d /etc/local.d ]; then
+elif command -v rc-update >/dev/null 2>&1; then
+    mkdir -p /etc/local.d
     cat >/etc/local.d/openstack-incus-bfv-restore-check.start <<'OPENRC'
 #!/bin/sh
 exec /usr/local/sbin/openstack-incus-bfv-restore-check
@@ -287,7 +342,8 @@ source_server=$(openstack --os-compute-api-version 2.74 server create \
     --use-config-drive --user-data "$user_data" "$NAME-source" \
     -f value -c id)
 wait_field ACTIVE openstack server show "$source_server" -f value -c status
-wait_console_marker "$source_server" "$source_marker"
+wait_guest_value "$source_server" \
+    /root/openstack-incus-bfv-snapshot-marker "$token"
 
 # Stop before image-create so the Cinder root snapshot is crash-consistent.
 # Applications still need their own guest quiesce transaction.
@@ -368,10 +424,27 @@ restore_server=$(openstack --os-compute-api-version 2.74 server create \
     --use-config-drive "$NAME-restore" -f value -c id)
 wait_field ACTIVE openstack server show "$restore_server" -f value -c status
 
-mapfile -t restore_volumes < <(
-    openstack server volume list "$restore_server" -f value -c ID |
-        sed '/^[[:space:]]*$/d'
+restore_volume_inventory=$(
+    openstack server volume list "$restore_server" -f json
 )
+restore_volume_ids=$(RESTORE_VOLUME_INVENTORY="$restore_volume_inventory" \
+    python3 - <<'PY'
+import json
+import os
+
+inventory = json.loads(os.environ["RESTORE_VOLUME_INVENTORY"])
+if not isinstance(inventory, list):
+    raise SystemExit("server volume inventory is not a JSON list")
+for item in inventory:
+    if not isinstance(item, dict):
+        raise SystemExit("server volume inventory contains a non-object")
+    volume_id = item.get("Volume ID") or item.get("ID")
+    if not isinstance(volume_id, str) or not volume_id:
+        raise SystemExit("server volume inventory is missing Volume ID")
+    print(volume_id)
+PY
+)
+mapfile -t restore_volumes < <(printf '%s' "$restore_volume_ids")
 (( ${#restore_volumes[@]} == 1 )) || {
     echo "Restored BFV server must have exactly one Cinder root volume" >&2
     exit 1
@@ -399,6 +472,9 @@ if str(actual or "") != expected_snapshot:
         "restored BFV root volume was not created from the Nova image "
         "snapshot")
 PY
-wait_console_marker "$restore_server" "$restore_marker"
+wait_guest_value "$restore_server" \
+    /root/openstack-incus-bfv-snapshot-marker "$token"
+wait_guest_value "$restore_server" \
+    /run/openstack-incus-bfv-restore-check.ok "$token"
 
 pass_message="PASS public API BFV snapshot source=$source_server image=$snapshot_image restore=$restore_server root=$restore_volume"

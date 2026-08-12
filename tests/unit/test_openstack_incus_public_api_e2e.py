@@ -26,6 +26,7 @@ DATA_SCRIPT = (
     REPO_ROOT / 'tools' / 'openstack-incus-initial-data-volume-e2e.sh')
 BFV_SCRIPT = (
     REPO_ROOT / 'tools' / 'openstack-incus-bfv-snapshot-public-api-e2e.sh')
+BFV_COW_SCRIPT = REPO_ROOT / 'tools' / 'openstack-incus-bfv-cow-e2e.sh'
 RELEASE_GATE = (
     REPO_ROOT / 'tools' / 'openstack-incus-release-gate.sh')
 IDMAP_SCRIPT = (
@@ -43,6 +44,7 @@ class PublicApiE2EContractTest(unittest.TestCase):
     def setUpClass(cls):
         cls.data = DATA_SCRIPT.read_text(encoding='utf-8')
         cls.bfv = BFV_SCRIPT.read_text(encoding='utf-8')
+        cls.bfv_cow = BFV_COW_SCRIPT.read_text(encoding='utf-8')
         cls.release_gate = RELEASE_GATE.read_text(encoding='utf-8')
         cls.idmap = IDMAP_SCRIPT.read_text(encoding='utf-8')
         cls.cleanup_audit = CLEANUP_AUDIT.read_text(encoding='utf-8')
@@ -82,12 +84,34 @@ class PublicApiE2EContractTest(unittest.TestCase):
                 if (pos := script.find(token)) >= 0)
             self.assertLess(gate, first_create)
 
-    def test_scripts_do_not_call_private_compute_interfaces(self):
-        for script in (self.bfv,):
-            self.assertNotIn('incus exec', script)
-            self.assertNotIn('podman exec', script)
-            self.assertNotIn('ssh ', script)
-            self.assertNotIn('/var/lib/incus', script)
+    def test_bfv_snapshot_reads_durable_guest_evidence_fail_closed(self):
+        self.assertIn(
+            'HOST_SSH_MAP=${HOST_SSH_MAP:?', self.bfv)
+        self.assertIn('StrictHostKeyChecking=yes', self.bfv)
+        self.assertIn(
+            'INCUS_PROJECT" =~ ^[A-Za-z0-9_.-]+$', self.bfv)
+        self.assertIn(
+            '^[A-Za-z0-9_][A-Za-z0-9_.-]*@', self.bfv)
+        self.assertIn(
+            "podman exec incus incus --project '$INCUS_PROJECT' exec",
+            self.bfv)
+        self.assertIn('/root/openstack-incus-bfv-snapshot-marker', self.bfv)
+        self.assertIn('/run/openstack-incus-bfv-restore-check.ok', self.bfv)
+        self.assertIn('mkdir -p /usr/local/sbin', self.bfv)
+        self.assertIn('mkdir -p /etc/local.d', self.bfv)
+        self.assertIn('/dev/console 2>/dev/null || true', self.bfv)
+        self.assertIn('console log (diagnostic only)', self.bfv)
+        self.assertNotIn('/var/lib/incus', self.bfv)
+
+    def test_bfv_snapshot_parses_current_server_volume_inventory(self):
+        self.assertIn(
+            'openstack server volume list "$restore_server" -f json',
+            self.bfv)
+        self.assertIn(
+            'item.get("Volume ID") or item.get("ID")', self.bfv)
+        self.assertNotIn(
+            'server volume list "$restore_server" -f value -c ID',
+            self.bfv)
 
     def test_initial_volume_host_fallback_is_explicit_and_read_only(self):
         self.assertIn('HOST_SSH_MAP=${HOST_SSH_MAP:-}', self.data)
@@ -182,7 +206,7 @@ class PublicApiE2EContractTest(unittest.TestCase):
                 'echo "PASS public API',
                 script)
 
-    def test_release_gate_requires_and_executes_both_public_api_e2es(self):
+    def test_release_gate_requires_all_public_api_storage_e2es(self):
         self.assertIn(
             'RUN_PUBLIC_API_E2E=${RUN_PUBLIC_API_E2E:-false}',
             self.release_gate)
@@ -193,11 +217,27 @@ class PublicApiE2EContractTest(unittest.TestCase):
             '"$SCRIPT_DIR/openstack-incus-bfv-snapshot-public-api-e2e.sh"',
             self.release_gate)
         self.assertIn(
+            '"$SCRIPT_DIR/openstack-incus-bfv-cow-e2e.sh"',
+            self.release_gate)
+        self.assertIn(
+            'PUBLIC_API_CINDER_POOL:?Set the Cinder RBD pool under test',
+            self.release_gate)
+        self.assertIn('HOST_SSH_MAP="$COMPUTE_NODES"', self.release_gate)
+        self.assertIn('CINDER_POOL="$PUBLIC_API_CINDER_POOL"',
+                      self.release_gate)
+        self.assertIn(
             '"$RUN_PUBLIC_API_E2E" == true',
             self.release_gate)
         self.assertIn('REQUIRE_HOST_CLEANUP_AUDIT=true', self.release_gate)
         self.assertIn('NOVA_INSTANCES_PATH="$NOVA_INSTANCES_PATH"',
                       self.release_gate)
+
+    def test_bfv_cow_proves_exact_parent_lineage(self):
+        self.assertIn("direct_url=$(openstack image show", self.bfv_cow)
+        self.assertIn("parent_pool=$(jq -r '.parent.pool", self.bfv_cow)
+        self.assertIn('[[ "$parent_pool" == "$glance_pool" ]]',
+                      self.bfv_cow)
+        self.assertIn('((overlap > 0))', self.bfv_cow)
 
     def test_initial_volume_cleanup_audit_is_exact_and_fail_closed(self):
         self.assertIn('StrictHostKeyChecking=yes', self.cleanup_audit)

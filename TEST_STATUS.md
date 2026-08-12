@@ -11,6 +11,46 @@ Entries are append-mostly and are release evidence, not permanent
 configuration. Each release must re-validate against its own approved
 digest/revision pair.
 
+## 2026-08-13 BFV public snapshot and RBD CoW rerun
+
+The two snapshot optimization failures recorded on 2026-08-12 are resolved
+and were rerun against the current three-compute testbed.
+
+- The public BFV snapshot test no longer treats Nova console output as its
+  data authority. The source and restored guest marker files are read through
+  the owning compute's Incus API over strict host-key-checked SSH. The Alpine
+  image also exposed a real cloud-init portability bug: it does not create
+  ``/usr/local/sbin`` by default. The user data now creates the helper and
+  OpenRC directories explicitly, while ``/dev/console`` is diagnostic-only.
+  A subsequent CLI compatibility failure was fixed by parsing the JSON
+  ``Volume ID`` field instead of requesting the obsolete ``ID`` column.
+- The complete public-API flow passed with source server
+  ``5743f42f-6261-47c5-b2a2-460ded838d28``, image
+  ``6b4c0090-db8b-4792-a05c-9bf26c5e6ac2`` and restored server
+  ``35c9ebbf-1d2c-4451-b4b4-f01438a74a72``. The restored root
+  ``80c89005-7bd1-4e86-ab27-7ea0994676c6`` was a different Cinder volume,
+  its exact snapshot ID matched the snapshot embedded in the Nova image, and
+  both the persisted source marker and the post-boot restore marker matched.
+  The script exited zero and removed both servers, the image, both root
+  volumes and the Cinder snapshot.
+- The missing RBD parent was caused by CephX drift: ``client.cinder`` could
+  write the Cinder pool but could not read the Glance image pool, so Cinder
+  correctly fell back to download/import and produced a full copy. The
+  authoritative Rook ``CephClient/cinder`` now grants only
+  ``profile rbd-read-only pool=glance-images-rbd-pool`` in addition to
+  ``profile rbd pool=cinder-volumes-rbd-pool``. The operator reconciled the
+  change before the final rerun.
+- The final CoW probe passed for volume
+  ``e6d0a16f-b12e-460d-a8ac-22be75470cad``. Its exact RBD parent was
+  ``glance-images-rbd-pool/30c4e059-316d-4208-bf46-c63cbd8a3517@snap``
+  with 805306368 bytes of overlap; provisioning took 9 seconds. The volume
+  and RBD image were then both absent.
+
+The aggregate release gate now requires ``PUBLIC_API_CINDER_POOL`` and runs
+both the public BFV snapshot/restore test and the exact Glance-to-Cinder RBD
+parent test. This prevents a future CephX regression from passing as a slower
+full-copy implementation.
+
 ## 2026-08-12 current-code migration and lifecycle rerun
 
 The three Incus computes were ``incus-node-02``, ``incus-node-03`` and

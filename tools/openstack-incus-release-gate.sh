@@ -364,6 +364,7 @@ if [[ "$RUN_PUBLIC_API_E2E" == true ]]; then
     : "${PUBLIC_API_FLAVOR:?Set the Incus-compatible Flavor ID}"
     : "${PUBLIC_API_NETWORK:?Set the tenant network ID}"
     : "${PUBLIC_API_VOLUME_TYPE:?Set the Cinder volume type under test}"
+    : "${PUBLIC_API_CINDER_POOL:?Set the Cinder RBD pool under test}"
     : "${COMPUTE_NODES:?Set COMPUTE_NODES for exact local cleanup proof}"
     : "${SSH_IDENTITY:?Set SSH_IDENTITY for exact local cleanup proof}"
     : "${NOVA_INSTANCES_PATH:?Set the absolute Nova instances_path}"
@@ -401,7 +402,20 @@ if [[ "$RUN_PUBLIC_API_E2E" == true ]]; then
         VOLUME_SIZE="${PUBLIC_API_BFV_VOLUME_SIZE:-5}" \
         TIMEOUT="${PUBLIC_API_TIMEOUT:-900}" \
         NAME="$PUBLIC_API_NAME_PREFIX-bfv-snapshot" \
+        HOST_SSH_MAP="$COMPUTE_NODES" \
+        SSH_IDENTITY="$SSH_IDENTITY" \
+        SSH_KNOWN_HOSTS_FILE="$SSH_KNOWN_HOSTS_FILE" \
         "$SCRIPT_DIR/openstack-incus-bfv-snapshot-public-api-e2e.sh"
+    run "Glance-to-Cinder BFV RBD copy-on-write clone" \
+        env \
+        IMAGE="$PUBLIC_API_BFV_IMAGE" \
+        VOLUME_TYPE="$PUBLIC_API_VOLUME_TYPE" \
+        CINDER_POOL="$PUBLIC_API_CINDER_POOL" \
+        CINDER_USER="${PUBLIC_API_CINDER_USER:-cinder}" \
+        SIZE="${PUBLIC_API_BFV_VOLUME_SIZE:-5}" \
+        TIMEOUT="${PUBLIC_API_TIMEOUT:-900}" \
+        NAME="$PUBLIC_API_NAME_PREFIX-bfv-cow" \
+        "$SCRIPT_DIR/openstack-incus-bfv-cow-e2e.sh"
     PHASE_PUBLIC_API_E2E_PASSED=true
 else
     echo "NO-GO: RUN_PUBLIC_API_E2E=false; no production release decision" >&2
