@@ -10880,9 +10880,12 @@ class IncusDriver(driver.ComputeDriver):
                         raise exception.InvalidVolume(
                             reason='Disconnected Cinder volume still has an '
                                    'Incus guest device')
-                    profile_record = _profile_volume_record(
-                        profile, volume_id)
-                    if profile_record:
+                    metadata_keys = [
+                        key for key in _volume_device_info_keys(volume_id)
+                        if key in profile.config]
+                    if metadata_keys:
+                        profile_record = _profile_volume_record(
+                            profile, volume_id)
                         profile_phase = _validate_volume_recovery_record(
                             profile_record, volume_id, mountpoint, effective)
                         if profile_phase not in (
@@ -10890,8 +10893,7 @@ class IncusDriver(driver.ComputeDriver):
                             raise exception.InvalidVolume(
                                 reason='Disconnected Cinder volume has '
                                        'non-terminal Incus metadata')
-                        for metadata_key in _volume_device_info_keys(
-                                volume_id):
+                        for metadata_key in metadata_keys:
                             profile.config.pop(metadata_key, None)
                         profile.save(wait=True)
             _write_volume_journal(
