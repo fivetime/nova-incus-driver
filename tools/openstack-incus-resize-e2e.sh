@@ -12,6 +12,7 @@ DEST_SSH=${DEST_SSH:-root@10.32.32.131}
 THIRD_HOST=${THIRD_HOST:-incus-node-03}
 THIRD_SSH=${THIRD_SSH:-root@10.32.32.132}
 SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute test key}
+INCUS_PROJECT=${INCUS_PROJECT:-nova}
 SERVER=${SERVER:-incus-resize-e2e-$RANDOM}
 TIMEOUT=${TIMEOUT:-180}
 
@@ -58,10 +59,11 @@ assert_limits() {
     local host=$1 expected_pids=$2 expected_memory=$3 expected_cpus=$4
     local actual_pids actual_memory actual_cpus
     actual_pids=$(remote "$host" \
-        "incus exec '$instance_name' -- cat /sys/fs/cgroup/pids.max")
+        "incus --project '$INCUS_PROJECT' exec '$instance_name' -- cat /sys/fs/cgroup/pids.max")
     actual_memory=$(remote "$host" \
-        "incus exec '$instance_name' -- cat /sys/fs/cgroup/memory.max")
-    actual_cpus=$(remote "$host" "incus exec '$instance_name' -- nproc")
+        "incus --project '$INCUS_PROJECT' exec '$instance_name' -- cat /sys/fs/cgroup/memory.max")
+    actual_cpus=$(remote "$host" \
+        "incus --project '$INCUS_PROJECT' exec '$instance_name' -- nproc")
     [[ "$actual_pids" == "$expected_pids" ]] || {
         echo "Expected pids.max=$expected_pids, got $actual_pids" >&2
         return 1
@@ -113,7 +115,7 @@ assert_limits "$SOURCE_SSH" 2048 $((512 * 1024 * 1024)) 1
 assert_allocations 1 512 1
 marker="resize-$server_id"
 remote "$SOURCE_SSH" \
-    "incus exec '$instance_name' -- sh -c \
+    "incus --project '$INCUS_PROJECT' exec '$instance_name' -- sh -c \
      'printf %s "$marker" > /root/nova-resize-marker; sync'"
 
 openstack server resize --flavor "$large_flavor" --wait "$server_id"
@@ -127,7 +129,7 @@ resize_ssh=$(ssh_for_host "$resize_host")
 }
 assert_limits "$resize_ssh" 4096 $((1024 * 1024 * 1024)) 2
 [[ "$(remote "$resize_ssh" \
-    "incus exec '$instance_name' -- cat /root/nova-resize-marker")" == \
+    "incus --project '$INCUS_PROJECT' exec '$instance_name' -- cat /root/nova-resize-marker")" == \
     "$marker" ]]
 
 openstack server resize revert "$server_id"

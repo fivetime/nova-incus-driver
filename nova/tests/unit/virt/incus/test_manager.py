@@ -3085,6 +3085,19 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         self.compute.driver.confirm_connected_volume_journal.\
             assert_not_called()
 
+    def test_internal_attach_recovery_rejects_missing_bdm(self):
+        instance = self._volume_recovery_instance()
+        volume_id = '50000000-0000-0000-0000-000000000005'
+
+        self.assertRaises(
+            exception.InvalidVolume,
+            self.compute._recover_incus_internal_attach_locked,
+            context.get_admin_context(), instance, volume_id,
+            'attach-pending', {}, None, None, None, None)
+
+        self.compute.driver.validate_internal_volume_attach_owner.\
+            assert_not_called()
+
     @mock.patch.object(manager.objects.MigrationList, 'get_by_filters')
     def test_failed_cold_bfv_intent_only_rejects_local_data_mapping(
             self, get_migrations):

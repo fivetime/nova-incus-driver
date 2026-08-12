@@ -11,6 +11,77 @@ Entries are append-mostly and are release evidence, not permanent
 configuration. Each release must re-validate against its own approved
 digest/revision pair.
 
+## 2026-08-12 current-code migration and lifecycle rerun
+
+The three Incus computes were ``incus-node-02``, ``incus-node-03`` and
+``incus-node-07``.  The deployed Incus image digest was
+``sha256:313636fb020da6f4ed07028ef822ce8eb5930398992522adf1acc942e8f284b0``
+at revision ``5df3773c94d32823d2a71127087934b09461fcbb``.  The OpenStack
+tree started at ``42dde5f``; the E2E fixes found below are committed with this
+evidence entry.
+
+The following current-code reruns passed:
+
+- all eight local/BFV x 0/1 Cinder x 0/1 Manila live-migration cases, with a
+  three-node ring for every case (24 migrations);
+- all 18 local/BFV x 0/1/3 Cinder x 0/1/3 Manila cardinality cases (54
+  migrations), both before and after a real compute reboot and BFV host-loss
+  evacuation;
+- all six ordered directions for each of the five BFV cold-migration fault
+  cases: confirm/revert, post-claim data failure, post-claim start failure,
+  stopped-instance failure and reverse-revert;
+- maximum BFV + three data volumes + three Manila shares with a destination
+  CRIU restore failure, source rollback, unchanged PID, exact target cleanup
+  and immediate three-node retry;
+- the four local/BFV x one/two initial-data-volume cases, including format,
+  marker persistence and hard reboot; QEMU computes had to be temporarily
+  disabled because this older script does not constrain its scheduler trait;
+- Manila destination pre-mount rejection, retry, compute restart/remount,
+  snapshot, create-from-snapshot and reattach marker recovery;
+- BFV delete protection, exact Ceph delete ABA, isolated-ID-map overlap on all
+  three computes, pause/unpause, shelve/unshelve, read-only config-drive,
+  ACTIVE/SHUTOFF reimage, resize revert/confirm and hard-reboot recovery;
+- Cinder data-volume attach, guest write, online extension to 2 GiB, cold
+  migration, detach, full/incremental backup and cross-compute restore.
+
+Both cardinality runs cleaned every resource created by their cases.  Their
+final whole-cloud byte-for-byte aggregate snapshot changed because unrelated
+background resources changed during each multi-hour run, so that aggregate
+gate returned 1.  An immediate static residual audit passed after both runs;
+this is per-case green evidence, not a claim that the otherwise active cloud
+was globally immutable for several hours.
+
+The rerun found and fixed three stale assumptions in the resize/data-volume
+E2E scripts: Incus commands now use the configured ``nova`` project, volume
+metadata validates the v2 ``mountpoint`` field, and expected ``fuse2fs``
+warnings cannot contaminate marker stdout.  Cold-migration submission now
+treats the Nova migration record and terminal server state as authoritative
+instead of OSC's non-zero informational return.  A deliberately triggered
+delete/migration race also exposed a periodic ``None.volume_id`` traceback;
+missing Nova BDM authority now raises ``InvalidVolume`` and retains durable
+evidence.  The complete manager unit suite passed 266/266 after that change.
+
+Two snapshot optimizations remain red and are not release evidence.  The
+public BFV snapshot script could not observe its cloud-init console marker on
+either admitted Alpine or Ubuntu BFV images, although the source instance was
+ACTIVE, so it never entered the snapshot API phase.  Separately, the BFV RBD
+CoW probe found that Cinder produced a flattened/full-copy image with no RBD
+parent instead of a Glance snapshot clone.  Public snapshot/clone optimization
+therefore remains NO-GO even though Cinder full/incremental backup and restore
+passed.
+
+The final inventory audit also retained one exact ID-map generation for the
+deleted test instance ``97bf8c94-c130-42ca-940d-b37420427c2d``
+(``instance-00004d1a``).  Nova, the Incus instance/profile, volume/share
+journals and the instance directory are absent, but the committed source claim
+has no Incus storage-release receipt.  The periodic replayer correctly refuses
+to infer destructive authority from absence and leaves the release intent,
+claim and slot visible for manual exact reconciliation.  No etcd key was
+deleted to manufacture a clean result.  This residue came from the early
+delete-during-cold-migration script error described above and is an additional
+release NO-GO until its exact generation is reconciled through an approved
+operator procedure.
+
 ## 2026-08-10 500-per-compute scale and full Tempest gate: NO-GO
 
 The physical-resource ceiling for this testbed is now **500 Incus system

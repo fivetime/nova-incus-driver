@@ -32,6 +32,9 @@ IDMAP_SCRIPT = (
     REPO_ROOT / 'tools' / 'openstack-incus-idmap-conflict-e2e.sh')
 CLEANUP_AUDIT = (
     REPO_ROOT / 'tools' / 'openstack-incus-data-volume-cleanup-audit.sh')
+RESIZE_SCRIPT = REPO_ROOT / 'tools' / 'openstack-incus-resize-e2e.sh'
+VOLUME_MIGRATION_SCRIPT = (
+    REPO_ROOT / 'tools' / 'openstack-incus-volume-migration-e2e.sh')
 
 
 class PublicApiE2EContractTest(unittest.TestCase):
@@ -43,6 +46,31 @@ class PublicApiE2EContractTest(unittest.TestCase):
         cls.release_gate = RELEASE_GATE.read_text(encoding='utf-8')
         cls.idmap = IDMAP_SCRIPT.read_text(encoding='utf-8')
         cls.cleanup_audit = CLEANUP_AUDIT.read_text(encoding='utf-8')
+        cls.resize = RESIZE_SCRIPT.read_text(encoding='utf-8')
+        cls.volume_migration = VOLUME_MIGRATION_SCRIPT.read_text(
+            encoding='utf-8')
+
+    def test_resize_checks_the_configured_incus_project(self):
+        self.assertIn('INCUS_PROJECT=${INCUS_PROJECT:-nova}', self.resize)
+        self.assertEqual(
+            5, self.resize.count("incus --project '$INCUS_PROJECT' exec"))
+        self.assertNotIn('"incus exec ', self.resize)
+
+    def test_volume_migration_checks_the_configured_incus_project(self):
+        script = self.volume_migration
+        self.assertIn('INCUS_PROJECT=${INCUS_PROJECT:-nova}', script)
+        self.assertEqual(
+            3, script.count("incus --project '$INCUS_PROJECT' exec"))
+        self.assertEqual(
+            4, script.count("incus --project '$INCUS_PROJECT' profile"))
+        self.assertNotIn('"incus exec ', script)
+        self.assertNotIn('"incus profile ', script)
+        self.assertIn('data[\\"mountpoint\\"].startswith(\\"/dev/\\")', script)
+        self.assertNotIn('data[\\"path\\"]', script)
+        self.assertIn('--host "$DEST_HOST" "$server_id" || true', script)
+        self.assertNotIn('--host "$DEST_HOST" --wait', script)
+        self.assertIn(
+            'fuse2fs $DEVICE /mnt/cinder >/dev/null 2>&1', script)
 
     def test_scripts_default_to_non_destructive(self):
         for script in (self.data, self.bfv):

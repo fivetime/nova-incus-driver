@@ -119,6 +119,14 @@ def _attachment_status(attachment):
         attachment).get('status')
 
 
+def _require_internal_volume_bdm(bdm):
+    if bdm is None:
+        raise exception.InvalidVolume(
+            reason='Internal volume recovery has no authoritative Nova '
+                   'block device mapping')
+    return bdm
+
+
 def _attachment_instance_uuid(attachment):
     if not isinstance(attachment, dict):
         return None
@@ -5154,6 +5162,7 @@ class IncusComputeManager(manager.ComputeManager):
             self, context, instance, volume_id, journal_phase, intent, bdm,
             attachment, status, connection_info):
         """Converge an exact spawn/reconcile/source attach generation."""
+        bdm = _require_internal_volume_bdm(bdm)
         self.driver.validate_internal_volume_attach_owner(instance, intent)
         operation_kind = intent['operation_kind']
         direction = intent['operation_direction']
