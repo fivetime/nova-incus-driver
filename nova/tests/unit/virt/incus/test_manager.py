@@ -3384,6 +3384,50 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         instance.save.assert_called_once_with(
             expected_task_state=task_states.RESIZE_MIGRATING)
 
+    @mock.patch.object(manager.objects.RequestSpec, 'get_by_instance_uuid')
+    def test_startup_provider_mapping_falls_back_for_source_only_allocation(
+            self, get_request_spec):
+        instance = self._volume_recovery_instance()
+        source_uuid = '61000000-0000-0000-0000-000000000006'
+        migration = mock.Mock(source_node='node-1')
+        allocations = {source_uuid: {'resources': {'VCPU': 1}}}
+        get_request_spec.side_effect = manager.messaging.RemoteError(
+            'CantStartEngineError',
+            'No sql_connection parameter is established')
+        self.compute.reportclient = mock.Mock()
+        self.compute.reportclient.get_provider_by_name.return_value = {
+            'uuid': source_uuid}
+        self.compute._fill_provider_mapping_based_on_allocs = mock.Mock()
+
+        result = self.compute._startup_cold_source_provider_mappings(
+            context.get_admin_context(), instance, migration, allocations)
+
+        self.assertIsNone(result)
+        self.compute._fill_provider_mapping_based_on_allocs.assert_not_called()
+
+    @mock.patch.object(manager.objects.RequestSpec, 'get_by_instance_uuid')
+    def test_startup_provider_mapping_fallback_rejects_extra_provider(
+            self, get_request_spec):
+        instance = self._volume_recovery_instance()
+        source_uuid = '61000000-0000-0000-0000-000000000006'
+        migration = mock.Mock(source_node='node-1')
+        allocations = {
+            source_uuid: {'resources': {'VCPU': 1}},
+            '62000000-0000-0000-0000-000000000006': {
+                'resources': {'NET_BW_EGR_KILOBIT_PER_SEC': 1000}},
+        }
+        get_request_spec.side_effect = manager.messaging.RemoteError(
+            'CantStartEngineError',
+            'No sql_connection parameter is established')
+        self.compute.reportclient = mock.Mock()
+        self.compute.reportclient.get_provider_by_name.return_value = {
+            'uuid': source_uuid}
+
+        self.assertRaises(
+            exception.MigrationError,
+            self.compute._startup_cold_source_provider_mappings,
+            context.get_admin_context(), instance, migration, allocations)
+
     @mock.patch.object(
         manager.objects.BlockDeviceMappingList, 'get_by_instance_uuid')
     @mock.patch.object(manager.objects.Instance, 'get_by_uuid')

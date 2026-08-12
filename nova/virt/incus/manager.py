@@ -30,6 +30,7 @@ from nova.objects import fields as obj_fields
 from nova import utils
 from oslo_concurrency import lockutils
 from oslo_log import log as logging
+import oslo_messaging as messaging
 from oslo_serialization import jsonutils
 from oslo_service import periodic_task
 from oslo_utils import uuidutils
@@ -448,10 +449,8 @@ class IncusComputeManager(manager.ComputeManager):
             instance, migration.uuid)
         source_allocations = self._restore_interrupted_cold_source_allocations(
             context, instance, migration)
-        request_spec = objects.RequestSpec.get_by_instance_uuid(
-            context, instance.uuid)
-        provider_mappings = self._fill_provider_mapping_based_on_allocs(
-            context, source_allocations, request_spec)
+        provider_mappings = self._startup_cold_source_provider_mappings(
+            context, instance, migration, source_allocations)
         self.network_api.setup_networks_on_host(
             context, instance, migration.source_compute)
         with utils.temporary_mutation(
@@ -492,6 +491,34 @@ class IncusComputeManager(manager.ComputeManager):
                 'could not yet be retired; periodic recovery will retry',
                 instance=instance)
         return True
+
+    def _startup_cold_source_provider_mappings(
+            self, context, instance, migration, source_allocations):
+        """Rebuild Neutron mappings, with a narrow legacy DB fallback."""
+        try:
+            request_spec = objects.RequestSpec.get_by_instance_uuid(
+                context, instance.uuid)
+        except messaging.RemoteError as exc:
+            if exc.exc_type != 'CantStartEngineError':
+                raise
+            source = self.reportclient.get_provider_by_name(
+                context, migration.source_node)
+            source_uuid = source.get('uuid') if isinstance(
+                source, dict) else None
+            if (not uuidutils.is_uuid_like(source_uuid) or
+                    set(source_allocations) != {source_uuid}):
+                raise exception.MigrationError(
+                    reason='Interrupted cold migration cannot prove that '
+                           'Neutron provider mappings are unnecessary')
+            LOG.warning(
+                'RequestSpec is unavailable through conductor during cold '
+                'source startup recovery for instance %s. Placement contains '
+                'only the source compute provider, so no Neutron resource '
+                'request mapping is required.', instance.uuid,
+                instance=instance)
+            return None
+        return self._fill_provider_mapping_based_on_allocs(
+            context, source_allocations, request_spec)
 
     def _init_instance(self, context, instance):
         """Recover cold attachment rotation before generic startup rollback."""
