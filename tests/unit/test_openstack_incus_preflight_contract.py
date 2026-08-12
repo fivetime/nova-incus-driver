@@ -338,6 +338,19 @@ class BfvCommandTimeoutContractTest(unittest.TestCase):
         self.assertIn(
             "'/1.0/profiles/$instance_name?project=nova'", self.e2e)
 
+    def test_bfv_start_failpoint_waits_for_target_instance(self):
+        target_ready = 'until podman exec incus incus list \\'
+        target_instance = (
+            '\\"$instance_name\\" --project nova --format csv -c s')
+        delete_vif = 'ip link delete \\"$vif_source\\"'
+
+        self.assertIn(target_ready, self.e2e)
+        self.assertIn(target_instance, self.e2e)
+        self.assertLess(self.e2e.index(target_ready),
+                        self.e2e.index(delete_vif))
+        self.assertNotIn(
+            'until ip link show "$vif_source"', self.e2e)
+
 
 class FullCheckpointMigrationContractTest(unittest.TestCase):
 

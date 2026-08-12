@@ -400,8 +400,10 @@ if [[ "$INJECT_POST_CLAIM_FAILURE" == true ]]; then
                    .parent'")
             [[ -n "$vif_source" ]] || fail "cannot determine Incus VIF source"
             start_failpoint_pid=$(remote "$DEST_SSH" \
-                "nohup sh -c 'until ip link show \"$vif_source\" \
+                "nohup sh -c 'until podman exec incus incus list \
+                 \"$instance_name\" --project nova --format csv -c s \
                  >/dev/null 2>&1; do sleep 0.02; done; \
+                 ip link show \"$vif_source\" >/dev/null 2>&1 || exit 1; \
                  ip link delete \"$vif_source\"' \
                  >/tmp/openstack-incus-start-failpoint.log 2>&1 & echo \$!")
             ;;
