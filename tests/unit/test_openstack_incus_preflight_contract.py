@@ -483,7 +483,8 @@ class FullCheckpointMigrationContractTest(unittest.TestCase):
 
     def test_live_e2e_selects_root_format_specific_default_image(self):
         self.assertIn(
-            'LOCAL_ROOT_IMAGE=${LOCAL_ROOT_IMAGE:-alpine-3.21-cloud-incus-criu-fuse}',
+            'LOCAL_ROOT_IMAGE=${LOCAL_ROOT_IMAGE:-'
+            'alpine-3.21-cloud-incus-criu-fuse}',
             self.e2e)
         self.assertIn(
             'BFV_ROOT_IMAGE=${BFV_ROOT_IMAGE:-alpine-3.21-criu-bfv-fuse}',

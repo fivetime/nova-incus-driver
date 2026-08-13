@@ -76,7 +76,10 @@ class ColdMigrationE2EContractTest(unittest.TestCase):
             'dd if="$data_device" bs=1 count="${#volume_marker}"',
             self.e2e)
         self.assertIn(
-            'exec "$instance_name" -- cat "$manila_marker_path"',
+            'incus_exec_read "$host" "$instance_name"',
+            self.e2e)
+        self.assertIn(
+            'cat "$manila_marker_path"',
             self.e2e)
         self.assertIn(
             'verify_guest_persistent_state "$target_ssh"', self.e2e)
@@ -90,7 +93,7 @@ class ColdMigrationE2EContractTest(unittest.TestCase):
 
     def test_cold_pid_is_not_used_as_a_continuity_assertion(self):
         live_check = 'if [[ "$MIGRATION_MODE" == live ]]; then'
-        pid_check = '[[ "$dest_pid" == "$source_pid" ]]'
+        pid_check = 'if [[ "$dest_pid" != "$source_pid" ]]; then'
         self.assertIn(live_check, self.e2e)
         pid_offset = self.e2e.index(pid_check)
         live_offset = self.e2e.rfind(live_check, 0, pid_offset)
