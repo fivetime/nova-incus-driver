@@ -31,8 +31,22 @@ baselines when developing and testing this project:
 - DevStack: `C:\MyProjects\OpenSource\openstack\devstack`
 - Incus Python SDK: `C:\MyProjects\IaasProjects\Incus\incus-python-sdk`
 - Incus server: `C:\MyProjects\IaasProjects\Incus\incus`
+- LXC upstream tracking checkout: `C:\MyProjects\IaasProjects\Incus\lxc`
 - etcd client: `C:\MyProjects\OpenSource\openstack\etcd3gw`
 - ceilometer: `C:\MyProjects\OpenSource\openstack\ceilometer`
+
+The Incus server and Incus Python SDK entries above are maintained forks, not
+pristine upstream baselines. Their authoritative remotes are
+`https://github.com/fivetime/incus.git` and
+`https://github.com/fivetime/incus-python-sdk.git`; releases must record exact
+commits. Nova, Neutron, os-brick, Glance, Cinder, Manila, Ceilometer, and the
+other OpenStack checkouts are upstream API baselines. Formal downstream
+changes to those non-fork projects live only under `patches/` in this
+repository; do not publish branches from their local validation worktrees.
+LXC is also an upstream dependency rather than an active fork. Its historical
+`fivetime/lxc` branch was superseded by upstream commit `f30cbb86f` and
+`lxc/lxc#4695`; production builds use `https://github.com/lxc/lxc.git` at an
+exact reviewed commit and must not add changes to the retired fork.
 
 The former ovsdbapp checkout at
 `C:\MyProjects\IaasProjects\OpenStack\openstack-ovsdbapp` was deleted because

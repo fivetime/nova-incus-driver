@@ -90,6 +90,22 @@ capabilities are independent:
 * CRIU live migration depends on the workload, host kernel, outer Incus
   image, and profile policy. Installing CRIU inside the guest is not required.
 
+Treat live migration as an image qualification result, not as a consequence
+of installing CRIU packages. In particular, systemd unit hardening can create
+nested UTS or mount namespaces (for example through ``ProtectHostname`` or
+service-specific mount isolation) that CRIU cannot restore on the deployed
+kernel/runtime combination. Do not broadly disable those protections to make
+an image pass. Either qualify the exact image and enabled units with the full
+checkpoint migration and restore-failure matrix, or publish it without the
+live-migration capability. OpenRC images avoid systemd-specific namespace
+creation but still require the same end-to-end qualification.
+
+Capability claims are independent. An image that passes root-only live
+migration does not qualify for the Cinder data-volume matrix unless
+``fuse2fs`` is present and ``hw_incus_data_volume_fuse=true`` is backed by the
+data-volume tests. Missing ``fuse2fs`` must narrow the advertised capability;
+it must not be replaced by a host bind mount or a privileged guest.
+
 Never make a guest privileged to avoid image preparation. The admitted
 profile must remain ``security.privileged=false`` with isolated ID maps.
 

@@ -39,8 +39,9 @@ Record one immutable release set before changing any host:
 * the Incus fork commit;
 * the outer Incus OCI manifest digest and its
   ``org.opencontainers.image.revision`` label;
-* the Incus Python SDK revision;
-* the Nova, os-brick, python-glanceclient, Ceilometer, and Manila patch set;
+* the Incus Python SDK fork commit;
+* the upstream LXC and CRIU commits embedded in the outer image;
+* the Nova, os-brick, python-glanceclient, and Ceilometer patch set;
 * the Nova configuration and the Incus project name;
 * the Ceph FSID, pool names, and CephX client names; and
 * the etcd namespace and TLS identities used for fleet ID maps.
@@ -213,6 +214,29 @@ Deploy the driver into the same Python environment as Nova. The repository's
 DevStack plugin is the reference integration and applies the required runtime
 patches fail-closed. For packaged deployment, make the same patch set part of
 the immutable Nova build; do not patch running files by hand.
+
+Nova, os-brick, python-glanceclient, Ceilometer, and Manila are upstream
+dependencies, not project forks. Their local checkouts must remain clean API
+baselines used to generate and validate the canonical patch files in this
+repository. Manila itself is not patched; the Manila-related downstream
+changes patch Nova's scheduling and compute-manager paths.
+The rationale, role ownership, rebase procedure, upstream tracking duty, and
+removal criteria for those files are defined in
+:doc:`upgrade_matrix`. Package maintainers and operators must follow that
+policy rather than preserving changes in an upstream checkout.
+
+The Incus server and Incus Python SDK use a different delivery model: both are
+maintained forks. Pin their exact commits in the release manifest and artifact
+provenance. ``INCUS_PYTHON_SDK_BRANCH=main`` is convenient for development but
+is not an immutable production pin. Fork ownership, rebase, and upstream
+removal rules are defined in :doc:`upgrade_matrix` alongside the non-fork
+patch policy.
+
+LXC is not one of those forks. Build the outer image from the official
+``https://github.com/lxc/lxc.git`` source at a reviewed commit. The retired
+``fivetime/lxc`` repository and its old CRIU cgroup-finalization branch are
+not valid production inputs because upstream LXC already contains the
+complete replacement.
 
 The custom ``IncusLiveMigrateData`` object must be importable by every
 conductor before any upgraded compute advertises version 1.6. Upgrade and

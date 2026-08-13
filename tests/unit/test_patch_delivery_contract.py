@@ -31,6 +31,79 @@ class PatchDeliveryContractTest(unittest.TestCase):
             self.assertIn(relative, plugin, relative)
             self.assertIn(patch.stem, matrix, relative)
 
+    def test_non_fork_patch_maintenance_policy_is_documented(self):
+        matrix = (ROOT / 'doc' / 'source' / 'upgrade_matrix.rst').read_text()
+        guide = (ROOT / 'doc' / 'source' / 'deployment_guide.rst').read_text()
+        matrix_words = ' '.join(matrix.split())
+        guide_words = ' '.join(guide.split())
+
+        for statement in (
+                'Non-fork dependency patch policy',
+                'kept as pristine',
+                'authoritative copies of every required downstream change',
+                'openstack-incus maintainers',
+                'release reviewers',
+                'deployment operators',
+                'Every upstream version change',
+                'A patch must be removed when upstream provides equivalent',
+                'Do not retain a downstream patch merely because it still '
+                'applies'):
+            self.assertIn(statement, matrix_words)
+
+        for project in (
+                'Nova', 'os-brick', 'python-glanceclient', 'Ceilometer',
+                'Manila'):
+            self.assertIn(project, matrix_words)
+            self.assertIn(project, guide_words)
+
+        self.assertIn(':doc:`upgrade_matrix`', guide_words)
+        self.assertIn(
+            'There is currently no Manila source patch', matrix_words)
+        self.assertIn('Manila itself is not patched', guide_words)
+
+    def test_forked_dependencies_are_distinguished_from_patches(self):
+        matrix = (ROOT / 'doc' / 'source' / 'upgrade_matrix.rst').read_text()
+        guide = (ROOT / 'doc' / 'source' / 'deployment_guide.rst').read_text()
+        settings = (ROOT / 'devstack' / 'settings').read_text()
+        matrix_words = ' '.join(matrix.split())
+        guide_words = ' '.join(guide.split())
+
+        for statement in (
+                'Forked dependency policy',
+                'https://github.com/fivetime/incus',
+                'https://github.com/fivetime/incus-python-sdk',
+                'canonical/pylxd',
+                'Instance.console_log()',
+                'cryptography>=43.0.3',
+                '72568c3',
+                '1a26b14',
+                'mutable branch name such as ``main``'):
+            self.assertIn(statement, matrix_words)
+
+        self.assertIn('Incus Python SDK fork commit', guide_words)
+        self.assertIn('INCUS_PYTHON_SDK_BRANCH=main', guide_words)
+        self.assertIn(
+            'https://github.com/fivetime/incus-python-sdk.git', settings)
+
+    def test_retired_lxc_fork_is_not_a_release_dependency(self):
+        matrix = (ROOT / 'doc' / 'source' / 'upgrade_matrix.rst').read_text()
+        guide = (ROOT / 'doc' / 'source' / 'deployment_guide.rst').read_text()
+        matrix_words = ' '.join(matrix.split())
+        guide_words = ' '.join(guide.split())
+
+        for statement in (
+                'LXC is explicitly **not** an active project fork',
+                'criu-finalize-cgroups-after-restore',
+                '6ebdb54a2',
+                'f30cbb86f',
+                'lxc/lxc#4695',
+                'https://github.com/lxc/lxc.git'):
+            self.assertIn(statement, matrix_words)
+
+        self.assertIn('upstream LXC and CRIU commits', guide_words)
+        self.assertIn('LXC is not one of those forks', guide_words)
+        self.assertIn('retired ``fivetime/lxc``', guide_words)
+
     def test_runtime_gates_cover_patched_service_roles(self):
         nova_gate = (
             ROOT / 'tools' / 'openstack-incus-nova-runtime-preflight.sh'

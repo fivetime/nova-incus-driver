@@ -2389,3 +2389,46 @@ image volume already exists, and that cluster pool has a single connection.
 - Focused unit, contract, lint, documentation, and real three-node migration
   results for this correction must be recorded before it becomes release
   evidence.
+
+## 2026-08-14 production Incus base and representative migration smoke
+
+- Deployed Incus chart revision 8 and Nova chart revision 42 on
+  ``container1`` and ``container2``. Both ``incusd`` and
+  ``nova-compute-incus`` DaemonSet pods were Ready after rollout. The Incus
+  image was pinned to
+  ``ghcr.io/fivetime/incus@sha256:fb23c582de6db85046ef3216df291e7f05629e8da5661a2593c0700e9bb07592``
+  from Incus commit ``a7866b1c2``.
+- Replacing the incusd pod preserved a running guest's Incus init PID
+  (``629403``), guest counter process PID (``702``), persistent marker, and
+  increasing counter. This proves the deployed Kubernetes mount/runtime
+  contract re-attached to that running container; it is not a substitute for
+  a host reboot test.
+- A fresh Alpine 3.21/OpenRC image completed a full-checkpoint live migration
+  from ``container1`` to ``container2``. The durable marker remained
+  ``alpine-marker-20260814``, the guest counter PID remained ``852``, the
+  counter advanced from 6 to 111, OVN binding moved to the destination, the
+  source instance/profile disappeared, and no ``migration_pre-dump_*`` log
+  was created. The exact migration UUID was
+  ``0fe177dd-82db-4aef-b842-b42cf23433cf``.
+- That Alpine package set did not provide ``fuse2fs``. It therefore qualifies
+  only the root-only live smoke and must not advertise Cinder data-volume FUSE
+  support or stand in for the 2x2x2/2x3x3 data-volume matrices.
+- The tested Ubuntu Noble/systemd image failed CRIU restore first on a nested
+  UTS namespace and then on a service mount namespace. No general removal of
+  systemd hardening was accepted as a fix. It remains suitable for the tested
+  cold/lifecycle path but is not qualified for live migration until its exact
+  enabled-unit set passes the complete failure matrix.
+- After writing node-local Nova ``[DEFAULT] my_ip`` from the validated Incus
+  migration listener, the Ubuntu image completed cold migration to
+  ``container2`` and resize confirm. Marker and counter data persisted; the
+  guest PID changed as expected for cold migration. Migration UUID:
+  ``a57773aa-170e-464d-8832-bf589f7c2dcd``.
+- Both smoke servers were deleted through Nova. The two Incus APIs then
+  reported no instances or instance profiles, their Neutron ports were
+  absent, the exact empty host mount directories were removed, and no current
+  etcd allocation remained for either server UUID.
+
+This is representative production smoke evidence only. The 8-combination
+live matrix, 18-combination capacity matrix, maximum-mount restore-failure
+case, BFV cold matrix, Cinder lifecycle matrix, Manila lifecycle matrix, and
+host-loss evacuation matrix were **not** rerun by this entry.
