@@ -411,7 +411,7 @@ in `TEST_STATUS.md`; this section keeps only the rules.
 - Cinder data-volume attach/detach is executed by host-side os-brick, not by
   the Incus container. Every compute using the Cinder RBD backend must install
   host `ceph-common` and hold the scoped Cinder keyring/configuration; placing
-  `ceph-common` only in `ghcr.io/fivetime/incus:alpine-novm` covers Incus
+  `ceph-common` only in `ghcr.io/fivetime/incus:quadlet` covers Incus
   rootfs operations but is insufficient for data volumes.
 - Do not enable `security.syscalls.intercept.mount.allowed=ext4`: tenant-owned
   filesystem input must not be parsed by the host kernel. Tenant images that
@@ -474,8 +474,9 @@ in `TEST_STATUS.md`; this section keeps only the rules.
 
 ### Image admission and preflight gates
 
-- The production BFV image is built from the Incus fork repository
-  `docker/alpine-novm/Dockerfile`, not from the separate `incus-docker-image`
+- The production Incus compute image used for BFV is built from the Incus
+  fork repository `docker/quadlet/Dockerfile`, not from the separate
+  `incus-docker-image`
   repository. The generic image does not contain `storage_driver_cephext` or
   `migration_shared_ceph_storage` and must never be admitted as an OpenStack
   BFV compute image. Each release approves a new digest/revision pair and runs

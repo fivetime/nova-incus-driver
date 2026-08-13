@@ -12,6 +12,8 @@ Contents:
    :maxdepth: 2
 
    usage
+   deployment_guide
+   image_build_guide
    architecture
    api_contract
    scale_design
