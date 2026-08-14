@@ -126,11 +126,18 @@ for hook in core_hooks:
         "Nova ComputeManager core hook {}".format(hook),
     )
 
-require(
-    "oslo_conf=CONF" in "".join(
-        inspect.getsource(nova_utils.get_sdk_adapter).split()),
-    "Nova user-token SDK connections honor service configuration",
-)
+sdk_adapter_source = "".join(
+    inspect.getsource(nova_utils.get_sdk_adapter).split())
+for token in (
+    "ks_identity.V3Token(",
+    "load_session_from_conf_options(CONF,confgrp,auth=token_auth)",
+    "session=token_session",
+    "oslo_conf=CONF",
+):
+    require(
+        token in sdk_adapter_source,
+        "Nova user-token SDK connections honor service configuration",
+    )
 
 if role == "api":
     from nova.api.openstack.compute import server_shares

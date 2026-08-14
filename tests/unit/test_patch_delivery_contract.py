@@ -120,7 +120,9 @@ class PatchDeliveryContractTest(unittest.TestCase):
         for symbol in (
                 'IncusLiveMigrateData', 'IterableWithLength', 'noudev',
                 '_find_root_device', 'image_size', '_UnixAdapter',
-                'oslo_conf=CONF'):
+                'ks_identity.V3Token(',
+                'load_session_from_conf_options(CONF,confgrp,auth=token_auth)',
+                'session=token_session', 'oslo_conf=CONF'):
             self.assertIn(symbol, nova_gate)
         self.assertIn('registered_migrate_versions', nova_gate)
         self.assertIn('MIN_INCUS_MIGRATE_DATA_VERSION', nova_gate)
