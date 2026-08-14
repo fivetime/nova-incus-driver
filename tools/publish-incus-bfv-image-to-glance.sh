@@ -8,9 +8,18 @@ IMAGE_NAME=${IMAGE_NAME:?Set IMAGE_NAME for the Glance BFV image}
 OUTPUT=${OUTPUT:-${UNIFIED_TAR%.*}.bfv.raw}
 IMAGE_SIZE_MIB=${IMAGE_SIZE_MIB:-512}
 VISIBILITY=${VISIBILITY:-public}
+IMAGE_STORE=${IMAGE_STORE:-}
+IMAGE_IMPORT_TIMEOUT=${IMAGE_IMPORT_TIMEOUT:-600}
 
 command -v openstack >/dev/null
 command -v mkfs.ext4 >/dev/null
+if [[ -n "$IMAGE_STORE" ]]; then
+    command -v python3 >/dev/null
+    [[ "$IMAGE_IMPORT_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || {
+        echo "IMAGE_IMPORT_TIMEOUT must be a positive integer" >&2
+        exit 1
+    }
+fi
 [[ $EUID -eq 0 ]] || {
     echo "This command requires root for the loop mount" >&2
     exit 1
@@ -23,6 +32,7 @@ command -v mkfs.ext4 >/dev/null
 work_dir=$(mktemp -d)
 mount_dir="$work_dir/root"
 loop_device=
+created_image_id=
 cleanup() {
     local status=$?
     if mountpoint -q "$mount_dir"; then
@@ -30,6 +40,9 @@ cleanup() {
     fi
     if [[ -n "$loop_device" ]]; then
         losetup -d "$loop_device" || status=$?
+    fi
+    if ((status != 0)) && [[ -n "$created_image_id" ]]; then
+        openstack image delete "$created_image_id" >/dev/null 2>&1 || true
     fi
     rm -rf "$work_dir"
     exit "$status"
@@ -86,11 +99,70 @@ if [[ "$data_volume_fuse" == true ]]; then
 fi
 
 openstack image delete "$IMAGE_NAME" >/dev/null 2>&1 || true
-openstack image create "$IMAGE_NAME" \
-    "--$VISIBILITY" --disk-format raw --container-format bare \
-    --property hw_incus_boot_from_volume=true \
-    --property hw_incus_rootfs_idmap_provenance=v1 \
-    --property hw_incus_rootfs_layout=rootfs-directory \
-    "${image_properties[@]}" \
-    --file "$OUTPUT"
-openstack image show "$IMAGE_NAME" -c id -c status -c size -c properties
+image_args=(
+    "$IMAGE_NAME"
+    --disk-format raw
+    --container-format bare
+    --property hw_incus_boot_from_volume=true
+    --property hw_incus_rootfs_idmap_provenance=v1
+    --property hw_incus_rootfs_layout=rootfs-directory
+    "${image_properties[@]}"
+)
+
+if [[ -n "$IMAGE_STORE" ]]; then
+    [[ "$IMAGE_STORE" =~ ^[A-Za-z0-9._-]+$ ]] || {
+        echo "IMAGE_STORE contains unsupported characters" >&2
+        exit 1
+    }
+    created_image_id=$(openstack image create "${image_args[@]}" --private \
+        --file "$OUTPUT" -f value -c id)
+    # --store accepts multiple values, so --wait terminates that option before
+    # the positional image ID. Its status wait is insufficient for an already
+    # active copy-image source; the store-specific poll below is authoritative.
+    openstack image import --method copy-image --store "$IMAGE_STORE" \
+        --wait "$created_image_id"
+
+    deadline=$((SECONDS + IMAGE_IMPORT_TIMEOUT))
+    while ((SECONDS < deadline)); do
+        stores=$(openstack image show "$created_image_id" -f json | python3 -c '
+import json
+import sys
+
+stores = json.load(sys.stdin).get("properties", {}).get("stores", "")
+print(",".join(store.strip() for store in stores.split(",") if store.strip()))
+')
+        if [[ ",$stores," == *",$IMAGE_STORE,"* ]]; then
+            break
+        fi
+        sleep 5
+    done
+
+    mapfile -t image_stores < <(
+        openstack image show "$created_image_id" -f json | python3 -c '
+import json
+import sys
+
+stores = json.load(sys.stdin).get("properties", {}).get("stores", "")
+for store in stores.split(","):
+    if store.strip():
+        print(store.strip())
+'
+    )
+    [[ " ${image_stores[*]} " == *" $IMAGE_STORE "* ]] || {
+        echo "Image was not copied to requested store $IMAGE_STORE" >&2
+        exit 1
+    }
+    for store in "${image_stores[@]}"; do
+        if [[ "$store" != "$IMAGE_STORE" ]]; then
+            openstack image delete --store "$store" "$created_image_id"
+        fi
+    done
+    openstack image set "--$VISIBILITY" "$created_image_id"
+else
+    openstack image create "${image_args[@]}" "--$VISIBILITY" --file "$OUTPUT"
+    created_image_id=$(openstack image show "$IMAGE_NAME" -f value -c id)
+fi
+
+openstack image show "$created_image_id" \
+    -c id -c status -c size -c properties
+created_image_id=

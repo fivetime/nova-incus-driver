@@ -160,6 +160,15 @@ Configure Glance with the RBD store and direct locations, for example::
   rbd_store_user = glance
   rbd_store_ceph_conf = /etc/ceph/ceph.conf
 
+Sites that retain S3 as the ordinary image store can expose RBD only for BFV
+publication. With the OpenStack-Helm chart in this workspace, apply
+``values_overrides/glance/s3-rbd-bfv.yaml`` after synchronizing the Rook
+``client.glance`` key into the configured OpenStack namespace Secret. The
+override deliberately sets chart ``storage: rbd`` so the API pods receive the
+Ceph configuration and keyring, while keeping ``glance_store.default_backend``
+set to ``s3``. Publish BFV images with ``IMAGE_STORE=rbd``; do not rely on the
+default store.
+
 Configure Cinder's RBD backend to use only its volume pool::
 
   [ceph]
@@ -267,8 +276,21 @@ specific and placeholders must not be copied literally::
   allow_bfv_evacuate = false
   migration_auto_recovery = true
   enable_manila_shares = true
+  manila_cephfs_cluster_fsid = <canonical-ceph-fsid>
+  manila_cephfs_filesystem_name = <manila-cephfs-name>
   share_mount_timeout = 30
   share_unmount_timeout = 30
+
+CephFS exports returned by Manila commonly use the legacy
+``monitor:port,...:/absolute/path`` form. Ceph clusters may expose multiple
+filesystems, so that form does not identify the filesystem by itself. The
+Incus driver requires the cluster FSID and the Manila filesystem name and
+converts the export to Ceph's unambiguous
+``client@fsid.filesystem=/absolute/path`` device syntax. Configure the same
+values on every eligible compute. A missing, malformed, or inconsistent value
+fails the share attach before a host mount is created. The selected filesystem
+must be the one used by every CephFS share type schedulable to that compute;
+use host aggregates to separate backends that use different CephFS names.
 
 Use ``nova.virt.incus.config.list_opts`` or the generated Nova sample config
 as the authority for option names. Do not infer options from this abbreviated

@@ -6,6 +6,7 @@
 #           ROOT_VOLUME_TYPE=... ROOT_VOLUME_SIZE=20 VOLUME_SIZE=1
 #           DATA_DEVICES="/dev/vdb /dev/vdc" TIMEOUT=600 NAME=...
 #           EVIDENCE_FILE=/secure/path/case.json
+#           INCUS_KUBE_NODE_MAP='ssh-target=kubernetes-node,...'
 #
 # The guest image must provide cloud-init, blkid, mkfs.ext4, fuse2fs, a
 # fusermount helper, and either systemd or OpenRC local services. Nova console
@@ -42,6 +43,11 @@ EVIDENCE_FILE=${EVIDENCE_FILE:-}
 HOST_SSH_MAP=${HOST_SSH_MAP:-}
 SSH_IDENTITY=${SSH_IDENTITY:-}
 SSH_KNOWN_HOSTS_FILE=${SSH_KNOWN_HOSTS_FILE:-$HOME/.ssh/known_hosts}
+INCUS_PROJECT=${INCUS_PROJECT:-nova}
+INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}
+INCUS_RUNTIME_CONTAINER=${INCUS_RUNTIME_CONTAINER:-incus}
+INCUS_KUBE_NAMESPACE=${INCUS_KUBE_NAMESPACE:-openstack}
+INCUS_KUBE_NODE_MAP=${INCUS_KUBE_NODE_MAP:-}
 GUEST_MARKER_LOG=/var/log/openstack-incus-data-e2e.log
 
 command -v openstack >/dev/null
@@ -68,6 +74,15 @@ if ((DATA_VOLUME_COUNT > 0)) && [[ -z "$VOLUME_TYPE" ]]; then
 fi
 if [[ "$ROOT_MODE" == bfv && -z "$ROOT_VOLUME_TYPE" ]]; then
     echo "ROOT_VOLUME_TYPE or VOLUME_TYPE is required for BFV" >&2
+    exit 2
+fi
+[[ "$INCUS_PROJECT" =~ ^[A-Za-z0-9_.-]+$ ]] || {
+    echo "INCUS_PROJECT contains unsupported characters" >&2
+    exit 2
+}
+if [[ "$INCUS_RUNTIME_MODE" == kubernetes && -n "$HOST_SSH_MAP" &&
+      -z "$INCUS_KUBE_NODE_MAP" ]]; then
+    echo "Set INCUS_KUBE_NODE_MAP to SSH-target=Kubernetes-node mappings" >&2
     exit 2
 fi
 
@@ -177,14 +192,45 @@ guest_marker_ssh_target() {
     return 1
 }
 
+kube_node_for_target() {
+    local target=$1 entry
+    for entry in ${INCUS_KUBE_NODE_MAP//,/ }; do
+        if [[ "${entry%%=*}" == "$target" ]]; then
+            printf '%s\n' "${entry#*=}"
+            return 0
+        fi
+    done
+    return 1
+}
+
 guest_marker_log() {
-    local target
+    local target command_line namespace kube_node
     target=$(guest_marker_ssh_target) || return 1
-    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no \
-        ${SSH_IDENTITY:+-i "$SSH_IDENTITY"} \
-        -o UserKnownHostsFile="$SSH_KNOWN_HOSTS_FILE" \
-        "$target" "podman exec incus incus exec '$instance_name' \
-        --project nova -- cat '$GUEST_MARKER_LOG'" 2>/dev/null
+    printf -v command_line '%q ' incus --project "$INCUS_PROJECT" exec \
+        "$instance_name" -- cat "$GUEST_MARKER_LOG"
+    case "$INCUS_RUNTIME_MODE" in
+        podman)
+            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=yes \
+                ${SSH_IDENTITY:+-i "$SSH_IDENTITY"} \
+                -o UserKnownHostsFile="$SSH_KNOWN_HOSTS_FILE" "$target" \
+                "podman exec $(printf '%q' "$INCUS_RUNTIME_CONTAINER") $command_line" \
+                2>/dev/null
+            ;;
+        kubernetes)
+            kube_node=$(kube_node_for_target "$target") || return 1
+            printf -v namespace '%q' "$INCUS_KUBE_NAMESPACE"
+            printf -v kube_node '%q' "$kube_node"
+            ssh -n -o BatchMode=yes -o StrictHostKeyChecking=yes \
+                ${SSH_IDENTITY:+-i "$SSH_IDENTITY"} \
+                -o UserKnownHostsFile="$SSH_KNOWN_HOSTS_FILE" "$target" \
+                "set -e; pods=\$(kubectl -n $namespace get pod -l application=incus --field-selector \"spec.nodeName=$kube_node\" --no-headers -o custom-columns=NAME:.metadata.name); set -- \$pods; [ \$# -eq 1 ]; kubectl -n $namespace exec \"\$1\" -- $command_line" \
+                2>/dev/null
+            ;;
+        *)
+            echo "INCUS_RUNTIME_MODE must be podman or kubernetes" >&2
+            return 2
+            ;;
+    esac
 }
 
 wait_console_marker() {

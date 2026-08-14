@@ -10,14 +10,46 @@ CINDER_USER=${CINDER_USER:-cinder}
 SIZE=${SIZE:-2}
 NAME=${NAME:-incus-bfv-cow-e2e-$RANDOM}
 TIMEOUT=${TIMEOUT:-300}
+RBD_RUNTIME_MODE=${RBD_RUNTIME_MODE:-local}
+RBD_KUBE_NAMESPACE=${RBD_KUBE_NAMESPACE:-rook-ceph}
+RBD_KUBE_TARGET=${RBD_KUBE_TARGET:-deploy/rook-ceph-tools}
 
 volume_id=
+
+rbd_cmd() {
+    case "$RBD_RUNTIME_MODE" in
+        local)
+            rbd "$@"
+            ;;
+        kubernetes)
+            kubectl -n "$RBD_KUBE_NAMESPACE" exec "$RBD_KUBE_TARGET" -- \
+                rbd "$@"
+            ;;
+        *)
+            echo "Unsupported RBD_RUNTIME_MODE: $RBD_RUNTIME_MODE" >&2
+            return 2
+            ;;
+    esac
+}
+
+case "$RBD_RUNTIME_MODE" in
+    local)
+        command -v rbd >/dev/null
+        ;;
+    kubernetes)
+        command -v kubectl >/dev/null
+        ;;
+    *)
+        echo "Unsupported RBD_RUNTIME_MODE: $RBD_RUNTIME_MODE" >&2
+        exit 2
+        ;;
+esac
 
 wait_absent() {
     local deadline=$((SECONDS + TIMEOUT))
     while ((SECONDS < deadline)); do
         if ! openstack volume show "$volume_id" >/dev/null 2>&1 &&
-                ! rbd --id "$CINDER_USER" --pool "$CINDER_POOL" \
+                ! rbd_cmd --id "$CINDER_USER" --pool "$CINDER_POOL" \
                     info "volume-$volume_id" >/dev/null 2>&1; then
             return 0
         fi
@@ -67,7 +99,7 @@ while ((SECONDS < deadline)); do
 done
 [[ "${status:-}" == available ]]
 
-info=$(rbd --id "$CINDER_USER" --pool "$CINDER_POOL" \
+info=$(rbd_cmd --id "$CINDER_USER" --pool "$CINDER_POOL" \
     info "volume-$volume_id" --format json)
 parent_pool=$(jq -r '.parent.pool // empty' <<<"$info")
 parent_image=$(jq -r '.parent.image // empty' <<<"$info")

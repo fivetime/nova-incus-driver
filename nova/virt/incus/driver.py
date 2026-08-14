@@ -266,6 +266,11 @@ _SHARE_ID_RE = re.compile(
     r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-'
     r'[0-9a-f]{4}-[0-9a-f]{12}$')
 _SHARE_TAG_RE = re.compile(r'^[A-Za-z0-9-]{1,255}$')
+_CEPHFS_NAME_RE = re.compile(r'^[A-Za-z0-9_.-]{1,255}$')
+_CEPHFS_EXPORT_RE = re.compile(
+    r'^(?P<monitors>[^\x00\r\n]+):(?P<path>/[A-Za-z0-9._/-]+)$')
+_CEPHFS_DNS_NAME_RE = re.compile(
+    r'^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$')
 _STORAGE_RELEASE_RECEIPT_DIGEST_RE = re.compile(
     r'^sha256:[0-9a-f]{64}$')
 _NETWORK_ACTIVATION_VENDOR_DATA = """#cloud-config
@@ -4662,6 +4667,89 @@ def _normalize_share_export(export):
     return normalized
 
 
+def _validate_cephfs_monitor(endpoint):
+    """Return a canonical Ceph monitor endpoint or fail closed."""
+    if endpoint.startswith('['):
+        closing = endpoint.find(']')
+        if closing < 0 or closing + 1 >= len(endpoint):
+            raise ValueError('bracketed monitor address has no port')
+        host = endpoint[1:closing]
+        if endpoint[closing + 1] != ':':
+            raise ValueError('bracketed monitor address has no port')
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError as exc:
+            raise ValueError('monitor IPv6 address is invalid') from exc
+        port_text = endpoint[closing + 2:]
+        canonical_host = '[%s]' % host.lower()
+    else:
+        host, separator, port_text = endpoint.rpartition(':')
+        if not separator or not host or ':' in host:
+            raise ValueError('monitor address must include a port')
+        try:
+            canonical_host = str(ipaddress.IPv4Address(host))
+        except ValueError:
+            if not _CEPHFS_DNS_NAME_RE.fullmatch(host):
+                raise ValueError('monitor hostname is invalid')
+            canonical_host = host.lower()
+    try:
+        port = int(port_text)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('monitor port is invalid') from exc
+    if str(port) != port_text or not 1 <= port <= 65535:
+        raise ValueError('monitor port is invalid')
+    return '%s:%d' % (canonical_host, port)
+
+
+def _cephfs_mount_spec(share_mapping):
+    """Build an unambiguous Ceph v2 device and monitor option."""
+    fsid = CONF.incus.manila_cephfs_cluster_fsid
+    filesystem = CONF.incus.manila_cephfs_filesystem_name
+    try:
+        canonical_fsid = str(uuid.UUID(fsid))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise exception.ShareMountError(
+            share_id=share_mapping.share_id,
+            server_id=share_mapping.instance_uuid,
+            reason='manila_cephfs_cluster_fsid is not a UUID') from exc
+    if canonical_fsid != fsid:
+        raise exception.ShareMountError(
+            share_id=share_mapping.share_id,
+            server_id=share_mapping.instance_uuid,
+            reason='manila_cephfs_cluster_fsid is not canonical')
+    if (not isinstance(filesystem, str) or
+            not _CEPHFS_NAME_RE.fullmatch(filesystem)):
+        raise exception.ShareMountError(
+            share_id=share_mapping.share_id,
+            server_id=share_mapping.instance_uuid,
+            reason='manila_cephfs_filesystem_name is invalid')
+
+    export = _normalize_share_export(share_mapping.export_location)
+    match = _CEPHFS_EXPORT_RE.fullmatch(export)
+    if match is None:
+        raise exception.ShareMountError(
+            share_id=share_mapping.share_id,
+            server_id=share_mapping.instance_uuid,
+            reason='CephFS export does not use monitors:/absolute/path')
+    try:
+        monitors = tuple(
+            _validate_cephfs_monitor(endpoint)
+            for endpoint in match.group('monitors').split(','))
+    except ValueError as exc:
+        raise exception.ShareMountError(
+            share_id=share_mapping.share_id,
+            server_id=share_mapping.instance_uuid,
+            reason='CephFS monitor list is invalid: %s' % exc) from exc
+    if not monitors or len(set(monitors)) != len(monitors):
+        raise exception.ShareMountError(
+            share_id=share_mapping.share_id,
+            server_id=share_mapping.instance_uuid,
+            reason='CephFS monitor list is empty or contains duplicates')
+    device = '{}@{}.{}={}'.format(
+        share_mapping.access_to, fsid, filesystem, match.group('path'))
+    return device, '/'.join(monitors)
+
+
 def _share_mount_table_index():
     """Return one normalized mount-table snapshot keyed by mountpoint."""
     return {
@@ -4677,8 +4765,12 @@ def _share_mount_table_index():
 def _validate_existing_share_mount(
         mount_path, share_mapping, mount_table=None):
     """Fail closed if a staged path is mounted from another export."""
-    expected_export = _normalize_share_export(
-        share_mapping.export_location)
+    if (share_mapping.share_proto ==
+            obj_fields.ShareMappingProto.CEPHFS):
+        expected_export, _mon_addr = _cephfs_mount_spec(share_mapping)
+    else:
+        expected_export = _normalize_share_export(
+            share_mapping.export_location)
     expected_fstypes = _share_mount_fstypes(share_mapping)
     real_mount_path = _validate_share_mount_path(
         mount_path, share_mapping.instance_uuid, share_mapping.share_id,
@@ -13700,6 +13792,7 @@ class IncusDriver(driver.ComputeDriver):
         secret_path = None
         try:
             options = ['rw', 'nosuid', 'nodev']
+            device = share_mapping.export_location
             if (share_mapping.share_proto ==
                     obj_fields.ShareMappingProto.NFS):
                 fstype = 'nfs'
@@ -13712,6 +13805,7 @@ class IncusDriver(driver.ComputeDriver):
                         server_id=instance.uuid,
                         reason='CephFS credentials are missing')
                 fstype = 'ceph'
+                device, mon_addr = _cephfs_mount_spec(share_mapping)
                 fd, secret_path = tempfile.mkstemp(
                     prefix='.ceph-secret-',
                     dir=os.path.dirname(mount_path))
@@ -13722,6 +13816,7 @@ class IncusDriver(driver.ComputeDriver):
                     os.close(fd)
                 options = [
                     'rw', 'nosuid', 'nodev',
+                    'mon_addr=%s' % mon_addr,
                     'name=%s' % share_mapping.access_to,
                     'secretfile=%s' % secret_path,
                 ]
@@ -13729,11 +13824,13 @@ class IncusDriver(driver.ComputeDriver):
                 raise exception.ShareProtocolNotSupported(
                     share_proto=share_mapping.share_proto)
             incus_privsep.mount(
-                fstype, share_mapping.export_location, mount_path, options,
+                fstype,
+                (device if fstype == 'ceph'
+                 else share_mapping.export_location),
+                mount_path, options,
                 CONF.incus.share_mount_timeout)
             mount_table[real_mount_path] = {
-                'device': _normalize_share_export(
-                    share_mapping.export_location),
+                'device': _normalize_share_export(device),
                 'fstype': fstype,
                 'opts': frozenset(options),
             }

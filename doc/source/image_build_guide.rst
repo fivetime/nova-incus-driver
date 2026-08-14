@@ -130,15 +130,20 @@ Alpine example::
 
   source /etc/openstack/admin-openrc
   sudo --preserve-env=OS_* \
-    SOURCE=images:alpine/3.21/cloud \
-    IMAGE_NAME=alpine-3.21-cloud-incus \
+    SOURCE=images:alpine/3.22/cloud \
+    IMAGE_NAME=alpine-3.22-cloud-incus \
     PREINSTALL_SSH=true \
-    PREINSTALL_PACKAGES='e2fsprogs-extra jq' \
+    PREINSTALL_PACKAGES='fuse2fs jq' \
     tools/publish-incus-image-to-glance.sh
 
 The exact upstream alias must exist in the configured Incus image remote.
-Package names differ by distribution. The publisher removes SSH host keys so
-each instance generates a unique identity.
+Package names differ by distribution, and distributions move binaries
+between packages over time: on every supported Alpine release (3.21+)
+``fuse2fs`` is its own package — it was never part of
+``e2fsprogs-extra`` — and Arch split ``fuse2fs`` out of ``e2fsprogs``
+in 2026. Rely on the publisher's capability detection, not the package
+name, as the authority. The publisher removes SSH host keys so each
+instance generates a unique identity.
 
 Inspect the resulting Glance artifact::
 
@@ -160,6 +165,7 @@ converter requires root for its temporary loop mount::
   sudo --preserve-env=OS_* \
     UNIFIED_TAR=/var/tmp/ubuntu-noble-24.04-cloud-incus.tar.gz \
     IMAGE_NAME=ubuntu-noble-24.04-cloud-incus-bfv \
+    IMAGE_STORE=rbd \
     IMAGE_SIZE_MIB=2048 \
     OUTPUT=/var/tmp/ubuntu-noble-24.04-cloud-incus-bfv.raw \
     tools/publish-incus-bfv-image-to-glance.sh
@@ -172,6 +178,13 @@ The tool performs these checks before upload:
 * the Incus-owned ``.incus-idmap`` provenance marker is mode ``0600``; and
 * the Glance properties describe BFV, rootfs layout, ID-map provenance, and
   optional ``fuse2fs`` support.
+
+Set ``IMAGE_STORE`` when Glance has multiple stores. The tool uploads a private
+image, copies it into that exact backend through Glance's interoperable import
+API, removes the initial default-store location, and only then applies the
+requested visibility. Omitting the variable retains the single-store direct
+upload behavior. Production BFV publication must select the RBD backend
+explicitly rather than relying on Glance's default store.
 
 The expected properties include::
 
@@ -288,8 +301,17 @@ Run at least the following for every admitted guest image revision:
      IMAGE=<bfv-image-id> FLAVOR=<flavor> NETWORK=<network> \
      VOLUME_TYPE=<ceph-volume-type> \
      HOST_SSH_MAP='compute-1=root@192.0.2.11,...' \
+     INCUS_RUNTIME_MODE=kubernetes \
+     INCUS_KUBE_NODE_MAP='root@192.0.2.11=worker-1,...' \
      SSH_IDENTITY=/path/to/audit-key \
        tools/openstack-incus-bfv-snapshot-public-api-e2e.sh
+
+``HOST_SSH_MAP`` keys are the exact Nova service ``host`` values. They may be
+short names, FQDNs, or explicit ``nova.conf`` overrides according to
+OpenStack-Helm's ``pod.use_fqdn.compute`` and ``conf.nova.DEFAULT.host``
+settings. ``INCUS_KUBE_NODE_MAP`` separately maps each SSH target to the exact
+Kubernetes ``spec.nodeName``. The gates never shorten, qualify, or otherwise
+guess either identifier.
 
 #. Run the RBD CoW test and confirm the exact Glance parent.
 #. If SSH is advertised, run Tempest SSH validation without installing

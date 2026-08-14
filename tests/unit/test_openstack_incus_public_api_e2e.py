@@ -27,6 +27,8 @@ DATA_SCRIPT = (
 BFV_SCRIPT = (
     REPO_ROOT / 'tools' / 'openstack-incus-bfv-snapshot-public-api-e2e.sh')
 BFV_COW_SCRIPT = REPO_ROOT / 'tools' / 'openstack-incus-bfv-cow-e2e.sh'
+BFV_PUBLISH_SCRIPT = (
+    REPO_ROOT / 'tools' / 'publish-incus-bfv-image-to-glance.sh')
 RELEASE_GATE = (
     REPO_ROOT / 'tools' / 'openstack-incus-release-gate.sh')
 IDMAP_SCRIPT = (
@@ -45,6 +47,7 @@ class PublicApiE2EContractTest(unittest.TestCase):
         cls.data = DATA_SCRIPT.read_text(encoding='utf-8')
         cls.bfv = BFV_SCRIPT.read_text(encoding='utf-8')
         cls.bfv_cow = BFV_COW_SCRIPT.read_text(encoding='utf-8')
+        cls.bfv_publish = BFV_PUBLISH_SCRIPT.read_text(encoding='utf-8')
         cls.release_gate = RELEASE_GATE.read_text(encoding='utf-8')
         cls.idmap = IDMAP_SCRIPT.read_text(encoding='utf-8')
         cls.cleanup_audit = CLEANUP_AUDIT.read_text(encoding='utf-8')
@@ -92,9 +95,17 @@ class PublicApiE2EContractTest(unittest.TestCase):
             'INCUS_PROJECT" =~ ^[A-Za-z0-9_.-]+$', self.bfv)
         self.assertIn(
             '^[A-Za-z0-9_][A-Za-z0-9_.-]*@', self.bfv)
+        self.assertIn('INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}',
+                      self.bfv)
+        self.assertIn('incus_runtime_remote()', self.bfv)
         self.assertIn(
-            "podman exec incus incus --project '$INCUS_PROJECT' exec",
-            self.bfv)
+            'kubectl -n $namespace get pod -l application=incus', self.bfv)
+        self.assertIn('INCUS_KUBE_NODE_MAP=${INCUS_KUBE_NODE_MAP:-}',
+                      self.bfv)
+        self.assertIn('spec.nodeName=$kube_node', self.bfv)
+        self.assertNotIn('hostname -s', self.bfv)
+        self.assertIn(
+            'incus_runtime_remote "$target" incus --project', self.bfv)
         self.assertIn('/root/openstack-incus-bfv-snapshot-marker', self.bfv)
         self.assertIn('/run/openstack-incus-bfv-restore-check.ok', self.bfv)
         self.assertIn('mkdir -p /usr/local/sbin', self.bfv)
@@ -119,8 +130,18 @@ class PublicApiE2EContractTest(unittest.TestCase):
             '[[ -n "$host" && -n "$HOST_SSH_MAP" ]] || return 1',
             self.data)
         self.assertIn(
-            'podman exec incus incus exec \'$instance_name\'', self.data)
-        self.assertIn("-- cat '$GUEST_MARKER_LOG'", self.data)
+            'INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}', self.data)
+        self.assertIn(
+            'kubectl -n $namespace get pod -l application=incus', self.data)
+        self.assertIn('INCUS_KUBE_NODE_MAP=${INCUS_KUBE_NODE_MAP:-}',
+                      self.data)
+        self.assertIn('spec.nodeName=$kube_node', self.data)
+        self.assertNotIn('hostname -s', self.data)
+        self.assertIn('StrictHostKeyChecking=yes', self.data)
+        self.assertIn(
+            'incus --project "$INCUS_PROJECT" exec', self.data)
+        self.assertIn(
+            '"$instance_name" -- cat "$GUEST_MARKER_LOG"', self.data)
         self.assertNotIn('/var/lib/incus', self.data)
 
     def test_initial_volume_is_in_first_create_bdm(self):
@@ -238,6 +259,28 @@ class PublicApiE2EContractTest(unittest.TestCase):
         self.assertIn('[[ "$parent_pool" == "$glance_pool" ]]',
                       self.bfv_cow)
         self.assertIn('((overlap > 0))', self.bfv_cow)
+
+    def test_bfv_cow_supports_kubernetes_ceph_toolbox(self):
+        self.assertIn(
+            'RBD_RUNTIME_MODE=${RBD_RUNTIME_MODE:-local}', self.bfv_cow)
+        self.assertIn(
+            'kubectl -n "$RBD_KUBE_NAMESPACE" exec "$RBD_KUBE_TARGET"',
+            self.bfv_cow)
+        self.assertEqual(2, self.bfv_cow.count('rbd_cmd --id'))
+
+    def test_bfv_publish_converges_to_one_requested_store(self):
+        script = self.bfv_publish
+        self.assertIn('IMAGE_STORE=${IMAGE_STORE:-}', script)
+        self.assertIn(
+            'image import --method copy-image --store "$IMAGE_STORE"',
+            script)
+        self.assertIn('while ((SECONDS < deadline))', script)
+        self.assertIn('image delete --store "$store"', script)
+        visibility = script.index(
+            'openstack image set "--$VISIBILITY" "$created_image_id"')
+        remove_default = script.index(
+            'openstack image delete --store "$store"')
+        self.assertLess(remove_default, visibility)
 
     def test_initial_volume_cleanup_audit_is_exact_and_fail_closed(self):
         self.assertIn('StrictHostKeyChecking=yes', self.cleanup_audit)

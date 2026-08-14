@@ -4,6 +4,7 @@
 # Required: RUN_DESTRUCTIVE=true IMAGE=... FLAVOR=... NETWORK=...
 #           VOLUME_TYPE=...
 #           HOST_SSH_MAP=host=user@address,... SSH_IDENTITY=...
+#           INCUS_KUBE_NODE_MAP='user@address=kubernetes-node,...'
 # Optional: VOLUME_SIZE=5 TIMEOUT=900 NAME=... INCUS_PROJECT=nova
 #
 # The guest image must provide cloud-init and either systemd or OpenRC local
@@ -30,9 +31,17 @@ HOST_SSH_MAP=${HOST_SSH_MAP:?Map every Incus compute as host=user@address}
 SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute audit key}
 SSH_KNOWN_HOSTS_FILE=${SSH_KNOWN_HOSTS_FILE:-$HOME/.ssh/known_hosts}
 INCUS_PROJECT=${INCUS_PROJECT:-nova}
+INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}
+INCUS_RUNTIME_CONTAINER=${INCUS_RUNTIME_CONTAINER:-incus}
+INCUS_KUBE_NAMESPACE=${INCUS_KUBE_NAMESPACE:-openstack}
+INCUS_KUBE_NODE_MAP=${INCUS_KUBE_NODE_MAP:-}
 
 command -v openstack >/dev/null
 command -v python3 >/dev/null
+if [[ "$INCUS_RUNTIME_MODE" == kubernetes && -z "$INCUS_KUBE_NODE_MAP" ]]; then
+    echo "Set INCUS_KUBE_NODE_MAP to SSH-target=Kubernetes-node mappings" >&2
+    exit 2
+fi
 [[ -r "$SSH_IDENTITY" ]] || {
     echo "SSH_IDENTITY is not readable: $SSH_IDENTITY" >&2
     exit 2
@@ -49,6 +58,14 @@ command -v python3 >/dev/null
     echo "VOLUME_SIZE must be a positive integer in GiB" >&2
     exit 2
 }
+SSH=(
+    ssh
+    -n
+    -i "$SSH_IDENTITY"
+    -o BatchMode=yes
+    -o StrictHostKeyChecking=yes
+    -o "UserKnownHostsFile=$SSH_KNOWN_HOSTS_FILE"
+)
 
 source_server=
 restore_server=
@@ -141,6 +158,41 @@ server_ssh_target() {
     return 1
 }
 
+kube_node_for_target() {
+    local target=$1 entry
+    for entry in ${INCUS_KUBE_NODE_MAP//,/ }; do
+        if [[ "${entry%%=*}" == "$target" ]]; then
+            printf '%s\n' "${entry#*=}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+incus_runtime_remote() {
+    local target=$1 command_line namespace kube_node
+    shift
+    printf -v command_line '%q ' "$@"
+
+    case "$INCUS_RUNTIME_MODE" in
+        podman)
+            "${SSH[@]}" "$target" \
+                "podman exec $(printf '%q' "$INCUS_RUNTIME_CONTAINER") $command_line"
+            ;;
+        kubernetes)
+            kube_node=$(kube_node_for_target "$target") || return 1
+            printf -v namespace '%q' "$INCUS_KUBE_NAMESPACE"
+            printf -v kube_node '%q' "$kube_node"
+            "${SSH[@]}" "$target" \
+                "set -e; pods=\$(kubectl -n $namespace get pod -l application=incus --field-selector \"spec.nodeName=$kube_node\" --no-headers -o custom-columns=NAME:.metadata.name); set -- \$pods; [ \$# -eq 1 ]; kubectl -n $namespace exec \"\$1\" -- $command_line"
+            ;;
+        *)
+            echo "INCUS_RUNTIME_MODE must be podman or kubernetes" >&2
+            return 2
+            ;;
+    esac
+}
+
 guest_file() {
     local server=$1 path=$2 target= instance_name=
     target=$(server_ssh_target "$server") || return 1
@@ -148,11 +200,8 @@ guest_file() {
         server show "$server" -f value \
         -c 'OS-EXT-SRV-ATTR:instance_name') || return 1
     [[ "$instance_name" =~ ^instance-[0-9a-f]+$ ]] || return 1
-    ssh -n -i "$SSH_IDENTITY" -o BatchMode=yes \
-        -o StrictHostKeyChecking=yes \
-        -o "UserKnownHostsFile=$SSH_KNOWN_HOSTS_FILE" "$target" \
-        "podman exec incus incus --project '$INCUS_PROJECT' exec \
-         '$instance_name' -- cat '$path'" 2>/dev/null
+    incus_runtime_remote "$target" incus --project "$INCUS_PROJECT" exec \
+        "$instance_name" -- cat "$path" 2>/dev/null
 }
 
 wait_guest_value() {

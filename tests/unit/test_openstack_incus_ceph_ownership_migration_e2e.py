@@ -88,6 +88,29 @@ class CephOwnershipMigrationE2EContractTest(unittest.TestCase):
         self.assertIn(
             'current_pool_id" == "$managed_root_pool_id', self.e2e)
 
+    def test_kubernetes_runtime_routes_incus_and_ceph_through_local_pod(self):
+        for token in (
+                'INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}',
+                'INCUS_KUBE_NAMESPACE=${INCUS_KUBE_NAMESPACE:-openstack}',
+                'INCUS_KUBE_NODE_MAP=${INCUS_KUBE_NODE_MAP:-}',
+                '--field-selector \\"spec.nodeName=$kube_node\\"',
+                'incus_runtime_remote "$host" incus query /1.0',
+                'incus_runtime_remote "$host" sh -c "$command_line"'):
+            self.assertIn(token, self.e2e)
+        self.assertNotIn('hostname -s', self.e2e)
+        self.assertIn('incus --project "$INCUS_PROJECT"', self.e2e)
+
+    def test_default_project_uses_unqualified_ceph_image_name(self):
+        default_project = self.e2e.index(
+            'if [[ "$INCUS_PROJECT" == default ]]')
+        unqualified = self.e2e.index(
+            'managed_root_rbd_image="container_${instance_name}"')
+        qualified = self.e2e.index(
+            'managed_root_rbd_image="container_${INCUS_PROJECT}_'
+            '${instance_name}"')
+        self.assertLess(default_project, unqualified)
+        self.assertLess(unqualified, qualified)
+
     def test_every_migration_outcome_rechecks_exact_owner(self):
         self.assertGreaterEqual(
             self.e2e.count('assert_managed_root_owner'), 6)
@@ -115,6 +138,30 @@ class CephOwnershipMigrationE2EContractTest(unittest.TestCase):
             'profile_uuid" == "$server_id', self.e2e)
         self.assertIn(
             'Refusing cleanup of $host/$instance_name', self.e2e)
+
+    def test_attachment_inventory_pins_required_cinder_microversion(self):
+        self.assertIn(
+            'openstack --os-volume-api-version 3.27 \\\n'
+            '        volume attachment list', self.e2e)
+
+    def test_share_api_preserves_non_success_response_body(self):
+        self.assertIn("-w '%{http_code}'", self.e2e)
+        self.assertIn(
+            'Nova share API $method returned HTTP $status', self.e2e)
+        self.assertIn('cat "$response_file" >&2', self.e2e)
+
+    def test_rbd_inventory_uses_the_incus_runtime_namespace(self):
+        self.assertIn(
+            'rbd_mapping_devices()', self.e2e)
+        self.assertIn(
+            'incus_runtime_remote "$host" sh -c "$command_line"', self.e2e)
+        self.assertIn(
+            'rbd_mapping_exists "$active_ssh" "$image_name"', self.e2e)
+        self.assertNotIn(
+            'remote "$active_ssh" \\\n'
+            '        "rbd device list', self.e2e)
+        self.assertNotIn(
+            'rbd device list --format json --id cinder | jq', self.e2e)
 
     def test_bfv_root_survives_nova_and_only_cinder_deletes_it(self):
         for token in (

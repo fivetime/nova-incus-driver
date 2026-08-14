@@ -94,13 +94,33 @@ class IncusPrivsepTest(test.NoDBTestCase):
         os.chmod(secret_path, 0o600)
 
         nova.virt.incus.privsep.mount(
-            'ceph', 'mon1:/project', self.mountpoint,
-            ['rw', 'nosuid', 'nodev', 'name=client.manila',
+            'ceph',
+            'client.manila@00000000-0000-0000-0000-000000000001.'
+            'cephfs=/project', self.mountpoint,
+            ['rw', 'nosuid', 'nodev', 'mon_addr=mon1:6789/mon2:6789',
+             'name=client.manila',
              'secretfile=%s' % secret_path], 30)
 
         self.assertIn(
-            'rw,nosuid,nodev,name=client.manila,secretfile=%s' % secret_path,
+            'rw,nosuid,nodev,mon_addr=mon1:6789/mon2:6789,'
+            'name=client.manila,secretfile=%s' % secret_path,
             execute.call_args.args)
+
+    @mock.patch.object(nova.virt.incus.privsep.processutils, 'execute')
+    def test_ceph_mount_rejects_invalid_monitor_option(self, execute):
+        secret_path = os.path.join(
+            os.path.dirname(self.mountpoint), '.ceph-secret-test')
+        with open(secret_path, 'w', encoding='utf-8') as secret:
+            secret.write('secret')
+        os.chmod(secret_path, 0o600)
+
+        self.assertRaises(
+            ValueError, nova.virt.incus.privsep.mount,
+            'ceph', 'client.manila@fsid.cephfs=/project', self.mountpoint,
+            ['rw', 'nosuid', 'nodev', 'mon_addr=mon1:6789/../bad:1',
+             'name=client.manila', 'secretfile=%s' % secret_path], 30)
+
+        execute.assert_not_called()
 
     @mock.patch.object(nova.virt.incus.privsep.processutils, 'execute')
     def test_mount_rejects_arbitrary_option_argv(self, execute):
@@ -131,7 +151,8 @@ class IncusPrivsepTest(test.NoDBTestCase):
         self.assertRaises(
             ValueError, nova.virt.incus.privsep.mount,
             'ceph', 'mon1:/project', self.mountpoint,
-            ['rw', 'nosuid', 'nodev', 'name=client.manila',
+            ['rw', 'nosuid', 'nodev', 'mon_addr=mon1:6789',
+             'name=client.manila',
              'secretfile=%s' % secret_path], 30)
 
         execute.assert_not_called()

@@ -35,9 +35,12 @@ _ALLOWED_FILESYSTEMS = frozenset(('nfs', 'nfs4', 'ceph'))
 _REQUIRED_MOUNT_OPTIONS = frozenset(('rw', 'nosuid', 'nodev'))
 _NFS_MOUNT_OPTIONS = _REQUIRED_MOUNT_OPTIONS
 _CEPH_MOUNT_OPTIONS = _REQUIRED_MOUNT_OPTIONS | frozenset((
-    'name', 'secretfile'))
+    'mon_addr', 'name', 'secretfile'))
 _CEPH_CLIENT_RE = re.compile(r'^[A-Za-z0-9_.-]{1,255}$')
 _CEPH_SECRET_RE = re.compile(r'^\.ceph-secret-[A-Za-z0-9_.-]+$')
+_CEPH_MON_ADDR_RE = re.compile(
+    r'^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):[0-9]{1,5}'
+    r'(?:/(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):[0-9]{1,5})*$')
 
 
 def _is_canonical_uuid(value):
@@ -149,6 +152,19 @@ def _validate_mount_options(fstype, options, mountpoint):
     if fstype == 'ceph':
         if not _CEPH_CLIENT_RE.fullmatch(parsed.get('name') or ''):
             raise ValueError(_('CephFS client name is invalid'))
+        mon_addr = parsed.get('mon_addr') or ''
+        if not _CEPH_MON_ADDR_RE.fullmatch(mon_addr):
+            raise ValueError(_('CephFS monitor addresses are invalid'))
+        for endpoint in mon_addr.split('/'):
+            _host, separator, port_text = endpoint.rpartition(':')
+            try:
+                port = int(port_text)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    _('CephFS monitor port is invalid')) from exc
+            if (not separator or str(port) != port_text or
+                    not 1 <= port <= 65535):
+                raise ValueError(_('CephFS monitor port is invalid'))
         secretfile = parsed.get('secretfile')
         if not secretfile:
             raise ValueError(_('CephFS secretfile is required'))

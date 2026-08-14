@@ -546,6 +546,24 @@ incus_opts = [
             "Incus share capability patch and mount helpers on every compute."
         ),
     ),
+    cfg.StrOpt(
+        "manila_cephfs_cluster_fsid",
+        default=None,
+        help=(
+            "Ceph cluster FSID used to convert Manila's legacy CephFS "
+            "monitor:/path export into the unambiguous Ceph v2 mount "
+            "syntax. Required when CephFS shares are enabled."
+        ),
+    ),
+    cfg.StrOpt(
+        "manila_cephfs_filesystem_name",
+        default=None,
+        help=(
+            "CephFS filesystem used by Manila shares attached to this "
+            "compute. Required for CephFS shares, especially when a Ceph "
+            "cluster exposes more than one filesystem."
+        ),
+    ),
     cfg.IntOpt(
         "share_mount_timeout",
         default=30,

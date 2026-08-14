@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Validate live or cold migration through the native Nova API.
+# Kubernetes runs also require exact SSH-target=Kubernetes-node entries in
+# INCUS_KUBE_NODE_MAP; Nova service hosts remain the opaque MIGRATION_TARGETS
+# keys and may be short names, FQDNs, or explicit nova.conf host values.
 
 set -Eeuo pipefail
 
@@ -28,6 +31,10 @@ SSH_KNOWN_HOSTS_FILE=${SSH_KNOWN_HOSTS_FILE:-$HOME/.ssh/known_hosts}
 SERVER=${SERVER:-incus-${MIGRATION_MODE}-migration-e2e-$RANDOM}
 TIMEOUT=${TIMEOUT:-300}
 INCUS_PROJECT=${INCUS_PROJECT:-nova}
+INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}
+INCUS_RUNTIME_CONTAINER=${INCUS_RUNTIME_CONTAINER:-incus}
+INCUS_KUBE_NAMESPACE=${INCUS_KUBE_NAMESPACE:-openstack}
+INCUS_KUBE_NODE_MAP=${INCUS_KUBE_NODE_MAP:-}
 KEEP_FAILED=${KEEP_FAILED:-0}
 WITH_DATA_VOLUME=${WITH_DATA_VOLUME:-0}
 BOOT_FROM_VOLUME=${BOOT_FROM_VOLUME:-0}
@@ -70,6 +77,10 @@ fi
     echo "SSH known_hosts is not a readable regular file: $SSH_KNOWN_HOSTS_FILE" >&2
     exit 2
 }
+if [[ "$INCUS_RUNTIME_MODE" == kubernetes && -z "$INCUS_KUBE_NODE_MAP" ]]; then
+    echo "Set INCUS_KUBE_NODE_MAP to SSH-target=Kubernetes-node mappings" >&2
+    exit 2
+fi
 SSH=(
     ssh
     -i "$SSH_IDENTITY"
@@ -157,17 +168,51 @@ remote() {
     "${SSH[@]}" "$host" "$@"
 }
 
+kube_node_for_target() {
+    local target=$1 entry
+    for entry in ${INCUS_KUBE_NODE_MAP//,/ }; do
+        if [[ "${entry%%=*}" == "$target" ]]; then
+            printf '%s\n' "${entry#*=}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+incus_runtime_remote() {
+    local host=$1 command_line namespace kube_node
+    shift
+    printf -v command_line '%q ' "$@"
+
+    case "$INCUS_RUNTIME_MODE" in
+        podman)
+            remote "$host" \
+                "podman exec $(printf '%q' "$INCUS_RUNTIME_CONTAINER") $command_line"
+            ;;
+        kubernetes)
+            kube_node=$(kube_node_for_target "$host") || return 1
+            printf -v namespace '%q' "$INCUS_KUBE_NAMESPACE"
+            printf -v kube_node '%q' "$kube_node"
+            remote "$host" \
+                "set -e; pods=\$(kubectl -n $namespace get pod -l application=incus --field-selector \"spec.nodeName=$kube_node\" --no-headers -o custom-columns=NAME:.metadata.name); set -- \$pods; [ \$# -eq 1 ]; kubectl -n $namespace exec \"\$1\" -- $command_line"
+            ;;
+        *)
+            echo "INCUS_RUNTIME_MODE must be podman or kubernetes" >&2
+            return 2
+            ;;
+    esac
+}
+
 clear_restore_failpoint() {
     local host=$1
     local detach_rc
     local _
     for _ in {1..10}; do
-        if remote "$host" \
-                "podman exec incus umount /usr/local/sbin/criu" \
+        if incus_runtime_remote "$host" \
+                umount /usr/local/sbin/criu \
                 >/dev/null 2>&1; then
-            remote "$host" \
-                "podman exec incus rm -f \
-                 /run/openstack-incus-e2e-criu-failpoint" \
+            incus_runtime_remote "$host" rm -f \
+                /run/openstack-incus-e2e-criu-failpoint \
                 >/dev/null 2>&1 || true
             return 0
         fi
@@ -176,16 +221,15 @@ clear_restore_failpoint() {
     # A failed CRIU exec can retain a transient executable reference. A lazy
     # detach removes the test mount from the namespace immediately and lets
     # the kernel release the old reference when that process exits.
-    if remote "$host" \
-            "podman exec incus umount -l /usr/local/sbin/criu" \
+    if incus_runtime_remote "$host" \
+            umount -l /usr/local/sbin/criu \
             >/dev/null 2>&1; then
         detach_rc=0
     else
         detach_rc=$?
     fi
-    remote "$host" \
-        "podman exec incus rm -f \
-         /run/openstack-incus-e2e-criu-failpoint" \
+    incus_runtime_remote "$host" rm -f \
+        /run/openstack-incus-e2e-criu-failpoint \
         >/dev/null 2>&1 || true
     return "$detach_rc"
 }
@@ -211,9 +255,8 @@ fi
 incus_remote() {
     local host=$1
     shift
-    local command_line
-    printf -v command_line '%q ' incus --project "$INCUS_PROJECT" "$@"
-    "${SSH[@]}" "$host" "$command_line"
+    incus_runtime_remote "$host" \
+        incus --project "$INCUS_PROJECT" "$@"
 }
 
 incus_exec_read() {
@@ -235,28 +278,48 @@ incus_exec_read() {
 }
 
 incus_query_remote() {
-    local host=$1 path=$2 command_line
-    printf -v command_line '%q ' incus query \
-        "${path}?project=${INCUS_PROJECT}"
-    "${SSH[@]}" "$host" "$command_line"
+    local host=$1 path=$2
+    incus_runtime_remote "$host" \
+        incus query "${path}?project=${INCUS_PROJECT}"
+}
+
+rbd_mapping_devices() {
+    local host=$1 image_name=$2 command_line python_program
+    python_program='import json,sys
+image=sys.argv[1]
+for row in json.load(sys.stdin):
+    if row.get("name") == image:
+        print(row.get("device", ""))'
+    printf -v command_line \
+        'rbd device list --format json --id cinder | python3 -c %q %q' \
+        "$python_program" "$image_name"
+    incus_runtime_remote "$host" sh -c "$command_line"
+}
+
+rbd_mapping_exists() {
+    [[ -n "$(rbd_mapping_devices "$1" "$2")" ]]
 }
 
 managed_root_image_id() {
     local host=$1 command_line
     printf -v command_line \
-        'rbd --id %q --pool %q info %q --format json | jq -er .id' \
+        'rbd --id %q --pool %q info %q --format json | python3 -c %q' \
         "$managed_root_ceph_user" "$managed_root_ceph_pool" \
-        "$managed_root_rbd_image"
-    remote "$host" "$command_line"
+        "$managed_root_rbd_image" \
+        'import json,sys; print(json.load(sys.stdin)["id"])'
+    incus_runtime_remote "$host" sh -c "$command_line"
 }
 
 managed_root_pool_identity() {
-    local host=$1 command_line
+    local host=$1 command_line python_program
+    python_program='import json,sys
+pool=sys.argv[1]
+print(next(row["id"] for row in json.load(sys.stdin)["pools"] if row["name"] == pool))'
     printf -v command_line \
-        'rados --id %q df --format json | jq -er --arg pool %q %q' \
-        "$managed_root_ceph_user" "$managed_root_ceph_pool" \
-        '.pools[] | select(.name == $pool) | .id'
-    remote "$host" "$command_line"
+        'rados --id %q df --format json | python3 -c %q %q' \
+        "$managed_root_ceph_user" "$python_program" \
+        "$managed_root_ceph_pool"
+    incus_runtime_remote "$host" sh -c "$command_line"
 }
 
 managed_root_exact_mapping_count() {
@@ -278,7 +341,7 @@ print(count)'
         "$managed_root_ceph_user" "$python_program" \
         "$managed_root_ceph_pool" "$managed_root_rbd_image" \
         "$managed_root_rbd_id" "$managed_root_pool_id"
-    remote "$host" "$command_line"
+    incus_runtime_remote "$host" sh -c "$command_line"
 }
 
 managed_root_exact_watcher_count() {
@@ -287,7 +350,7 @@ managed_root_exact_watcher_count() {
         "set -euo pipefail; rados --id %q --pool %q listwatchers %q | awk 'NF {count++} END {print count + 0}'" \
         "$managed_root_ceph_user" "$managed_root_ceph_pool" \
         "rbd_header.$managed_root_rbd_id"
-    remote "$host" "$command_line"
+    incus_runtime_remote "$host" sh -c "$command_line"
 }
 
 managed_root_exact_object_exists() {
@@ -295,7 +358,7 @@ managed_root_exact_object_exists() {
     printf -v command_line '%q ' rados --id "$managed_root_ceph_user" \
         --pool "$managed_root_ceph_pool" stat \
         "rbd_header.$managed_root_rbd_id"
-    remote "$host" "$command_line" >/dev/null
+    incus_runtime_remote "$host" sh -c "$command_line" >/dev/null
 }
 
 assert_managed_root_owner() {
@@ -389,12 +452,28 @@ wait_migration() {
 
 share_api() {
     local method=$1 url=$2 data=${3:-}
-    local args=(-fsS -X "$method" -H "X-Auth-Token: $token"
+    local response_file status
+    local args=(-sS -X "$method" -H "X-Auth-Token: $token"
         -H "OpenStack-API-Version: compute 2.97")
     if [[ -n "$data" ]]; then
         args+=(-H "Content-Type: application/json" -d "$data")
     fi
-    curl "${args[@]}" "$url"
+    response_file=$(mktemp)
+    if ! status=$(curl "${args[@]}" -o "$response_file" \
+            -w '%{http_code}' "$url"); then
+        cat "$response_file" >&2
+        rm -f "$response_file"
+        return 1
+    fi
+    if [[ "$status" != 2?? ]]; then
+        echo "Nova share API $method returned HTTP $status: " >&2
+        cat "$response_file" >&2
+        echo >&2
+        rm -f "$response_file"
+        return 1
+    fi
+    cat "$response_file"
+    rm -f "$response_file"
 }
 
 wait_share_status() {
@@ -467,8 +546,8 @@ cleanup() {
     if [[ -n "$restore_failpoint_ssh" ]]; then
         clear_restore_failpoint "$restore_failpoint_ssh" || true
         if [[ -n "$restore_failpoint_marker" ]]; then
-            remote "$restore_failpoint_ssh" \
-                "podman exec incus rm -f '$restore_failpoint_marker'" || true
+            incus_runtime_remote "$restore_failpoint_ssh" \
+                rm -f "$restore_failpoint_marker" || true
         fi
         restore_failpoint_ssh=
         restore_failpoint_marker=
@@ -549,7 +628,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 for host in "${test_sshs[@]}"; do
-    server_extensions=$(remote "$host" incus query /1.0)
+    server_extensions=$(incus_runtime_remote "$host" incus query /1.0)
     if [[ "$MIGRATION_MODE" == live ]]; then
         grep -q migration_stateful_shifted_root <<<"$server_extensions"
         if [[ "$BOOT_FROM_VOLUME" == "1" ]]; then
@@ -559,7 +638,7 @@ for host in "${test_sshs[@]}"; do
         # Recover from a test process killed before its EXIT trap could remove
         # the restore failpoint. On an unmodified mount this returns EINVAL.
         clear_restore_failpoint "$host" || true
-        remote "$host" "podman exec incus criu check --extra" >/dev/null
+        incus_runtime_remote "$host" criu check --extra >/dev/null
     elif [[ "$BOOT_FROM_VOLUME" == "1" ]]; then
         for extension in storage_driver_cephext \
                 migration_shared_ceph_storage \
@@ -723,7 +802,11 @@ if [[ "$BOOT_FROM_VOLUME" != "1" ]]; then
         managed_root_ceph_user=$(incus_remote "$SOURCE_SSH" storage get \
             "$managed_root_pool" ceph.user.name)
         managed_root_ceph_user=${managed_root_ceph_user:-admin}
-        managed_root_rbd_image="container_${INCUS_PROJECT}_${instance_name}"
+        if [[ "$INCUS_PROJECT" == default ]]; then
+            managed_root_rbd_image="container_${instance_name}"
+        else
+            managed_root_rbd_image="container_${INCUS_PROJECT}_${instance_name}"
+        fi
         managed_root_rbd_id=$(managed_root_image_id "$SOURCE_SSH")
         managed_root_pool_id=$(managed_root_pool_identity "$SOURCE_SSH")
         [[ -n "$managed_root_rbd_id" &&
@@ -737,7 +820,7 @@ fi
 
 if [[ -n "$managed_root_rbd_id" ]]; then
     for host in "${test_sshs[@]}"; do
-        server_extensions=$(remote "$host" incus query /1.0)
+        server_extensions=$(incus_runtime_remote "$host" incus query /1.0)
         required_extensions=(
             storage_materialization_attempt_v1
             storage_release_receipt_v2
@@ -953,11 +1036,11 @@ inject_and_verify_restore_rollback() {
 
     restore_failpoint_ssh=$target_ssh
     restore_failpoint_marker="/var/log/incus/openstack-incus-e2e-criu-${server_id}.marker"
-    remote "$target_ssh" \
-        "podman exec incus sh -c \"rm -f '$restore_failpoint_marker'; \
+    incus_runtime_remote "$target_ssh" sh -c \
+        "rm -f '$restore_failpoint_marker'; \
          printf '%s\\n' '#!/bin/sh' ': > $restore_failpoint_marker' \
          'exit 1' > '$failpoint_script'; chmod 700 '$failpoint_script'; \
-         mount --bind '$failpoint_script' /usr/local/sbin/criu\""
+         mount --bind '$failpoint_script' /usr/local/sbin/criu"
     # OSC can return zero when Nova accepted the request and subsequently
     # rolled it back. The migration record, not the client exit status, is
     # authoritative for the injected failure.
@@ -977,10 +1060,10 @@ inject_and_verify_restore_rollback() {
     # empty. The injected target-side CRIU executable writes this marker to
     # Incus's persistent log bind before returning failure, which proves the
     # request reached target restore without depending on stdout logging.
-    remote "$target_ssh" \
-        "podman exec incus test -f '$restore_failpoint_marker'"
-    remote "$target_ssh" \
-        "podman exec incus rm -f '$restore_failpoint_marker'"
+    incus_runtime_remote "$target_ssh" \
+        test -f "$restore_failpoint_marker"
+    incus_runtime_remote "$target_ssh" \
+        rm -f "$restore_failpoint_marker"
     restore_failpoint_marker=
     restore_failpoint_ssh=
 
@@ -1016,23 +1099,15 @@ inject_and_verify_restore_rollback() {
 
     if [[ "$BOOT_FROM_VOLUME" == "1" ]]; then
         image_name="volume-$root_volume_id"
-        remote "$current_ssh" \
-            "rbd device list --format json --id cinder | jq -e \
-             '.[] | select(.name == \"$image_name\")'" >/dev/null
+        rbd_mapping_exists "$current_ssh" "$image_name"
         assert_fails "target BFV mapping must be absent after rollback" \
-            remote "$target_ssh" \
-            "rbd device list --format json --id cinder | jq -e \
-             '.[] | select(.name == \"$image_name\")'" >/dev/null
+            rbd_mapping_exists "$target_ssh" "$image_name"
     fi
     for volume_id in "${volume_ids[@]}"; do
         image_name="volume-$volume_id"
-        remote "$current_ssh" \
-            "rbd device list --format json --id cinder | jq -e \
-             '.[] | select(.name == \"$image_name\")'" >/dev/null
+        rbd_mapping_exists "$current_ssh" "$image_name"
         assert_fails "target data-volume mapping must be absent after rollback" \
-            remote "$target_ssh" \
-            "rbd device list --format json --id cinder | jq -e \
-             '.[] | select(.name == \"$image_name\")'" >/dev/null
+            rbd_mapping_exists "$target_ssh" "$image_name"
     done
     for index in "${!share_ids[@]}"; do
         share_id=${share_ids[index]}
@@ -1078,13 +1153,9 @@ assert_rbd_mapping_owner() {
     local active_ssh=$1 inactive_ssh=$2 image_name=$3
     local deadline=$((SECONDS + TIMEOUT)) mappings
 
-    remote "$active_ssh" \
-        "rbd device list --format json --id cinder | jq -e \
-         '.[] | select(.name == \"$image_name\")'" >/dev/null
+    rbd_mapping_exists "$active_ssh" "$image_name"
     while true; do
-        mappings=$(remote "$inactive_ssh" \
-            "rbd device list --format json --id cinder | jq -r \
-             '.[] | select(.name == \"$image_name\") | .device'")
+        mappings=$(rbd_mapping_devices "$inactive_ssh" "$image_name")
         [[ -z "$mappings" ]] && return 0
         ((SECONDS < deadline)) || {
             echo "Inactive host retained RBD mapping $image_name" >&2
@@ -1183,7 +1254,8 @@ if len(actual) != len(set(actual)) or sorted(actual) != sorted(expected):
             server_id, actual, expected))' "$server_id" "${expected[@]}"
 
     ((${#expected[@]} > 0)) || return 0
-    attachments=$(openstack volume attachment list -f json \
+    attachments=$(openstack --os-volume-api-version 3.27 \
+        volume attachment list -f json \
         -c 'Volume ID' -c 'Server ID' -c Status)
     printf '%s' "$attachments" | python3 -c '
 import json
@@ -1342,14 +1414,10 @@ migrate_and_verify() {
         [[ "$(openstack volume show "$root_volume_id" -f value -c status)" == \
             "in-use" ]]
         root_image="volume-$root_volume_id"
-        remote "$target_ssh" \
-            "rbd device list --format json --id cinder | jq -e \
-             '.[] | select(.name == \"$root_image\")'" >/dev/null
+        rbd_mapping_exists "$target_ssh" "$root_image"
         if [[ "$MIGRATION_MODE" == live ]]; then
             assert_fails "source BFV mapping must be absent after migration" \
-                remote "$current_ssh" \
-                "rbd device list --format json --id cinder | jq -e \
-                 '.[] | select(.name == \"$root_image\")'" >/dev/null
+                rbd_mapping_exists "$current_ssh" "$root_image"
         fi
     fi
     verify_guest_persistent_state "$target_ssh"

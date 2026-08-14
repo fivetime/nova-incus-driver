@@ -2560,6 +2560,9 @@ class IncusDriverTest(test.NoDBTestCase):
         self.CONF.incus.num_volume_scan_tries = 3
         self.CONF.incus.data_volume_mount_fuse = 'ext4=fuse2fs'
         self.CONF.incus.enable_manila_shares = False
+        self.CONF.incus.manila_cephfs_cluster_fsid = (
+            '00000000-0000-0000-0000-000000000001')
+        self.CONF.incus.manila_cephfs_filesystem_name = 'cephfs'
         self.CONF.serial_console.enabled = False
         self.CONF.serial_console.proxyclient_address = '127.0.0.1'
 
@@ -14616,7 +14619,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             share_id='10000000-0000-0000-0000-000000000001',
             instance_uuid=instance.uuid,
             tag='project-data',
-            export_location='mon1:/volumes/project',
+            export_location='mon1:6789,mon2:6789:/volumes/project',
             share_proto='CEPHFS',
             access_to='nova-client',
             access_key='secret')
@@ -14629,17 +14632,41 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         args = mount.call_args.args
         self.assertEqual(
-            ('ceph', share.export_location,
+            ('ceph',
+             'nova-client@00000000-0000-0000-0000-000000000001.'
+             'cephfs=/volumes/project',
              driver._share_mount_path(instance, share)), args[:3])
         self.assertEqual(
-            ['rw', 'nosuid', 'nodev', 'name=nova-client'],
-            args[3][:4])
-        secret_path = args[3][4].removeprefix('secretfile=')
+            ['rw', 'nosuid', 'nodev',
+             'mon_addr=mon1:6789/mon2:6789', 'name=nova-client'],
+            args[3][:5])
+        secret_path = args[3][5].removeprefix('secretfile=')
         self.assertEqual(
             os.path.dirname(driver._share_mount_path(instance, share)),
             os.path.dirname(secret_path))
         self.assertFalse(os.path.exists(secret_path))
         self.assertEqual(self.CONF.incus.share_mount_timeout, args[4])
+
+    def test_cephfs_mount_spec_rejects_missing_fsid(self):
+        self.CONF.incus.manila_cephfs_cluster_fsid = None
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid='00000000-0000-0000-0000-000000000001',
+            export_location='mon1:6789:/volumes/project',
+            access_to='nova')
+
+        self.assertRaises(
+            exception.ShareMountError, driver._cephfs_mount_spec, share)
+
+    def test_cephfs_mount_spec_rejects_ambiguous_legacy_export(self):
+        share = mock.Mock(
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid='00000000-0000-0000-0000-000000000001',
+            export_location='mon1:/volumes/project',
+            access_to='nova')
+
+        self.assertRaises(
+            exception.ShareMountError, driver._cephfs_mount_spec, share)
 
     @mock.patch.object(driver.os.path, 'ismount')
     @mock.patch.object(driver.incus_privsep, 'mount')

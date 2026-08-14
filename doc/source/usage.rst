@@ -1458,8 +1458,16 @@ mount helpers. Configure independent bounds for mount and unmount::
 
     [incus]
     enable_manila_shares = true
+    manila_cephfs_cluster_fsid = <canonical-ceph-fsid>
+    manila_cephfs_filesystem_name = <manila-cephfs-name>
     share_mount_timeout = 30
     share_unmount_timeout = 30
+
+The two CephFS identity options are mandatory for CephFS shares. They prevent
+the Ceph mount helper from guessing a filesystem when Manila supplies a
+legacy monitor-list export and the cluster contains multiple CephFS filesystems.
+All computes in one scheduling aggregate must use the exact same FSID and
+filesystem name. NFS shares do not use these options.
 
 On expiry GNU ``timeout`` sends ``TERM`` and, after a five-second grace period,
 ``KILL``. The driver never uses lazy or forced unmount. A timed-out unmount

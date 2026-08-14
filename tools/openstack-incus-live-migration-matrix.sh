@@ -23,7 +23,7 @@ MATRIX_CASES=${MATRIX_CASES:-all}
     echo "SSH known_hosts is not a readable regular file: $SSH_KNOWN_HOSTS_FILE" >&2
     exit 2
 }
-MIGRATION_TARGETS="${NODE02_HOST}=${NODE02_SSH},${NODE03_HOST}=${NODE03_SSH},${NODE01_HOST}=${NODE01_SSH}"
+MIGRATION_TARGETS=${MIGRATION_TARGETS:-"${NODE02_HOST}=${NODE02_SSH},${NODE03_HOST}=${NODE03_SSH},${NODE01_HOST}=${NODE01_SSH}"}
 
 placement_allocations() {
     local provider
