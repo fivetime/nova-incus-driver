@@ -368,7 +368,7 @@ and are listed here only so the count in reviews is unambiguous.
 Nova patches
 ------------
 
-Five, in ``patches/nova/``. Unlike the overrides these fail loudly: the patch
+Six, in ``patches/nova/``. Unlike the overrides these fail loudly: the patch
 will not apply.
 
 ``0002-hardware-accept-incus-manila-share-trait``
@@ -402,6 +402,15 @@ will not apply.
     three overrides lose their foundation. **Remove when** Nova exposes an
     equivalent failed-build cleanup policy or durable resource-ownership
     transaction for out-of-tree compute managers.
+
+``0006-sdk-user-token-honor-service-config``
+    Passes Nova's oslo.conf service adapter settings to SDK connections that
+    authenticate with a request token. This is required for Manila when the
+    deployment deliberately selects the internal interface rather than an
+    externally published endpoint. **Re-verify**: attach a share through the
+    Nova server-share API with ``[manila] valid_interfaces=internal``.
+    **Remove when** Nova passes its service configuration to token-authenticated
+    SDK connections upstream.
 
 Reporting to Nova upstream
 --------------------------

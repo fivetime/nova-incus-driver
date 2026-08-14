@@ -201,6 +201,18 @@ function install_nova_incus {
         git -C "${NOVA_DIR}" apply "${glance_upload_size_patch}"
     fi
 
+    local sdk_user_token_patch
+    sdk_user_token_patch="${NOVA_INCUS_DIR}/patches/nova/0006-sdk-user-token-honor-service-config.patch"
+    if git -C "${NOVA_DIR}" apply --reverse --check \
+            "${sdk_user_token_patch}" >/dev/null 2>&1; then
+        echo "Nova user-token SDK connections already honor service config"
+    elif git -C "${NOVA_DIR}" apply --check "${sdk_user_token_patch}"; then
+        git -C "${NOVA_DIR}" apply "${sdk_user_token_patch}"
+    else
+        die $LINENO \
+            "Nova user-token SDK service-config patch does not apply cleanly"
+    fi
+
     # Nova's source checkout is a regular Python package, so an editable
     # external distribution cannot extend nova.virt with another namespace
     # path. Keep this repository authoritative and deploy its driver package

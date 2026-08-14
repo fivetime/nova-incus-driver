@@ -87,6 +87,7 @@ def code_names(callable_object):
 
 
 from nova.compute import manager as nova_manager
+from nova import utils as nova_utils
 from nova.objects import base as nova_object_base
 from nova.objects import register_all
 from oslo_utils import versionutils
@@ -124,6 +125,12 @@ for hook in core_hooks:
         callable(getattr(nova_manager.ComputeManager, hook, None)),
         "Nova ComputeManager core hook {}".format(hook),
     )
+
+require(
+    "oslo_conf=CONF" in "".join(
+        inspect.getsource(nova_utils.get_sdk_adapter).split()),
+    "Nova user-token SDK connections honor service configuration",
+)
 
 if role == "api":
     from nova.api.openstack.compute import server_shares

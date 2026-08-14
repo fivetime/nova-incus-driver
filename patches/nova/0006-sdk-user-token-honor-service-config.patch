@@ -1,0 +1,50 @@
+diff --git a/nova/tests/unit/test_utils.py b/nova/tests/unit/test_utils.py
+index dc5a600018..7330957a1f 100644
+--- a/nova/tests/unit/test_utils.py
++++ b/nova/tests/unit/test_utils.py
+@@ -1151,6 +1151,33 @@ class TestGetSDKAdapter(test.NoDBTestCase):
+             exception.ServiceUnavailable,
+             self._test_get_sdk_adapter, True, strict=True)
+ 
++    @mock.patch('nova.utils.ks_loading.load_auth_from_conf_options')
++    def test_get_sdk_adapter_user_token_uses_oslo_conf(self, mock_load_auth):
++        ctxt = mock.Mock(
++            auth_token=mock.sentinel.token,
++            project_id=mock.sentinel.project_id,
++            project_domain_id=mock.sentinel.project_domain_id,
++        )
++
++        self.assertEqual(
++            mock.sentinel.proxy,
++            utils.get_sdk_adapter(
++                self.service_type, admin=False, context=ctxt))
++
++        self.mock_get_confgrp.assert_called_once_with(self.service_type)
++        self.mock_get_auth_sess.assert_not_called()
++        mock_load_auth.assert_called_once_with(
++            self.mock_conf, 'service_user')
++        self.mock_connection.assert_called_once_with(
++            token=mock.sentinel.token,
++            auth_type='v3token',
++            project_id=mock.sentinel.project_id,
++            project_domain_id=mock.sentinel.project_domain_id,
++            auth_url=self.mock_conf.service_user.auth_url,
++            oslo_conf=self.mock_conf,
++            service_types={'test_service'},
++            strict_proxies=False)
++
+     def test_get_sdk_adapter_conf_group_fail(self):
+         self.mock_get_confgrp.side_effect = (
+             exception.ConfGroupForServiceTypeNotFound(stype=self.service_type))
+diff --git a/nova/utils.py b/nova/utils.py
+index f88aecc65a..43aed58159 100644
+--- a/nova/utils.py
++++ b/nova/utils.py
+@@ -952,6 +952,7 @@ def get_sdk_adapter(
+                 project_id=context.project_id,
+                 project_domain_id=context.project_domain_id,
+                 auth_url=CONF.service_user.auth_url,
++                oslo_conf=CONF,
+                 service_types={service_type},
+                 strict_proxies=check_service,
+                 **kwargs,
