@@ -292,6 +292,18 @@ fails the share attach before a host mount is created. The selected filesystem
 must be the one used by every CephFS share type schedulable to that compute;
 use host aggregates to separate backends that use different CephFS names.
 
+For unprivileged Incus containers, configure the Manila CephFS backend with
+``cephfs_volume_mode = 777`` before creating shares. Manila's default ``755``
+subvolume mode is not writable by the fleet ID-mapped container UID: the
+CephFS subvolume is normally owned by UID/GID 0 or 65534 while container root
+is a different host UID. The permissive directory mode does not grant access
+to other shares; Manila's per-share CephX path capability remains the storage
+authorization boundary. Existing shares retain the mode with which they were
+created and must be recreated or changed by an explicitly authorized CephFS
+administrator before they are attached to tenants. Verify the resulting
+subvolume mode and a real write from an unprivileged test instance rather than
+accepting a successful mount as proof of usability.
+
 Use ``nova.virt.incus.config.list_opts`` or the generated Nova sample config
 as the authority for option names. Do not infer options from this abbreviated
 example. In particular, live migration, cold migration, and BFV evacuation

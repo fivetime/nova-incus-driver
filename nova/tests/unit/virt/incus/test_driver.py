@@ -15229,9 +15229,50 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertNotIn('do-not-write-this-secret', serialized)
         self.assertNotIn('access_key', serialized)
         payload = jsonutils.loads(serialized)
+        self.assertEqual(2, payload['version'])
+        self.assertEqual('nova-client', payload['access_to'])
         self.assertEqual(token, payload['operation_token'])
         self.assertEqual(instance.uuid, payload['instance_uuid'])
         self.assertEqual(instance.name, payload['instance_name'])
+
+    def test_legacy_cephfs_journal_validates_exact_mounted_source(self):
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        record = {
+            'version': 1,
+            'instance_uuid': instance.uuid,
+            'instance_name': instance.name,
+            'share_id': '10000000-0000-0000-0000-000000000001',
+            'operation_token': '20000000-0000-0000-0000-000000000002',
+            'phase': 'mounted',
+            'share_proto': 'CEPHFS',
+            'export_location': 'mon1:6789:/volumes/project',
+            'tag': 'project-data',
+        }
+        mapping = driver._share_mapping_from_journal(instance, record)
+        mount_path = driver._share_mount_path(instance, mapping)
+        mount_table = {
+            os.path.realpath(mount_path): {
+                'device': (
+                    'nova-client@00000000-0000-0000-0000-000000000001.'
+                    'cephfs=/volumes/project'),
+                'fstype': 'ceph',
+                'opts': frozenset(('rw', 'nosuid', 'nodev')),
+            },
+        }
+
+        driver._validate_existing_share_mount(
+            mount_path, mapping, mount_table=mount_table)
+
+        mount_table[os.path.realpath(mount_path)]['device'] = (
+            'nova-client@00000000-0000-0000-0000-000000000001.'
+            'cephfs=/volumes/other')
+        self.assertRaises(
+            exception.ShareMountError,
+            driver._validate_existing_share_mount,
+            mount_path, mapping, mount_table=mount_table)
 
     def test_share_journal_rejects_different_migration_owner(self):
         instance = mock.Mock(

@@ -196,7 +196,7 @@ _VOLUME_ATTACH_MIGRATION_DIRECTIONS = frozenset({
     'cold-target', 'cold-source-restore', 'cold-revert-source',
     'live-target', 'live-source-release',
 })
-_SHARE_JOURNAL_VERSION = 1
+_SHARE_JOURNAL_VERSION = 2
 _SPAWN_ATTEMPT_JOURNAL_VERSION = 1
 _SPAWN_ATTEMPT_PHASES = frozenset({'preflight', 'opening'})
 _HOST_RESOURCE_CACHE_TTL = 60
@@ -4258,8 +4258,10 @@ def _share_journal_payload(
             server_id=getattr(instance, 'uuid', 'unknown'),
             reason='share staging identity contains an invalid value')
     # access_key is deliberately absent. In particular, a CephFS secret must
-    # remain in memory and in the short-lived 0600 secretfile only.
-    return {
+    # remain in memory and in the short-lived 0600 secretfile only. The
+    # non-secret CephX client name is required to validate a mount exactly
+    # during journal replay after the Nova ShareMapping is no longer present.
+    payload = {
         'version': _SHARE_JOURNAL_VERSION,
         'instance_uuid': identity['instance_uuid'],
         'instance_name': identity['instance_name'],
@@ -4270,6 +4272,10 @@ def _share_journal_payload(
         'export_location': identity['export_location'],
         'tag': identity['tag'],
     }
+    if (share_mapping.share_proto ==
+            obj_fields.ShareMappingProto.CEPHFS):
+        payload['access_to'] = share_mapping.access_to
+    return payload
 
 
 def _write_share_journal(
@@ -4336,9 +4342,10 @@ def _validate_share_journal_payload(
     share_id = (
         share_mapping.share_id if share_mapping is not None
         else payload.get('share_id'))
+    version = payload.get('version') if isinstance(payload, dict) else None
     valid = (
         isinstance(payload, dict) and
-        payload.get('version') == _SHARE_JOURNAL_VERSION and
+        version in (1, _SHARE_JOURNAL_VERSION) and
         payload.get('instance_uuid') == instance.uuid and
         payload.get('instance_name') == instance.name and
         payload.get('share_id') == share_id and
@@ -4349,12 +4356,22 @@ def _validate_share_journal_payload(
         isinstance(payload.get('export_location'), str) and
         isinstance(payload.get('tag'), str) and
         'access_key' not in payload)
+    if (valid and payload.get('share_proto') ==
+            obj_fields.ShareMappingProto.CEPHFS):
+        valid = (
+            version == 1 or
+            (isinstance(payload.get('access_to'), str) and
+             bool(_CEPHFS_NAME_RE.fullmatch(payload['access_to']))))
     if share_mapping is not None:
         valid = valid and (
             payload.get('share_proto') == share_mapping.share_proto and
             payload.get('export_location') ==
             share_mapping.export_location and
-            payload.get('tag') == share_mapping.tag)
+            payload.get('tag') == share_mapping.tag and
+            (version == 1 or
+             payload.get('share_proto') !=
+             obj_fields.ShareMappingProto.CEPHFS or
+             payload.get('access_to') == share_mapping.access_to))
     if operation_token is not None:
         valid = valid and (
             payload.get('operation_token') == operation_token)
@@ -4528,6 +4545,8 @@ def _share_mapping_from_journal(instance, record):
         'share_proto': record['share_proto'],
         'export_location': record['export_location'],
         'tag': record['tag'],
+        'access_to': record.get('access_to'),
+        'journal_version': record['version'],
     })()
 
 
@@ -4701,7 +4720,7 @@ def _validate_cephfs_monitor(endpoint):
     return '%s:%d' % (canonical_host, port)
 
 
-def _cephfs_mount_spec(share_mapping):
+def _cephfs_mount_spec(share_mapping, access_to=None):
     """Build an unambiguous Ceph v2 device and monitor option."""
     fsid = CONF.incus.manila_cephfs_cluster_fsid
     filesystem = CONF.incus.manila_cephfs_filesystem_name
@@ -4745,8 +4764,16 @@ def _cephfs_mount_spec(share_mapping):
             share_id=share_mapping.share_id,
             server_id=share_mapping.instance_uuid,
             reason='CephFS monitor list is empty or contains duplicates')
+    if access_to is None:
+        access_to = share_mapping.access_to
+    if (not isinstance(access_to, str) or
+            not _CEPHFS_NAME_RE.fullmatch(access_to)):
+        raise exception.ShareMountError(
+            share_id=share_mapping.share_id,
+            server_id=share_mapping.instance_uuid,
+            reason='CephFS access client name is invalid')
     device = '{}@{}.{}={}'.format(
-        share_mapping.access_to, fsid, filesystem, match.group('path'))
+        access_to, fsid, filesystem, match.group('path'))
     return device, '/'.join(monitors)
 
 
@@ -4765,10 +4792,14 @@ def _share_mount_table_index():
 def _validate_existing_share_mount(
         mount_path, share_mapping, mount_table=None):
     """Fail closed if a staged path is mounted from another export."""
-    if (share_mapping.share_proto ==
-            obj_fields.ShareMappingProto.CEPHFS):
+    cephfs = (share_mapping.share_proto ==
+              obj_fields.ShareMappingProto.CEPHFS)
+    legacy_cephfs_journal = (
+        cephfs and getattr(share_mapping, 'journal_version', None) == 1 and
+        getattr(share_mapping, 'access_to', None) is None)
+    if cephfs and not legacy_cephfs_journal:
         expected_export, _mon_addr = _cephfs_mount_spec(share_mapping)
-    else:
+    elif not cephfs:
         expected_export = _normalize_share_export(
             share_mapping.export_location)
     expected_fstypes = _share_mount_fstypes(share_mapping)
@@ -4781,6 +4812,15 @@ def _validate_existing_share_mount(
     mounted = mount_table.get(real_mount_path)
     if mounted is not None:
         actual_export = mounted['device']
+        if legacy_cephfs_journal:
+            access_to, separator, _remainder = actual_export.partition('@')
+            if not separator:
+                raise exception.ShareMountError(
+                    share_id=share_mapping.share_id,
+                    server_id=share_mapping.instance_uuid,
+                    reason='existing CephFS host mount source is invalid')
+            expected_export, _mon_addr = _cephfs_mount_spec(
+                share_mapping, access_to=access_to)
         actual_options = frozenset(mounted.get('opts') or ())
         required_options = {'rw', 'nosuid', 'nodev'}
         if (mounted['fstype'] not in expected_fstypes or
