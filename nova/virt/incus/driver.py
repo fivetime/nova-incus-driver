@@ -5486,7 +5486,7 @@ def _validate_volume_recovery_record(
 
 def _profile_volume_attachment_matches(
         profile, volume_id, mountpoint, qos_limits, connection_info,
-        rbd_mapping_cache=None):
+        rbd_mapping_cache=None, allow_missing_rbd_mapping=False):
     """Validate an already-connected volume for idempotent retries."""
     device = profile.devices.get(volume_id)
     metadata = [
@@ -5506,14 +5506,15 @@ def _profile_volume_attachment_matches(
             reason='Existing Incus device for Cinder volume %s does not '
                    'match the requested attachment' % volume_id)
 
-    source = os.path.realpath(device.get('source', ''))
-    _validate_block_device_path(source, 'Existing os-brick connector path')
     record = _profile_volume_record(profile, volume_id, device=device)
+    source = os.path.realpath(device.get('source', ''))
+    requested_protocol = connection_info.get('driver_volume_type')
+    if not (allow_missing_rbd_mapping and requested_protocol == 'rbd'):
+        _validate_block_device_path(source, 'Existing os-brick connector path')
     if record.get('phase') != 'connected':
         raise exception.InvalidVolume(
             reason='Cinder volume %s has an unfinished %s journal record' %
                    (volume_id, record.get('phase')))
-    requested_protocol = connection_info.get('driver_volume_type')
     stored_protocol = record.get('driver_volume_type')
     if stored_protocol and stored_protocol != requested_protocol:
         raise exception.InvalidVolume(
@@ -5535,13 +5536,39 @@ def _profile_volume_attachment_matches(
             raise exception.InvalidVolume(
                 reason='Stored RBD namespace for Cinder volume %s does not '
                        'match the requested namespace' % volume_id)
-        expected_source = _mapped_rbd_device(
-            connection_info.get('data') or {},
-            mapping_cache=rbd_mapping_cache)
-        if source != expected_source:
-            raise exception.InvalidVolume(
-                reason='Existing Incus source for Cinder volume %s resolves '
-                       'to a different RBD mapping' % volume_id)
+        if allow_missing_rbd_mapping:
+            unused_image, mappings = _rbd_mapping_matches(
+                connection_info.get('data') or {},
+                mapping_cache=rbd_mapping_cache)
+            if len(mappings) > 1:
+                raise exception.InvalidVolume(
+                    reason='Expected at most one local RBD mapping for Cinder '
+                           'volume %s, found %d' % (volume_id, len(mappings)))
+            if not mappings:
+                recorded_source = os.path.realpath(
+                    (record.get('device_info') or {}).get('path', ''))
+                if not recorded_source or source != recorded_source:
+                    raise exception.InvalidVolume(
+                        reason='Disconnected Incus source for Cinder volume '
+                               '%s does not match its durable os-brick record'
+                               % volume_id)
+            else:
+                expected_source = _validate_block_device_path(
+                    os.path.realpath(mappings[0].get('device', '')),
+                    'rbd showmapped device')
+                if source != expected_source:
+                    raise exception.InvalidVolume(
+                        reason='Existing Incus source for Cinder volume %s '
+                               'resolves to a different RBD mapping' %
+                               volume_id)
+        else:
+            expected_source = _mapped_rbd_device(
+                connection_info.get('data') or {},
+                mapping_cache=rbd_mapping_cache)
+            if source != expected_source:
+                raise exception.InvalidVolume(
+                    reason='Existing Incus source for Cinder volume %s '
+                           'resolves to a different RBD mapping' % volume_id)
     for key in ('limits.read', 'limits.write'):
         if device.get(key) != qos_limits.get(key):
             raise exception.InvalidVolume(
@@ -16096,6 +16123,8 @@ class IncusDriver(driver.ComputeDriver):
                             instance.uuid, volume_id),
                         external=True,
                         lock_path=_volume_operation_lock_path()):
+                    source_mapping_present = True
+                    source_record = None
                     if not boot_volume:
                         qos_limits = _data_volume_qos(
                             connection_info,
@@ -16105,14 +16134,32 @@ class IncusDriver(driver.ComputeDriver):
                                 instance.name)
                             _validate_profile_volume_owner(
                                 source_profile, instance)
+                        mapping_cache = {}
+                        if connection_info.get('driver_volume_type') == 'rbd':
+                            unused_image, source_mappings = (
+                                _rbd_mapping_matches(
+                                    connection_info.get('data') or {},
+                                    mapping_cache=mapping_cache))
+                            if len(source_mappings) > 1:
+                                raise exception.InvalidVolume(
+                                    reason='Live migration source has '
+                                           'multiple '
+                                           'local RBD mappings for %s' %
+                                           volume_id)
+                            source_mapping_present = bool(source_mappings)
                         if not _profile_volume_attachment_matches(
                                 source_profile, volume_id, mountpoint,
-                                qos_limits, connection_info):
+                                qos_limits, connection_info,
+                                rbd_mapping_cache=mapping_cache,
+                                allow_missing_rbd_mapping=True):
                             raise exception.InvalidVolume(
                                 reason='Live migration source profile does '
                                        'not contain the exact Cinder '
                                        'data-volume mapping for %s' %
                                        volume_id)
+                        source_record = _profile_volume_record(
+                            source_profile, volume_id,
+                            device=source_profile.devices.get(volume_id))
                     phase = self.get_volume_journal_phase(instance, volume_id)
                     if phase is not None:
                         raise exception.InvalidVolume(
@@ -16126,6 +16173,15 @@ class IncusDriver(driver.ComputeDriver):
                         operation_migration_uuid=(
                             _live_migration_uuid(migrate_data)),
                         boot_volume=boot_volume)
+                    if not boot_volume and not source_mapping_present:
+                        # The source mapping can already be absent when the
+                        # CRIU source operation becomes terminal. Preserve that
+                        # exact, disconnected state before the source record is
+                        # irreversibly deleted.
+                        _write_volume_journal(
+                            instance, volume_id, connection_info,
+                            source_record.get('device_info') or {}, mountpoint,
+                            phase='disconnected')
                 source_volume_releases.append((
                     bdm, connection_info, mountpoint, volume_id, intent,
                     boot_volume))
@@ -16274,6 +16330,13 @@ class IncusDriver(driver.ComputeDriver):
                 raise exception.InvalidVolume(
                     reason='Live migration source volume release generation '
                            'changed before disconnect')
+            journal_phase = self.get_volume_journal_phase(instance, volume_id)
+            if journal_phase == 'disconnected':
+                return
+            if journal_phase is not None:
+                raise exception.InvalidVolume(
+                    reason='Live migration source volume release has '
+                           'unexpected %s host evidence' % journal_phase)
             self._detach_volume(
                 context, connection_info, instance, mountpoint,
                 retain_journal=True)

@@ -19811,9 +19811,13 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         container.delete.assert_not_called()
 
     @mock.patch.object(
-        driver, '_mapped_rbd_device', return_value='/dev/rbd0')
+        driver, '_validate_block_device_path',
+        side_effect=lambda path, unused_label: path)
+    @mock.patch.object(
+        driver, '_rbd_mapping_matches',
+        return_value=('volumes/volume-test', [{'device': '/dev/rbd0'}]))
     def test_post_live_migration_disconnects_source_data_volumes(
-            self, mapped_rbd_device):
+            self, unused_rbd_mapping_matches, unused_validate_device):
         ctx = context.get_admin_context()
         instance = fake_instance.fake_instance_obj(
             ctx, name='test', memory_mb=0)
@@ -19888,8 +19892,65 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         self.assertFalse(prepare.call_args_list[1].kwargs['boot_volume'])
         incus_driver._detach_volume.assert_called_once_with(
             ctx, data_connection, instance, '/dev/sdb', retain_journal=True)
-        mapped_rbd_device.assert_called_once_with(
-            data_connection['data'], mapping_cache=None)
+
+    @mock.patch.object(driver, '_write_volume_journal')
+    @mock.patch.object(
+        driver, '_rbd_mapping_matches',
+        return_value=('volumes/volume-test', []))
+    def test_post_live_migration_accepts_already_disconnected_source_volume(
+            self, unused_rbd_mapping_matches, write_volume_journal):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-disconnected-source', memory_mb=0)
+        container = mock.Mock(status='Stopped')
+        self.client.instances.get.return_value = container
+        volume_id = '20000000-0000-0000-0000-000000000002'
+        attachment_id = '40000000-0000-0000-0000-000000000004'
+        connection_info = {
+            'driver_volume_type': 'rbd',
+            'serial': volume_id,
+            'data': {
+                'volume_id': volume_id,
+                'name': 'volumes/volume-test',
+            },
+        }
+        block_device_info = {'block_device_mapping': [{
+            'boot_index': None,
+            'connection_info': connection_info,
+            'mount_device': '/dev/sdb',
+            'attachment_id': attachment_id,
+        }]}
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        data, _remote, _handover = (
+            self._prepare_post_live_migration_protocol(instance))
+        self._configure_exact_idmap_release(
+            incus_driver, instance, container,
+            self.client.profiles.get.return_value,
+            outcome='detached', idmap_base=1065536)
+        profile = self.client.profiles.get.return_value
+        profile.devices = {
+            volume_id: {
+                'type': 'unix-block', 'path': '/dev/sdb',
+                'source': '/dev/rbd0', 'required': 'true',
+            },
+        }
+        profile.config[driver._volume_device_info_key(volume_id)] = (
+            driver._serialize_volume_attachment(
+                connection_info, {'path': '/dev/rbd0'}, '/dev/sdb',
+                phase='connected'))
+        incus_driver._detach_volume = mock.Mock()
+        incus_driver.get_volume_journal_phase = mock.Mock(
+            side_effect=[None, 'disconnected'])
+
+        incus_driver.post_live_migration(
+            ctx, instance, block_device_info, migrate_data=data)
+
+        write_volume_journal.assert_called_once_with(
+            instance, volume_id, connection_info, {'path': '/dev/rbd0'},
+            '/dev/sdb', phase='disconnected')
+        container.delete.assert_called_once_with(wait=True)
+        incus_driver._detach_volume.assert_not_called()
 
     def test_live_source_disconnect_accepts_periodic_convergence(self):
         ctx = context.get_admin_context()
