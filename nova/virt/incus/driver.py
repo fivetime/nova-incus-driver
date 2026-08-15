@@ -4666,6 +4666,11 @@ def _volume_topology_lock_path():
     return CONF.state_path
 
 
+def _live_migration_host_generation_lock_name(instance):
+    """Serialize source retirement and reverse-target preparation."""
+    return 'incus-live-host-generation-{}'.format(instance.uuid)
+
+
 def _volume_operation_lock_name(volume_id):
     """Serialize one Cinder volume across instances on this compute host."""
     digest = hashlib.sha256(str(volume_id).encode('utf-8')).hexdigest()
@@ -15549,6 +15554,16 @@ class IncusDriver(driver.ComputeDriver):
 
     def pre_live_migration(self, context, instance, block_device_info,
                            network_info, disk_info, migrate_data):
+        with lockutils.lock(
+                _live_migration_host_generation_lock_name(instance),
+                external=True, lock_path=CONF.state_path):
+            return self._pre_live_migration_locked(
+                context, instance, block_device_info, network_info,
+                disk_info, migrate_data)
+
+    def _pre_live_migration_locked(
+            self, context, instance, block_device_info, network_info,
+            disk_info, migrate_data):
         if not isinstance(
                 migrate_data, incus_migrate_data.IncusLiveMigrateData):
             raise exception.MigrationError(
@@ -16392,8 +16407,59 @@ class IncusDriver(driver.ComputeDriver):
                 context, connection_info, instance, mountpoint,
                 retain_journal=True)
 
+    def _live_source_cleanup_was_superseded(self, instance):
+        """Detect a newer destination generation on the former source host.
+
+        Nova calls ``post_live_migration_at_source`` after the old Cinder
+        attachment has been retired.  An immediate reverse migration can
+        create a new destination profile or instance on this host before that
+        callback runs.  The resource names are intentionally stable, so the
+        old callback must not consume the new generation.
+        """
+        with lockutils.lock(_profile_lock_name(instance)):
+            try:
+                profile = self.client.profiles.get(instance.name)
+            except incus_exceptions.LXDAPIException as exc:
+                if _is_incus_not_found(exc):
+                    profile = None
+                else:
+                    raise
+            if profile is not None:
+                _validate_profile_volume_owner(profile, instance)
+                config = (
+                    profile.config if isinstance(profile.config, dict)
+                    else {})
+                if config.get(MIGRATION_DESTINATION_PREPARED_KEY):
+                    return True
+
+            try:
+                container = self.client.instances.get(instance.name)
+            except incus_exceptions.LXDAPIException as exc:
+                if _is_incus_not_found(exc):
+                    return False
+                raise
+            if _instance_nova_uuid(container) != instance.uuid:
+                raise exception.MigrationError(
+                    reason='Incus instance name was reused by a different '
+                           'owner before live source cleanup')
+            return True
+
     @_invalidates_instance_inventory
     def post_live_migration_at_source(self, context, instance, network_info):
+        with lockutils.lock(
+                _live_migration_host_generation_lock_name(instance),
+                external=True, lock_path=CONF.state_path):
+            return self._post_live_migration_at_source_locked(
+                context, instance, network_info)
+
+    def _post_live_migration_at_source_locked(
+            self, context, instance, network_info):
+        if self._live_source_cleanup_was_superseded(instance):
+            LOG.warning(
+                'Skipping obsolete live source cleanup because this host '
+                'already owns a newer destination generation',
+                instance=instance)
+            return
         # The guest now runs on the destination, so any broker left here is
         # bound to a container this host is about to delete. Keeping it
         # would hold a proxy port, and would hand a dead console to the

@@ -14426,6 +14426,12 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         incus_driver = driver.IncusDriver(None)
         incus_driver.client = self.client
         incus_driver.cleanup = mock.Mock()
+        self.client.profiles.get.return_value.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+        }
+        self.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
         broker = mock.Mock()
         incus_driver._serial_consoles[instance.uuid] = broker
 
@@ -16208,6 +16214,10 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             self.CONF.instances_path, 'incus-shares',
             instance.uuid, share_id)
         profile = self.client.profiles.get.return_value
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+        }
         profile.devices = {
             'manila-' + share_id: {
                 'type': 'disk',
@@ -16230,6 +16240,8 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         incus_driver = driver.IncusDriver(None)
         incus_driver.client = self.client
         incus_driver._cleanup = mock.Mock()
+        self.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
 
         incus_driver.post_live_migration_at_source(
             None, instance, mock.sentinel.network_info)
@@ -20054,8 +20066,14 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             ctx, name='test', memory_mb=0)
         network_info = []
         profile = mock.Mock()
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+        }
         profile.devices = {}
         self.client.profiles.get.return_value = profile
+        self.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
 
         incus_driver = driver.IncusDriver(None)
         incus_driver._cleanup = mock.Mock()
@@ -20066,6 +20084,57 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
 
         incus_driver._cleanup.assert_called_once_with(
             ctx, instance, network_info, delete_profile=True)
+
+    def test_post_live_source_cleanup_skips_new_destination_instance(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-reverse-target', memory_mb=0)
+        profile = mock.Mock(
+            config={
+                'environment.product_name': 'OpenStack Nova',
+                'user.openstack.uuid': instance.uuid,
+            },
+            devices={'volume': {
+                'type': 'unix-block',
+                'path': '/dev/sdb',
+                'source': '/dev/rbd0',
+            }})
+        self.client.profiles.get.return_value = profile
+        self.client.instances.get.return_value = mock.Mock(
+            config={'user.openstack.uuid': instance.uuid})
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver._cleanup = mock.Mock()
+        incus_driver._release_serial_console_broker = mock.Mock()
+
+        incus_driver.post_live_migration_at_source(ctx, instance, [])
+
+        incus_driver._release_serial_console_broker.assert_not_called()
+        incus_driver._cleanup.assert_not_called()
+        self.assertIn('volume', profile.devices)
+
+    def test_post_live_source_cleanup_skips_prepared_reverse_target(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test-reverse-prepared', memory_mb=0)
+        profile = mock.Mock(config={
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+            driver.MIGRATION_DESTINATION_PREPARED_KEY:
+                '00000000-0000-0000-0000-000000000002',
+        }, devices={})
+        self.client.profiles.get.return_value = profile
+        self.client.instances.get.side_effect = (
+            incuscore_exceptions.NotFound(MockResponse(404)))
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+        incus_driver._cleanup = mock.Mock()
+        incus_driver._release_serial_console_broker = mock.Mock()
+
+        incus_driver.post_live_migration_at_source(ctx, instance, [])
+
+        incus_driver._release_serial_console_broker.assert_not_called()
+        incus_driver._cleanup.assert_not_called()
 
     def test_post_live_migration_at_destination_is_idempotent_after_retire(
             self):
