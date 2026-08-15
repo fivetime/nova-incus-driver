@@ -6574,6 +6574,20 @@ class IncusComputeManagerTest(test.NoDBTestCase):
             [shares[0], shares[2]],
             [call.args[0] for call in
              self.compute._set_share_mapping_status.call_args_list])
+        for share in shares:
+            share.set_access_according_to_protocol.assert_called_once_with()
+
+    def test_umount_all_shares_hydrates_cephfs_before_driver(self):
+        ctxt = context.get_admin_context()
+        instance = mock.Mock(uuid='instance')
+        share = mock.Mock(share_id='share', share_proto='CEPHFS')
+
+        self.compute._umount_all_shares(ctxt, instance, [share])
+
+        share.set_access_according_to_protocol.assert_called_once_with()
+        share.enhance_with_ceph_credentials.assert_called_once_with(ctxt)
+        self.compute.driver.umount_share_transaction.assert_called_once_with(
+            ctxt, instance, share, mount_table=self.mount_table)
 
     def test_mount_table_is_built_once_for_32_and_64_shares(self):
         ctxt = context.get_admin_context()
@@ -6597,15 +6611,16 @@ class IncusComputeManagerTest(test.NoDBTestCase):
                     cardinality,
                     self.compute.driver.mount_share_transaction.call_count)
 
-    def test_pre_deny_share_unmounts_without_credential_hydration(self):
+    def test_pre_deny_share_hydrates_before_unmount(self):
         ctxt = context.get_admin_context()
         instance = mock.Mock(uuid='instance')
-        share = mock.Mock(share_id='share')
+        share = mock.Mock(share_id='share', share_proto='CEPHFS')
 
         result = self.compute._pre_deny_share(ctxt, instance, share)
 
         self.assertIsNone(result)
-        share.enhance_with_ceph_credentials.assert_not_called()
+        share.set_access_according_to_protocol.assert_called_once_with()
+        share.enhance_with_ceph_credentials.assert_called_once_with(ctxt)
         self.compute.driver.umount_share_transaction.assert_called_once_with(
             ctxt, instance, share, mount_table=self.mount_table)
 

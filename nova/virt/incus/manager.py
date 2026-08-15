@@ -2814,6 +2814,7 @@ class IncusComputeManager(manager.ComputeManager):
         mount_table = self.driver.get_share_mount_table()
         for share_mapping in list(share_info or []):
             try:
+                self._hydrate_share_mapping(context, share_mapping)
                 self.driver.umount_share_transaction(
                     context, instance, share_mapping,
                     mount_table=mount_table)
@@ -2844,6 +2845,7 @@ class IncusComputeManager(manager.ComputeManager):
     def _pre_deny_share(self, context, instance, share_mapping):
         """Remove physical state before Manila revokes the access rule."""
         try:
+            self._hydrate_share_mapping(context, share_mapping)
             self.driver.umount_share_transaction(
                 context, instance, share_mapping,
                 mount_table=self.driver.get_share_mount_table())
