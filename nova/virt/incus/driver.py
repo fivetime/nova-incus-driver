@@ -16332,6 +16332,45 @@ class IncusDriver(driver.ComputeDriver):
                            'changed before disconnect')
             journal_phase = self.get_volume_journal_phase(instance, volume_id)
             if journal_phase == 'disconnected':
+                journal = _read_volume_journal(instance, volume_id)
+                if journal is None:
+                    raise exception.InvalidVolume(
+                        reason='Live migration source volume release lost '
+                               'its disconnected host evidence')
+                _validate_volume_recovery_record(
+                    journal, volume_id, mountpoint, connection_info)
+                device_info = journal.get('device_info') or {}
+                device_path = os.path.realpath(device_info.get('path', ''))
+                if not device_path:
+                    raise exception.InvalidVolume(
+                        reason='Live migration source disconnect journal has '
+                               'no device path')
+                with lockutils.lock(_profile_lock_name(instance)):
+                    try:
+                        profile = self.client.profiles.get(instance.name)
+                    except incus_exceptions.LXDAPIException as exc:
+                        if _is_incus_not_found(exc):
+                            return
+                        raise
+                    _validate_profile_volume_owner(profile, instance)
+                    device = profile.devices.get(volume_id)
+                    if device is not None and (
+                            device.get('type') != 'unix-block' or
+                            device.get('path') != mountpoint or
+                            os.path.realpath(device.get('source', '')) !=
+                            device_path):
+                        raise exception.InvalidVolume(
+                            reason='Incus source device no longer matches '
+                                   'the disconnected migration journal')
+                    if device is not None:
+                        profile.devices.pop(volume_id)
+                        profile.config[_volume_device_info_key(volume_id)] = (
+                            _serialize_volume_attachment(
+                                connection_info, device_info, mountpoint,
+                                phase='disconnected'))
+                        profile.config.pop(
+                            _legacy_volume_device_info_key(volume_id), None)
+                        profile.save(wait=True)
                 return
             if journal_phase is not None:
                 raise exception.InvalidVolume(

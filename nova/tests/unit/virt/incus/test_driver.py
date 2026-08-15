@@ -19939,18 +19939,35 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             driver._serialize_volume_attachment(
                 connection_info, {'path': '/dev/rbd0'}, '/dev/sdb',
                 phase='connected'))
+        profile.save.reset_mock()
         incus_driver._detach_volume = mock.Mock()
+        journal = {
+            'version': 2,
+            'volume_id': volume_id,
+            'mountpoint': '/dev/sdb',
+            'driver_volume_type': 'rbd',
+            'connection_data': connection_info['data'],
+            'device_info': {'path': '/dev/rbd0'},
+            'phase': 'disconnected',
+        }
         incus_driver.get_volume_journal_phase = mock.Mock(
             side_effect=[None, 'disconnected'])
 
-        incus_driver.post_live_migration(
-            ctx, instance, block_device_info, migrate_data=data)
+        with mock.patch.object(
+                driver, '_read_volume_journal', return_value=journal):
+            incus_driver.post_live_migration(
+                ctx, instance, block_device_info, migrate_data=data)
 
         write_volume_journal.assert_called_once_with(
             instance, volume_id, connection_info, {'path': '/dev/rbd0'},
             '/dev/sdb', phase='disconnected')
         container.delete.assert_called_once_with(wait=True)
         incus_driver._detach_volume.assert_not_called()
+        self.assertNotIn(volume_id, profile.devices)
+        self.assertEqual(
+            'disconnected',
+            driver._profile_volume_record(profile, volume_id)['phase'])
+        profile.save.assert_called_with(wait=True)
 
     def test_live_source_disconnect_accepts_periodic_convergence(self):
         ctx = context.get_admin_context()
