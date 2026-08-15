@@ -299,6 +299,35 @@ class ReleaseSshIdentityContractTest(unittest.TestCase):
         self.assertNotIn('ssh-keyscan', self.gate)
 
 
+class MigrationResidualAuditContractTest(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.e2e = LIVE_E2E.read_text(encoding='utf-8')
+        cls.wrappers = [
+            path.read_text(encoding='utf-8')
+            for path in (LIVE_MATRIX, LIVE_CARDINALITY, COLD_CARDINALITY)
+        ]
+
+    def test_e2e_requires_exact_placement_consumer_cleanup(self):
+        self.assertIn(
+            'openstack resource provider allocation show \\\n'
+            '    "$server_id" -f json', self.e2e)
+        self.assertIn(
+            "jq -e 'length == 0' <<<\"$placement_allocations\"",
+            self.e2e)
+
+    def test_global_baselines_require_explicit_quiescent_cloud_mode(self):
+        for script in self.wrappers:
+            self.assertIn(
+                'QUIESCENT_CLOUD_AUDIT=${QUIESCENT_CLOUD_AUDIT:-0}',
+                script)
+            baseline = script.index('baseline_servers=$(')
+            gate = script.rindex(
+                'if [[ "$QUIESCENT_CLOUD_AUDIT" == 1 ]]', 0, baseline)
+            self.assertLess(gate, baseline)
+
+
 class BfvCommandTimeoutContractTest(unittest.TestCase):
 
     @classmethod

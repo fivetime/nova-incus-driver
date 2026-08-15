@@ -18,6 +18,7 @@ BFV_IMAGE=${BFV_IMAGE:-alpine-3.21-criu-bfv-fuse}
 MANILA_SHARE=${MANILA_SHARE:-incus-e2e-share}
 TIMEOUT=${TIMEOUT:-420}
 MATRIX_CASES=${MATRIX_CASES:-all}
+QUIESCENT_CLOUD_AUDIT=${QUIESCENT_CLOUD_AUDIT:-0}
 
 [[ -f "$SSH_KNOWN_HOSTS_FILE" && -r "$SSH_KNOWN_HOSTS_FILE" ]] || {
     echo "SSH known_hosts is not a readable regular file: $SSH_KNOWN_HOSTS_FILE" >&2
@@ -43,9 +44,11 @@ for consumer, allocation in sorted(data["allocations"].items()):
     done < <(openstack resource provider list -f value -c uuid | sort)
 }
 
-baseline_servers=$(openstack server list --all-projects -f value -c ID | sort)
-baseline_volumes=$(openstack volume list --all-projects -f value -c ID | sort)
-baseline_allocations=$(placement_allocations)
+if [[ "$QUIESCENT_CLOUD_AUDIT" == 1 ]]; then
+    baseline_servers=$(openstack server list --all-projects -f value -c ID | sort)
+    baseline_volumes=$(openstack volume list --all-projects -f value -c ID | sort)
+    baseline_allocations=$(placement_allocations)
+fi
 
 case_selected() {
     local case_name=$1
@@ -94,12 +97,14 @@ run_case bfv_data 1 1 0
 run_case bfv_manila 1 0 1
 run_case bfv_data_manila 1 1 1
 
-final_servers=$(openstack server list --all-projects -f value -c ID | sort)
-final_volumes=$(openstack volume list --all-projects -f value -c ID | sort)
-final_allocations=$(placement_allocations)
-[[ "$final_servers" == "$baseline_servers" ]]
-[[ "$final_volumes" == "$baseline_volumes" ]]
-[[ "$final_allocations" == "$baseline_allocations" ]]
+if [[ "$QUIESCENT_CLOUD_AUDIT" == 1 ]]; then
+    final_servers=$(openstack server list --all-projects -f value -c ID | sort)
+    final_volumes=$(openstack volume list --all-projects -f value -c ID | sort)
+    final_allocations=$(placement_allocations)
+    [[ "$final_servers" == "$baseline_servers" ]]
+    [[ "$final_volumes" == "$baseline_volumes" ]]
+    [[ "$final_allocations" == "$baseline_allocations" ]]
+fi
 
 if [[ "$MATRIX_CASES" == all ]]; then
     echo "PASS Incus live migration 2x2x2 matrix and residual-state audit"

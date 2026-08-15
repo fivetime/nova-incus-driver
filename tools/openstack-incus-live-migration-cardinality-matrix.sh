@@ -19,6 +19,7 @@ MANILA_SHARES=${MANILA_SHARES:?Set space-separated Manila share names or IDs}
 CARDINALITY_COUNTS=${CARDINALITY_COUNTS:-0 1 3}
 TIMEOUT=${TIMEOUT:-600}
 MATRIX_CASES=${MATRIX_CASES:-all}
+QUIESCENT_CLOUD_AUDIT=${QUIESCENT_CLOUD_AUDIT:-0}
 
 [[ -f "$SSH_KNOWN_HOSTS_FILE" && -r "$SSH_KNOWN_HOSTS_FILE" ]] || {
     echo "SSH known_hosts is not a readable regular file: $SSH_KNOWN_HOSTS_FILE" >&2
@@ -101,11 +102,13 @@ run_case() {
     echo "PASS live migration cardinality case=$case_name"
 }
 
-baseline_servers=$(openstack server list --all-projects -f value -c ID | sort)
-baseline_volumes=$(openstack volume list --all-projects -f value -c ID | sort)
-baseline_ports=$(openstack port list --device-owner compute:nova \
-    -f value -c ID | sort)
-baseline_allocations=$(placement_allocations)
+if [[ "$QUIESCENT_CLOUD_AUDIT" == 1 ]]; then
+    baseline_servers=$(openstack server list --all-projects -f value -c ID | sort)
+    baseline_volumes=$(openstack volume list --all-projects -f value -c ID | sort)
+    baseline_ports=$(openstack port list --device-owner compute:nova \
+        -f value -c ID | sort)
+    baseline_allocations=$(placement_allocations)
+fi
 
 for root_model in local bfv; do
     for data_count in "${cardinalities[@]}"; do
@@ -117,15 +120,17 @@ for root_model in local bfv; do
     done
 done
 
-final_servers=$(openstack server list --all-projects -f value -c ID | sort)
-final_volumes=$(openstack volume list --all-projects -f value -c ID | sort)
-final_ports=$(openstack port list --device-owner compute:nova \
-    -f value -c ID | sort)
-final_allocations=$(placement_allocations)
-[[ "$final_servers" == "$baseline_servers" ]]
-[[ "$final_volumes" == "$baseline_volumes" ]]
-[[ "$final_ports" == "$baseline_ports" ]]
-[[ "$final_allocations" == "$baseline_allocations" ]]
+if [[ "$QUIESCENT_CLOUD_AUDIT" == 1 ]]; then
+    final_servers=$(openstack server list --all-projects -f value -c ID | sort)
+    final_volumes=$(openstack volume list --all-projects -f value -c ID | sort)
+    final_ports=$(openstack port list --device-owner compute:nova \
+        -f value -c ID | sort)
+    final_allocations=$(placement_allocations)
+    [[ "$final_servers" == "$baseline_servers" ]]
+    [[ "$final_volumes" == "$baseline_volumes" ]]
+    [[ "$final_ports" == "$baseline_ports" ]]
+    [[ "$final_allocations" == "$baseline_allocations" ]]
+fi
 
 if [[ "$MATRIX_CASES" == all ]]; then
     echo "PASS Incus live migration 2x3x3 cardinality matrix and residual-state audit"

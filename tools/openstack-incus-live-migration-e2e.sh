@@ -1588,6 +1588,13 @@ if [[ -n "$root_volume_id" ]]; then
 fi
 assert_fails "Neutron port must be absent after server delete" \
     openstack port show "$port_id" >/dev/null 2>&1
+placement_allocations=$(openstack resource provider allocation show \
+    "$server_id" -f json)
+jq -e 'length == 0' <<<"$placement_allocations" >/dev/null || {
+    echo "Placement allocations remain after server delete: $server_id" >&2
+    jq . <<<"$placement_allocations" >&2
+    exit 1
+}
 for host in "${test_sshs[@]}"; do
     wait_incus_absent "$host"
     wait_profile_absent "$host"
