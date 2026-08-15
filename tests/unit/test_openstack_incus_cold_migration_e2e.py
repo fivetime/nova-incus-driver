@@ -91,6 +91,21 @@ class ColdMigrationE2EContractTest(unittest.TestCase):
         self.assertIn('verify_share_api_active', self.e2e)
         self.assertIn('share mapping cardinality differs:', self.e2e)
 
+    def test_manila_mount_checks_use_compute_runtime_namespace(self):
+        self.assertIn('compute_runtime_remote()', self.e2e)
+        self.assertIn(
+            '-l application=nova,component=compute-incus', self.e2e)
+        self.assertIn(
+            'NOVA_INSTANCES_PATH_KUBERNETES=${'
+            'NOVA_INSTANCES_PATH_KUBERNETES:-/var/lib/nova/instances}',
+            self.e2e)
+        self.assertIn(
+            'share_mount="$(share_staging_root)/$server_id/$share_id"',
+            self.e2e)
+        self.assertNotIn(
+            'share_mount="/opt/stack/data/nova/instances/incus-shares/',
+            self.e2e)
+
     def test_cold_pid_is_not_used_as_a_continuity_assertion(self):
         live_check = 'if [[ "$MIGRATION_MODE" == live ]]; then'
         pid_check = 'if [[ "$dest_pid" != "$source_pid" ]]; then'

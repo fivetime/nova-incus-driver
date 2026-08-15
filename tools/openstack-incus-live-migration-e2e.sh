@@ -35,6 +35,8 @@ INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}
 INCUS_RUNTIME_CONTAINER=${INCUS_RUNTIME_CONTAINER:-incus}
 INCUS_KUBE_NAMESPACE=${INCUS_KUBE_NAMESPACE:-openstack}
 INCUS_KUBE_NODE_MAP=${INCUS_KUBE_NODE_MAP:-}
+NOVA_INSTANCES_PATH_PODMAN=${NOVA_INSTANCES_PATH_PODMAN:-/opt/stack/data/nova/instances}
+NOVA_INSTANCES_PATH_KUBERNETES=${NOVA_INSTANCES_PATH_KUBERNETES:-/var/lib/nova/instances}
 KEEP_FAILED=${KEEP_FAILED:-0}
 WITH_DATA_VOLUME=${WITH_DATA_VOLUME:-0}
 BOOT_FROM_VOLUME=${BOOT_FROM_VOLUME:-0}
@@ -199,6 +201,40 @@ incus_runtime_remote() {
         *)
             echo "INCUS_RUNTIME_MODE must be podman or kubernetes" >&2
             return 2
+            ;;
+    esac
+}
+
+compute_runtime_remote() {
+    local host=$1 command_line namespace kube_node
+    shift
+    printf -v command_line '%q ' "$@"
+
+    case "$INCUS_RUNTIME_MODE" in
+        podman)
+            remote "$host" "$command_line"
+            ;;
+        kubernetes)
+            kube_node=$(kube_node_for_target "$host") || return 1
+            printf -v namespace '%q' "$INCUS_KUBE_NAMESPACE"
+            printf -v kube_node '%q' "$kube_node"
+            remote "$host" \
+                "set -e; pods=\$(kubectl -n $namespace get pod -l application=nova,component=compute-incus --field-selector \"spec.nodeName=$kube_node\" --no-headers -o custom-columns=NAME:.metadata.name); set -- \$pods; [ \$# -eq 1 ]; kubectl -n $namespace exec \"\$1\" -- $command_line"
+            ;;
+        *)
+            echo "INCUS_RUNTIME_MODE must be podman or kubernetes" >&2
+            return 2
+            ;;
+    esac
+}
+
+share_staging_root() {
+    case "$INCUS_RUNTIME_MODE" in
+        podman)
+            printf '%s\n' "$NOVA_INSTANCES_PATH_PODMAN/incus-shares"
+            ;;
+        kubernetes)
+            printf '%s\n' "$NOVA_INSTANCES_PATH_KUBERNETES/incus-shares"
             ;;
     esac
 }
@@ -897,7 +933,7 @@ if ((${#requested_manila_shares[@]} > 0)); then
     for index in "${!share_ids[@]}"; do
         share_id=${share_ids[index]}
         share_tag=${share_tags[index]}
-        share_mount="/opt/stack/data/nova/instances/incus-shares/$server_id/$share_id"
+        share_mount="$(share_staging_root)/$server_id/$share_id"
         share_mounts+=("$share_mount")
         until incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
                 grep -Fq "/mnt/manila/$share_tag" /proc/self/mountinfo; do
@@ -921,7 +957,8 @@ if ((${#requested_manila_shares[@]} > 0)); then
         done
         [[ "$(incus_remote "$SOURCE_SSH" exec "$instance_name" -- \
             cat "$manila_marker_path")" == "$manila_marker" ]]
-        remote "$SOURCE_SSH" findmnt -rn "$share_mount" >/dev/null
+        compute_runtime_remote "$SOURCE_SSH" \
+            findmnt -rn "$share_mount" >/dev/null
     done
 fi
 
@@ -1112,9 +1149,11 @@ inject_and_verify_restore_rollback() {
     for index in "${!share_ids[@]}"; do
         share_id=${share_ids[index]}
         share_mount=${share_mounts[index]}
-        remote "$current_ssh" findmnt -rn "$share_mount" >/dev/null
+        compute_runtime_remote "$current_ssh" \
+            findmnt -rn "$share_mount" >/dev/null
         assert_fails "target Manila staging mount must be absent after rollback" \
-            remote "$target_ssh" findmnt -rn "$share_mount" >/dev/null
+            compute_runtime_remote "$target_ssh" \
+            findmnt -rn "$share_mount" >/dev/null
     done
     assert_managed_root_owner "$current_ssh" "$target_ssh"
     verify_full_checkpoint_policy "$current_ssh"
@@ -1170,7 +1209,7 @@ wait_mount_absent() {
     local mounts
 
     while true; do
-        mounts=$(remote "$host" findmnt -rn -o TARGET)
+        mounts=$(compute_runtime_remote "$host" findmnt -rn -o TARGET)
         ! grep -Fqx -- "$mount_path" <<<"$mounts" && return 0
         ((SECONDS < deadline)) || {
             echo "Inactive host retained Manila mount $mount_path" >&2
@@ -1227,7 +1266,7 @@ verify_guest_persistent_state() {
         restored_manila_marker=$(incus_exec_read "$host" "$instance_name" \
             cat "$manila_marker_path")
         [[ "$restored_manila_marker" == "$manila_marker" ]]
-        remote "$host" findmnt -rn "$share_mount" >/dev/null
+        compute_runtime_remote "$host" findmnt -rn "$share_mount" >/dev/null
     done
 }
 
@@ -1517,7 +1556,8 @@ if ((${#share_ids[@]} > 0)); then
         wait_share_absent "$share_id"
         for host in "${test_sshs[@]}"; do
             assert_fails "Manila staging mount must be absent after detach" \
-                remote "$host" findmnt -rn "$share_mount" >/dev/null
+                compute_runtime_remote "$host" \
+                findmnt -rn "$share_mount" >/dev/null
         done
     done
 fi
