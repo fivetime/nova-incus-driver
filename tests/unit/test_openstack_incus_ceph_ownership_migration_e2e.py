@@ -156,6 +156,11 @@ class CephOwnershipMigrationE2EContractTest(unittest.TestCase):
         self.assertIn(
             'incus_runtime_remote "$host" sh -c "$command_line"', self.e2e)
         self.assertIn(
+            'rbd device list --format json | python3 -c', self.e2e)
+        self.assertNotIn(
+            'rbd device list --format json --id cinder | python3 -c',
+            self.e2e)
+        self.assertIn(
             'rbd_mapping_exists "$active_ssh" "$image_name"', self.e2e)
         self.assertNotIn(
             'remote "$active_ssh" \\\n'

@@ -327,7 +327,7 @@ for row in json.load(sys.stdin):
     if row.get("name") == image:
         print(row.get("device", ""))'
     printf -v command_line \
-        'rbd device list --format json --id cinder | python3 -c %q %q' \
+        'rbd device list --format json | python3 -c %q %q' \
         "$python_program" "$image_name"
     incus_runtime_remote "$host" sh -c "$command_line"
 }
