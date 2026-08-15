@@ -4320,6 +4320,14 @@ class IncusComputeManagerTest(test.NoDBTestCase):
         self.compute.driver._recover_source_release_volume_journal_locked.\
             assert_called_once_with(
                 mock.ANY, instance, volume_id, '/dev/vdb')
+        self.assertEqual(
+            2,
+            self.compute.driver.
+            _retire_disconnected_source_profile_device_locked.call_count)
+        self.compute.driver.\
+            _retire_disconnected_source_profile_device_locked.\
+            assert_called_with(
+                instance, volume_id, '/dev/vdb', source_info)
         self.assertEqual(2, delete_attempts[0])
         self.compute.driver.finalize_disconnected_volume_journal.\
             assert_called_once_with(instance, volume_id)

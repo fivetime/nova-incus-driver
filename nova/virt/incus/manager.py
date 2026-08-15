@@ -5554,6 +5554,8 @@ class IncusComputeManager(manager.ComputeManager):
                 raise exception.InvalidVolume(
                     reason='Migration source host disconnect did not reach '
                            'its durable terminal phase')
+            self.driver._retire_disconnected_source_profile_device_locked(
+                instance, volume_id, intent['mountpoint'], local_info)
 
         if source_attachment is not None:
             try:
