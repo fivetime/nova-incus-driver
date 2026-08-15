@@ -15926,6 +15926,60 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             self.CONF.incus.share_unmount_timeout)
 
     @mock.patch.object(driver, '_share_mount_table_index')
+    @mock.patch.object(driver.os.path, 'ismount', return_value=True)
+    @mock.patch.object(driver.incus_privsep, 'umount')
+    @mock.patch.object(driver.os, 'rmdir')
+    def test_umount_cephfs_uses_journal_when_access_to_is_unloaded(
+            self, rmdir, umount, ismount, mount_table):
+        self.CONF.incus.enable_manila_shares = True
+        instance = mock.Mock(
+            uuid='00000000-0000-0000-0000-000000000001',
+            name='instance-share')
+        instance.name = 'instance-share'
+        share = mock.Mock(
+            id=7,
+            share_id='10000000-0000-0000-0000-000000000001',
+            instance_uuid=instance.uuid,
+            tag='project-data',
+            export_location='mon1:6789:/volumes/project',
+            share_proto='CEPHFS',
+            access_to='nova-client')
+        owner_token = driver._share_mapping_owner_token(instance, share)
+        driver._write_share_journal(
+            instance, share, owner_token, 'mounted')
+        unloaded = mock.Mock(
+            id=share.id,
+            share_id=share.share_id,
+            instance_uuid=instance.uuid,
+            tag=share.tag,
+            export_location=share.export_location,
+            share_proto=share.share_proto)
+        unloaded.obj_attr_is_set.return_value = False
+        mount_path = driver._share_mount_path(instance, share)
+        mount_table.return_value = {
+            mount_path: {
+                'device': (
+                    'nova-client@00000000-0000-0000-0000-000000000001.'
+                    'cephfs=/volumes/project'),
+                'fstype': 'ceph',
+                'opts': frozenset(('rw', 'nosuid', 'nodev')),
+            },
+        }
+        profile = self.client.profiles.get.return_value
+        profile.devices = {
+            driver._share_device_name(share): {'type': 'disk'}}
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.client = self.client
+
+        self.assertFalse(
+            incus_driver.umount_share(None, instance, unloaded))
+
+        profile.save.assert_called_once_with(wait=True)
+        umount.assert_called_once_with(
+            mount_path, self.CONF.incus.share_unmount_timeout)
+        self.assertEqual([], driver._share_journal_records(instance))
+
+    @mock.patch.object(driver, '_share_mount_table_index')
     @mock.patch.object(driver.os.path, 'isdir', return_value=True)
     @mock.patch.object(driver.os.path, 'ismount', return_value=True)
     @mock.patch.object(driver.incus_privsep, 'umount')

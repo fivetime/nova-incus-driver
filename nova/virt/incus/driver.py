@@ -4274,7 +4274,7 @@ def _share_journal_payload(
     }
     if (share_mapping.share_proto ==
             obj_fields.ShareMappingProto.CEPHFS):
-        payload['access_to'] = share_mapping.access_to
+        payload['access_to'] = _loaded_share_access_to(share_mapping)
     return payload
 
 
@@ -4363,6 +4363,7 @@ def _validate_share_journal_payload(
             (isinstance(payload.get('access_to'), str) and
              bool(_CEPHFS_NAME_RE.fullmatch(payload['access_to']))))
     if share_mapping is not None:
+        expected_access_to = _loaded_share_access_to(share_mapping)
         valid = valid and (
             payload.get('share_proto') == share_mapping.share_proto and
             payload.get('export_location') ==
@@ -4371,7 +4372,8 @@ def _validate_share_journal_payload(
             (version == 1 or
              payload.get('share_proto') !=
              obj_fields.ShareMappingProto.CEPHFS or
-             payload.get('access_to') == share_mapping.access_to))
+             expected_access_to is None or
+             payload.get('access_to') == expected_access_to))
     if operation_token is not None:
         valid = valid and (
             payload.get('operation_token') == operation_token)
@@ -4381,6 +4383,23 @@ def _validate_share_journal_payload(
             server_id=instance.uuid,
             reason='host Manila staging journal ownership is invalid')
     return payload
+
+
+def _loaded_share_access_to(share_mapping):
+    """Return a loaded CephX client name without triggering OVO loading."""
+    attr_is_set = getattr(share_mapping, 'obj_attr_is_set', None)
+    if callable(attr_is_set):
+        try:
+            loaded = attr_is_set('access_to')
+        except Exception:
+            loaded = None
+        if loaded is False:
+            return None
+    try:
+        access_to = share_mapping.access_to
+    except Exception:
+        return None
+    return access_to if isinstance(access_to, str) else None
 
 
 def _read_share_journal(
@@ -14224,8 +14243,13 @@ class IncusDriver(driver.ComputeDriver):
             raise exception.ShareProtocolNotSupported(
                 share_proto=share_mapping.share_proto)
         owner_token = _share_mapping_owner_token(instance, share_mapping)
+        journal = _read_share_journal(
+            instance, share_mapping, operation_token=owner_token)
+        owned_mapping = (
+            _share_mapping_from_journal(instance, journal)
+            if journal is not None else share_mapping)
         _write_share_journal(
-            instance, share_mapping, owner_token, 'unmounting')
+            instance, owned_mapping, owner_token, 'unmounting')
         with lockutils.lock(_profile_lock_name(instance)):
             try:
                 profile = self.client.profiles.get(instance.name)
@@ -14255,7 +14279,7 @@ class IncusDriver(driver.ComputeDriver):
                             instance=instance)
 
         self._unstage_share_mount_locked(
-            instance, share_mapping, operation_token=owner_token,
+            instance, owned_mapping, operation_token=owner_token,
             mount_table=mount_table)
         return False
 
