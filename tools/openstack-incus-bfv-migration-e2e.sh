@@ -7,8 +7,13 @@ IMAGE=${IMAGE:?Set IMAGE to a raw rootfs-directory Glance image}
 FLAVOR=${FLAVOR:-m1.small}
 NETWORK=${NETWORK:-private}
 INCUS_PROJECT=${INCUS_PROJECT:-nova}
+INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}
+INCUS_RUNTIME_CONTAINER=${INCUS_RUNTIME_CONTAINER:-incus}
+INCUS_KUBE_NAMESPACE=${INCUS_KUBE_NAMESPACE:-openstack}
+INCUS_KUBE_NODE_MAP=${INCUS_KUBE_NODE_MAP:-}
 VOLUME_SIZE=${VOLUME_SIZE:-2}
 VOLUME_TYPE=${VOLUME_TYPE:-ceph}
+BFV_STORAGE_POOL=${BFV_STORAGE_POOL:-cinder-bfv}
 SOURCE_HOST=${SOURCE_HOST:-incus-node-01}
 DEST_HOST=${DEST_HOST:-incus-node-02}
 SOURCE_SSH=${SOURCE_SSH:-root@10.32.32.132}
@@ -46,6 +51,10 @@ command -v timeout >/dev/null || {
     echo "timeout command is required" >&2
     exit 2
 }
+if [[ "$INCUS_RUNTIME_MODE" == kubernetes && -z "$INCUS_KUBE_NODE_MAP" ]]; then
+    echo "INCUS_KUBE_NODE_MAP is required for Kubernetes runtime mode" >&2
+    exit 2
+fi
 SSH=(
     ssh
     -i "$SSH_IDENTITY"
@@ -74,6 +83,74 @@ remote() {
     fi
 }
 
+kube_node_for_target() {
+    local target=$1 entry
+    for entry in ${INCUS_KUBE_NODE_MAP//,/ }; do
+        if [[ "${entry%%=*}" == "$target" ]]; then
+            printf '%s\n' "${entry#*=}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+runtime_remote() {
+    local host=$1 selector=$2 command_line namespace kube_node
+    shift 2
+    printf -v command_line '%q ' "$@"
+
+    case "$INCUS_RUNTIME_MODE" in
+        podman)
+            remote "$host" \
+                "podman exec $(printf '%q' "$INCUS_RUNTIME_CONTAINER") $command_line"
+            ;;
+        kubernetes)
+            kube_node=$(kube_node_for_target "$host") || return 1
+            printf -v namespace '%q' "$INCUS_KUBE_NAMESPACE"
+            printf -v kube_node '%q' "$kube_node"
+            printf -v selector '%q' "$selector"
+            remote "$host" \
+                "set -e; pods=\$(kubectl -n $namespace get pod -l $selector --field-selector \"spec.nodeName=$kube_node\" --no-headers -o custom-columns=NAME:.metadata.name); set -- \$pods; [ \$# -eq 1 ]; kubectl -n $namespace exec \"\$1\" -- $command_line"
+            ;;
+        *)
+            echo "INCUS_RUNTIME_MODE must be podman or kubernetes" >&2
+            return 2
+            ;;
+    esac
+}
+
+incus_runtime_remote() {
+    local host=$1
+    shift
+    runtime_remote "$host" application=incus "$@"
+}
+
+compute_runtime_remote() {
+    local host=$1
+    shift
+    if [[ "$INCUS_RUNTIME_MODE" == podman ]]; then
+        remote "$host" "$@"
+    else
+        runtime_remote "$host" application=nova,component=compute-incus "$@"
+    fi
+}
+
+compute_runtime_root_remote() {
+    local host=$1 executable=$2 command_line namespace kube_node
+    shift 2
+    if [[ "$INCUS_RUNTIME_MODE" == podman ]]; then
+        remote "$host" "$executable" "$@"
+        return
+    fi
+
+    kube_node=$(kube_node_for_target "$host") || return 1
+    printf -v namespace '%q' "$INCUS_KUBE_NAMESPACE"
+    printf -v kube_node '%q' "$kube_node"
+    printf -v command_line '%q ' /bin/busybox "$executable" "$@"
+    remote "$host" \
+        "set -e; pod=\$(kubectl -n $namespace get pod -l application=nova,component=compute-incus --field-selector \"spec.nodeName=$kube_node\" --no-headers -o custom-columns=NAME:.metadata.name); set -- \$pod; [ \$# -eq 1 ]; cid=\$(kubectl -n $namespace get pod \"\$1\" -o jsonpath='{.status.containerStatuses[0].containerID}' | sed 's#^[^:]*://##'); pid=\$(crictl inspect \"\$cid\" | jq -er .info.pid); nsenter -t \"\$pid\" -m -r -- $command_line"
+}
+
 openstack() {
     local command_line
     printf -v command_line '%q ' "$@"
@@ -84,13 +161,10 @@ openstack() {
 incus() {
     local host=$1
     shift
-    local command_line
-    printf -v command_line '%q ' "$@"
     if [[ "${1:-}" == query ]]; then
-        remote "$host" "podman exec incus incus $command_line"
+        incus_runtime_remote "$host" incus "$@"
     else
-        remote "$host" \
-            "podman exec incus incus --project $(printf '%q' "$INCUS_PROJECT") $command_line"
+        incus_runtime_remote "$host" incus --project "$INCUS_PROJECT" "$@"
     fi
 }
 
@@ -118,7 +192,8 @@ wait_incus_ready() {
                 grep -q migration_shared_ceph_storage_ready_fence \
                     <<<"$server" &&
                 run_until_deadline "$deadline" \
-                    incus "$host" storage show cinder-bfv 2>/dev/null |
+                    incus "$host" storage show "$BFV_STORAGE_POOL" \
+                    2>/dev/null |
                     grep -q '^driver: cephext$'; then
             return 0
         fi
@@ -213,7 +288,8 @@ attachment_status() {
     local expected_volume=${1:-$volume_id}
     # Some openstackclient releases accept --volume-id but still return every
     # attachment. Filter explicitly so another server cannot change the value.
-    openstack volume attachment list -f value -c 'Volume ID' -c Status | \
+    openstack --os-volume-api-version 3.27 volume attachment list \
+        -f value -c 'Volume ID' -c Status | \
         awk -v id="$expected_volume" '$1 == id {print $2}'
 }
 
@@ -281,12 +357,13 @@ assert_owner() {
 cleanup() {
     local exit_status=$?
     if [[ -n "$post_claim_failpoint_path" ]]; then
-        remote "$DEST_SSH" umount "$post_claim_failpoint_path" \
+        compute_runtime_root_remote "$DEST_SSH" \
+            umount "$post_claim_failpoint_path" \
             >/dev/null 2>&1 || true
         post_claim_failpoint_path=
     fi
     if [[ -n "$start_failpoint_pid" ]]; then
-        remote "$DEST_SSH" kill "$start_failpoint_pid" >/dev/null 2>&1 || true
+        kill "$start_failpoint_pid" >/dev/null 2>&1 || true
         start_failpoint_pid=
     fi
     if [[ "$preflight_rule_installed" == true ]]; then
@@ -392,27 +469,29 @@ if [[ "$INJECT_POST_CLAIM_FAILURE" == true ]]; then
             post_claim_failpoint_path=/usr/bin/rbd
             ;;
         start)
-            vif_source=$(remote "$SOURCE_SSH" \
-                "podman exec incus incus query \
-                 '/1.0/profiles/$instance_name?project=nova' |
-                 jq -r '(.metadata.devices // .devices)[] |
-                   select(.type == \"nic\" and .nictype == \"physical\") |
-                   .parent'")
+            vif_source=$(incus "$SOURCE_SSH" query \
+                "/1.0/profiles/$instance_name?project=$INCUS_PROJECT" |
+                jq -r '(.metadata.devices // .devices)[] |
+                  select(.type == "nic" and .nictype == "physical") |
+                  .parent')
             [[ -n "$vif_source" ]] || fail "cannot determine Incus VIF source"
-            start_failpoint_pid=$(remote "$DEST_SSH" \
-                "nohup sh -c 'until podman exec incus incus list \
-                 \"$instance_name\" --project nova --format csv -c s \
-                 >/dev/null 2>&1; do sleep 0.02; done; \
-                 ip link show \"$vif_source\" >/dev/null 2>&1 || exit 1; \
-                 ip link delete \"$vif_source\"' \
-                 >/tmp/openstack-incus-start-failpoint.log 2>&1 & echo \$!")
+            (
+                until incus "$DEST_SSH" list "$instance_name" \
+                        --format csv -c s >/dev/null 2>&1; do
+                    sleep 0.02
+                done
+                remote "$DEST_SSH" ip link show "$vif_source" >/dev/null
+                remote "$DEST_SSH" ip link delete "$vif_source"
+            ) >/tmp/openstack-incus-start-failpoint.log 2>&1 &
+            start_failpoint_pid=$!
             ;;
         *)
             fail "unsupported POST_CLAIM_FAILPOINT: $POST_CLAIM_FAILPOINT"
             ;;
     esac
     if [[ -n "$post_claim_failpoint_path" ]]; then
-        remote "$DEST_SSH" mount --bind /bin/false \
+        compute_runtime_root_remote "$DEST_SSH" \
+            mount --bind /bin/false \
             "$post_claim_failpoint_path"
     fi
     openstack --os-compute-api-version 2.56 server migrate \
@@ -420,7 +499,8 @@ if [[ "$INJECT_POST_CLAIM_FAILURE" == true ]]; then
     wait_value finished latest_migration_status
     wait_value VERIFY_RESIZE server_status
     if [[ -n "$post_claim_failpoint_path" ]]; then
-        remote "$DEST_SSH" umount "$post_claim_failpoint_path"
+        compute_runtime_root_remote "$DEST_SSH" \
+            umount "$post_claim_failpoint_path"
         post_claim_failpoint_path=
     fi
     start_failpoint_pid=
@@ -489,11 +569,11 @@ if [[ -n "$data_volume_id" ]]; then
     incus "$DEST_SSH" profile unset "$instance_name" \
         "user.openstack.volume.$data_volume_id"
     data_device=$(remote "$DEST_SSH" \
-        "podman exec incus rbd device list --format json --id cinder | \
-         jq -r '.[] | select(.name == \"volume-$data_volume_id\") | .device'")
+        rbd device list --format json --id cinder |
+        jq -r ".[] | select(.name == \"volume-$data_volume_id\") | .device")
     [[ -n "$data_device" ]] || fail "data RBD mapping is missing before injection"
     remote "$DEST_SSH" \
-        "podman exec incus rbd device unmap '$data_device' --id cinder"
+        rbd device unmap "$data_device" --id cinder
 fi
 openstack server reboot --hard "$server_id"
 wait_value ACTIVE server_status
@@ -517,10 +597,12 @@ openstack --os-compute-api-version 2.56 server migrate \
 wait_value VERIFY_RESIZE server_status
 if [[ "$INJECT_REVERT_FAILURE" == true ]]; then
     post_claim_failpoint_path=/usr/bin/rbd
-    remote "$DEST_SSH" mount --bind /bin/false "$post_claim_failpoint_path"
+    compute_runtime_root_remote "$DEST_SSH" \
+        mount --bind /bin/false "$post_claim_failpoint_path"
     openstack server resize revert "$server_id"
     wait_value present recovery_marker_status
-    remote "$DEST_SSH" umount "$post_claim_failpoint_path"
+    compute_runtime_root_remote "$DEST_SSH" \
+        umount "$post_claim_failpoint_path"
     post_claim_failpoint_path=
     wait_value absent recovery_marker_status
 else

@@ -284,6 +284,11 @@ class PublicApiE2EContractTest(unittest.TestCase):
 
     def test_initial_volume_cleanup_audit_is_exact_and_fail_closed(self):
         self.assertIn('StrictHostKeyChecking=yes', self.cleanup_audit)
+        self.assertIn(
+            'INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}',
+            self.cleanup_audit)
+        self.assertIn('incus_runtime_remote()', self.cleanup_audit)
+        self.assertIn('application=incus', self.cleanup_audit)
         self.assertIn('incus-volume-journal/$server_uuid',
                       self.cleanup_audit)
         self.assertIn('profile list --format json', self.cleanup_audit)

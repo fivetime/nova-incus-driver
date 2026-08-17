@@ -365,13 +365,13 @@ class BfvCommandTimeoutContractTest(unittest.TestCase):
 
     def test_bfv_start_failpoint_reads_the_nova_project_profile(self):
         self.assertIn(
-            "'/1.0/profiles/$instance_name?project=nova'", self.e2e)
+            '"/1.0/profiles/$instance_name?project=$INCUS_PROJECT"',
+            self.e2e)
 
     def test_bfv_start_failpoint_waits_for_target_instance(self):
-        target_ready = 'until podman exec incus incus list \\'
-        target_instance = (
-            '\\"$instance_name\\" --project nova --format csv -c s')
-        delete_vif = 'ip link delete \\"$vif_source\\"'
+        target_ready = 'until incus "$DEST_SSH" list "$instance_name" \\'
+        target_instance = '--format csv -c s >/dev/null 2>&1; do'
+        delete_vif = 'ip link delete "$vif_source"'
 
         self.assertIn(target_ready, self.e2e)
         self.assertIn(target_instance, self.e2e)

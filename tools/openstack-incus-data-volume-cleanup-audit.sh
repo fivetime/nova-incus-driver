@@ -11,6 +11,10 @@ SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute audit key}
 SSH_KNOWN_HOSTS_FILE=${SSH_KNOWN_HOSTS_FILE:?Set SSH_KNOWN_HOSTS_FILE}
 NOVA_INSTANCES_PATH=${NOVA_INSTANCES_PATH:?Set the absolute Nova instances_path}
 INCUS_PROJECT=${INCUS_PROJECT:-nova}
+INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}
+INCUS_RUNTIME_CONTAINER=${INCUS_RUNTIME_CONTAINER:-incus}
+INCUS_KUBE_NAMESPACE=${INCUS_KUBE_NAMESPACE:-openstack}
+INCUS_KUBE_NODE_MAP=${INCUS_KUBE_NODE_MAP:-}
 
 [[ -r "$EVIDENCE_FILE" && -f "$EVIDENCE_FILE" ]] || {
     echo "Cleanup evidence is not a readable regular file: $EVIDENCE_FILE" >&2
@@ -28,6 +32,10 @@ INCUS_PROJECT=${INCUS_PROJECT:-nova}
     echo "NOVA_INSTANCES_PATH must be one absolute path" >&2
     exit 2
 }
+if [[ "$INCUS_RUNTIME_MODE" == kubernetes && -z "$INCUS_KUBE_NODE_MAP" ]]; then
+    echo "INCUS_KUBE_NODE_MAP is required for Kubernetes runtime mode" >&2
+    exit 2
+fi
 
 mapfile -t evidence < <(python3 - "$EVIDENCE_FILE" <<'PY'
 import json
@@ -75,6 +83,40 @@ remote() {
     "${SSH[@]}" "$target" "$@"
 }
 
+kube_node_for_target() {
+    local target=$1 entry
+    for entry in ${INCUS_KUBE_NODE_MAP//,/ }; do
+        if [[ "${entry%%=*}" == "$target" ]]; then
+            printf '%s\n' "${entry#*=}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+incus_runtime_remote() {
+    local target=$1 command_line namespace kube_node
+    shift
+    printf -v command_line '%q ' "$@"
+    case "$INCUS_RUNTIME_MODE" in
+        podman)
+            remote "$target" \
+                "podman exec $(printf '%q' "$INCUS_RUNTIME_CONTAINER") $command_line"
+            ;;
+        kubernetes)
+            kube_node=$(kube_node_for_target "$target") || return 1
+            printf -v namespace '%q' "$INCUS_KUBE_NAMESPACE"
+            printf -v kube_node '%q' "$kube_node"
+            remote "$target" \
+                "set -e; pods=\$(kubectl -n $namespace get pod -l application=incus --field-selector \"spec.nodeName=$kube_node\" --no-headers -o custom-columns=NAME:.metadata.name); set -- \$pods; [ \$# -eq 1 ]; kubectl -n $namespace exec \"\$1\" -- $command_line"
+            ;;
+        *)
+            echo "INCUS_RUNTIME_MODE must be podman or kubernetes" >&2
+            return 2
+            ;;
+    esac
+}
+
 IFS=, read -r -a nodes <<<"$COMPUTE_NODES"
 ((${#nodes[@]} > 0)) || {
     echo "COMPUTE_NODES contains no entries" >&2
@@ -89,12 +131,12 @@ for entry in "${nodes[@]}"; do
     host=${entry%%=*}
     target=${entry#*=}
 
-    instance_json=$(remote "$target" podman exec incus incus \
+    instance_json=$(incus_runtime_remote "$target" incus \
         --project "$INCUS_PROJECT" list --format json) || {
         echo "$host could not query the Incus instance inventory" >&2
         exit 1
     }
-    profile_json=$(remote "$target" podman exec incus incus \
+    profile_json=$(incus_runtime_remote "$target" incus \
         --project "$INCUS_PROJECT" profile list --format json) || {
         echo "$host could not query the Incus profile inventory" >&2
         exit 1

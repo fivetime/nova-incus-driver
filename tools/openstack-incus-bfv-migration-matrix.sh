@@ -11,6 +11,11 @@ SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute test key}
 SSH_KNOWN_HOSTS_FILE=${SSH_KNOWN_HOSTS_FILE:-$HOME/.ssh/known_hosts}
 CONTROLLER_SSH=${CONTROLLER_SSH:?Set CONTROLLER_SSH}
 CONTROLLER_OPENRC=${CONTROLLER_OPENRC:-/opt/stack/devstack/openrc admin admin}
+INCUS_PROJECT=${INCUS_PROJECT:-nova}
+INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}
+INCUS_RUNTIME_CONTAINER=${INCUS_RUNTIME_CONTAINER:-incus}
+INCUS_KUBE_NAMESPACE=${INCUS_KUBE_NAMESPACE:-openstack}
+INCUS_KUBE_NODE_MAP=${INCUS_KUBE_NODE_MAP:-}
 RUN_FLEET_PREFLIGHT=${RUN_FLEET_PREFLIGHT:-true}
 NAME_PREFIX=${NAME_PREFIX:-incus-bfv-release}
 CASES=${CASES:-normal,post-claim-data,post-claim-start,stopped-post-claim-data,reverse-revert}
@@ -54,6 +59,10 @@ done
     echo "BFV migration matrix requires at least two computes" >&2
     exit 2
 }
+if [[ "$INCUS_RUNTIME_MODE" == kubernetes && -z "$INCUS_KUBE_NODE_MAP" ]]; then
+    echo "INCUS_KUBE_NODE_MAP is required for Kubernetes runtime mode" >&2
+    exit 2
+fi
 
 remote() {
     if [[ -n "${ACTIVE_COMMAND_TIMEOUT:-}" ]]; then
@@ -62,6 +71,40 @@ remote() {
     else
         "${SSH[@]}" "$@"
     fi
+}
+
+kube_node_for_target() {
+    local target=$1 entry
+    for entry in ${INCUS_KUBE_NODE_MAP//,/ }; do
+        if [[ "${entry%%=*}" == "$target" ]]; then
+            printf '%s\n' "${entry#*=}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+incus_runtime_remote() {
+    local host=$1 command_line namespace kube_node
+    shift
+    printf -v command_line '%q ' "$@"
+    case "$INCUS_RUNTIME_MODE" in
+        podman)
+            remote "$host" \
+                "podman exec $(printf '%q' "$INCUS_RUNTIME_CONTAINER") $command_line"
+            ;;
+        kubernetes)
+            kube_node=$(kube_node_for_target "$host") || return 1
+            printf -v namespace '%q' "$INCUS_KUBE_NAMESPACE"
+            printf -v kube_node '%q' "$kube_node"
+            remote "$host" \
+                "set -e; pods=\$(kubectl -n $namespace get pod -l application=incus --field-selector \"spec.nodeName=$kube_node\" --no-headers -o custom-columns=NAME:.metadata.name); set -- \$pods; [ \$# -eq 1 ]; kubectl -n $namespace exec \"\$1\" -- $command_line"
+            ;;
+        *)
+            echo "INCUS_RUNTIME_MODE must be podman or kubernetes" >&2
+            return 2
+            ;;
+    esac
 }
 
 # Keep residual-state polling bounded when a compute or control-plane endpoint
@@ -94,13 +137,15 @@ snapshot_resources() {
 
 snapshot_node() {
     local ssh_host=$1
+    incus_runtime_remote "$ssh_host" incus --project "$INCUS_PROJECT" \
+        list --format csv -c n
+    echo --
+    incus_runtime_remote "$ssh_host" incus --project "$INCUS_PROJECT" \
+        profile list --format csv -c n
+    echo --
     remote "$ssh_host" \
-        "{ podman exec incus incus --project nova list --format csv -c n;
-           echo --;
-           podman exec incus incus --project nova profile list --format csv -c n;
-           echo --;
-           rbd device list --format json --id cinder 2>/dev/null |
-             jq -S '[.[] | {id, pool, namespace, name, device}]'; }"
+        "rbd device list --format json --id cinder 2>/dev/null |
+         jq -S '[.[] | {id, pool, namespace, name, device}]'"
 }
 
 run_case() {
