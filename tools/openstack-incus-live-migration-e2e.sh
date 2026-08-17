@@ -243,6 +243,16 @@ clear_restore_failpoint() {
     local host=$1
     local detach_rc
     local _
+
+    if ! incus_runtime_remote "$host" sh -c \
+            "grep -q ' /usr/local/sbin/criu ' /proc/self/mountinfo" \
+            >/dev/null 2>&1; then
+        incus_runtime_remote "$host" rm -f \
+            /run/openstack-incus-e2e-criu-failpoint \
+            >/dev/null 2>&1 || true
+        return 0
+    fi
+
     for _ in {1..10}; do
         if incus_runtime_remote "$host" \
                 umount /usr/local/sbin/criu \
@@ -263,6 +273,11 @@ clear_restore_failpoint() {
         detach_rc=0
     else
         detach_rc=$?
+    fi
+    if ! incus_runtime_remote "$host" sh -c \
+            "grep -q ' /usr/local/sbin/criu ' /proc/self/mountinfo" \
+            >/dev/null 2>&1; then
+        detach_rc=0
     fi
     incus_runtime_remote "$host" rm -f \
         /run/openstack-incus-e2e-criu-failpoint \
