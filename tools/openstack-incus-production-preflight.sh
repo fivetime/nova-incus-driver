@@ -21,6 +21,7 @@ INCUS_RUNTIME_ROOT=${INCUS_RUNTIME_ROOT:-/run/incus-podman}
 INCUS_LXCFS_ROOT=${INCUS_LXCFS_ROOT:-/var/lib/lxcfs}
 NOVA_SERVICE=${NOVA_SERVICE:-devstack@n-cpu.service}
 NOVA_CONFIG=${NOVA_CONFIG:-/etc/nova/nova-cpu.conf}
+MIN_REIMAGE_TIMEOUT_PER_GB=${MIN_REIMAGE_TIMEOUT_PER_GB:-60}
 INCUS_SHARE_MOUNT_ROOT=${INCUS_SHARE_MOUNT_ROOT:-/opt/stack/data/nova/instances/incus-shares}
 PREFLIGHT_PROJECT=${PREFLIGHT_PROJECT:-nova-preflight}
 MIN_FREE_PERCENT=${MIN_FREE_PERCENT:-20}
@@ -598,6 +599,17 @@ check_equal "preflight protocol" 1 \
 compute_driver=$(crudini --get "$NOVA_CONFIG" DEFAULT compute_driver \
     2>/dev/null)
 check_equal "Nova compute driver" incus.IncusDriver "$compute_driver"
+reimage_timeout_per_gb=$(crudini --get "$NOVA_CONFIG" DEFAULT \
+    reimage_timeout_per_gb 2>/dev/null || true)
+if [[ "$MIN_REIMAGE_TIMEOUT_PER_GB" =~ ^[0-9]+$ && \
+      "$reimage_timeout_per_gb" =~ ^[0-9]+$ ]] && \
+        (( reimage_timeout_per_gb >= MIN_REIMAGE_TIMEOUT_PER_GB )); then
+    pass "Nova BFV reimage event timeout" \
+        "${reimage_timeout_per_gb}s/GiB"
+else
+    fail "Nova BFV reimage event timeout" \
+        "reimage_timeout_per_gb must be at least ${MIN_REIMAGE_TIMEOUT_PER_GB}s, actual=${reimage_timeout_per_gb:-missing}"
+fi
 nova_state_path=$(crudini --get "$NOVA_CONFIG" DEFAULT state_path \
     2>/dev/null || true)
 compute_id_path=${nova_state_path%/}/compute_id

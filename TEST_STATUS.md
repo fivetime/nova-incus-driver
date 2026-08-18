@@ -2432,3 +2432,72 @@ This is representative production smoke evidence only. The 8-combination
 live matrix, 18-combination capacity matrix, maximum-mount restore-failure
 case, BFV cold matrix, Cinder lifecycle matrix, Manila lifecycle matrix, and
 host-loss evacuation matrix were **not** rerun by this entry.
+
+## 2026-08-18 production lifecycle and migration matrix rerun
+
+This entry supersedes the release-evidence limitation in the 2026-08-14
+smoke entry. It does not rewrite that earlier result: the larger matrices were
+run only after the production fixes and rollouts described here.
+
+**Frozen production inputs.** Nova Helm revision 75 and Incus Helm revision 16
+were deployed on both container computes. The two ``nova-compute-incus`` pods
+used image ID
+``ghcr.io/fivetime/openstackhelm/nova-incus@sha256:0a8f4f803dfdc1cfe40c7fb83ef85d0092a5e91c6455aa19c84cee3a9d11508c``;
+the two ``incusd`` pods used
+``ghcr.io/fivetime/incus@sha256:d61acad06073232f668a870f125c647afce04380b49deb33e39a51e13de9460d``.
+Nova revision 75 raised ``[DEFAULT] reimage_timeout_per_gb`` to 120 seconds
+after proving that the former 20-second default timed out before Cinder's
+successful BFV reimage completion event. The production preflight now rejects
+a value below the configured safety floor.
+
+**Live migration matrices.** The 2 x 3 x 3 cardinality matrix covered local
+and BFV roots, 0/1/3 Cinder data volumes, and 0/1/3 Manila shares. All 18
+combinations completed the ordered three-hop ring
+``container1 -> container2 -> container1 -> container2``: 54/54 live
+migrations passed. Every case checked the unchanged guest PID, advancing
+counter, root/data/share markers, exact Cinder attachment identity, OVN
+destination ownership, source absence, and post-delete journal/profile/mount
+cleanup. The maximum BFV case with three data volumes and three shares also
+passed a target CRIU restore-failure injection: the source resumed with its
+original PID and data, target resources were removed, and the immediate
+three-hop retry passed. The post-reboot matrix log on ``control1`` is
+``/tmp/live-cardinality-post-reboot.log`` (709 lines, SHA-256
+``8dd9f7065a8f11cfd6f7ecaa11a5ca566017abed986986f5a2582c836626cdd7``)
+and returned zero with its final residual-state audit green.
+
+**Host restart coverage.** With the cloud quiescent, ``container1`` and then
+``container2`` were physically rebooted one at a time. Their boot times and
+boot IDs were respectively ``2026-08-17 20:08:18`` /
+``1a6d1c3d-28c9-47bd-90a0-0ef0c8e35a40`` and
+``2026-08-17 20:15:07`` /
+``2413a485-eafd-4e6c-af46-702ff2b33cf7``. Kubernetes, Incus, LXCFS, OVS/OVN,
+and Nova compute returned healthy before the next node was touched. The full
+18-combination/54-migration matrix above was then rerun after both reboots.
+
+**Cold, storage, and lifecycle coverage.** The BFV cold-migration matrix ran
+normal confirm and revert, post-claim data-volume failure, target container
+start failure, SHUTOFF failure, and reverse-revert failure in both ordered
+node directions. The initial data-volume matrix covered local/BFV roots with
+one/two volumes through create, format, marker write, hard reboot, and delete.
+Manila covered destination pre-mount rejection, retry, compute restart
+reattach, snapshot, create-from-snapshot, and marker recovery. Cinder covered
+attach/detach, online extend, snapshot/clone, full plus incremental
+backup/restore, and cold-migration attachment rotation. BFV lifecycle covered
+pause/unpause, hard reboot, shelve-offload/unshelve, ACTIVE and SHUTOFF
+explicit reimage, exact-delete ABA protection, and deletion protection. The
+ID-map overlap rejection and leak recovery gates also passed.
+
+**Final cleanup and remaining gate.** Nova reported no instances or active
+migrations, and both host-local Incus inventories were empty. One detached
+test data volume (``121a0324-437d-4074-a3a2-b4ea024b0a4c``) was verified by
+exact name, ``available`` state, and zero attachments before deletion. The
+Glance/Cinder read-only image cache volume was deliberately retained. Both
+Incus compute services remained ``enabled/up``.
+
+A destructive failed-host BFV evacuation was not run. This site currently has
+no independent IPMI/Redfish/PDU fence provider, and
+``[incus] allow_bfv_evacuate`` correctly remains false. An SSH shutdown, pod
+deletion, or Nova service-down flag is not STONITH and must not be recorded as
+evacuation evidence. Production BFV evacuation remains NO-GO until an
+external fence proves the source cannot access Ceph and the returning-host
+audit/admission sequence is exercised.

@@ -51,6 +51,9 @@ class BFVDeleteProtectionE2EContractTest(unittest.TestCase):
         self.assertIn('Nova/Incus deletion removed the Cinder-owned BFV root',
                       self.script)
         self.assertIn('rbd_image_exists ||', self.script)
+        self.assertIn(
+            'openstack --os-volume-api-version 3.27 volume attachment list',
+            self.script)
 
     def test_deletes_the_rbd_only_after_explicit_cinder_delete(self):
         main_flow = self.script.index(
@@ -74,6 +77,16 @@ class BFVDeleteProtectionE2EContractTest(unittest.TestCase):
         self.assertIn('COMPUTE_SSH=${COMPUTE_SSH:?', self.script)
         self.assertIn('for index in "${!compute_hosts[@]}"', self.script)
         self.assertIn('StrictHostKeyChecking=yes', self.script)
+
+    def test_supports_kubernetes_incus_runtime_from_control_plane(self):
+        self.assertIn(
+            'INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}', self.script)
+        self.assertIn(
+            'INCUS_KUBE_NODE_MAP=${INCUS_KUBE_NODE_MAP:-}', self.script)
+        self.assertIn('application=incus', self.script)
+        self.assertIn('remote "$KUBE_CONTROL_SSH" "$kube_command"',
+                      self.script)
+        self.assertIn('bash -c "$kube_command"', self.script)
 
 
 if __name__ == '__main__':

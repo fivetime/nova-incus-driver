@@ -9,7 +9,8 @@
 #           INCUS_KUBE_NODE_MAP='ssh-target=kubernetes-node,...'
 #
 # The guest image must provide cloud-init, blkid, mkfs.ext4, fuse2fs, a
-# fusermount helper, and either systemd or OpenRC local services. Nova console
+# FUSE unmount helper (fusermount or umount), and either systemd or OpenRC
+# local services. Nova console
 # output must be enabled. The test never mounts tenant ext4 with the host
 # kernel.
 
@@ -355,8 +356,13 @@ unmount_fuse() {
         fusermount3 -u "\$mountpoint"
     elif command -v fusermount >/dev/null 2>&1; then
         fusermount -u "\$mountpoint"
+    elif command -v umount >/dev/null 2>&1; then
+        # Incus gives the guest mount namespace enough authority to unmount
+        # its own FUSE filesystem even when the minimal image omits the
+        # fusermount packages.
+        umount "\$mountpoint"
     else
-        emit "OPENSTACK_INCUS_DATA_ERROR:no-fusermount"
+        emit "OPENSTACK_INCUS_DATA_ERROR:no-fuse-unmount-helper"
         return 1
     fi
 }

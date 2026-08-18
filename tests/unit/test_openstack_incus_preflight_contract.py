@@ -429,6 +429,17 @@ class FullCheckpointMigrationContractTest(unittest.TestCase):
             '"/1.0/projects/$incus_project_query"', self.host)
         self.assertIn('$value | @uri', self.host)
 
+    def test_host_requires_bounded_bfv_reimage_event_timeout(self):
+        self.assertIn(
+            'MIN_REIMAGE_TIMEOUT_PER_GB=${MIN_REIMAGE_TIMEOUT_PER_GB:-60}',
+            self.host)
+        self.assertIn(
+            'crudini --get "$NOVA_CONFIG" DEFAULT \\\n'
+            '    reimage_timeout_per_gb', self.host)
+        self.assertIn(
+            'reimage_timeout_per_gb >= MIN_REIMAGE_TIMEOUT_PER_GB',
+            self.host)
+
     def test_host_requires_profile_local_and_expanded_false(self):
         compact = ' '.join(self.host.split())
         self.assertIn(

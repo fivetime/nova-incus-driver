@@ -1,107 +1,161 @@
 #!/usr/bin/env bash
-# Manila destination pre-mount gating and host-reboot startup recovery.
+# Manila destination pre-mount gating and nova-compute restart recovery.
 #
-# Three cases, all through the public API with a share this script owns:
-#
-#   gate     Destination NFS is unreachable, so pre_live_migration cannot
-#            stage the share. The migration must fail as if nothing had
-#            happened: source instance ACTIVE on its original host with an
-#            unchanged process, and no mount or instance residue on the
-#            destination.
-#   retry    With the block removed the same migration succeeds and the
-#            share content survives.
-#   recovery A host reboot loses both the guest process and the host NFS
-#            mount. Nova's _resume_guests_state -> _mount_all_shares path
-#            must re-establish the mount and resume the guest with working
-#            share access. (The Incus share-journal recovery loop is a
-#            different mechanism: it cleans journal-only mounts left by a
-#            terminal migration, it never remounts for a live instance.)
-#
-# Required: RUN_DESTRUCTIVE=true SSH_IDENTITY=... IMAGE=... FLAVOR=...
-#           NETWORK=... SOURCE_HOST=... DEST_HOST=... DEST_SSH=...
-#           CONTROLLER_IP=<address the destination reaches Manila on>
+# The script owns the Nova server and share mapping, but consumes an existing
+# available Manila share. It supports both Podman and Kubernetes Incus
+# runtimes. In Kubernetes mode the mount failure is injected only into the
+# destination nova-compute Pod mount namespace.
 
-set -Eo pipefail
-# The openrc path carries its cloud arguments, so it must word-split; it
-# also reads unset variables, which -u would turn into a silent exit.
-CONTROLLER_OPENRC=${CONTROLLER_OPENRC:-/opt/stack/devstack/openrc admin admin}
-set +u
-# shellcheck disable=SC2086
-source $CONTROLLER_OPENRC >/dev/null 2>&1
-set -u
+set -Eeuo pipefail
 
 RUN_DESTRUCTIVE=${RUN_DESTRUCTIVE:-false}
-IMAGE=${IMAGE:-alpine-3.21-cloud-incus-criu-fuse}
-FLAVOR=${FLAVOR:-m1.tiny}
-NETWORK=${NETWORK:-public}
-SOURCE_HOST=${SOURCE_HOST:-incus-node-01}
-DEST_HOST=${DEST_HOST:-incus-node-02}
-DEST_SSH=${DEST_SSH:-root@10.32.32.131}
-CONTROLLER_IP=${CONTROLLER_IP:-10.32.32.130}
+IMAGE=${IMAGE:?Set IMAGE to an Incus guest image}
+FLAVOR=${FLAVOR:?Set FLAVOR}
+NETWORK=${NETWORK:?Set NETWORK}
+SHARE=${SHARE:?Set SHARE to an available Manila share}
+SHARE_ROOT_MODE=${SHARE_ROOT_MODE:-}
+SOURCE_HOST=${SOURCE_HOST:?Set SOURCE_HOST to the Nova source hostname}
+DEST_HOST=${DEST_HOST:?Set DEST_HOST to the Nova destination hostname}
+SOURCE_SSH=${SOURCE_SSH:?Set SOURCE_SSH to the source compute SSH target}
+DEST_SSH=${DEST_SSH:?Set DEST_SSH to the destination compute SSH target}
 SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute test key}
-SHARE_TYPE=${SHARE_TYPE:-incus-nfs}
-SHARE_PROTO=${SHARE_PROTO:-NFS}
-SHARE_SIZE=${SHARE_SIZE:-1}
-CLIENT_CIDR=${CLIENT_CIDR:-10.32.32.128/27}
+SSH_KNOWN_HOSTS_FILE=${SSH_KNOWN_HOSTS_FILE:-$HOME/.ssh/known_hosts}
+INCUS_PROJECT=${INCUS_PROJECT:-nova}
+INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}
+INCUS_RUNTIME_CONTAINER=${INCUS_RUNTIME_CONTAINER:-incus}
+INCUS_KUBE_NAMESPACE=${INCUS_KUBE_NAMESPACE:-openstack}
+INCUS_KUBE_NODE_MAP=${INCUS_KUBE_NODE_MAP:-}
+NOVA_INSTANCES_PATH_PODMAN=${NOVA_INSTANCES_PATH_PODMAN:-/opt/stack/data/nova/instances}
+NOVA_INSTANCES_PATH_KUBERNETES=${NOVA_INSTANCES_PATH_KUBERNETES:-/var/lib/nova-incus/instances}
 TAG=${TAG:-tenant-data}
 NAME=${NAME:-incus-manila-gate-$RANDOM}
-TIMEOUT=${TIMEOUT:-420}
+TIMEOUT=${TIMEOUT:-600}
 CASES=${CASES:-gate,retry,recovery}
+KEEP_FAILED=${KEEP_FAILED:-false}
 
 [[ "$RUN_DESTRUCTIVE" == true ]] || {
     echo "Set RUN_DESTRUCTIVE=true to run this destructive case" >&2
     exit 2
 }
+[[ -r "$SSH_IDENTITY" && -r "$SSH_KNOWN_HOSTS_FILE" ]] || {
+    echo "SSH identity and known_hosts must be readable" >&2
+    exit 2
+}
+if [[ "$INCUS_RUNTIME_MODE" == kubernetes && -z "$INCUS_KUBE_NODE_MAP" ]]; then
+    echo "Set INCUS_KUBE_NODE_MAP for Kubernetes mode" >&2
+    exit 2
+fi
+if [[ -n "$SHARE_ROOT_MODE" && ! "$SHARE_ROOT_MODE" =~ ^0?[0-7]{3}$ ]]; then
+    echo "SHARE_ROOT_MODE must be an octal mode such as 0777" >&2
+    exit 2
+fi
 
-SSH=(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -i "$SSH_IDENTITY")
+SSH=(ssh -n -i "$SSH_IDENTITY" -o BatchMode=yes
+    -o StrictHostKeyChecking=yes
+    -o "UserKnownHostsFile=$SSH_KNOWN_HOSTS_FILE")
 server_id=
+instance_name=
 share_id=
-blocked=0
+shares_url=
+token=
+mount_failpoint=0
+marker_path=
 
 fail() { echo "FAIL $1" >&2; exit 1; }
-
 case_selected() { [[ ",$CASES," == *",$1,"* ]]; }
+remote() { local host=$1; shift; "${SSH[@]}" "$host" "$@"; }
 
-dest() { "${SSH[@]}" "$DEST_SSH" "$@"; }
-
-dest_incus() {
-    # --project must precede the subcommand: appending it would land after
-    # the "--" separator of exec and be handed to the guest command.
-    dest "podman exec incus incus --project nova $*"
+kube_node_for_target() {
+    local target=$1 entry
+    for entry in ${INCUS_KUBE_NODE_MAP//,/ }; do
+        if [[ "${entry%%=*}" == "$target" ]]; then
+            printf '%s\n' "${entry#*=}"
+            return 0
+        fi
+    done
+    return 1
 }
 
-unblock_nfs() {
-    ((blocked)) || return 0
-    dest "iptables -D OUTPUT -p tcp -d $CONTROLLER_IP --dport 2049 -j REJECT" \
-        >/dev/null 2>&1
-    blocked=0
+runtime_remote() {
+    local kind=$1 host=$2 command_line node label
+    shift 2
+    printf -v command_line '%q ' "$@"
+    case "$INCUS_RUNTIME_MODE:$kind" in
+        podman:incus)
+            remote "$host" \
+                "podman exec $(printf '%q' "$INCUS_RUNTIME_CONTAINER") $command_line"
+            ;;
+        podman:compute)
+            remote "$host" "$command_line"
+            ;;
+        kubernetes:incus|kubernetes:compute)
+            node=$(kube_node_for_target "$host") || return 1
+            if [[ "$kind" == incus ]]; then
+                label='application=incus'
+            else
+                label='application=nova,component=compute-incus'
+            fi
+            remote "$host" "set -e; pods=\$(kubectl -n $(printf '%q' "$INCUS_KUBE_NAMESPACE") get pod -l $(printf '%q' "$label") --field-selector spec.nodeName=$(printf '%q' "$node") --no-headers -o custom-columns=NAME:.metadata.name); set -- \$pods; [ \$# -eq 1 ]; kubectl -n $(printf '%q' "$INCUS_KUBE_NAMESPACE") exec \"\$1\" -- $command_line"
+            ;;
+        *)
+            echo "Unsupported runtime mode/kind: $INCUS_RUNTIME_MODE/$kind" >&2
+            return 2
+            ;;
+    esac
 }
 
-cleanup() {
-    local status=$?
-    set +e
-    unblock_nfs
-    if [[ -n "$server_id" ]]; then
-        openstack server stop "$server_id" >/dev/null 2>&1
-        wait_status SHUTOFF >/dev/null 2>&1
-        [[ -n "$share_id" ]] &&
-            api DELETE "$shares_url/$share_id" >/dev/null 2>&1
-        openstack server delete --wait "$server_id" >/dev/null 2>&1
+incus_remote() { local host=$1; shift; runtime_remote incus "$host" "$@"; }
+compute_remote() { local host=$1; shift; runtime_remote compute "$host" "$@"; }
+
+compute_mount_namespace_remote() {
+    local host=$1 command_line
+    shift
+    printf -v command_line '%q ' "$@"
+    if [[ "$INCUS_RUNTIME_MODE" == kubernetes ]]; then
+        remote "$host" \
+            "set -e; id=\$(crictl ps --name nova-compute -q); set -- \$id; [ \$# -eq 1 ]; pid=\$(crictl inspect \"\$1\" | jq -er .info.pid); nsenter --target \"\$pid\" --mount --pid -- $command_line"
+    else
+        remote "$host" "$command_line"
     fi
-    [[ -n "$share_id" ]] &&
-        openstack share delete "$share_id" >/dev/null 2>&1
-    exit "$status"
+}
+
+share_staging_root() {
+    if [[ "$INCUS_RUNTIME_MODE" == kubernetes ]]; then
+        printf '%s/incus-shares\n' "$NOVA_INSTANCES_PATH_KUBERNETES"
+    else
+        printf '%s/incus-shares\n' "$NOVA_INSTANCES_PATH_PODMAN"
+    fi
+}
+
+api() {
+    local method=$1 url=$2 data=${3:-}
+    local args=(-fsS -X "$method" -H "X-Auth-Token: $token"
+        -H "OpenStack-API-Version: compute 2.97")
+    [[ -n "$data" ]] && args+=(-H 'Content-Type: application/json' -d "$data")
+    curl "${args[@]}" "$url"
 }
 
 wait_status() {
-    local expected=$1 deadline=$((SECONDS + TIMEOUT)) current=
+    local expected=$1 current= deadline=$((SECONDS + TIMEOUT))
     while ((SECONDS < deadline)); do
-        current=$(openstack server show "$server_id" -f value -c status \
-            2>/dev/null)
+        current=$(openstack server show "$server_id" -f value -c status 2>/dev/null || true)
         [[ "$current" == "$expected" ]] && return 0
         sleep 3
     done
-    echo "Server did not reach $expected (current: ${current:-missing})" >&2
+    echo "Server did not reach $expected (current=${current:-missing})" >&2
+    return 1
+}
+
+wait_mapping() {
+    local expected=$1 body= deadline=$((SECONDS + TIMEOUT))
+    while ((SECONDS < deadline)); do
+        body=$(api GET "$shares_url")
+        if python3 -c 'import json,sys; d=json.load(sys.stdin); sid,expected=sys.argv[1:]; raise SystemExit(0 if any(x["share_id"] == sid and x["status"] == expected for x in d["shares"]) else 1)' "$share_id" "$expected" <<<"$body"; then
+            return 0
+        fi
+        sleep 3
+    done
+    echo "Share mapping did not reach $expected: $body" >&2
     return 1
 }
 
@@ -111,46 +165,72 @@ server_host() {
 }
 
 guest_pid() {
-    dest_incus "info $instance_name" 2>/dev/null | grep -oP 'PID: \K[0-9]+'
+    local host=$1
+    incus_remote "$host" incus --project "$INCUS_PROJECT" info "$instance_name" |
+        sed -n 's/^PID: //p'
 }
 
-source_pid() {
-    "${SSH[@]}" "$SOURCE_SSH" \
-        "podman exec incus incus --project nova info $instance_name" |
-        grep -oP 'PID: \K[0-9]+'
+clear_mount_failpoint() {
+    ((mount_failpoint)) || return 0
+    compute_mount_namespace_remote "$DEST_SSH" sh -c \
+        'umount -l /sbin/mount.ceph 2>/dev/null || true'
+    mount_failpoint=0
 }
 
-api() {
-    local method=$1 url=$2 data=${3:-}
-    local args=(-fsS -X "$method" -H "X-Auth-Token: $token"
-        -H "OpenStack-API-Version: compute 2.97")
-    [[ -n "$data" ]] && args+=(-H "Content-Type: application/json" -d "$data")
-    curl "${args[@]}" "$url"
+restart_compute_pod() {
+    local node old_pod= new_pod= deadline
+    [[ "$INCUS_RUNTIME_MODE" == kubernetes ]] || {
+        remote "$DEST_SSH" systemctl restart nova-compute
+        return
+    }
+    node=$(kube_node_for_target "$DEST_SSH") || return 1
+    old_pod=$(remote "$DEST_SSH" "kubectl -n $(printf '%q' "$INCUS_KUBE_NAMESPACE") get pod -l application=nova,component=compute-incus --field-selector spec.nodeName=$(printf '%q' "$node") --no-headers -o custom-columns=NAME:.metadata.name")
+    [[ -n "$old_pod" && "$old_pod" != *$'\n'* ]] || return 1
+    remote "$DEST_SSH" "kubectl -n $(printf '%q' "$INCUS_KUBE_NAMESPACE") delete pod $(printf '%q' "$old_pod") --wait=false"
+    deadline=$((SECONDS + TIMEOUT))
+    while ((SECONDS < deadline)); do
+        new_pod=$(remote "$DEST_SSH" "kubectl -n $(printf '%q' "$INCUS_KUBE_NAMESPACE") get pod -l application=nova,component=compute-incus --field-selector spec.nodeName=$(printf '%q' "$node") --no-headers -o custom-columns=NAME:.metadata.name 2>/dev/null" || true)
+        if [[ -n "$new_pod" && "$new_pod" != "$old_pod" ]] && \
+                remote "$DEST_SSH" "kubectl -n $(printf '%q' "$INCUS_KUBE_NAMESPACE") wait --for=condition=Ready pod/$(printf '%q' "$new_pod") --timeout=10s" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 5
+    done
+    return 1
 }
 
-SOURCE_SSH=${SOURCE_SSH:-root@$CONTROLLER_IP}
+cleanup() {
+    local status=$?
+    set +e
+    clear_mount_failpoint
+    if ((status != 0)) && [[ "$KEEP_FAILED" == true ]]; then
+        echo "KEEP_FAILED preserved server=$server_id share=$share_id" >&2
+        return
+    fi
+    if [[ -n "$server_id" ]] && openstack server show "$server_id" >/dev/null 2>&1; then
+        if [[ -n "$marker_path" && -n "$instance_name" ]]; then
+            if [[ "$(server_host 2>/dev/null)" == "$DEST_HOST" ]]; then
+                marker_host=$DEST_SSH
+            else
+                marker_host=$SOURCE_SSH
+            fi
+            incus_remote "$marker_host" incus --project "$INCUS_PROJECT" \
+                exec "$instance_name" -- rm -f "$marker_path" \
+                >/dev/null 2>&1
+        fi
+        openstack server stop "$server_id" >/dev/null 2>&1
+        wait_status SHUTOFF >/dev/null 2>&1
+        [[ -n "$shares_url" && -n "$share_id" ]] && \
+            api DELETE "$shares_url/$share_id" >/dev/null 2>&1
+        openstack server delete --wait "$server_id" >/dev/null 2>&1
+    fi
+    exit "$status"
+}
 trap cleanup EXIT INT TERM
 
-share_id=$(openstack share create "$SHARE_PROTO" "$SHARE_SIZE" \
-    --name "$NAME-share" --share-type "$SHARE_TYPE" -f value -c id)
-deadline=$((SECONDS + TIMEOUT))
-while ((SECONDS < deadline)); do
-    share_status=$(openstack share show "$share_id" -f value -c status)
-    [[ "$share_status" == available ]] && break
-    [[ "$share_status" == error ]] && fail "share creation errored"
-    sleep 5
-done
-[[ "$share_status" == available ]] || fail "share never became available"
-openstack share access create "$share_id" ip "$CLIENT_CIDR" \
-    --access-level rw >/dev/null
-deadline=$((SECONDS + TIMEOUT))
-while ((SECONDS < deadline)); do
-    access_state=$(openstack share access list "$share_id" -f value -c State |
-        head -1)
-    [[ "$access_state" == active ]] && break
-    sleep 3
-done
-[[ "$access_state" == active ]] || fail "share access rule never activated"
+share_id=$(openstack share show "$SHARE" -f value -c id)
+[[ "$(openstack share show "$share_id" -f value -c status)" == available ]] ||
+    fail "share is not available"
 
 server_id=$(openstack --os-compute-api-version 2.74 server create \
     --flavor "$FLAVOR" --image "$IMAGE" --network "$NETWORK" \
@@ -158,6 +238,7 @@ server_id=$(openstack --os-compute-api-version 2.74 server create \
 wait_status ACTIVE
 instance_name=$(openstack --os-compute-api-version 2.74 server show \
     "$server_id" -f value -c OS-EXT-SRV-ATTR:instance_name)
+marker_path="/mnt/manila/$TAG/marker-$server_id"
 
 token=$(openstack token issue -f value -c id)
 endpoint=$(openstack endpoint list --service nova --interface public \
@@ -170,97 +251,99 @@ openstack server stop "$server_id"
 wait_status SHUTOFF
 api POST "$shares_url" \
     "{\"share\":{\"share_id\":\"$share_id\",\"tag\":\"$TAG\"}}" >/dev/null
-deadline=$((SECONDS + TIMEOUT))
-while ((SECONDS < deadline)); do
-    api GET "$shares_url" | grep -q '"status": *"active"' && break
-    sleep 3
-done
+wait_mapping inactive
 openstack server start "$server_id"
 wait_status ACTIVE
-"${SSH[@]}" "$SOURCE_SSH" "podman exec incus incus exec $instance_name \
-    --project nova -- sh -c 'echo $NAME > /mnt/manila/$TAG/marker && sync'" ||
+wait_mapping active
+staging="$(share_staging_root)/$server_id/$share_id"
+if [[ -n "$SHARE_ROOT_MODE" ]]; then
+    compute_mount_namespace_remote "$SOURCE_SSH" \
+        chmod "$SHARE_ROOT_MODE" "$staging"
+fi
+deadline=$((SECONDS + TIMEOUT))
+until incus_remote "$SOURCE_SSH" incus --project "$INCUS_PROJECT" exec \
+        "$instance_name" -- sh -c \
+        "echo '$NAME' > '$marker_path' && sync" \
+        >/dev/null 2>&1; do
+    if ((SECONDS >= deadline)); then
+    compute_remote "$SOURCE_SSH" stat -c 'host-share=%a:%u:%g' "$staging" || true
+    incus_remote "$SOURCE_SSH" incus --project "$INCUS_PROJECT" exec \
+        "$instance_name" -- sh -c \
+        "id; stat -c 'guest-share=%a:%u:%g' '/mnt/manila/$TAG'; grep -F '/mnt/manila/$TAG' /proc/self/mountinfo" || true
     fail "guest cannot write the attached share"
+    fi
+    sleep 2
+done
 
 if case_selected gate; then
-    pid_before=$(source_pid)
-    dest "iptables -I OUTPUT -p tcp -d $CONTROLLER_IP --dport 2049 -j REJECT"
-    blocked=1
+    pid_before=$(guest_pid "$SOURCE_SSH")
+    compute_mount_namespace_remote "$DEST_SSH" \
+        mount --bind /bin/false /sbin/mount.ceph
+    mount_failpoint=1
     openstack server migrate --live-migration --host "$DEST_HOST" \
         --wait "$server_id" >/dev/null 2>&1 || true
-    sleep 5
-    migration_status=$(openstack server migration list --server "$server_id" \
-        -f value -c Id -c Status | sort -n | tail -n1 | awk '{print $2}')
-    [[ "$migration_status" == failed || "$migration_status" == error ]] ||
-        fail "blocked-destination migration reported $migration_status"
-    unblock_nfs
-    [[ "$(openstack server show "$server_id" -f value -c status)" == ACTIVE ]] ||
-        fail "source instance is not ACTIVE after the gated failure"
+    clear_mount_failpoint
+    wait_status ACTIVE
     [[ "$(server_host)" == "$SOURCE_HOST" ]] ||
-        fail "instance left its source host after the gated failure"
-    [[ "$(source_pid)" == "$pid_before" ]] ||
-        fail "source guest process changed after the gated failure"
-    residue=$(dest "findmnt -rn | grep -c incus-shares/$server_id || true")
-    [[ "${residue//[$'\r\n']}" == 0 ]] ||
-        fail "destination retained $residue share mount(s)"
-    records=$(dest "podman exec incus incus list --project nova -f csv -c n |
-        grep -c $instance_name || true")
-    [[ "${records//[$'\r\n']}" == 0 ]] ||
+        fail "instance left the source after the gated failure"
+    [[ "$(guest_pid "$SOURCE_SSH")" == "$pid_before" ]] ||
+        fail "source guest PID changed after the gated failure"
+    staging="$(share_staging_root)/$server_id/$share_id"
+    ! compute_remote "$DEST_SSH" findmnt -rn "$staging" >/dev/null 2>&1 ||
+        fail "destination retained the gated share mount"
+    ! incus_remote "$DEST_SSH" incus --project "$INCUS_PROJECT" info \
+        "$instance_name" >/dev/null 2>&1 ||
         fail "destination retained an instance record"
-    echo "PASS manila destination gate failed the migration cleanly"
+    echo "PASS Manila destination pre-mount gate failed cleanly"
 fi
 
 if case_selected retry; then
     openstack server migrate --live-migration --host "$DEST_HOST" \
-        --wait "$server_id" >/dev/null 2>&1 || true
+        --wait "$server_id"
     wait_status ACTIVE
     [[ "$(server_host)" == "$DEST_HOST" ]] ||
-        fail "retried migration did not land on $DEST_HOST"
-    dest_incus "exec $instance_name -- cat /mnt/manila/$TAG/marker" |
-        grep -q "$NAME" || fail "share content lost across the retry"
-    echo "PASS manila migration retry succeeded with the share intact"
+        fail "retry did not land on the destination"
+    incus_remote "$DEST_SSH" incus --project "$INCUS_PROJECT" exec \
+        "$instance_name" -- cat "$marker_path" | grep -Fxq "$NAME" ||
+        fail "share content was lost across retry"
+    echo "PASS Manila migration retry preserved share content"
 fi
 
 if case_selected recovery; then
-    [[ "$(server_host)" == "$DEST_HOST" ]] || {
-        openstack server migrate --live-migration --host "$DEST_HOST" \
-            --wait "$server_id" >/dev/null 2>&1 || true
-        wait_status ACTIVE
-    }
-    staging=$(dest "findmnt -rn -o TARGET | \
-        grep incus-shares/$server_id | head -1")
-    staging=${staging//[$'\r\n']}
-    [[ -n "$staging" ]] || fail "no host staging mount to lose"
-    dest_incus "stop $instance_name --force"
-    dest "umount -l '$staging'"
-    dest "findmnt -rn '$staging' >/dev/null" &&
-        fail "staging mount survived the simulated reboot"
-    dest "systemctl restart devstack@n-cpu"
-    remounted=0
+    [[ "$(server_host)" == "$DEST_HOST" ]] ||
+        fail "recovery requires the successful retry on destination"
+    staging="$(share_staging_root)/$server_id/$share_id"
+    compute_remote "$DEST_SSH" findmnt -rn "$staging" >/dev/null ||
+        fail "share staging mount is absent before restart"
+    incus_remote "$DEST_SSH" incus --project "$INCUS_PROJECT" stop \
+        "$instance_name" --force
+    compute_mount_namespace_remote "$DEST_SSH" umount -l "$staging"
+    restart_compute_pod || fail "nova-compute Pod did not restart"
     deadline=$((SECONDS + TIMEOUT))
     while ((SECONDS < deadline)); do
-        dest "findmnt -rn '$staging' >/dev/null" && { remounted=1; break; }
+        if compute_remote "$DEST_SSH" findmnt -rn "$staging" >/dev/null 2>&1 && \
+                [[ "$(incus_remote "$DEST_SSH" incus --project "$INCUS_PROJECT" list "$instance_name" --format csv -c s 2>/dev/null | tr -d '\r')" == RUNNING ]]; then
+            break
+        fi
         sleep 5
     done
-    ((remounted)) || fail "host share mount was not re-established"
-    resumed=0
+    compute_remote "$DEST_SSH" findmnt -rn "$staging" >/dev/null ||
+        fail "share was not remounted after compute restart"
+    [[ "$(incus_remote "$DEST_SSH" incus --project "$INCUS_PROJECT" list "$instance_name" --format csv -c s | tr -d '\r')" == RUNNING ]] ||
+        fail "guest was not resumed after compute restart"
+    incus_remote "$DEST_SSH" incus --project "$INCUS_PROJECT" exec \
+        "$instance_name" -- cat "$marker_path" | grep -Fxq "$NAME" ||
+        fail "guest lost share access after compute restart"
     deadline=$((SECONDS + TIMEOUT))
-    while ((SECONDS < deadline)); do
-        [[ "$(dest_incus "list $instance_name --format csv -c s" |
-            tr -d '\r')" == RUNNING ]] && { resumed=1; break; }
-        sleep 5
+    until incus_remote "$DEST_SSH" incus --project "$INCUS_PROJECT" exec \
+            "$instance_name" -- sh -c \
+            "echo recovered >> '$marker_path' && sync" \
+            >/dev/null 2>&1; do
+        ((SECONDS < deadline)) || fail "recovered share is not writable"
+        sleep 2
     done
-    ((resumed)) || fail "guest was not resumed after the host boot"
-    dest_incus "exec $instance_name -- cat /mnt/manila/$TAG/marker" |
-        grep -q "$NAME" || fail "guest lost share access after recovery"
-    dest_incus "exec $instance_name -- sh -c \
-        'echo recovered >> /mnt/manila/$TAG/marker && sync'" ||
-        fail "recovered share is not writable"
-    mapping_status=$(api GET "$shares_url" | python3 -c \
-        'import json,sys; print(json.load(sys.stdin)["shares"][0]["status"])')
-    [[ "$mapping_status" == active ]] ||
-        fail "share mapping is $mapping_status after recovery"
-    echo "PASS manila host-reboot recovery remounted and resumed the guest"
+    wait_mapping active
+    echo "PASS Manila compute restart remounted the share and resumed the guest"
 fi
 
-echo "PASS Incus Manila gate and recovery cases=$CASES server=$server_id" \
-    "share=$share_id"
+echo "PASS Incus Manila gate/retry/recovery cases=$CASES server=$server_id share=$share_id"

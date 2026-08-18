@@ -38,6 +38,12 @@ CLEANUP_AUDIT = (
 RESIZE_SCRIPT = REPO_ROOT / 'tools' / 'openstack-incus-resize-e2e.sh'
 VOLUME_MIGRATION_SCRIPT = (
     REPO_ROOT / 'tools' / 'openstack-incus-volume-migration-e2e.sh')
+CEPH_BACKUP_SCRIPT = (
+    REPO_ROOT / 'tools' / 'openstack-incus-ceph-backup-e2e.sh')
+BFV_LIFECYCLE_SCRIPT = (
+    REPO_ROOT / 'tools' / 'openstack-incus-bfv-lifecycle-e2e.sh')
+BFV_REIMAGE_SCRIPT = (
+    REPO_ROOT / 'tools' / 'openstack-incus-bfv-reimage-e2e.sh')
 
 
 class PublicApiE2EContractTest(unittest.TestCase):
@@ -54,6 +60,9 @@ class PublicApiE2EContractTest(unittest.TestCase):
         cls.resize = RESIZE_SCRIPT.read_text(encoding='utf-8')
         cls.volume_migration = VOLUME_MIGRATION_SCRIPT.read_text(
             encoding='utf-8')
+        cls.ceph_backup = CEPH_BACKUP_SCRIPT.read_text(encoding='utf-8')
+        cls.bfv_lifecycle = BFV_LIFECYCLE_SCRIPT.read_text(encoding='utf-8')
+        cls.bfv_reimage = BFV_REIMAGE_SCRIPT.read_text(encoding='utf-8')
 
     def test_resize_checks_the_configured_incus_project(self):
         self.assertIn('INCUS_PROJECT=${INCUS_PROJECT:-nova}', self.resize)
@@ -64,18 +73,53 @@ class PublicApiE2EContractTest(unittest.TestCase):
     def test_volume_migration_checks_the_configured_incus_project(self):
         script = self.volume_migration
         self.assertIn('INCUS_PROJECT=${INCUS_PROJECT:-nova}', script)
-        self.assertEqual(
-            3, script.count("incus --project '$INCUS_PROJECT' exec"))
-        self.assertEqual(
-            4, script.count("incus --project '$INCUS_PROJECT' profile"))
-        self.assertNotIn('"incus exec ', script)
-        self.assertNotIn('"incus profile ', script)
-        self.assertIn('data[\\"mountpoint\\"].startswith(\\"/dev/\\")', script)
-        self.assertNotIn('data[\\"path\\"]', script)
+        self.assertIn(
+            "printf -v command_line '%q ' incus --project "
+            '"$INCUS_PROJECT" "$@"', script)
+        self.assertGreaterEqual(script.count('incus_remote '), 7)
+        self.assertIn('INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}',
+                      script)
+        self.assertIn('application=incus', script)
+        self.assertIn('data["mountpoint"].startswith("/dev/")', script)
+        self.assertNotIn('data["path"]', script)
         self.assertIn('--host "$DEST_HOST" "$server_id" || true', script)
         self.assertNotIn('--host "$DEST_HOST" --wait', script)
         self.assertIn(
-            'fuse2fs $DEVICE /mnt/cinder >/dev/null 2>&1', script)
+            "fuse2fs '$DEVICE' /mnt/cinder >/dev/null 2>&1", script)
+
+    def test_ceph_backup_covers_snapshot_clone_and_kubernetes_runtime(self):
+        script = self.ceph_backup
+        self.assertIn('RUN_DESTRUCTIVE=${RUN_DESTRUCTIVE:-false}', script)
+        self.assertIn('INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}',
+                      script)
+        self.assertIn('application=incus', script)
+        self.assertIn('volume snapshot create', script)
+        self.assertIn('volume create --snapshot', script)
+        self.assertIn('volume backup create --incremental', script)
+
+    def test_bfv_lifecycle_covers_kubernetes_and_hard_reboot(self):
+        script = self.bfv_lifecycle
+        self.assertIn('RUN_DESTRUCTIVE=${RUN_DESTRUCTIVE:-false}', script)
+        self.assertIn('INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}',
+                      script)
+        self.assertIn('application=incus', script)
+        self.assertIn('server reboot --hard', script)
+        self.assertIn('server shelve', script)
+        self.assertIn('server unshelve', script)
+        self.assertIn('/config-drive/openstack/latest/meta_data.json', script)
+
+    def test_bfv_reimage_covers_kubernetes_and_both_power_states(self):
+        script = self.bfv_reimage
+        self.assertIn('RUN_DESTRUCTIVE=${RUN_DESTRUCTIVE:-false}', script)
+        self.assertIn('INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}',
+                      script)
+        self.assertIn('application=incus', script)
+        self.assertIn('KUBE_CONTROL_SSH=${KUBE_CONTROL_SSH:-}', script)
+        self.assertIn('remote "$KUBE_CONTROL_SSH" "$kube_command"', script)
+        self.assertIn('bash -c "$kube_command"', script)
+        self.assertIn('--reimage-boot-volume', script)
+        self.assertIn('wait_value ACTIVE', script)
+        self.assertIn('wait_value SHUTOFF', script)
 
     def test_scripts_default_to_non_destructive(self):
         for script in (self.data, self.bfv):
@@ -297,6 +341,12 @@ class PublicApiE2EContractTest(unittest.TestCase):
         self.assertIn("%$'\\r'", self.cleanup_audit)
         self.assertNotIn('|| true', self.cleanup_audit)
 
+    def test_initial_volume_guest_can_unmount_fuse_in_minimal_images(self):
+        self.assertIn('command -v fusermount3', self.data)
+        self.assertIn('command -v fusermount', self.data)
+        self.assertIn('command -v umount', self.data)
+        self.assertIn('umount "\\$mountpoint"', self.data)
+
     def test_release_gate_executes_complete_migration_evidence(self):
         self.assertIn(
             'MIGRATION_COMPUTE_NODES must contain exactly three mappings',
@@ -338,6 +388,9 @@ class PublicApiE2EContractTest(unittest.TestCase):
         self.assertIn('security.idmap.isolated', self.idmap)
         self.assertIn('volatile.idmap.base', self.idmap)
         self.assertIn('/1.0/migration-attempts/', self.idmap)
+        self.assertIn(
+            'INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}', self.idmap)
+        self.assertIn('application=incus', self.idmap)
         self.assertIn("grep -qi 'overlap.*instance'", self.idmap)
         self.assertIn('rejected migration attempt was persisted', self.idmap)
         self.assertIn(

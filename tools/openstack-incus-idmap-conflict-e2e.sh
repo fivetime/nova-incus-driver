@@ -14,11 +14,16 @@ FLAVOR=${FLAVOR:?Set FLAVOR to an Incus-compatible Flavor}
 NETWORK=${NETWORK:?Set NETWORK to a tenant network}
 NOVA_HOST=${NOVA_HOST:?Set NOVA_HOST to the target nova-compute hostname}
 COMPUTE_SSH=${COMPUTE_SSH:?Set COMPUTE_SSH to the target compute SSH address}
-CONTROLLER_SSH=${CONTROLLER_SSH:?Set CONTROLLER_SSH to the API runner}
+CONTROLLER_SSH=${CONTROLLER_SSH:-}
 CONTROLLER_OPENRC=${CONTROLLER_OPENRC:-/opt/stack/devstack/openrc admin admin}
 SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute test key}
 SSH_KNOWN_HOSTS_FILE=${SSH_KNOWN_HOSTS_FILE:-$HOME/.ssh/known_hosts}
 INCUS_PROJECT=${INCUS_PROJECT:-nova}
+INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}
+INCUS_RUNTIME_CONTAINER=${INCUS_RUNTIME_CONTAINER:-incus}
+INCUS_KUBE_NAMESPACE=${INCUS_KUBE_NAMESPACE:-openstack}
+INCUS_KUBE_NODE=${INCUS_KUBE_NODE:-}
+KUBE_CONTROL_SSH=${KUBE_CONTROL_SSH:-}
 TIMEOUT=${TIMEOUT:-600}
 NAME=${NAME:-incus-idmap-conflict-$RANDOM}
 
@@ -54,6 +59,10 @@ remote() {
 }
 
 openstack() {
+    if [[ -z "$CONTROLLER_SSH" ]]; then
+        command openstack "$@"
+        return
+    fi
     local command_line
     printf -v command_line '%q ' "$@"
     remote "$CONTROLLER_SSH" \
@@ -61,10 +70,27 @@ openstack() {
 }
 
 incus() {
-    local command_line
-    printf -v command_line '%q ' "$@"
-    remote "$COMPUTE_SSH" \
-        "podman exec incus incus $command_line"
+    local command_line kube_command
+    printf -v command_line '%q ' incus "$@"
+    case "$INCUS_RUNTIME_MODE" in
+        podman)
+            remote "$COMPUTE_SSH" \
+                "podman exec $(printf '%q' "$INCUS_RUNTIME_CONTAINER") $command_line"
+            ;;
+        kubernetes)
+            [[ -n "$INCUS_KUBE_NODE" ]] || return 2
+            printf -v kube_command \
+                'set -e; pods=$(kubectl -n %q get pod -l application=incus --field-selector spec.nodeName=%q --no-headers -o custom-columns=NAME:.metadata.name); set -- $pods; [ $# -eq 1 ]; kubectl -n %q exec -i "$1" -- %s' \
+                "$INCUS_KUBE_NAMESPACE" "$INCUS_KUBE_NODE" \
+                "$INCUS_KUBE_NAMESPACE" "$command_line"
+            if [[ -n "$KUBE_CONTROL_SSH" ]]; then
+                remote "$KUBE_CONTROL_SSH" "$kube_command"
+            else
+                bash -c "$kube_command"
+            fi
+            ;;
+        *) return 2 ;;
+    esac
 }
 
 fail() {

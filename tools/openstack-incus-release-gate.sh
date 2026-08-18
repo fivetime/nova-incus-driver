@@ -1148,6 +1148,7 @@ if [[ "$RUN_MIGRATION_MATRIX" == true ]]; then
 
     run "Manila NFS snapshot and restore through Nova public API" \
         env \
+        RUN_DESTRUCTIVE=true \
         IMAGE="$MIGRATION_LOCAL_IMAGE" \
         FLAVOR="$MIGRATION_FLAVOR" \
         NETWORK="$MIGRATION_NETWORK" \
@@ -1163,6 +1164,7 @@ if [[ "$RUN_MIGRATION_MATRIX" == true ]]; then
         "$SCRIPT_DIR/openstack-incus-manila-snapshot-e2e.sh"
     run "Manila CephFS snapshot and restore through Nova public API" \
         env \
+        RUN_DESTRUCTIVE=true \
         IMAGE="$MIGRATION_LOCAL_IMAGE" \
         FLAVOR="$MIGRATION_FLAVOR" \
         NETWORK="$MIGRATION_NETWORK" \

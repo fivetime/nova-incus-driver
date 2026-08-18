@@ -20,6 +20,11 @@ CONTROLLER_OPENRC=${CONTROLLER_OPENRC:-/opt/stack/devstack/openrc admin admin}
 SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute test key}
 SSH_KNOWN_HOSTS_FILE=${SSH_KNOWN_HOSTS_FILE:-$HOME/.ssh/known_hosts}
 INCUS_PROJECT=${INCUS_PROJECT:-nova}
+INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}
+INCUS_RUNTIME_CONTAINER=${INCUS_RUNTIME_CONTAINER:-incus}
+INCUS_KUBE_NAMESPACE=${INCUS_KUBE_NAMESPACE:-openstack}
+INCUS_KUBE_NODE=${INCUS_KUBE_NODE:-}
+KUBE_CONTROL_SSH=${KUBE_CONTROL_SSH:-}
 TIMEOUT=${TIMEOUT:-600}
 RUN_UUID=${RUN_UUID:-$(python3 -c 'import uuid; print(uuid.uuid4())')}
 NAME=${NAME:-incus-ceph-aba-${RUN_UUID}}
@@ -85,9 +90,28 @@ openstack() {
 }
 
 runtime() {
-    local command_line
-    printf -v command_line '%q ' podman exec incus "$@"
-    remote "$COMPUTE_SSH" "$command_line"
+    local command_line kube_command
+    case "$INCUS_RUNTIME_MODE" in
+        podman)
+            printf -v command_line '%q ' podman exec \
+                "$INCUS_RUNTIME_CONTAINER" "$@"
+            remote "$COMPUTE_SSH" "$command_line"
+            ;;
+        kubernetes)
+            [[ -n "$INCUS_KUBE_NODE" ]] || return 2
+            printf -v command_line '%q ' "$@"
+            printf -v kube_command \
+                'set -e; pods=$(kubectl -n %q get pod -l application=incus --field-selector spec.nodeName=%q --no-headers -o custom-columns=NAME:.metadata.name); set -- $pods; [ $# -eq 1 ]; kubectl -n %q exec -i "$1" -- %s' \
+                "$INCUS_KUBE_NAMESPACE" "$INCUS_KUBE_NODE" \
+                "$INCUS_KUBE_NAMESPACE" "$command_line"
+            if [[ -n "$KUBE_CONTROL_SSH" ]]; then
+                remote "$KUBE_CONTROL_SSH" "$kube_command"
+            else
+                bash -c "$kube_command"
+            fi
+            ;;
+        *) return 2 ;;
+    esac
 }
 
 incus_query() {
@@ -327,9 +351,11 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-remote "$COMPUTE_SSH" \
-    "command -v podman >/dev/null && test \"\$(podman inspect -f '{{.State.Running}}' incus)\" = true" || \
-    fail "compute host has no running Podman Incus runtime"
+if [[ "$INCUS_RUNTIME_MODE" == podman ]]; then
+    remote "$COMPUTE_SSH" \
+        "command -v podman >/dev/null && test \"\$(podman inspect -f '{{.State.Running}}' $(printf '%q' "$INCUS_RUNTIME_CONTAINER"))\" = true" || \
+        fail "compute host has no running Podman Incus runtime"
+fi
 runtime sh -ceu '
     for command_name in incus python3 ceph rbd rados dd base64; do
         command -v "$command_name" >/dev/null || {
@@ -434,7 +460,11 @@ storage_volume=$(jq -er .storage_volume <<<"$attempt_document")
     "$instance_name" ]] || fail "attempt instance name does not match Nova"
 [[ "$(jq -r .storage_pool <<<"$attempt_document")" == "$root_pool" ]] || \
     fail "attempt storage pool does not match the instance root"
-[[ "$storage_volume" == "${INCUS_PROJECT}_${instance_name}" ]] || \
+expected_storage_volume="${INCUS_PROJECT}_${instance_name}"
+if [[ "$INCUS_PROJECT" == default ]]; then
+    expected_storage_volume=$instance_name
+fi
+[[ "$storage_volume" == "$expected_storage_volume" ]] || \
     fail "public attempt returned an unexpected root volume name: $storage_volume"
 rbd_name="container_${storage_volume}"
 actual_identity=$(rbd_identity "$rbd_name") || \

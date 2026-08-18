@@ -229,8 +229,9 @@ class CephOwnershipMigrationE2EContractTest(unittest.TestCase):
                 'actual_identity=$(rbd_identity "$rbd_name")'):
             self.assertIn(token, self.aba_delete)
         self.assertIn(
-            '"$storage_volume" == "${INCUS_PROJECT}_${instance_name}"',
+            'expected_storage_volume="${INCUS_PROJECT}_${instance_name}"',
             self.aba_delete)
+        self.assertIn('[[ "$INCUS_PROJECT" == default ]]', self.aba_delete)
         self.assertIn(
             '"$actual_identity" == "$identity_document"',
             self.aba_delete)

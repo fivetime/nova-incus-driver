@@ -3,25 +3,76 @@
 
 set -euo pipefail
 
-IMAGE=${IMAGE:-alpine-3.21-cloud-incus-criu-fuse}
-FLAVOR=${FLAVOR:-ds512M}
-NETWORK=${NETWORK:-public}
-COMPUTE_HOST=${COMPUTE_HOST:-incus-node-01}
-COMPUTE_SSH=${COMPUTE_SSH:-root@10.32.32.130}
+RUN_DESTRUCTIVE=${RUN_DESTRUCTIVE:-false}
+IMAGE=${IMAGE:?Set IMAGE}
+FLAVOR=${FLAVOR:?Set FLAVOR}
+NETWORK=${NETWORK:?Set NETWORK}
+COMPUTE_HOST=${COMPUTE_HOST:?Set COMPUTE_HOST}
+COMPUTE_SSH=${COMPUTE_SSH:?Set COMPUTE_SSH}
 SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute test key}
+SSH_KNOWN_HOSTS_FILE=${SSH_KNOWN_HOSTS_FILE:-$HOME/.ssh/known_hosts}
+INCUS_PROJECT=${INCUS_PROJECT:-nova}
+INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}
+INCUS_RUNTIME_CONTAINER=${INCUS_RUNTIME_CONTAINER:-incus}
+INCUS_KUBE_NAMESPACE=${INCUS_KUBE_NAMESPACE:-openstack}
+INCUS_KUBE_NODE_MAP=${INCUS_KUBE_NODE_MAP:-}
 VOLUME_TYPE=${VOLUME_TYPE:-ceph}
 NAME=${NAME:-incus-ceph-backup-e2e-$RANDOM}
-TIMEOUT=${TIMEOUT:-360}
+TIMEOUT=${TIMEOUT:-900}
 
-SSH=(ssh -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=no)
+[[ "$RUN_DESTRUCTIVE" == true ]] || {
+    echo "Set RUN_DESTRUCTIVE=true to run this destructive case" >&2
+    exit 2
+}
+[[ -r "$SSH_IDENTITY" && -r "$SSH_KNOWN_HOSTS_FILE" ]] || {
+    echo "SSH identity and known_hosts must be readable" >&2
+    exit 2
+}
+if [[ "$INCUS_RUNTIME_MODE" == kubernetes && -z "$INCUS_KUBE_NODE_MAP" ]]; then
+    echo "Set INCUS_KUBE_NODE_MAP for Kubernetes mode" >&2
+    exit 2
+fi
+
+SSH=(ssh -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=yes
+    -o "UserKnownHostsFile=$SSH_KNOWN_HOSTS_FILE")
 server_id=
 source_id=
 restore_id=
 full_id=
 incremental_id=
+snapshot_id=
+clone_id=
 instance_name=
 
 remote() { "${SSH[@]}" "$COMPUTE_SSH" "$@"; }
+
+kube_node_for_target() {
+    local entry
+    for entry in ${INCUS_KUBE_NODE_MAP//,/ }; do
+        if [[ "${entry%%=*}" == "$COMPUTE_SSH" ]]; then
+            printf '%s\n' "${entry#*=}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+incus_remote() {
+    local command_line node
+    printf -v command_line '%q ' incus --project "$INCUS_PROJECT" "$@"
+    case "$INCUS_RUNTIME_MODE" in
+        podman)
+            remote "podman exec $(printf '%q' "$INCUS_RUNTIME_CONTAINER") $command_line"
+            ;;
+        kubernetes)
+            node=$(kube_node_for_target) || return 1
+            remote "set -e; pods=\$(kubectl -n $(printf '%q' "$INCUS_KUBE_NAMESPACE") get pod -l application=incus --field-selector spec.nodeName=$(printf '%q' "$node") --no-headers -o custom-columns=NAME:.metadata.name); set -- \$pods; [ \$# -eq 1 ]; kubectl -n $(printf '%q' "$INCUS_KUBE_NAMESPACE") exec \"\$1\" -- $command_line"
+            ;;
+        *)
+            return 2
+            ;;
+    esac
+}
 
 wait_value() {
     local command=$1 expected=$2 deadline=$((SECONDS + TIMEOUT)) current
@@ -70,6 +121,12 @@ cleanup() {
     if [[ -n "$restore_id" ]]; then
         openstack volume delete "$restore_id" >/dev/null 2>&1 || true
     fi
+    if [[ -n "$clone_id" ]]; then
+        openstack volume delete "$clone_id" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$snapshot_id" ]]; then
+        openstack volume snapshot delete "$snapshot_id" >/dev/null 2>&1 || true
+    fi
     if [[ -n "$source_id" ]]; then
         openstack volume delete "$source_id" >/dev/null 2>&1 || true
     fi
@@ -97,9 +154,30 @@ openstack server add volume --device /dev/vdb "$server_id" "$source_id"
 wait_value "openstack volume show '$source_id' -f value -c status" in-use
 device=$(openstack server volume list "$server_id" -f value -c Device | head -n1)
 marker="full-$source_id"
-remote "incus exec '$instance_name' -- sh -c \
-    'printf %s $marker | dd of=$device bs=1 seek=4096 2>/dev/null; sync'"
+incus_remote exec "$instance_name" -- sh -c \
+    "printf %s '$marker' | dd of='$device' bs=1 seek=4096 2>/dev/null; sync"
 detach "$source_id"
+
+snapshot_id=$(openstack volume snapshot create --volume "$source_id" \
+    --property openstack-incus-e2e=true "$NAME-snapshot" -f value -c id)
+wait_value "openstack volume snapshot show '$snapshot_id' -f value -c status" \
+    available
+clone_id=$(openstack volume create --snapshot "$snapshot_id" \
+    --type "$VOLUME_TYPE" "$NAME-clone" -f value -c id)
+wait_value "openstack volume show '$clone_id' -f value -c status" available
+openstack server add volume --device /dev/vdb "$server_id" "$clone_id"
+wait_value "openstack volume show '$clone_id' -f value -c status" in-use
+clone_device=$(openstack server volume list "$server_id" -f value -c Device | head -n1)
+cloned=$(incus_remote exec "$instance_name" -- sh -c \
+    "dd if='$clone_device' bs=1 skip=4096 count=${#marker} 2>/dev/null")
+[[ "$cloned" == "$marker" ]]
+detach "$clone_id"
+openstack volume delete "$clone_id"
+wait_absent "openstack volume show '$clone_id'"
+clone_id=
+openstack volume snapshot delete "$snapshot_id"
+wait_absent "openstack volume snapshot show '$snapshot_id'"
+snapshot_id=
 
 full_id=$(openstack volume backup create --name "$NAME-full" \
     "$source_id" -f value -c id)
@@ -109,8 +187,8 @@ wait_value "openstack volume backup show '$full_id' -f value -c status" \
 openstack server add volume --device /dev/vdb "$server_id" "$source_id"
 wait_value "openstack volume show '$source_id' -f value -c status" in-use
 marker="incremental-$source_id"
-remote "incus exec '$instance_name' -- sh -c \
-    'printf %s $marker | dd of=$device bs=1 seek=8192 2>/dev/null; sync'"
+incus_remote exec "$instance_name" -- sh -c \
+    "printf %s '$marker' | dd of='$device' bs=1 seek=8192 2>/dev/null; sync"
 detach "$source_id"
 
 incremental_id=$(openstack volume backup create --incremental \
@@ -128,8 +206,8 @@ openstack volume backup restore --force "$incremental_id" "$restore_id"
 wait_value "openstack volume show '$restore_id' -f value -c status" available
 openstack server add volume --device /dev/vdb "$server_id" "$restore_id"
 wait_value "openstack volume show '$restore_id' -f value -c status" in-use
-restored=$(remote "incus exec '$instance_name' -- sh -c \
-    'dd if=$device bs=1 skip=8192 count=${#marker} 2>/dev/null'")
+restored=$(incus_remote exec "$instance_name" -- sh -c \
+    "dd if='$device' bs=1 skip=8192 count=${#marker} 2>/dev/null")
 [[ "$restored" == "$marker" ]]
 detach "$restore_id"
 
@@ -149,4 +227,4 @@ openstack server delete --wait "$server_id"
 server_id=
 
 trap - EXIT INT TERM
-echo "PASS full backup, incremental backup, restore, and cleanup"
+echo "PASS snapshot/clone, full backup, incremental backup, restore, and cleanup"

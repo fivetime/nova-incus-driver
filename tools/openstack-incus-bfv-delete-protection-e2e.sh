@@ -11,11 +11,17 @@ VOLUME_TYPE=${VOLUME_TYPE:?Set VOLUME_TYPE to the Cinder volume type under test}
 VOLUME_SIZE=${VOLUME_SIZE:-5}
 COMPUTE_HOSTS=${COMPUTE_HOSTS:?Set COMPUTE_HOSTS to comma-separated Nova hosts}
 COMPUTE_SSH=${COMPUTE_SSH:?Set COMPUTE_SSH to matching SSH targets}
-CONTROLLER_SSH=${CONTROLLER_SSH:?Set CONTROLLER_SSH to the OpenStack/Ceph controller}
+CONTROLLER_SSH=${CONTROLLER_SSH:-}
+CEPH_SSH=${CEPH_SSH:-$CONTROLLER_SSH}
 CONTROLLER_OPENRC=${CONTROLLER_OPENRC:-/opt/stack/devstack/openrc admin admin}
 SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute test key}
 SSH_KNOWN_HOSTS_FILE=${SSH_KNOWN_HOSTS_FILE:-$HOME/.ssh/known_hosts}
 INCUS_PROJECT=${INCUS_PROJECT:-nova}
+INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}
+INCUS_RUNTIME_CONTAINER=${INCUS_RUNTIME_CONTAINER:-incus}
+INCUS_KUBE_NAMESPACE=${INCUS_KUBE_NAMESPACE:-openstack}
+INCUS_KUBE_NODE_MAP=${INCUS_KUBE_NODE_MAP:-}
+KUBE_CONTROL_SSH=${KUBE_CONTROL_SSH:-}
 CINDER_RBD_POOL=${CINDER_RBD_POOL:?Set CINDER_RBD_POOL to the selected Cinder RBD pool}
 CINDER_RBD_USER=${CINDER_RBD_USER:-cinder}
 TIMEOUT=${TIMEOUT:-900}
@@ -66,6 +72,10 @@ remote() {
 }
 
 openstack() {
+    if [[ -z "$CONTROLLER_SSH" ]]; then
+        command openstack "$@"
+        return
+    fi
     local command_line
     printf -v command_line '%q ' "$@"
     remote "$CONTROLLER_SSH" \
@@ -73,12 +83,32 @@ openstack() {
 }
 
 incus() {
-    local host=$1
+    local host=$1 command_line kube_command node entry
     shift
-    local command_line
-    printf -v command_line '%q ' "$@"
-    remote "$host" \
-        "podman exec -i incus incus --project $(printf '%q' "$INCUS_PROJECT") $command_line"
+    printf -v command_line '%q ' incus --project "$INCUS_PROJECT" "$@"
+    case "$INCUS_RUNTIME_MODE" in
+        podman)
+            remote "$host" \
+                "podman exec -i $(printf '%q' "$INCUS_RUNTIME_CONTAINER") $command_line"
+            ;;
+        kubernetes)
+            node=
+            for entry in ${INCUS_KUBE_NODE_MAP//,/ }; do
+                [[ "${entry%%=*}" == "$host" ]] && node=${entry#*=}
+            done
+            [[ -n "$node" ]] || return 1
+            printf -v kube_command \
+                'set -e; pods=$(kubectl -n %q get pod -l application=incus --field-selector spec.nodeName=%q --no-headers -o custom-columns=NAME:.metadata.name); set -- $pods; [ $# -eq 1 ]; kubectl -n %q exec -i "$1" -- %s' \
+                "$INCUS_KUBE_NAMESPACE" "$node" \
+                "$INCUS_KUBE_NAMESPACE" "$command_line"
+            if [[ -n "$KUBE_CONTROL_SSH" ]]; then
+                remote "$KUBE_CONTROL_SSH" "$kube_command"
+            else
+                bash -c "$kube_command"
+            fi
+            ;;
+        *) return 2 ;;
+    esac
 }
 
 fail() {
@@ -117,7 +147,8 @@ volume_status() {
 }
 
 cinder_attachment_count() {
-    openstack volume attachment list -f json | python3 -c '
+    openstack --os-volume-api-version 3.27 volume attachment list -f json |
+        python3 -c '
 import json
 import sys
 
@@ -142,7 +173,7 @@ rbd_image_exists() {
     image=$(rbd_image_name)
     printf -v command_line '%q ' rbd --id "$CINDER_RBD_USER" info \
         "$CINDER_RBD_POOL/$image"
-    remote "$CONTROLLER_SSH" "$command_line" >/dev/null
+    remote "$CEPH_SSH" "$command_line" >/dev/null
 }
 
 rbd_image_id() {
@@ -151,7 +182,7 @@ rbd_image_id() {
     printf -v command_line \
         'rbd --id %q --pool %q info %q --format json | jq -er .id' \
         "$CINDER_RBD_USER" "$CINDER_RBD_POOL" "$image"
-    remote "$CONTROLLER_SSH" "$command_line"
+    remote "$CEPH_SSH" "$command_line"
 }
 
 rbd_pool_id() {
@@ -160,7 +191,7 @@ rbd_pool_id() {
         'rados --id %q df --format json | jq -er --arg pool %q %q' \
         "$CINDER_RBD_USER" "$CINDER_RBD_POOL" \
         '.pools[] | select(.name == $pool) | .id'
-    remote "$CONTROLLER_SSH" "$command_line"
+    remote "$CEPH_SSH" "$command_line"
 }
 
 exact_rbd_object_exists() {
@@ -168,7 +199,7 @@ exact_rbd_object_exists() {
     printf -v command_line '%q ' rados --id "$CINDER_RBD_USER" \
         --pool "$CINDER_RBD_POOL" stat \
         "rbd_header.$original_rbd_image_id"
-    remote "$CONTROLLER_SSH" "$command_line" >/dev/null
+    remote "$CEPH_SSH" "$command_line" >/dev/null
 }
 
 watcher_count() {
@@ -178,7 +209,7 @@ watcher_count() {
         fail "cannot resolve RBD image ID for $(rbd_image_name)"
     printf -v command_line '%q ' rados --id "$CINDER_RBD_USER" -p \
         "$CINDER_RBD_POOL" listwatchers "rbd_header.$image_id"
-    output=$(remote "$CONTROLLER_SSH" "$command_line") ||
+    output=$(remote "$CEPH_SSH" "$command_line") ||
         fail "cannot query Ceph watchers for $(rbd_image_name)"
     sed '/^[[:space:]]*$/d' <<<"$output" | wc -l
 }

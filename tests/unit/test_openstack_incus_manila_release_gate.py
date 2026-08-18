@@ -23,6 +23,8 @@ FLEET = REPO_ROOT / 'tools' / 'openstack-incus-fleet-preflight.sh'
 RELEASE = REPO_ROOT / 'tools' / 'openstack-incus-release-gate.sh'
 SNAPSHOT = (
     REPO_ROOT / 'tools' / 'openstack-incus-manila-snapshot-e2e.sh')
+GATE_RECOVERY = (
+    REPO_ROOT / 'tools' / 'openstack-incus-manila-gate-recovery-e2e.sh')
 ARCHITECTURE = REPO_ROOT / 'doc' / 'source' / 'architecture.rst'
 READINESS = REPO_ROOT / 'doc' / 'source' / 'production_readiness.rst'
 TEST_STATUS = REPO_ROOT / 'TEST_STATUS.md'
@@ -36,6 +38,7 @@ class ManilaReleaseGateContractTest(unittest.TestCase):
         cls.fleet = FLEET.read_text(encoding='utf-8')
         cls.release = RELEASE.read_text(encoding='utf-8')
         cls.snapshot = SNAPSHOT.read_text(encoding='utf-8')
+        cls.gate_recovery = GATE_RECOVERY.read_text(encoding='utf-8')
         cls.architecture = ARCHITECTURE.read_text(encoding='utf-8')
         cls.readiness = READINESS.read_text(encoding='utf-8')
         cls.test_status = TEST_STATUS.read_text(encoding='utf-8')
@@ -131,6 +134,37 @@ class ManilaReleaseGateContractTest(unittest.TestCase):
                       self.snapshot)
         self.assertNotIn('StrictHostKeyChecking=no', self.snapshot)
         self.assertIn('.lower().replace(" ", "_")', self.snapshot)
+        self.assertIn('RUN_DESTRUCTIVE=${RUN_DESTRUCTIVE:-false}',
+                      self.snapshot)
+        self.assertIn('INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}',
+                      self.snapshot)
+        self.assertIn('application=incus', self.snapshot)
+        self.assertIn('crictl inspect', self.snapshot)
+        self.assertEqual(
+            2,
+            self.release.count(
+                'RUN_DESTRUCTIVE=true \\\n        IMAGE="$MIGRATION_LOCAL_IMAGE"'))
+
+    def test_gate_recovery_targets_kubernetes_runtime_without_host_firewall(self):
+        script = self.gate_recovery
+        self.assertIn('INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}',
+                      script)
+        self.assertIn('application=nova,component=compute-incus', script)
+        self.assertIn('mount --bind /bin/false /sbin/mount.ceph', script)
+        self.assertIn('umount -l /sbin/mount.ceph', script)
+        self.assertNotIn('mountpoint -q /sbin/mount.ceph', script)
+        self.assertIn('crictl inspect', script)
+        self.assertIn('nsenter --target', script)
+        self.assertIn('--mount --pid', script)
+        self.assertIn('SHARE_ROOT_MODE=${SHARE_ROOT_MODE:-}', script)
+        self.assertIn('chmod "$SHARE_ROOT_MODE" "$staging"', script)
+        self.assertIn('until incus_remote "$SOURCE_SSH"', script)
+        self.assertIn('until incus_remote "$DEST_SSH"', script)
+        self.assertIn('marker-$server_id', script)
+        self.assertIn('delete pod', script)
+        self.assertIn('StrictHostKeyChecking=yes', script)
+        self.assertNotIn('iptables ', script)
+        self.assertNotIn('devstack@n-cpu', script)
 
     def test_docs_do_not_claim_file_presence_is_runtime_evidence(self):
         self.assertIn('every running API and\ncompute process',

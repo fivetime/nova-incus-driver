@@ -3,23 +3,43 @@
 
 set -euo pipefail
 
+RUN_DESTRUCTIVE=${RUN_DESTRUCTIVE:-false}
 IMAGE=${IMAGE:?Set IMAGE to a raw rootfs-directory Glance image}
-FLAVOR=${FLAVOR:-ds512M}
-NETWORK=${NETWORK:-private}
+FLAVOR=${FLAVOR:?Set FLAVOR}
+NETWORK=${NETWORK:?Set NETWORK}
 VOLUME_SIZE=${VOLUME_SIZE:-5}
 VOLUME_TYPE=${VOLUME_TYPE:-ceph}
 SOURCE_HOST=${SOURCE_HOST:-incus-node-01}
 DEST_HOST=${DEST_HOST:-incus-node-02}
 COMPUTE_HOSTS=${COMPUTE_HOSTS:-incus-node-01,incus-node-02,incus-node-03}
 COMPUTE_SSH=${COMPUTE_SSH:-root@10.32.32.130,root@10.32.32.131,root@10.32.32.132}
-CONTROLLER_SSH=${CONTROLLER_SSH:-root@10.32.32.130}
+CONTROLLER_SSH=${CONTROLLER_SSH:-}
 CONTROLLER_OPENRC=${CONTROLLER_OPENRC:-/opt/stack/devstack/openrc admin admin}
 INCUS_PROJECT=${INCUS_PROJECT:-nova}
 SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute test key}
+SSH_KNOWN_HOSTS_FILE=${SSH_KNOWN_HOSTS_FILE:-$HOME/.ssh/known_hosts}
+INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}
+INCUS_RUNTIME_CONTAINER=${INCUS_RUNTIME_CONTAINER:-incus}
+INCUS_KUBE_NAMESPACE=${INCUS_KUBE_NAMESPACE:-openstack}
+INCUS_KUBE_NODE_MAP=${INCUS_KUBE_NODE_MAP:-}
 TIMEOUT=${TIMEOUT:-600}
 NAME=${NAME:-incus-bfv-lifecycle-$RANDOM}
 
-SSH=(ssh -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=no)
+[[ "$RUN_DESTRUCTIVE" == true ]] || {
+    echo "Set RUN_DESTRUCTIVE=true to run this destructive case" >&2
+    exit 2
+}
+[[ -r "$SSH_IDENTITY" && -r "$SSH_KNOWN_HOSTS_FILE" ]] || {
+    echo "SSH identity and known_hosts must be readable" >&2
+    exit 2
+}
+if [[ "$INCUS_RUNTIME_MODE" == kubernetes && -z "$INCUS_KUBE_NODE_MAP" ]]; then
+    echo "Set INCUS_KUBE_NODE_MAP for Kubernetes mode" >&2
+    exit 2
+fi
+
+SSH=(ssh -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=yes
+    -o "UserKnownHostsFile=$SSH_KNOWN_HOSTS_FILE")
 IFS=, read -r -a compute_hosts <<< "$COMPUTE_HOSTS"
 IFS=, read -r -a compute_ssh <<< "$COMPUTE_SSH"
 
@@ -40,6 +60,10 @@ remote() {
 }
 
 openstack() {
+    if [[ -z "$CONTROLLER_SSH" ]]; then
+        command openstack "$@"
+        return
+    fi
     local command_line
     printf -v command_line '%q ' "$@"
     remote "$CONTROLLER_SSH" \
@@ -47,12 +71,24 @@ openstack() {
 }
 
 incus() {
-    local host=$1
+    local host=$1 command_line node entry
     shift
-    local command_line
-    printf -v command_line '%q ' "$@"
-    remote "$host" \
-        "podman exec -i incus incus --project $(printf '%q' "$INCUS_PROJECT") $command_line"
+    printf -v command_line '%q ' incus --project "$INCUS_PROJECT" "$@"
+    case "$INCUS_RUNTIME_MODE" in
+        podman)
+            remote "$host" \
+                "podman exec -i $(printf '%q' "$INCUS_RUNTIME_CONTAINER") $command_line"
+            ;;
+        kubernetes)
+            node=
+            for entry in ${INCUS_KUBE_NODE_MAP//,/ }; do
+                [[ "${entry%%=*}" == "$host" ]] && node=${entry#*=}
+            done
+            [[ -n "$node" ]] || return 1
+            remote "$host" "set -e; pods=\$(kubectl -n $(printf '%q' "$INCUS_KUBE_NAMESPACE") get pod -l application=incus --field-selector spec.nodeName=$(printf '%q' "$node") --no-headers -o custom-columns=NAME:.metadata.name); set -- \$pods; [ \$# -eq 1 ]; kubectl -n $(printf '%q' "$INCUS_KUBE_NAMESPACE") exec -i \"\$1\" -- $command_line"
+            ;;
+        *) return 2 ;;
+    esac
 }
 
 fail() {
@@ -172,6 +208,11 @@ wait_value PAUSED server_status
 openstack server unpause "$server_id"
 wait_value ACTIVE server_status
 assert_single_owner "$SOURCE_HOST"
+openstack server reboot --hard "$server_id"
+wait_value ACTIVE server_status
+assert_single_owner "$SOURCE_HOST"
+[[ "$(incus "$source_ssh" exec "$instance_name" -- \
+    cat /root/shelve-marker)" == "$marker" ]]
 
 openstack server shelve "$server_id"
 wait_value SHELVED_OFFLOADED server_status
@@ -209,4 +250,4 @@ addresses = next(iter(json.load(sys.stdin)["addresses"].values()))
 print(addresses[0] if isinstance(addresses[0], str) else addresses[0]["addr"])
 ')" == "$fixed_ip" ]]
 
-echo "PASS server=$server_id volume=$volume_id owner=$owner_host ip=$fixed_ip"
+echo "PASS pause/unpause hard-reboot shelve/unshelve config-drive server=$server_id volume=$volume_id owner=$owner_host ip=$fixed_ip"
