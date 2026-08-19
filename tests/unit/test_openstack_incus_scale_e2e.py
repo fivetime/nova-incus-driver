@@ -575,6 +575,22 @@ class ScaleRunnerTest(unittest.TestCase):
         self.assertEqual(3, args.min_compute_hosts)
         self.assertEqual(500, args.per_compute_target_by_total[1500])
 
+    def test_parse_args_requires_per_compute_targets_for_host_pinning(self):
+        with self.assertRaises(SystemExit):
+            scale.parse_args([
+                '--image', 'image',
+                '--flavor', 'flavor',
+                '--network', 'network',
+                '--checkpoints', '300',
+                '--pin-to-incus-hosts',
+                '--incus-host', 'compute-1=ssh-1',
+                '--expected-root-pool', 'ceph-rootfs',
+                '--rbd-inventory-command', '/bin/rbd-inventory',
+                '--ovn-lsp-inventory-command', '/bin/ovn-inventory',
+                '--ceph-status-command', '/bin/ceph-status',
+                '--idmap-inventory-command', '/bin/idmap-inventory',
+            ])
+
     def test_idmap_inventory_is_schema_opaque_but_uuid_exact(self):
         instance_id = str(uuid.uuid4())
         baseline = scale.normalize_idmap_inventory({
@@ -755,6 +771,49 @@ class ScaleRunnerTest(unittest.TestCase):
             wal = scale.artifact_wal_path(run.artifact)
             self.assertTrue(wal.exists())
             self.assertEqual(1, len(wal.read_text().splitlines()))
+
+    def test_create_round_robins_explicit_incus_hosts(self):
+        calls = []
+        run = scale.ScaleRun.__new__(scale.ScaleRun)
+        run.args = types.SimpleNamespace(
+            pin_to_incus_hosts=True,
+            availability_zone='nova',
+            incus_host=[
+                ('compute-3', 'ssh-3'),
+                ('compute-1', 'ssh-1'),
+                ('compute-2', 'ssh-2'),
+            ],
+        )
+
+        def create_server(**kwargs):
+            calls.append(kwargs)
+            return resource(str(uuid.uuid4()))
+
+        run.connection = types.SimpleNamespace(
+            compute=types.SimpleNamespace(create_server=create_server))
+        run.image = resource(str(uuid.uuid4()))
+        run.flavor = resource(str(uuid.uuid4()))
+        run.network = resource(str(uuid.uuid4()))
+        run.prefix = 'scale'
+        run.run_id = str(uuid.uuid4())
+        run.cleanup_token = str(uuid.uuid4())
+        run.server_ids = []
+        run.instance_names = {}
+        run.create_latencies = {}
+        run.submitted_epoch = {}
+        run.accepted_epoch = {}
+        run._state_lock = threading.Lock()
+        run._stop_event = threading.Event()
+        with tempfile.TemporaryDirectory() as directory:
+            run.artifact = Path(directory) / 'scale.json'
+            scale.reserve_artifact(run.artifact)
+            for ordinal in range(1, 5):
+                run.create_one(ordinal)
+
+        self.assertEqual(
+            ['nova:compute-1', 'nova:compute-2', 'nova:compute-3',
+             'nova:compute-1'],
+            [call['availability_zone'] for call in calls])
 
     def test_release_gate_wires_fail_closed_scale_evidence(self):
         gate = (

@@ -1935,6 +1935,12 @@ class ScaleRun:
             raise concurrent.futures.CancelledError()
         submitted_epoch = time.time()
         started = time.monotonic()
+        create_options = {}
+        if getattr(self.args, 'pin_to_incus_hosts', False):
+            hosts = sorted(host for host, _target in self.args.incus_host)
+            host = hosts[(ordinal - 1) % len(hosts)]
+            create_options['availability_zone'] = '{}:{}'.format(
+                self.args.availability_zone, host)
         server = self.connection.compute.create_server(
             name='{}-{:04d}'.format(self.prefix, ordinal),
             image_id=self.image.id,
@@ -1945,6 +1951,7 @@ class ScaleRun:
                 CLEANUP_METADATA_KEY: self.cleanup_token,
                 ORDINAL_METADATA_KEY: str(ordinal),
             },
+            **create_options,
         )
         latency = time.monotonic() - started
         accepted_epoch = time.time()
@@ -3642,6 +3649,15 @@ def parse_args(argv=None):
         help=(
             'cumulative target per mapped Incus compute; for three hosts '
             '100,500,1000 becomes fleet totals 300,1500,3000'))
+    parser.add_argument(
+        '--pin-to-incus-hosts', action='store_true',
+        help=(
+            'round-robin creates across the mapped Incus hosts using an '
+            'explicit Nova availability-zone host target; requires '
+            '--per-compute-checkpoints'))
+    parser.add_argument(
+        '--availability-zone', default='nova',
+        help='Nova availability zone used with --pin-to-incus-hosts')
     parser.add_argument('--concurrency', type=positive_int, default=16)
     parser.add_argument(
         '--delete-concurrency', type=positive_int, default=16)
@@ -3808,6 +3824,16 @@ def parse_args(argv=None):
                     .format(option.replace('_', '-')))
     if not args.name_prefix:
         parser.error('--name-prefix cannot be empty')
+    if args.pin_to_incus_hosts:
+        if args.per_compute_checkpoints is None:
+            parser.error(
+                '--pin-to-incus-hosts requires --per-compute-checkpoints')
+        if not args.incus_host:
+            parser.error('--pin-to-incus-hosts requires --incus-host')
+        if not args.availability_zone or ':' in args.availability_zone:
+            parser.error(
+                '--availability-zone must be a non-empty zone name without '
+                "':'")
     if not args.cleanup_artifact and not args.incus_project:
         parser.error('--incus-project cannot be empty')
     if args.min_per_compute_percent > 100:
