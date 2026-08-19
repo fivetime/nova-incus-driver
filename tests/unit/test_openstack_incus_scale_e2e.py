@@ -1262,6 +1262,7 @@ class ScaleRunnerTest(unittest.TestCase):
             'server_ids': [str(uuid.uuid4())],
             'incus_hosts': [['compute-1', 'root@10.0.0.11']],
             'incus_project': 'nova-custom',
+            'incus_cli_command': 'crictl exec daemon incus',
         }
         with tempfile.TemporaryDirectory() as directory:
             artifact = Path(directory) / 'scale.json'
@@ -1271,6 +1272,7 @@ class ScaleRunnerTest(unittest.TestCase):
                 cloud=None,
                 incus_host=[],
                 incus_project=None,
+                incus_cli_command=None,
             )
             connection = types.SimpleNamespace(
                 current_project_id=project_id)
@@ -1283,6 +1285,40 @@ class ScaleRunnerTest(unittest.TestCase):
             run.args.incus_host,
         )
         self.assertEqual('nova-custom', run.args.incus_project)
+        self.assertEqual(
+            'crictl exec daemon incus', run.args.incus_cli_command)
+
+    def test_incus_inventory_uses_configured_cli_command(self):
+        run = scale.ScaleRun.__new__(scale.ScaleRun)
+        run.args = types.SimpleNamespace(
+            incus_host=[('compute-1', 'compute-ssh')],
+            incus_project='nova',
+            incus_cli_command='crictl exec daemon incus',
+        )
+        commands = []
+
+        def remote_json(host, command):
+            commands.append((host, command))
+            return []
+
+        run.remote_json = remote_json
+
+        inventory = run._incus_inventory()
+
+        self.assertEqual([], inventory['compute-1']['instances'])
+        self.assertEqual([], inventory['compute-1']['profiles'])
+        self.assertEqual([
+            (
+                'compute-ssh',
+                'crictl exec daemon incus --project nova list '
+                '--columns=n --format=json',
+            ),
+            (
+                'compute-ssh',
+                'crictl exec daemon incus --project nova profile list '
+                '--format=json',
+            ),
+        ], commands)
 
     def test_exact_absence_distinguishes_present_not_found_and_error(self):
         present_id = str(uuid.uuid4())

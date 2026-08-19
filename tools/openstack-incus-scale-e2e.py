@@ -43,6 +43,7 @@ import openstack
 
 
 ARTIFACT_SCHEMA_VERSION = 4
+DEFAULT_INCUS_CLI_COMMAND = 'podman exec incus incus'
 RUN_METADATA_KEY = 'openstack_incus_scale_run'
 CLEANUP_METADATA_KEY = 'openstack_incus_scale_cleanup'
 ORDINAL_METADATA_KEY = 'openstack_incus_scale_ordinal'
@@ -1182,6 +1183,16 @@ class ScaleRun:
                 'cleanup Incus project must match the artifact')
         if not args.incus_project:
             raise ScaleFailure('artifact contains an invalid Incus project')
+        stored_cli_command = state.get(
+            'incus_cli_command', DEFAULT_INCUS_CLI_COMMAND)
+        if not isinstance(stored_cli_command, str) or not stored_cli_command:
+            raise ScaleFailure(
+                'artifact contains an invalid Incus CLI command')
+        if args.incus_cli_command is None:
+            args.incus_cli_command = stored_cli_command
+        elif args.incus_cli_command != stored_cli_command:
+            raise ScaleFailure(
+                'cleanup Incus CLI command must match the artifact')
         self.resources = dict(state.get('resources', {}))
         self._state_lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -1228,6 +1239,8 @@ class ScaleRun:
             'resources': dict(self.resources),
             'incus_hosts': list(self.args.incus_host),
             'incus_project': self.args.incus_project,
+            'incus_cli_command': getattr(
+                self.args, 'incus_cli_command', DEFAULT_INCUS_CLI_COMMAND),
             'artifact': str(self.artifact),
         }
 
@@ -2475,12 +2488,14 @@ class ScaleRun:
     def _incus_inventory(self):
         inventory = {}
         project = shlex.quote(self.args.incus_project)
+        cli = getattr(
+            self.args, 'incus_cli_command', DEFAULT_INCUS_CLI_COMMAND)
         command_instances = (
-            'podman exec incus incus --project {} list '
-            '--columns=n --format=json'.format(project))
+            '{} --project {} list --columns=n --format=json'.format(
+                cli, project))
         command_profiles = (
-            'podman exec incus incus --project {} profile list '
-            '--format=json'.format(project))
+            '{} --project {} profile list --format=json'.format(
+                cli, project))
         for nova_host, ssh_target in self.args.incus_host:
             instances = self.remote_json(ssh_target, command_instances)
             profiles = self.remote_json(ssh_target, command_profiles)
@@ -3721,6 +3736,11 @@ def parse_args(argv=None):
         help='map a Nova host to its Incus SSH target; repeat for every node')
     parser.add_argument('--incus-project')
     parser.add_argument(
+        '--incus-cli-command',
+        help=(
+            'remote shell command prefix that invokes the Incus CLI; '
+            'defaults to the legacy Podman deployment command'))
+    parser.add_argument(
         '--ssh-connect-timeout', type=positive_int, default=10)
     parser.add_argument(
         '--ssh-command-timeout', type=positive_int, default=120)
@@ -3764,6 +3784,8 @@ def parse_args(argv=None):
                     ', '.join('--{}'.format(option) for option in missing)))
         if args.incus_project is None:
             args.incus_project = 'nova'
+        if args.incus_cli_command is None:
+            args.incus_cli_command = DEFAULT_INCUS_CLI_COMMAND
         for option in (
                 'expected_root_pool',
                 'rbd_inventory_command',
