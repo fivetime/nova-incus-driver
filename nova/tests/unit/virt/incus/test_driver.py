@@ -2776,6 +2776,17 @@ class IncusDriverTest(test.NoDBTestCase):
             config.update(local_config)
             resource.config = config
 
+        profile = self.client.profiles.get.return_value
+        if isinstance(profile, mock.Mock):
+            profile_config = dict(
+                profile.config if isinstance(profile.config, dict) else {})
+            profile_config.update({
+                'environment.product_name': 'OpenStack Nova',
+                'user.openstack.uuid': instance.uuid,
+            })
+            profile.config = profile_config
+            profile.used_by = []
+
         if outcome is None:
             if storage_driver == 'cephext':
                 outcome = 'normalized'
@@ -6182,18 +6193,21 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
     def test_destroy_converges_current_migration_owner_before_final_delete(
             self, lock, converge, is_owned):
         token = '10000000-0000-0000-0000-000000000001'
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
         container = mock.Mock(status='Stopped', config={})
         self.client.instances.get.return_value = container
         initial_profile = mock.Mock(config={
             driver.MIGRATION_CLEANUP_TOKEN_KEY: token,
         })
-        retired_profile = mock.Mock(config={})
+        retired_profile = mock.Mock(config={
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+        }, used_by=[])
         self.client.profiles.get.side_effect = [
             initial_profile, initial_profile, retired_profile,
-            retired_profile]
-        ctx = context.get_admin_context()
-        instance = fake_instance.fake_instance_obj(
-            ctx, name='test', memory_mb=0)
+            retired_profile, retired_profile]
         incus_driver = driver.IncusDriver(None)
         incus_driver.init_host(None)
         self._configure_exact_idmap_release(
@@ -6591,7 +6605,47 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         chown.assert_called_once_with(
             instance_dir, uid=1001, gid=1001, recursive=True)
         rmtree.assert_called_once_with(instance_dir)
-        mock_profile.delete.assert_called_once_with()
+        mock_profile.delete.assert_called_once_with(wait=True)
+
+    def test_final_delete_marks_profile_before_instance_removal(self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': instance.uuid,
+        }
+        profile.used_by = [
+            '/1.0/instances/{}?project=nova'.format(instance.name)]
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        incus_driver._mark_final_delete_profile_for_recovery(instance)
+
+        self.assertEqual(
+            'true', profile.config[driver.CLEANUP_RECOVERY_KEY])
+        profile.save.assert_called_once_with(wait=True)
+
+    def test_final_delete_rejects_foreign_profile_before_instance_removal(
+            self):
+        ctx = context.get_admin_context()
+        instance = fake_instance.fake_instance_obj(
+            ctx, name='test', memory_mb=0)
+        profile = self.client.profiles.get.return_value
+        profile.config = {
+            'environment.product_name': 'OpenStack Nova',
+            'user.openstack.uuid': '10000000-0000-0000-0000-000000000001',
+        }
+        profile.used_by = []
+        incus_driver = driver.IncusDriver(None)
+        incus_driver.init_host(None)
+
+        self.assertRaises(
+            exception.InvalidConfiguration,
+            incus_driver._mark_final_delete_profile_for_recovery, instance)
+
+        profile.save.assert_not_called()
 
     @mock.patch.object(driver.LOG, 'debug')
     @mock.patch.object(driver.IncusDriver, 'unplug_vifs')
@@ -6803,7 +6857,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         incus_driver._detach_volume.assert_called_once_with(
             ctx, connection_info, instance, '/dev/sdb',
             retain_journal=False)
-        profile.delete.assert_called_once_with()
+        profile.delete.assert_called_once_with(wait=True)
 
     @mock.patch.object(driver.os.path, 'exists', return_value=False)
     def test_cleanup_does_not_reread_profile_per_data_volume(
@@ -6854,7 +6908,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
         # One initial snapshot and one final deletion-safety read. The number
         # is independent of the number of Nova BDMs.
         self.assertEqual(2, self.client.profiles.get.call_count)
-        profile.delete.assert_called_once_with()
+        profile.delete.assert_called_once_with(wait=True)
 
     @mock.patch.object(driver.IncusDriver, 'unplug_vifs')
     @mock.patch.object(driver.os.path, 'exists', return_value=False)
@@ -16497,7 +16551,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             instance, vif)
         self.vif_driver.unplug.assert_called_once_with(
             instance, vif)
-        profile.delete.assert_called_once_with()
+        profile.delete.assert_called_once_with(wait=True)
 
     @mock.patch.object(driver.flavor, 'to_profile')
     def test_finish_migration_partial_vif_cleanup_retains_profile(
@@ -16855,7 +16909,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             mock.Mock(), True, {}, block_device_info={}, power_on=True)
 
         self.assertNotIn(driver.MIGRATION_RECOVERY_KEY, profile.config)
-        profile.delete.assert_called_once_with()
+        profile.delete.assert_called_once_with(wait=True)
         self.vif_driver.unplug.assert_called_once_with(
             instance, vif)
 
@@ -18314,7 +18368,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
                 'connection_info': connection_info,
             }]}, [vif], None, data)
 
-        profile.delete.assert_called_once_with()
+        profile.delete.assert_called_once_with(wait=True)
         self.vif_driver.unplug.assert_called_once_with(
             instance, vif)
         self.assertIs(
@@ -18541,7 +18595,7 @@ incus_disk_read_bytes_total{device="rbd2",name="other"} 999
             incus_driver.cleanup_pre_live_migration_destination(
                 ctx, instance, data))
 
-        profile.delete.assert_called_once_with()
+        profile.delete.assert_called_once_with(wait=True)
         self._retire_migration_attempt.assert_called_once_with(
             self.client, instance, cleanup_token, 1065536, 65536)
         self.assertEqual(4, self.vif_driver.unplug.call_count)

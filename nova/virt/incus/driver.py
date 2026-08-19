@@ -9584,6 +9584,35 @@ class IncusDriver(driver.ComputeDriver):
                 reason='Refusing to destroy an Incus source while its '
                        'rollback volume generation is not retired')
 
+    def _mark_final_delete_profile_for_recovery(self, instance):
+        """Make profile cleanup replayable before deleting the instance.
+
+        Incus profile deletion can be asynchronous.  The marker must be
+        durable before the instance record is removed, otherwise a process
+        exit or a lost operation result can leave an unreferenced profile
+        with no periodic recovery owner.
+        """
+        with lockutils.lock(_profile_lock_name(instance)):
+            try:
+                profile = self.client.profiles.get(instance.name)
+            except incus_exceptions.LXDAPIException as exc:
+                if _is_incus_not_found(exc):
+                    return
+                raise
+
+            config = (
+                profile.config if isinstance(profile.config, dict) else {})
+            if (config.get('environment.product_name') != 'OpenStack Nova' or
+                    config.get('user.openstack.uuid') != instance.uuid or
+                    _profile_users_other_than(profile, instance)):
+                raise exception.InvalidConfiguration(
+                    'Refusing to mark a foreign or shared Incus profile for '
+                    'final-delete recovery')
+            if config.get(CLEANUP_RECOVERY_KEY) == 'true':
+                return
+            profile.config[CLEANUP_RECOVERY_KEY] = 'true'
+            profile.save(wait=True)
+
     @_invalidates_instance_inventory
     @_guards_serial_console
     def destroy(self, context, instance, network_info, block_device_info=None,
@@ -9642,6 +9671,9 @@ class IncusDriver(driver.ComputeDriver):
                 container = self.client.instances.get(name)
             except incus_exceptions.LXDAPIException as exc:
                 if _is_incus_not_found(exc):
+                    if name == instance.name and not cleanup_token:
+                        self._mark_final_delete_profile_for_recovery(
+                            instance)
                     if name == instance.name and release_claim is not None:
                         self._settle_idmap_host_claim(
                             instance, release_claim,
@@ -9689,6 +9721,9 @@ class IncusDriver(driver.ComputeDriver):
                             container=container)
             if container.status != 'Stopped':
                 container.stop(wait=True)
+
+            if name == instance.name and not cleanup_token:
+                self._mark_final_delete_profile_for_recovery(instance)
 
             if name == instance.name and release_claim is not None:
                 self._delete_instance_with_rootfs_release_receipt(
@@ -9930,7 +9965,9 @@ class IncusDriver(driver.ComputeDriver):
                     'Retaining Incus profile because a durable Cinder '
                     'transaction is unfinished', instance=instance)
             elif delete_profile and not failures:
-                attempt('delete Incus profile', profile.delete)
+                attempt(
+                    'delete Incus profile',
+                    lambda: profile.delete(wait=True))
             else:
                 LOG.error(
                     'Retaining Incus profile as a migration cleanup barrier',
