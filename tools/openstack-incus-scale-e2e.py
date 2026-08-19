@@ -1992,10 +1992,7 @@ class ScaleRun:
             return ordinal, '{}: {}'.format(type(exc).__name__, exc)
         return None
 
-    def create_until(self, target):
-        start = len(self.server_ids) + 1
-        if start > target:
-            return
+    def _create_range(self, start, target):
         print(
             'Creating servers {}..{} with concurrency {}'.format(
                 start, target, self.args.concurrency),
@@ -2047,6 +2044,26 @@ class ScaleRun:
                     len(failures), failures[0][0], failures[0][1]))
         if self._stop_event.is_set():
             raise ScaleFailure('run interrupted')
+
+    def create_until(self, target):
+        start = len(self.server_ids) + 1
+        if start > target:
+            return
+        wave_size = getattr(self.args, 'create_wave_size', None)
+        if wave_size is None:
+            self._create_range(start, target)
+            return
+
+        while start <= target:
+            wave_target = min(target, start + wave_size - 1)
+            self._create_range(start, wave_target)
+            if wave_target < target:
+                print(
+                    'Waiting for creation wave through {}'.format(
+                        wave_target),
+                    flush=True)
+                self.wait_active(wave_target)
+            start = wave_target + 1
 
     def list_run_servers(self, server_ids):
         wanted = set(server_ids)
@@ -3622,9 +3639,12 @@ class ScaleRun:
         for checkpoint in self.args.checkpoints:
             if self._stop_event.is_set():
                 raise ScaleFailure('run interrupted')
+            stage_started = time.monotonic()
             self.create_until(checkpoint)
             servers, list_latencies, active_seconds = self.wait_active(
                 checkpoint)
+            if self.args.create_wave_size is not None:
+                active_seconds = time.monotonic() - stage_started
             self.audit_checkpoint(
                 checkpoint, servers, list_latencies, active_seconds)
         self.idle_soak(self.args.checkpoints[-1])
@@ -3659,6 +3679,12 @@ def parse_args(argv=None):
         '--availability-zone', default='nova',
         help='Nova availability zone used with --pin-to-incus-hosts')
     parser.add_argument('--concurrency', type=positive_int, default=16)
+    parser.add_argument(
+        '--create-wave-size', type=positive_int,
+        help=(
+            'maximum fleet-wide create requests submitted before waiting for '
+            'that wave to become ACTIVE; separates capacity validation from '
+            'scheduler-allocation burst testing'))
     parser.add_argument(
         '--delete-concurrency', type=positive_int, default=16)
     parser.add_argument('--stage-timeout', type=positive_int, default=7200)

@@ -1191,7 +1191,10 @@ class ScaleRunnerTest(unittest.TestCase):
 
     def test_create_until_stops_submitting_after_first_bounded_batch(self):
         run = scale.ScaleRun.__new__(scale.ScaleRun)
-        run.args = types.SimpleNamespace(concurrency=3)
+        run.args = types.SimpleNamespace(
+            concurrency=3,
+            create_wave_size=None,
+        )
         run.server_ids = []
         run._stop_event = threading.Event()
         submitted = []
@@ -1207,6 +1210,40 @@ class ScaleRunnerTest(unittest.TestCase):
             run.create_until(1000)
         self.assertTrue(submitted)
         self.assertLessEqual(max(submitted), 3)
+
+    def test_create_until_waits_between_bounded_creation_waves(self):
+        run = scale.ScaleRun.__new__(scale.ScaleRun)
+        run.args = types.SimpleNamespace(
+            concurrency=8,
+            create_wave_size=6,
+        )
+        run.server_ids = []
+        run._stop_event = threading.Event()
+        events = []
+
+        def create_range(start, target):
+            events.append(('create', start, target))
+            run.server_ids.extend(
+                str(uuid.uuid4()) for unused in range(start, target + 1))
+
+        def wait_active(target):
+            events.append(('active', target))
+
+        run._create_range = create_range
+        run.wait_active = wait_active
+
+        run.create_until(15)
+
+        self.assertEqual(
+            [
+                ('create', 1, 6),
+                ('active', 6),
+                ('create', 7, 12),
+                ('active', 12),
+                ('create', 13, 15),
+            ],
+            events,
+        )
 
     def test_cleanup_deletes_only_exact_metadata_pair_and_recovers_id(self):
         recorded_id = str(uuid.uuid4())
