@@ -784,6 +784,30 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
             self.etcd.values[self.allocator.slot_key(
                 assignment.slot).encode()])
 
+    def test_allocate_retries_completed_audit_generation_rotation(self):
+        original_try_allocate = self.allocator._try_allocate
+        rotate_on_write = True
+
+        def rotate_after_transaction_is_built(client, unused_transaction):
+            owner, unused_snapshot = self.allocator.run_coordinated_audit(
+                full=False)
+            self.assertTrue(owner)
+
+        def try_allocate(*args):
+            nonlocal rotate_on_write
+            if rotate_on_write:
+                rotate_on_write = False
+                self.etcd.before_transaction = (
+                    rotate_after_transaction_is_built)
+            return original_try_allocate(*args)
+
+        with mock.patch.object(
+                self.allocator, '_try_allocate', side_effect=try_allocate):
+            assignment = self.allocator.allocate(self._uuid(101))
+
+        self.assertEqual(assignment, self.allocator.get(self._uuid(101)))
+        self.assertFalse(rotate_on_write)
+
     def test_assignment_has_no_global_materialization_state(self):
         assignment = self.allocator.allocate(self._uuid(2))
         self.assertNotIn("rootfs_materialized", assignment.__dict__)

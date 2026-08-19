@@ -2664,46 +2664,53 @@ class IDMapAllocator:
         instance_key = self.instance_key(instance_uuid)
         slot_key = self.slot_key(slot)
         raw = self._assignment_raw(instance_uuid, slot, allocation_id)
-        transaction = {
-            "compare": self._guard_compares() + [
-                self._compare_absent(instance_key),
-                self._compare_absent(slot_key),
-                self._compare_absent(self.release_key(instance_uuid)),
-            ],
-            "success": [
-                {
-                    "request_put": {
-                        "key": self._b64(instance_key),
-                        "value": self._b64(raw),
+        for attempt in range(2):
+            guard_raw = self._fleet_health_raw
+            guard_lease_id = self._fleet_health_lease_id
+            transaction = {
+                "compare": self._guard_compares_for(
+                    guard_raw, guard_lease_id) + [
+                    self._compare_absent(instance_key),
+                    self._compare_absent(slot_key),
+                    self._compare_absent(self.release_key(instance_uuid)),
+                ],
+                "success": [
+                    {
+                        "request_put": {
+                            "key": self._b64(instance_key),
+                            "value": self._b64(raw),
+                        },
                     },
-                },
-                {
-                    "request_put": {
-                        "key": self._b64(slot_key),
-                        "value": self._b64(raw),
+                    {
+                        "request_put": {
+                            "key": self._b64(slot_key),
+                            "value": self._b64(raw),
+                        },
                     },
-                },
-            ],
-            "failure": [],
-        }
-        try:
-            succeeded = self._transaction(transaction)
-        except IDMapBackendError:
-            current, unused_raw = self._get_allocatable_assignment(
-                instance_uuid)
-            if (current is not None and current.slot == slot and
-                    current.allocation_id == allocation_id):
+                ],
+                "failure": [],
+            }
+            try:
+                succeeded = self._transaction(transaction)
+            except IDMapBackendError:
+                current, unused_raw = self._get_allocatable_assignment(
+                    instance_uuid)
+                if (current is not None and current.slot == slot and
+                        current.allocation_id == allocation_id):
+                    return current
+                raise
+            if succeeded:
+                current, unused_raw = self._get_allocatable_assignment(
+                    instance_uuid)
+                if (current is None or current.slot != slot or
+                        current.allocation_id != allocation_id):
+                    raise IDMapIntegrityError(
+                        reason="committed allocation cannot be verified")
                 return current
-            raise
-        if succeeded:
-            current, unused_raw = self._get_allocatable_assignment(
-                instance_uuid)
-            if (current is None or current.slot != slot or
-                    current.allocation_id != allocation_id):
-                raise IDMapIntegrityError(
-                    reason="committed allocation cannot be verified")
-            return current
-        return None
+            if (attempt == 0 and
+                    self._refresh_fleet_read_guard(guard_raw)):
+                continue
+            return None
 
     def allocate(self, instance_uuid, preferred_base=None,
                  preferred_size=None):
