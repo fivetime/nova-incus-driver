@@ -2501,3 +2501,45 @@ deletion, or Nova service-down flag is not STONITH and must not be recorded as
 evacuation evidence. Production BFV evacuation remains NO-GO until an
 external fence proves the source cannot access Ceph and the returning-host
 audit/admission sequence is exercised.
+
+## 2026-08-21 three-node 500-per-node capacity rerun
+
+The production rerun used ``container1``, ``container2``, and ``container3``
+with Nova Helm revision 89. All three ``nova-compute-incus`` pods used
+``ghcr.io/fivetime/openstackhelm/nova-incus@sha256:4ba36be3b354a11277514f1ea27b1370c189413453eb1d9c4ced422f3d5c52ac``
+and completed the run with zero pod restarts. The image contained
+openstack-incus ``7f90fde`` (bounded retry for transient etcd transaction
+failures); the scale runner contained ``8362aec`` (15-instance bounded create
+waves), and Nova used ``[DEFAULT] vif_plugging_timeout = 900`` from
+openstack-helm ``34104e7ab``.
+
+The pin smoke passed with one instance on each compute. The formal run
+``959aaf77-08bb-4605-962a-7b6c989521bf`` then reached every requested
+checkpoint with exact balanced placement: 100, 200, 300, 400, and 500
+instances per compute. All 1,500 instances reached ``ACTIVE``. At every
+checkpoint the runner verified Incus instance/profile ownership, Ceph root
+images, OVN logical switch ports, Placement consumers/provider usage, Neutron
+ports, etcd ID-map ownership, process limits, host storage, Ceph health, and a
+ten-cycle periodic-task soak. The OVN inventory adapter was corrected during
+the exercise to query each northbound Raft member until the current leader
+returned a complete result; a follower's leader-only local socket is not a
+valid fixed audit endpoint.
+
+The functional capacity and integrity checks passed, but the formal result is
+**not an all-green performance gate**. Incremental create-to-ACTIVE throughput
+at 100/200/300/400/500 instances per compute was respectively 0.12762,
+0.09354, 0.07433, 0.05945, and 0.04448 instances/second. The final stage was
+below the configured 0.05 minimum; submit throughput was 0.04670/second.
+Cumulative create-to-ACTIVE throughput across all 1,500 instances remained
+0.06973/second. The evidence artifact is
+``/root/openstack-incus-scale-current/evidence/scale-current-pc500-959aaf77-08bb-4605-962a-7b6c989521bf.json``.
+
+At 500 instances per compute, Incus RSS was approximately 10.96 GB per node
+and available host memory remained 30.8-32.2 GB. Cleanup removed all 1,500
+servers in 6,737 seconds and passed its own SLO: delete API p95 was 0.716
+seconds. Final residual counts were zero for Nova servers, Incus instances and
+profiles, Neutron ports, Placement consumers, RBD images, and added OVN LSPs;
+provider usage returned to zero and etcd ID-map inventory returned exactly to
+its three-key baseline. The temporary scale network/subnet/flavor were deleted
+and project quotas were restored to 10 instances, 20 cores, 51,200 MB RAM, and
+500 ports.
