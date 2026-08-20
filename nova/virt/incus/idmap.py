@@ -23,6 +23,7 @@ import time
 from urllib import parse as urlparse
 import uuid
 
+from etcd3gw import exceptions as etcd_exceptions
 from nova import exception
 from nova.i18n import _
 from oslo_serialization import jsonutils
@@ -41,6 +42,12 @@ _RELEASE_OUTCOMES = frozenset(("deleted", "normalized", "detached"))
 _INVALID_AUTH_TOKEN = "etcdserver: invalid auth token"
 _AUDIT_CONTROL_SCHEMA = 1
 _AUDIT_CONTROL_STATES = frozenset(("pending", "healthy"))
+_TRANSIENT_TRANSACTION_ERRORS = (
+    etcd_exceptions.ConnectionFailedError,
+    etcd_exceptions.ConnectionTimeoutError,
+    etcd_exceptions.InternalServerError,
+)
+_TRANSIENT_TRANSACTION_RETRY_DELAYS = (0.25, 0.5, 1.0)
 
 
 class IDMapError(exception.NovaException):
@@ -849,13 +856,25 @@ class IDMapAllocator:
 
     def _transaction_response(self, transaction):
         for attempt in range(2):
-            try:
-                result = self._call_with_auth_retry(
-                    lambda: self._client.transaction(transaction))
-            except Exception as exc:
-                raise IDMapBackendError(
-                    reason="etcd transaction failed: %s" %
-                    self._gateway_error_text(exc))
+            for transient_attempt in range(
+                    len(_TRANSIENT_TRANSACTION_RETRY_DELAYS) + 1):
+                try:
+                    result = self._call_with_auth_retry(
+                        lambda: self._client.transaction(transaction))
+                    break
+                except _TRANSIENT_TRANSACTION_ERRORS as exc:
+                    if transient_attempt == len(
+                            _TRANSIENT_TRANSACTION_RETRY_DELAYS):
+                        raise IDMapBackendError(
+                            reason="etcd transaction failed: %s" %
+                            self._gateway_error_text(exc))
+                    time.sleep(
+                        _TRANSIENT_TRANSACTION_RETRY_DELAYS[
+                            transient_attempt])
+                except Exception as exc:
+                    raise IDMapBackendError(
+                        reason="etcd transaction failed: %s" %
+                        self._gateway_error_text(exc))
             if (isinstance(result, dict) and
                     isinstance(result.get("header"), dict)):
                 # etcd3gw intentionally models the gateway's proto3 JSON:

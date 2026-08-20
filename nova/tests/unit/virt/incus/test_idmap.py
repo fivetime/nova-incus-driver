@@ -20,6 +20,7 @@ import threading
 from unittest import mock
 import uuid
 
+from etcd3gw import exceptions as etcd_exceptions
 import fixtures
 from nova import test
 from oslo_serialization import jsonutils
@@ -525,6 +526,25 @@ class IDMapAllocatorV3Test(test.NoDBTestCase):
 
         self.assertFalse(normalized["succeeded"])
         self.assertEqual([], normalized["responses"])
+
+    def test_transaction_retries_transient_leader_change(self):
+        response = {
+            "header": {"revision": "2"},
+            "responses": [],
+        }
+        with mock.patch.object(
+                self.allocator._client, "transaction",
+                side_effect=[
+                    etcd_exceptions.ConnectionFailedError(
+                        "etcdserver: leader changed"),
+                    response,
+                ]) as transaction, mock.patch.object(
+                    idmap.time, "sleep") as sleep:
+            normalized = self.allocator._transaction_response({})
+
+        self.assertFalse(normalized["succeeded"])
+        self.assertEqual(2, transaction.call_count)
+        sleep.assert_called_once_with(0.25)
 
     def test_concurrent_invalid_token_refresh_authenticates_once(self):
         directory = self.useFixture(fixtures.TempDir()).path
