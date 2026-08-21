@@ -143,9 +143,11 @@ class ManilaReleaseGateContractTest(unittest.TestCase):
         self.assertEqual(
             2,
             self.release.count(
-                'RUN_DESTRUCTIVE=true \\\n        IMAGE="$MIGRATION_LOCAL_IMAGE"'))
+                'RUN_DESTRUCTIVE=true \\\n'
+                '        IMAGE="$MIGRATION_LOCAL_IMAGE"'))
 
-    def test_gate_recovery_targets_kubernetes_runtime_without_host_firewall(self):
+    def test_gate_recovery_targets_kubernetes_runtime_without_host_firewall(
+            self):
         script = self.gate_recovery
         self.assertIn('INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}',
                       script)
