@@ -61,6 +61,13 @@ class EvacuationRuntimeContractTest(unittest.TestCase):
                 'INCUS_KUBE_ADMISSION_LABEL_VALUE'):
             self.assertIn(f'{name}="${name}"', self.evacuation)
 
+    def test_idmap_fence_provider_can_follow_execution_boundary(self):
+        self.assertIn(
+            'IDMAP_FENCE_PROVIDER=${IDMAP_FENCE_PROVIDER:-$FENCE_PROVIDER}',
+            self.evacuation)
+        self.assertIn(
+            "--fence-provider '$IDMAP_FENCE_PROVIDER'", self.evacuation)
+
     def test_kubernetes_quarantine_precedes_return_audit(self):
         self.assertIn('kube_compute_daemonset_is_guarded()', self.evacuation)
         self.assertIn('kube_quarantine_source_compute()', self.evacuation)

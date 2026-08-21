@@ -12,6 +12,7 @@ DEST_SSH=${DEST_SSH:?Set DEST_SSH}
 CONTROLLER_SSH=${CONTROLLER_SSH:?Set CONTROLLER_SSH}
 SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY}
 FENCE_PROVIDER=${FENCE_PROVIDER:?Set FENCE_PROVIDER executable}
+IDMAP_FENCE_PROVIDER=${IDMAP_FENCE_PROVIDER:-$FENCE_PROVIDER}
 SOURCE_FENCE_ID=${SOURCE_FENCE_ID:-$SOURCE_HOST}
 CONTROLLER_OPENRC=${CONTROLLER_OPENRC:-/opt/stack/devstack/openrc admin admin}
 RETURN_AUDIT=${RETURN_AUDIT:-"$SCRIPT_DIR/openstack-incus-returning-host-audit.sh"}
@@ -479,7 +480,7 @@ remote "$CONTROLLER_SSH" "$IDMAP_REGISTRY_TOOL \
     --fence-retire-host-claim '$SERVER_ID' \
     --host-id '$source_host_id' \
     --fence-plug '$SOURCE_FENCE_ID' \
-    --fence-provider '$FENCE_PROVIDER' \
+    --fence-provider '$IDMAP_FENCE_PROVIDER' \
     --fence-agent '$FENCE_PROVIDER' --fenced-at '$fenced_at' \
     --operator '$FENCE_OPERATOR' \
     --fence-evidence 'BFV root watcher count 0'" >/dev/null || {
