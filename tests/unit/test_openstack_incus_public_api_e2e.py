@@ -66,9 +66,14 @@ class PublicApiE2EContractTest(unittest.TestCase):
 
     def test_resize_checks_the_configured_incus_project(self):
         self.assertIn('INCUS_PROJECT=${INCUS_PROJECT:-nova}', self.resize)
-        self.assertEqual(
-            5, self.resize.count("incus --project '$INCUS_PROJECT' exec"))
-        self.assertNotIn('"incus exec ', self.resize)
+        self.assertIn(
+            "printf -v command_line '%q ' incus --project "
+            '"$INCUS_PROJECT" "$@"', self.resize)
+        self.assertGreaterEqual(self.resize.count('incus_remote '), 5)
+        self.assertIn('INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}',
+                      self.resize)
+        self.assertIn(
+            'INCUS_KUBE_NODE_MAP=${INCUS_KUBE_NODE_MAP:-}', self.resize)
 
     def test_volume_migration_checks_the_configured_incus_project(self):
         script = self.volume_migration

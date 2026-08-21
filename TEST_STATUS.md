@@ -11,6 +11,74 @@ Entries are append-mostly and are release evidence, not permanent
 configuration. Each release must re-validate against its own approved
 digest/revision pair.
 
+## 2026-08-22 three-node production matrix rerun
+
+The production rerun used ``container1``, ``container2`` and ``container3``.
+All three ``nova-compute-incus`` pods ran
+``ghcr.io/fivetime/openstackhelm/nova-incus@sha256:4ba36be3b354a11277514f1ea27b1370c189413453eb1d9c4ced422f3d5c52ac``;
+all three Incus pods ran
+``ghcr.io/fivetime/incus@sha256:d61acad06073232f668a870f125c647afce04380b49deb33e39a51e13de9460d``.
+The test tools were based on openstack-incus ``47e4a89``. Nova was upgraded
+to Helm revision 93 during the run to restore the Nova default
+``allow_resize_to_same_host = false`` in the API configuration. This option
+is an API scheduling decision, not a compute-driver option; placing it only
+in ``nova-incus.conf`` had allowed a same-host resize that the exact isolated
+ID-map contract correctly rejected.
+
+The current-code functional rerun passed:
+
+- all eight local/BFV x 0/1 Cinder x 0/1 Manila live-migration cases, with a
+  three-node ring per case (24 migrations);
+- all 18 local/BFV x 0/1/3 Cinder x 0/1/3 Manila cases (54 migrations), both
+  before and after real node reboots and again after a real BFV STONITH and
+  evacuation; the interrupted four-hour post-evacuation batch was resumed
+  from its exact remaining four cases rather than counted as a new run;
+- maximum BFV plus three data volumes plus three Manila shares with injected
+  destination CRIU restore failure, unchanged source PID and data, exact
+  target cleanup, and immediate three-hop retry;
+- all six ordered three-node directions for the five BFV cold-migration
+  scenarios: confirm/revert, post-claim data failure, target start failure,
+  SHUTOFF failure and reverse-revert failure (30/30 cases);
+- local/BFV roots with one/two initial Cinder data volumes through format,
+  marker write, hard reboot and persistence (4/4 cases);
+- Manila destination pre-mount rejection, retry, compute-pod restart/remount,
+  snapshot, create-from-snapshot, reattach and marker recovery;
+- BFV pause/unpause, hard reboot, shelve/unshelve, config-drive,
+  ACTIVE/SHUTOFF reimage, public snapshot/restore and deletion protection;
+- Cinder attach/write/online extension/cold migration/detach,
+  snapshot/clone, full and incremental backup/restore;
+- resize revert and confirm across different computes, including persistent
+  marker, Placement and process-limit validation;
+- exact Ceph delete ABA protection and isolated-ID-map overlap rejection on
+  each of the three computes.
+
+The destructive BFV evacuation used an external power-off through the
+hypervisor host, verified watcher retirement before claim fencing, preserved
+the BFV marker, and completed returning-host quarantine, audit and admission.
+The 500-per-compute capacity run also reached 1,500 ACTIVE instances with
+balanced placement and complete cleanup. Its final-stage create-to-ACTIVE
+throughput was 0.04448 instances/second against the 0.05 minimum, so capacity
+and integrity pass but the performance release SLO remains **NO-GO**.
+
+One interrupted cold-migration test had already purged its Nova row while a
+volume-rotation journal and unused profile remained. Automatic recovery
+correctly retained them because it cannot invent deleted Nova BDM authority.
+Operator cleanup first proved the server, Cinder volume and attachments,
+Neutron port, Incus instance and exact Ceph root volume absent; the ID-map
+claim already held a complete storage-release receipt. The journal was
+archived before deleting only the exact journal and unused profile. Periodic
+replay then retired the remaining claim, release intent and slot without a
+direct etcd deletion.
+
+The final audit reported zero Nova servers on all three Incus hosts, zero
+active migrations, zero Incus instances and OpenStack profiles, zero volume
+journal files, and an empty ID-map assignment/release-intent inventory. All
+three Incus compute services remained ``enabled/up``. Evidence is retained on
+``control1`` under ``/root/openstack-incus-current-evidence``; the final
+summary files are ``isolation.summary`` and ``final-residual-audit.log``.
+The supported full Tempest selection was not rerun by this entry, so its last
+recorded concurrency-4 snapshot timeout remains a separate release NO-GO.
+
 ## 2026-08-13 BFV public snapshot and RBD CoW rerun
 
 The two snapshot optimization failures recorded on 2026-08-12 are resolved

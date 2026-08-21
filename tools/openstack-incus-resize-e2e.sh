@@ -12,11 +12,26 @@ DEST_SSH=${DEST_SSH:-root@10.32.32.131}
 THIRD_HOST=${THIRD_HOST:-incus-node-03}
 THIRD_SSH=${THIRD_SSH:-root@10.32.32.132}
 SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute test key}
+SSH_KNOWN_HOSTS_FILE=${SSH_KNOWN_HOSTS_FILE:-$HOME/.ssh/known_hosts}
 INCUS_PROJECT=${INCUS_PROJECT:-nova}
+INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}
+INCUS_RUNTIME_CONTAINER=${INCUS_RUNTIME_CONTAINER:-incus}
+INCUS_KUBE_NAMESPACE=${INCUS_KUBE_NAMESPACE:-openstack}
+INCUS_KUBE_NODE_MAP=${INCUS_KUBE_NODE_MAP:-}
 SERVER=${SERVER:-incus-resize-e2e-$RANDOM}
 TIMEOUT=${TIMEOUT:-180}
 
-SSH=(ssh -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=no)
+[[ -r "$SSH_IDENTITY" && -r "$SSH_KNOWN_HOSTS_FILE" ]] || {
+    echo "SSH identity and known_hosts must be readable" >&2
+    exit 2
+}
+if [[ "$INCUS_RUNTIME_MODE" == kubernetes && -z "$INCUS_KUBE_NODE_MAP" ]]; then
+    echo "Set INCUS_KUBE_NODE_MAP for Kubernetes mode" >&2
+    exit 2
+fi
+
+SSH=(ssh -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=yes
+    -o "UserKnownHostsFile=$SSH_KNOWN_HOSTS_FILE")
 small_flavor="${SERVER}-small"
 large_flavor="${SERVER}-large"
 server_id=
@@ -25,6 +40,37 @@ remote() {
     local host=$1
     shift
     "${SSH[@]}" "$host" "$@"
+}
+
+kube_node_for_target() {
+    local target=$1 entry
+    for entry in ${INCUS_KUBE_NODE_MAP//,/ }; do
+        if [[ "${entry%%=*}" == "$target" ]]; then
+            printf '%s\n' "${entry#*=}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+incus_remote() {
+    local host=$1 command_line node
+    shift
+    printf -v command_line '%q ' incus --project "$INCUS_PROJECT" "$@"
+    case "$INCUS_RUNTIME_MODE" in
+        podman)
+            remote "$host" \
+                "podman exec $(printf '%q' "$INCUS_RUNTIME_CONTAINER") $command_line"
+            ;;
+        kubernetes)
+            node=$(kube_node_for_target "$host") || return 1
+            remote "$host" "set -e; pods=\$(kubectl -n $(printf '%q' "$INCUS_KUBE_NAMESPACE") get pod -l application=incus --field-selector spec.nodeName=$(printf '%q' "$node") --no-headers -o custom-columns=NAME:.metadata.name); set -- \$pods; [ \$# -eq 1 ]; kubectl -n $(printf '%q' "$INCUS_KUBE_NAMESPACE") exec \"\$1\" -- $command_line"
+            ;;
+        *)
+            echo "INCUS_RUNTIME_MODE must be podman or kubernetes" >&2
+            return 2
+            ;;
+    esac
 }
 
 ssh_for_host() {
@@ -58,12 +104,11 @@ wait_status() {
 assert_limits() {
     local host=$1 expected_pids=$2 expected_memory=$3 expected_cpus=$4
     local actual_pids actual_memory actual_cpus
-    actual_pids=$(remote "$host" \
-        "incus --project '$INCUS_PROJECT' exec '$instance_name' -- cat /sys/fs/cgroup/pids.max")
-    actual_memory=$(remote "$host" \
-        "incus --project '$INCUS_PROJECT' exec '$instance_name' -- cat /sys/fs/cgroup/memory.max")
-    actual_cpus=$(remote "$host" \
-        "incus --project '$INCUS_PROJECT' exec '$instance_name' -- nproc")
+    actual_pids=$(incus_remote "$host" exec "$instance_name" -- \
+        cat /sys/fs/cgroup/pids.max)
+    actual_memory=$(incus_remote "$host" exec "$instance_name" -- \
+        cat /sys/fs/cgroup/memory.max)
+    actual_cpus=$(incus_remote "$host" exec "$instance_name" -- nproc)
     [[ "$actual_pids" == "$expected_pids" ]] || {
         echo "Expected pids.max=$expected_pids, got $actual_pids" >&2
         return 1
@@ -114,9 +159,8 @@ instance_name=$(openstack server show "$server_id" -f value \
 assert_limits "$SOURCE_SSH" 2048 $((512 * 1024 * 1024)) 1
 assert_allocations 1 512 1
 marker="resize-$server_id"
-remote "$SOURCE_SSH" \
-    "incus --project '$INCUS_PROJECT' exec '$instance_name' -- sh -c \
-     'printf %s "$marker" > /root/nova-resize-marker; sync'"
+incus_remote "$SOURCE_SSH" exec "$instance_name" -- sh -c \
+    "printf %s '$marker' > /root/nova-resize-marker; sync"
 
 openstack server resize --flavor "$large_flavor" --wait "$server_id"
 wait_status VERIFY_RESIZE
@@ -128,8 +172,8 @@ resize_ssh=$(ssh_for_host "$resize_host")
     exit 1
 }
 assert_limits "$resize_ssh" 4096 $((1024 * 1024 * 1024)) 2
-[[ "$(remote "$resize_ssh" \
-    "incus --project '$INCUS_PROJECT' exec '$instance_name' -- cat /root/nova-resize-marker")" == \
+[[ "$(incus_remote "$resize_ssh" exec "$instance_name" -- \
+    cat /root/nova-resize-marker)" == \
     "$marker" ]]
 
 openstack server resize revert "$server_id"
