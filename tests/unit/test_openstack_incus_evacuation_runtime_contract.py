@@ -75,6 +75,14 @@ class EvacuationRuntimeContractTest(unittest.TestCase):
                       kubernetes_branch)
         self.assertNotIn('crudini', kubernetes_branch)
 
+    def test_fenced_watcher_retirement_is_bounded_but_not_instantaneous(self):
+        self.assertIn(
+            'wait_for "fenced source BFV watcher retirement" watchers_are 0',
+            self.evacuation)
+        self.assertNotIn(
+            'Source is fenced but the BFV root still has a watcher',
+            self.evacuation)
+
     def test_kubernetes_quarantine_precedes_return_audit(self):
         self.assertIn('kube_compute_daemonset_is_guarded()', self.evacuation)
         self.assertIn('kube_quarantine_source_compute()', self.evacuation)

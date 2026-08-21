@@ -466,10 +466,7 @@ if [[ "$INCUS_RUNTIME_MODE" == kubernetes ]]; then
 fi
 wait_for "Nova source service down" source_service_down
 
-[[ "$(watcher_count)" == 0 ]] || {
-    echo "Source is fenced but the BFV root still has a watcher" >&2
-    exit 1
-}
+wait_for "fenced source BFV watcher retirement" watchers_are 0
 
 # The dead source's committed claim structurally blocks every rescheduled
 # spawn of this allocation generation; only recorded fence evidence may
