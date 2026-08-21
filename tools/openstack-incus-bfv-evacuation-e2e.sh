@@ -21,10 +21,18 @@ INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}
 INCUS_RUNTIME_CONTAINER=${INCUS_RUNTIME_CONTAINER:-incus}
 INCUS_KUBE_NAMESPACE=${INCUS_KUBE_NAMESPACE:-openstack}
 INCUS_KUBE_NODE_MAP=${INCUS_KUBE_NODE_MAP:-}
+INCUS_KUBE_ADMISSION_LABEL_KEY=${INCUS_KUBE_ADMISSION_LABEL_KEY:-openstack-incus-admitted}
+INCUS_KUBE_ADMISSION_LABEL_VALUE=${INCUS_KUBE_ADMISSION_LABEL_VALUE:-enabled}
 TIMEOUT=${TIMEOUT:-}
 
 if [[ "$INCUS_RUNTIME_MODE" == kubernetes && -z "$INCUS_KUBE_NODE_MAP" ]]; then
     echo "Set INCUS_KUBE_NODE_MAP to SSH-target=Kubernetes-node mappings" >&2
+    exit 2
+fi
+if [[ "$INCUS_RUNTIME_MODE" == kubernetes ]] &&
+   { [[ ! "$INCUS_KUBE_ADMISSION_LABEL_KEY" =~ ^[A-Za-z0-9./_-]+$ ]] ||
+     [[ ! "$INCUS_KUBE_ADMISSION_LABEL_VALUE" =~ ^[A-Za-z0-9._-]+$ ]]; }; then
+    echo "Invalid Kubernetes Incus admission label" >&2
     exit 2
 fi
 
@@ -101,6 +109,86 @@ incus_runtime_remote_stdin() {
             return 2
             ;;
     esac
+}
+
+compute_runtime_remote() {
+    local host=$1 command_line namespace kube_node
+    shift
+    printf -v command_line '%q ' "$@"
+
+    case "$INCUS_RUNTIME_MODE" in
+        podman)
+            remote "$host" "$command_line"
+            ;;
+        kubernetes)
+            kube_node=$(kube_node_for_target "$host") || return 1
+            printf -v namespace '%q' "$INCUS_KUBE_NAMESPACE"
+            printf -v kube_node '%q' "$kube_node"
+            remote "$host" \
+                "set -e; pods=\$(kubectl -n $namespace get pod -l application=nova,component=compute-incus --field-selector \"spec.nodeName=$kube_node\" --no-headers -o custom-columns=NAME:.metadata.name); set -- \$pods; [ \$# -eq 1 ]; kubectl -n $namespace exec \"\$1\" -- $command_line"
+            ;;
+        *)
+            echo "INCUS_RUNTIME_MODE must be podman or kubernetes" >&2
+            return 2
+            ;;
+    esac
+}
+
+kube_compute_daemonset_is_guarded() {
+    local namespace key value
+    printf -v namespace '%q' "$INCUS_KUBE_NAMESPACE"
+    printf -v key '%q' "$INCUS_KUBE_ADMISSION_LABEL_KEY"
+    printf -v value '%q' "$INCUS_KUBE_ADMISSION_LABEL_VALUE"
+    remote "$CONTROLLER_SSH" \
+        "kubectl -n $namespace get daemonset nova-compute-incus -o json | jq -e --arg key $key --arg value $value '.spec.template.spec.nodeSelector[\$key] == \$value' >/dev/null"
+}
+
+kube_source_node_label_is() {
+    local expected=$1 node key
+    node=$(kube_node_for_target "$SOURCE_SSH") || return 1
+    printf -v node '%q' "$node"
+    printf -v key '%q' "$INCUS_KUBE_ADMISSION_LABEL_KEY"
+    [[ "$(remote "$CONTROLLER_SSH" \
+        "kubectl get node $node -o json | jq -r --arg key $key '.metadata.labels[\$key] // empty'")" == "$expected" ]]
+}
+
+kube_quarantine_source_compute() {
+    local node key
+    node=$(kube_node_for_target "$SOURCE_SSH") || return 1
+    printf -v node '%q' "$node"
+    printf -v key '%q' "$INCUS_KUBE_ADMISSION_LABEL_KEY"
+    remote "$CONTROLLER_SSH" \
+        "kubectl label node $node \"$key-\" --overwrite >/dev/null"
+}
+
+kube_admit_source_compute() {
+    local node key value
+    node=$(kube_node_for_target "$SOURCE_SSH") || return 1
+    printf -v node '%q' "$node"
+    printf -v key '%q' "$INCUS_KUBE_ADMISSION_LABEL_KEY"
+    printf -v value '%q' "$INCUS_KUBE_ADMISSION_LABEL_VALUE"
+    remote "$CONTROLLER_SSH" \
+        "kubectl label node $node \"$key=$value\" --overwrite >/dev/null"
+}
+
+kube_source_compute_absent() {
+    local node namespace count
+    node=$(kube_node_for_target "$SOURCE_SSH") || return 1
+    printf -v node '%q' "$node"
+    printf -v namespace '%q' "$INCUS_KUBE_NAMESPACE"
+    count=$(remote "$CONTROLLER_SSH" \
+        "kubectl -n $namespace get pod -l application=nova,component=compute-incus --field-selector \"spec.nodeName=$node\" -o json | jq '[.items[] | select(.metadata.deletionTimestamp == null)] | length'")
+    [[ "$count" == 0 ]]
+}
+
+kube_source_compute_ready() {
+    local node namespace count
+    node=$(kube_node_for_target "$SOURCE_SSH") || return 1
+    printf -v node '%q' "$node"
+    printf -v namespace '%q' "$INCUS_KUBE_NAMESPACE"
+    count=$(remote "$CONTROLLER_SSH" \
+        "kubectl -n $namespace get pod -l application=nova,component=compute-incus --field-selector \"spec.nodeName=$node\" -o json | jq '[.items[] | select(.metadata.deletionTimestamp == null) | select(any(.status.conditions[]?; .type == \"Ready\" and .status == \"True\"))] | length'")
+    [[ "$count" == 1 ]]
 }
 
 openstack() {
@@ -295,8 +383,8 @@ network_owner_is_destination() {
 
 bfv_evacuation_enabled() {
     local target=$1
-    [[ "$(remote "$target" \
-        "crudini --get /etc/nova/nova-cpu.conf incus \
+    [[ "$(compute_runtime_remote "$target" sh -c \
+        "crudini --get /etc/nova/nova-incus.conf incus \
          allow_bfv_evacuate 2>/dev/null || echo false" |
         tr '[:upper:]' '[:lower:]')" == true ]]
 }
@@ -344,6 +432,16 @@ for target in "$SOURCE_SSH" "$DEST_SSH"; do
         exit 1
     }
 done
+if [[ "$INCUS_RUNTIME_MODE" == kubernetes ]]; then
+    kube_compute_daemonset_is_guarded || {
+        echo "nova-compute-incus DaemonSet is not guarded by the configured admission label" >&2
+        exit 1
+    }
+    kube_source_node_label_is "$INCUS_KUBE_ADMISSION_LABEL_VALUE" || {
+        echo "Source Kubernetes node is not admitted before evacuation" >&2
+        exit 1
+    }
+fi
 
 if [[ "$original_status" == ACTIVE ]]; then
     printf '%s\n' "$marker" |
@@ -356,6 +454,9 @@ fi
 fenced_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 wait_for "source power fencing" source_fenced
 openstack compute service set --disable "$SOURCE_HOST" nova-compute
+if [[ "$INCUS_RUNTIME_MODE" == kubernetes ]]; then
+    kube_quarantine_source_compute
+fi
 wait_for "Nova source service down" source_service_down
 
 [[ "$(watcher_count)" == 0 ]] || {
@@ -414,10 +515,15 @@ fi
 "$FENCE_PROVIDER" on "$SOURCE_FENCE_ID"
 wait_for "returning source SSH" source_reachable
 wait_for "returning source Incus daemon" source_incus_ready
-remote "$SOURCE_SSH" \
-    "test ! -e /run/openstack-incus/compute-admitted"
-remote "$SOURCE_SSH" \
-    "! systemctl is-active --quiet devstack@n-cpu.service"
+if [[ "$INCUS_RUNTIME_MODE" == kubernetes ]]; then
+    wait_for "returning source compute quarantine" kube_source_compute_absent
+    ! kube_source_node_label_is "$INCUS_KUBE_ADMISSION_LABEL_VALUE"
+else
+    remote "$SOURCE_SSH" \
+        "test ! -e /run/openstack-incus/compute-admitted"
+    remote "$SOURCE_SSH" \
+        "! systemctl is-active --quiet devstack@n-cpu.service"
+fi
 if incus_runtime_remote "$SOURCE_SSH" incus --project "$INCUS_PROJECT" \
         list --format json |
         jq -e '.[] | select(.config["user.openstack.uuid"] != null) |
@@ -437,13 +543,20 @@ INCUS_RUNTIME_MODE="$INCUS_RUNTIME_MODE" \
 INCUS_RUNTIME_CONTAINER="$INCUS_RUNTIME_CONTAINER" \
 INCUS_KUBE_NAMESPACE="$INCUS_KUBE_NAMESPACE" \
 INCUS_KUBE_NODE_MAP="$INCUS_KUBE_NODE_MAP" \
+INCUS_KUBE_ADMISSION_LABEL_KEY="$INCUS_KUBE_ADMISSION_LABEL_KEY" \
+INCUS_KUBE_ADMISSION_LABEL_VALUE="$INCUS_KUBE_ADMISSION_LABEL_VALUE" \
     bash "$RETURN_AUDIT"
 
-remote "$SOURCE_SSH" \
-    "/usr/local/sbin/openstack-incus-compute-admission admit \
-     --reason evacuation-reconciliation-passed; \
-     systemctl reset-failed devstack@n-cpu.service; \
-     systemctl start devstack@n-cpu.service"
+if [[ "$INCUS_RUNTIME_MODE" == kubernetes ]]; then
+    kube_admit_source_compute
+    wait_for "returning source compute pod readiness" kube_source_compute_ready
+else
+    remote "$SOURCE_SSH" \
+        "/usr/local/sbin/openstack-incus-compute-admission admit \
+         --reason evacuation-reconciliation-passed; \
+         systemctl reset-failed devstack@n-cpu.service; \
+         systemctl start devstack@n-cpu.service"
+fi
 
 wait_for "returning Nova compute heartbeat" source_service_up
 wait_for "stale source record cleanup" source_instance_absent

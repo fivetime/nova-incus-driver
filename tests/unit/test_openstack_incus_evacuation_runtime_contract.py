@@ -32,6 +32,9 @@ class EvacuationRuntimeContractTest(unittest.TestCase):
             self.assertIn(
                 'kubectl -n $namespace get pod -l application=incus',
                 script)
+        self.assertIn('compute_runtime_remote()', self.evacuation)
+        self.assertIn(
+            'application=nova,component=compute-incus', self.evacuation)
 
     def test_evacuation_streams_marker_through_selected_runtime(self):
         self.assertIn('incus_runtime_remote_stdin()', self.evacuation)
@@ -53,8 +56,29 @@ class EvacuationRuntimeContractTest(unittest.TestCase):
     def test_runtime_settings_are_forwarded_to_return_audit(self):
         for name in (
                 'INCUS_RUNTIME_MODE', 'INCUS_RUNTIME_CONTAINER',
-                'INCUS_KUBE_NAMESPACE', 'INCUS_KUBE_NODE_MAP'):
+                'INCUS_KUBE_NAMESPACE', 'INCUS_KUBE_NODE_MAP',
+                'INCUS_KUBE_ADMISSION_LABEL_KEY',
+                'INCUS_KUBE_ADMISSION_LABEL_VALUE'):
             self.assertIn(f'{name}="${name}"', self.evacuation)
+
+    def test_kubernetes_quarantine_precedes_return_audit(self):
+        self.assertIn('kube_compute_daemonset_is_guarded()', self.evacuation)
+        self.assertIn('kube_quarantine_source_compute()', self.evacuation)
+        self.assertIn('kube_source_compute_absent()', self.evacuation)
+        self.assertIn('kube_admit_source_compute()', self.evacuation)
+        quarantine = self.evacuation.index('kube_quarantine_source_compute\n')
+        power_on = self.evacuation.index(
+            '"$FENCE_PROVIDER" on "$SOURCE_FENCE_ID"')
+        audit = self.evacuation.index('bash "$RETURN_AUDIT"')
+        admit = self.evacuation.index('kube_admit_source_compute\n')
+        self.assertLess(quarantine, power_on)
+        self.assertLess(power_on, audit)
+        self.assertLess(audit, admit)
+
+    def test_return_audit_checks_kubernetes_label_and_compute_pod(self):
+        self.assertIn('kube_returning_node_label()', self.return_audit)
+        self.assertIn('kube_returning_compute_count()', self.return_audit)
+        self.assertIn('active_compute_pods=$compute_count', self.return_audit)
 
 
 if __name__ == '__main__':

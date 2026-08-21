@@ -13,10 +13,18 @@ INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}
 INCUS_RUNTIME_CONTAINER=${INCUS_RUNTIME_CONTAINER:-incus}
 INCUS_KUBE_NAMESPACE=${INCUS_KUBE_NAMESPACE:-openstack}
 INCUS_KUBE_NODE_MAP=${INCUS_KUBE_NODE_MAP:-}
+INCUS_KUBE_ADMISSION_LABEL_KEY=${INCUS_KUBE_ADMISSION_LABEL_KEY:-openstack-incus-admitted}
+INCUS_KUBE_ADMISSION_LABEL_VALUE=${INCUS_KUBE_ADMISSION_LABEL_VALUE:-enabled}
 CINDER_RBD_POOL=${CINDER_RBD_POOL:-cinder-volumes-rbd-pool}
 
 if [[ "$INCUS_RUNTIME_MODE" == kubernetes && -z "$INCUS_KUBE_NODE_MAP" ]]; then
     echo "Set INCUS_KUBE_NODE_MAP to SSH-target=Kubernetes-node mappings" >&2
+    exit 2
+fi
+if [[ "$INCUS_RUNTIME_MODE" == kubernetes ]] &&
+   { [[ ! "$INCUS_KUBE_ADMISSION_LABEL_KEY" =~ ^[A-Za-z0-9./_-]+$ ]] ||
+     [[ ! "$INCUS_KUBE_ADMISSION_LABEL_VALUE" =~ ^[A-Za-z0-9._-]+$ ]]; }; then
+    echo "Invalid Kubernetes Incus admission label" >&2
     exit 2
 fi
 
@@ -71,6 +79,24 @@ incus_runtime_remote() {
     esac
 }
 
+kube_returning_node_label() {
+    local node key
+    node=$(kube_node_for_target "$RETURNING_SSH") || return 1
+    printf -v node '%q' "$node"
+    printf -v key '%q' "$INCUS_KUBE_ADMISSION_LABEL_KEY"
+    "${SSH[@]}" "$CONTROLLER_SSH" \
+        "kubectl get node $node -o json | jq -r --arg key $key '.metadata.labels[\$key] // empty'"
+}
+
+kube_returning_compute_count() {
+    local node namespace
+    node=$(kube_node_for_target "$RETURNING_SSH") || return 1
+    printf -v node '%q' "$node"
+    printf -v namespace '%q' "$INCUS_KUBE_NAMESPACE"
+    "${SSH[@]}" "$CONTROLLER_SSH" \
+        "kubectl -n $namespace get pod -l application=nova,component=compute-incus --field-selector \"spec.nodeName=$node\" -o json | jq '[.items[] | select(.metadata.deletionTimestamp == null)] | length'"
+}
+
 openstack() {
     local command_line
     printf -v command_line '%q ' "$@"
@@ -78,19 +104,31 @@ openstack() {
         "source $CONTROLLER_OPENRC >/dev/null 2>&1; openstack $command_line"
 }
 
-if remote /usr/local/sbin/openstack-incus-compute-admission check \
-        >/dev/null 2>&1; then
-    fail "returning-host quarantine" "host is already admitted"
+if [[ "$INCUS_RUNTIME_MODE" == kubernetes ]]; then
+    admission_label=$(kube_returning_node_label)
+    compute_count=$(kube_returning_compute_count)
+    if [[ -z "$admission_label" && "$compute_count" == 0 ]]; then
+        pass "returning-host quarantine" "Kubernetes label enforced"
+    else
+        fail "returning-host quarantine" \
+            "label=${admission_label:-absent} active_compute_pods=$compute_count"
+    fi
+    compute_state="pods=$compute_count"
+    pass "nova-compute service" "$compute_state"
 else
-    pass "returning-host quarantine" enforced
-fi
-
-compute_state=$(remote \
-    "systemctl is-active devstack@n-cpu.service 2>/dev/null || true")
-if [[ "$compute_state" == active ]]; then
-    fail "nova-compute service" "must not run before reconciliation"
-else
-    pass "nova-compute service" "${compute_state:-inactive}"
+    if remote /usr/local/sbin/openstack-incus-compute-admission check \
+            >/dev/null 2>&1; then
+        fail "returning-host quarantine" "host is already admitted"
+    else
+        pass "returning-host quarantine" enforced
+    fi
+    compute_state=$(remote \
+        "systemctl is-active devstack@n-cpu.service 2>/dev/null || true")
+    if [[ "$compute_state" == active ]]; then
+        fail "nova-compute service" "must not run before reconciliation"
+    else
+        pass "nova-compute service" "${compute_state:-inactive}"
+    fi
 fi
 
 service_status=$(openstack compute service list --service nova-compute \
