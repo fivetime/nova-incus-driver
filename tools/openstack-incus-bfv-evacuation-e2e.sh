@@ -352,7 +352,8 @@ mappings_are() {
 
 attachment_is_unique() {
     local attachments total matching
-    attachments=$(openstack volume attachment list -f json)
+    attachments=$(openstack --os-volume-api-version 3.27 \
+        volume attachment list -f json)
     total=$(jq -r --arg volume "$root_volume" \
         '[.[] | select(."Volume ID" == $volume)] | length' \
         <<<"$attachments")

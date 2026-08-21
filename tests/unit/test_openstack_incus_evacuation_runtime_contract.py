@@ -116,6 +116,11 @@ class EvacuationRuntimeContractTest(unittest.TestCase):
         self.assertIn('kube_returning_compute_count()', self.return_audit)
         self.assertIn('active_compute_pods=$compute_count', self.return_audit)
 
+    def test_cinder_attachment_inventory_pins_required_microversion(self):
+        for script in (self.evacuation, self.return_audit):
+            self.assertIn('--os-volume-api-version 3.27', script)
+            self.assertIn('volume attachment list -f json', script)
+
 
 if __name__ == '__main__':
     unittest.main()
