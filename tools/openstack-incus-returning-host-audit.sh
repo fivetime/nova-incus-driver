@@ -16,6 +16,8 @@ INCUS_KUBE_NODE_MAP=${INCUS_KUBE_NODE_MAP:-}
 INCUS_KUBE_ADMISSION_LABEL_KEY=${INCUS_KUBE_ADMISSION_LABEL_KEY:-openstack-incus-admitted}
 INCUS_KUBE_ADMISSION_LABEL_VALUE=${INCUS_KUBE_ADMISSION_LABEL_VALUE:-enabled}
 CINDER_RBD_POOL=${CINDER_RBD_POOL:-cinder-volumes-rbd-pool}
+CINDER_RBD_CLIENT=${CINDER_RBD_CLIENT:-cinder}
+CEPH_QUERY_SSH=${CEPH_QUERY_SSH:-$RETURNING_SSH}
 
 if [[ "$INCUS_RUNTIME_MODE" == kubernetes && -z "$INCUS_KUBE_NODE_MAP" ]]; then
     echo "Set INCUS_KUBE_NODE_MAP to SSH-target=Kubernetes-node mappings" >&2
@@ -71,6 +73,29 @@ incus_runtime_remote() {
             printf -v kube_node '%q' "$kube_node"
             "${SSH[@]}" "$host" \
                 "set -e; pods=\$(kubectl -n $namespace get pod -l application=incus --field-selector \"spec.nodeName=$kube_node\" --no-headers -o custom-columns=NAME:.metadata.name); set -- \$pods; [ \$# -eq 1 ]; kubectl -n $namespace exec \"\$1\" -- $command_line"
+            ;;
+        *)
+            echo "INCUS_RUNTIME_MODE must be podman or kubernetes" >&2
+            return 2
+            ;;
+    esac
+}
+
+compute_runtime_remote() {
+    local host=$1 command_line namespace kube_node
+    shift
+    printf -v command_line '%q ' "$@"
+
+    case "$INCUS_RUNTIME_MODE" in
+        podman)
+            "${SSH[@]}" "$host" "$command_line"
+            ;;
+        kubernetes)
+            kube_node=$(kube_node_for_target "$host") || return 1
+            printf -v namespace '%q' "$INCUS_KUBE_NAMESPACE"
+            printf -v kube_node '%q' "$kube_node"
+            "${SSH[@]}" "$host" \
+                "set -e; pods=\$(kubectl -n $namespace get pod -l application=nova,component=compute-incus --field-selector \"spec.nodeName=$kube_node\" --no-headers -o custom-columns=NAME:.metadata.name); set -- \$pods; [ \$# -eq 1 ]; kubectl -n $namespace exec \"\$1\" -- $command_line"
             ;;
         *)
             echo "INCUS_RUNTIME_MODE must be podman or kubernetes" >&2
@@ -209,7 +234,7 @@ for record in "${records[@]}"; do
     fi
 
     local_mapping=$(remote \
-        "rbd device list --format json --id cinder 2>/dev/null || echo '[]'" |
+        "rbd device list --format json 2>/dev/null || echo '[]'" |
         jq -r --arg image "$root_image" \
             '.[] | select(.name == $image) | .device')
     if [[ -z "$local_mapping" ]]; then
@@ -218,16 +243,16 @@ for record in "${records[@]}"; do
         fail "$label local RBD mapping" "$local_mapping"
     fi
 
-    image_id=$(remote \
-        "rados --id cinder -p '$CINDER_RBD_POOL' get \
-         'rbd_id.$root_image' - 2>/dev/null | tail -c +5" || true)
+    image_id=$(compute_runtime_remote "$CEPH_QUERY_SSH" rados \
+        --id "$CINDER_RBD_CLIENT" -p "$CINDER_RBD_POOL" get \
+        "rbd_id.$root_image" - 2>/dev/null | tail -c +5 || true)
     if [[ ! "$image_id" =~ ^[0-9a-f]+$ ]]; then
         fail "$label Ceph watcher" "cannot resolve RBD image ID"
         continue
     fi
-    watcher_output=$(remote \
-        "rados --id cinder -p '$CINDER_RBD_POOL' listwatchers \
-         'rbd_header.$image_id'" 2>/dev/null) || {
+    watcher_output=$(compute_runtime_remote "$CEPH_QUERY_SSH" rados \
+        --id "$CINDER_RBD_CLIENT" -p "$CINDER_RBD_POOL" listwatchers \
+        "rbd_header.$image_id" 2>/dev/null) || {
         fail "$label Ceph watcher" "cannot query RBD header"
         continue
     }

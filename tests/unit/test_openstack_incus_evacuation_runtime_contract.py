@@ -79,6 +79,20 @@ class EvacuationRuntimeContractTest(unittest.TestCase):
         self.assertIn(
             'wait_for "fenced source BFV watcher retirement" watchers_are 0',
             self.evacuation)
+
+    def test_ceph_watcher_queries_use_online_compute_runtime(self):
+        self.assertIn('CINDER_RBD_CLIENT=${CINDER_RBD_CLIENT:-cinder}',
+                      self.evacuation)
+        self.assertIn(
+            'compute_runtime_remote "$DEST_SSH" rados', self.evacuation)
+        self.assertIn('CEPH_QUERY_SSH="$DEST_SSH"', self.evacuation)
+        self.assertIn('compute_runtime_remote()', self.return_audit)
+        self.assertIn(
+            'compute_runtime_remote "$CEPH_QUERY_SSH" rados',
+            self.return_audit)
+        self.assertNotIn(
+            'rbd device list --format json --id cinder',
+            self.evacuation + self.return_audit)
         self.assertNotIn(
             'Source is fenced but the BFV root still has a watcher',
             self.evacuation)

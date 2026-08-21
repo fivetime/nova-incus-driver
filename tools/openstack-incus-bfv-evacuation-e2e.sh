@@ -17,6 +17,7 @@ SOURCE_FENCE_ID=${SOURCE_FENCE_ID:-$SOURCE_HOST}
 CONTROLLER_OPENRC=${CONTROLLER_OPENRC:-/opt/stack/devstack/openrc admin admin}
 RETURN_AUDIT=${RETURN_AUDIT:-"$SCRIPT_DIR/openstack-incus-returning-host-audit.sh"}
 CINDER_RBD_POOL=${CINDER_RBD_POOL:-cinder-volumes-rbd-pool}
+CINDER_RBD_CLIENT=${CINDER_RBD_CLIENT:-cinder}
 INCUS_PROJECT=${INCUS_PROJECT:-nova}
 INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}
 INCUS_RUNTIME_CONTAINER=${INCUS_RUNTIME_CONTAINER:-incus}
@@ -322,13 +323,13 @@ source_fenced() {
 
 watcher_count() {
     local image_id output
-    image_id=$(remote "$CONTROLLER_SSH" \
-        "rados --id cinder -p '$CINDER_RBD_POOL' get \
-         'rbd_id.$root_image' - 2>/dev/null | tail -c +5")
+    image_id=$(compute_runtime_remote "$DEST_SSH" rados \
+        --id "$CINDER_RBD_CLIENT" -p "$CINDER_RBD_POOL" get \
+        "rbd_id.$root_image" - 2>/dev/null | tail -c +5)
     [[ "$image_id" =~ ^[0-9a-f]+$ ]] || return 1
-    output=$(remote "$CONTROLLER_SSH" \
-        "rados --id cinder -p '$CINDER_RBD_POOL' listwatchers \
-         'rbd_header.$image_id'") || return 1
+    output=$(compute_runtime_remote "$DEST_SSH" rados \
+        --id "$CINDER_RBD_CLIENT" -p "$CINDER_RBD_POOL" listwatchers \
+        "rbd_header.$image_id") || return 1
     sed '/^[[:space:]]*$/d' <<<"$output" | wc -l
 }
 
@@ -339,7 +340,7 @@ watchers_are() {
 mapping_count() {
     local target=$1
     remote "$target" \
-        "rbd device list --format json --id cinder 2>/dev/null || echo '[]'" |
+        "rbd device list --format json 2>/dev/null || echo '[]'" |
         jq --arg image "$root_image" \
             '[.[] | select(.name == $image)] | length'
 }
@@ -542,6 +543,8 @@ CONTROLLER_SSH="$CONTROLLER_SSH" \
 CONTROLLER_OPENRC="$CONTROLLER_OPENRC" \
 SSH_IDENTITY="$SSH_IDENTITY" \
 CINDER_RBD_POOL="$CINDER_RBD_POOL" \
+CINDER_RBD_CLIENT="$CINDER_RBD_CLIENT" \
+CEPH_QUERY_SSH="$DEST_SSH" \
 INCUS_PROJECT="$INCUS_PROJECT" \
 INCUS_RUNTIME_MODE="$INCUS_RUNTIME_MODE" \
 INCUS_RUNTIME_CONTAINER="$INCUS_RUNTIME_CONTAINER" \
