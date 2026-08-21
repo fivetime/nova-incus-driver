@@ -9,7 +9,16 @@ CONTROLLER_SSH=${CONTROLLER_SSH:?Set CONTROLLER_SSH}
 SSH_IDENTITY=${SSH_IDENTITY:?Set SSH_IDENTITY to the compute audit key}
 CONTROLLER_OPENRC=${CONTROLLER_OPENRC:-/opt/stack/devstack/openrc admin admin}
 INCUS_PROJECT=${INCUS_PROJECT:-nova}
+INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}
+INCUS_RUNTIME_CONTAINER=${INCUS_RUNTIME_CONTAINER:-incus}
+INCUS_KUBE_NAMESPACE=${INCUS_KUBE_NAMESPACE:-openstack}
+INCUS_KUBE_NODE_MAP=${INCUS_KUBE_NODE_MAP:-}
 CINDER_RBD_POOL=${CINDER_RBD_POOL:-cinder-volumes-rbd-pool}
+
+if [[ "$INCUS_RUNTIME_MODE" == kubernetes && -z "$INCUS_KUBE_NODE_MAP" ]]; then
+    echo "Set INCUS_KUBE_NODE_MAP to SSH-target=Kubernetes-node mappings" >&2
+    exit 2
+fi
 
 SSH=(ssh -n -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=no)
 failures=0
@@ -25,6 +34,41 @@ fail() {
 
 remote() {
     "${SSH[@]}" "$RETURNING_SSH" "$@"
+}
+
+kube_node_for_target() {
+    local target=$1 entry
+    for entry in ${INCUS_KUBE_NODE_MAP//,/ }; do
+        if [[ "${entry%%=*}" == "$target" ]]; then
+            printf '%s\n' "${entry#*=}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+incus_runtime_remote() {
+    local host=$1 command_line namespace kube_node
+    shift
+    printf -v command_line '%q ' "$@"
+
+    case "$INCUS_RUNTIME_MODE" in
+        podman)
+            "${SSH[@]}" "$host" \
+                "podman exec $(printf '%q' "$INCUS_RUNTIME_CONTAINER") $command_line"
+            ;;
+        kubernetes)
+            kube_node=$(kube_node_for_target "$host") || return 1
+            printf -v namespace '%q' "$INCUS_KUBE_NAMESPACE"
+            printf -v kube_node '%q' "$kube_node"
+            "${SSH[@]}" "$host" \
+                "set -e; pods=\$(kubectl -n $namespace get pod -l application=incus --field-selector \"spec.nodeName=$kube_node\" --no-headers -o custom-columns=NAME:.metadata.name); set -- \$pods; [ \$# -eq 1 ]; kubectl -n $namespace exec \"\$1\" -- $command_line"
+            ;;
+        *)
+            echo "INCUS_RUNTIME_MODE must be podman or kubernetes" >&2
+            return 2
+            ;;
+    esac
 }
 
 openstack() {
@@ -57,8 +101,8 @@ else
     fail "Nova scheduling" "disable $RETURNING_HOST before audit"
 fi
 
-mapfile -t records < <(remote \
-    "podman exec incus incus --project '$INCUS_PROJECT' list --format json" |
+mapfile -t records < <(incus_runtime_remote "$RETURNING_SSH" incus \
+    --project "$INCUS_PROJECT" list --format json |
     jq -r '.[] | select(.config["user.openstack.uuid"] != null) |
         [.name, .status, .config["user.openstack.uuid"]] | @tsv')
 
@@ -81,9 +125,8 @@ for record in "${records[@]}"; do
         continue
     fi
 
-    root_image=$(remote \
-        "podman exec incus incus query \
-         '/1.0/instances/$instance_name?project=$INCUS_PROJECT&recursion=1'" |
+    root_image=$(incus_runtime_remote "$RETURNING_SSH" incus query \
+        "/1.0/instances/$instance_name?project=$INCUS_PROJECT&recursion=1" |
         jq -r '.expanded_devices.root[
             "initial.ceph.rbd.image_name"] // empty')
 

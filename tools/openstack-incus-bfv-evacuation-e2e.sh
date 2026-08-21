@@ -17,7 +17,16 @@ CONTROLLER_OPENRC=${CONTROLLER_OPENRC:-/opt/stack/devstack/openrc admin admin}
 RETURN_AUDIT=${RETURN_AUDIT:-"$SCRIPT_DIR/openstack-incus-returning-host-audit.sh"}
 CINDER_RBD_POOL=${CINDER_RBD_POOL:-cinder-volumes-rbd-pool}
 INCUS_PROJECT=${INCUS_PROJECT:-nova}
+INCUS_RUNTIME_MODE=${INCUS_RUNTIME_MODE:-podman}
+INCUS_RUNTIME_CONTAINER=${INCUS_RUNTIME_CONTAINER:-incus}
+INCUS_KUBE_NAMESPACE=${INCUS_KUBE_NAMESPACE:-openstack}
+INCUS_KUBE_NODE_MAP=${INCUS_KUBE_NODE_MAP:-}
 TIMEOUT=${TIMEOUT:-}
+
+if [[ "$INCUS_RUNTIME_MODE" == kubernetes && -z "$INCUS_KUBE_NODE_MAP" ]]; then
+    echo "Set INCUS_KUBE_NODE_MAP to SSH-target=Kubernetes-node mappings" >&2
+    exit 2
+fi
 
 SSH=(ssh -i "$SSH_IDENTITY" -o BatchMode=yes -o StrictHostKeyChecking=no)
 marker="openstack-incus-evacuation-$(date +%s)-$$"
@@ -33,6 +42,65 @@ remote_stdin() {
     local target=$1
     shift
     "${SSH[@]}" "$target" "$@"
+}
+
+kube_node_for_target() {
+    local target=$1 entry
+    for entry in ${INCUS_KUBE_NODE_MAP//,/ }; do
+        if [[ "${entry%%=*}" == "$target" ]]; then
+            printf '%s\n' "${entry#*=}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+incus_runtime_remote() {
+    local host=$1 command_line namespace kube_node
+    shift
+    printf -v command_line '%q ' "$@"
+
+    case "$INCUS_RUNTIME_MODE" in
+        podman)
+            remote "$host" \
+                "podman exec $(printf '%q' "$INCUS_RUNTIME_CONTAINER") $command_line"
+            ;;
+        kubernetes)
+            kube_node=$(kube_node_for_target "$host") || return 1
+            printf -v namespace '%q' "$INCUS_KUBE_NAMESPACE"
+            printf -v kube_node '%q' "$kube_node"
+            remote "$host" \
+                "set -e; pods=\$(kubectl -n $namespace get pod -l application=incus --field-selector \"spec.nodeName=$kube_node\" --no-headers -o custom-columns=NAME:.metadata.name); set -- \$pods; [ \$# -eq 1 ]; kubectl -n $namespace exec \"\$1\" -- $command_line"
+            ;;
+        *)
+            echo "INCUS_RUNTIME_MODE must be podman or kubernetes" >&2
+            return 2
+            ;;
+    esac
+}
+
+incus_runtime_remote_stdin() {
+    local host=$1 command_line namespace kube_node
+    shift
+    printf -v command_line '%q ' "$@"
+
+    case "$INCUS_RUNTIME_MODE" in
+        podman)
+            remote_stdin "$host" \
+                "podman exec -i $(printf '%q' "$INCUS_RUNTIME_CONTAINER") $command_line"
+            ;;
+        kubernetes)
+            kube_node=$(kube_node_for_target "$host") || return 1
+            printf -v namespace '%q' "$INCUS_KUBE_NAMESPACE"
+            printf -v kube_node '%q' "$kube_node"
+            remote_stdin "$host" \
+                "set -e; pods=\$(kubectl -n $namespace get pod -l application=incus --field-selector \"spec.nodeName=$kube_node\" --no-headers -o custom-columns=NAME:.metadata.name); set -- \$pods; [ \$# -eq 1 ]; kubectl -n $namespace exec -i \"\$1\" -- $command_line"
+            ;;
+        *)
+            echo "INCUS_RUNTIME_MODE must be podman or kubernetes" >&2
+            return 2
+            ;;
+    esac
 }
 
 openstack() {
@@ -104,8 +172,12 @@ source_reachable() {
 }
 
 source_incus_ready() {
-    remote "$SOURCE_SSH" \
-        "podman exec incus incus query /1.0 >/dev/null 2>&1"
+    incus_runtime_remote "$SOURCE_SSH" incus query /1.0 >/dev/null 2>&1
+}
+
+source_instance_absent() {
+    ! incus_runtime_remote "$SOURCE_SSH" incus --project "$INCUS_PROJECT" \
+        info "$instance_name" >/dev/null 2>&1
 }
 
 control_plane_is_independent() {
@@ -275,9 +347,9 @@ done
 
 if [[ "$original_status" == ACTIVE ]]; then
     printf '%s\n' "$marker" |
-        remote_stdin "$SOURCE_SSH" \
-            "podman exec -i incus incus --project '$INCUS_PROJECT' \
-             file push - '$instance_name/root/stonith-e2e-marker'"
+        incus_runtime_remote_stdin "$SOURCE_SSH" incus \
+            --project "$INCUS_PROJECT" file push - \
+            "$instance_name/root/stonith-e2e-marker"
 fi
 
 "$FENCE_PROVIDER" off "$SOURCE_FENCE_ID"
@@ -326,9 +398,9 @@ if [[ "$original_status" == ACTIVE ]]; then
     fi
     wait_for "target ACTIVE state" server_field_is status ACTIVE
     wait_for "single target watcher" watchers_are 1
-    recovered_sha=$(remote "$DEST_SSH" \
-        "podman exec incus incus --project '$INCUS_PROJECT' \
-         file pull '$instance_name/root/stonith-e2e-marker' -" |
+    recovered_sha=$(incus_runtime_remote "$DEST_SSH" incus \
+        --project "$INCUS_PROJECT" file pull \
+        "$instance_name/root/stonith-e2e-marker" - |
         sha256sum | awk '{print $1}')
     [[ "$recovered_sha" == "$marker_sha" ]] || {
         echo "Root marker did not survive evacuation" >&2
@@ -346,9 +418,8 @@ remote "$SOURCE_SSH" \
     "test ! -e /run/openstack-incus/compute-admitted"
 remote "$SOURCE_SSH" \
     "! systemctl is-active --quiet devstack@n-cpu.service"
-if remote "$SOURCE_SSH" \
-        "podman exec incus incus --project '$INCUS_PROJECT' list \
-         --format json" |
+if incus_runtime_remote "$SOURCE_SSH" incus --project "$INCUS_PROJECT" \
+        list --format json |
         jq -e '.[] | select(.config["user.openstack.uuid"] != null) |
             select((.status | ascii_downcase) != "stopped")' >/dev/null; then
     echo "Returning source started a tenant container before admission" >&2
@@ -361,6 +432,11 @@ CONTROLLER_SSH="$CONTROLLER_SSH" \
 CONTROLLER_OPENRC="$CONTROLLER_OPENRC" \
 SSH_IDENTITY="$SSH_IDENTITY" \
 CINDER_RBD_POOL="$CINDER_RBD_POOL" \
+INCUS_PROJECT="$INCUS_PROJECT" \
+INCUS_RUNTIME_MODE="$INCUS_RUNTIME_MODE" \
+INCUS_RUNTIME_CONTAINER="$INCUS_RUNTIME_CONTAINER" \
+INCUS_KUBE_NAMESPACE="$INCUS_KUBE_NAMESPACE" \
+INCUS_KUBE_NODE_MAP="$INCUS_KUBE_NODE_MAP" \
     bash "$RETURN_AUDIT"
 
 remote "$SOURCE_SSH" \
@@ -370,10 +446,7 @@ remote "$SOURCE_SSH" \
      systemctl start devstack@n-cpu.service"
 
 wait_for "returning Nova compute heartbeat" source_service_up
-wait_for "stale source record cleanup" \
-    remote "$SOURCE_SSH" \
-        "! podman exec incus incus --project '$INCUS_PROJECT' \
-         info '$instance_name' >/dev/null 2>&1"
+wait_for "stale source record cleanup" source_instance_absent
 openstack compute service set --enable "$SOURCE_HOST" nova-compute
 wait_for "returning source Placement eligibility" source_placement_enabled
 wait_for "single watcher after source admission" \
