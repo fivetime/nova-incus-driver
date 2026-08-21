@@ -68,6 +68,13 @@ class EvacuationRuntimeContractTest(unittest.TestCase):
         self.assertIn(
             "--fence-provider '$IDMAP_FENCE_PROVIDER'", self.evacuation)
 
+    def test_kubernetes_bfv_gate_does_not_require_crudini(self):
+        kubernetes_branch = self.evacuation.split(
+            'bfv_evacuation_enabled() {', 1)[1].split('else', 1)[0]
+        self.assertIn('compute_runtime_remote "$target" grep -Eiq',
+                      kubernetes_branch)
+        self.assertNotIn('crudini', kubernetes_branch)
+
     def test_kubernetes_quarantine_precedes_return_audit(self):
         self.assertIn('kube_compute_daemonset_is_guarded()', self.evacuation)
         self.assertIn('kube_quarantine_source_compute()', self.evacuation)

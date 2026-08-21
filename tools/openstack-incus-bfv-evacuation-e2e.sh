@@ -384,10 +384,16 @@ network_owner_is_destination() {
 
 bfv_evacuation_enabled() {
     local target=$1
-    [[ "$(compute_runtime_remote "$target" sh -c \
-        "crudini --get /etc/nova/nova-incus.conf incus \
-         allow_bfv_evacuate 2>/dev/null || echo false" |
-        tr '[:upper:]' '[:lower:]')" == true ]]
+    if [[ "$INCUS_RUNTIME_MODE" == kubernetes ]]; then
+        compute_runtime_remote "$target" grep -Eiq \
+            '^[[:space:]]*allow_bfv_evacuate[[:space:]]*=[[:space:]]*true[[:space:]]*$' \
+            /etc/nova/nova-incus.conf
+    else
+        [[ "$(remote "$target" \
+            "crudini --get /etc/nova/nova-cpu.conf incus \
+             allow_bfv_evacuate 2>/dev/null || echo false" |
+            tr '[:upper:]' '[:lower:]')" == true ]]
+    fi
 }
 
 original_status=$(openstack server show "$SERVER_ID" -f value -c status)
