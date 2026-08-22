@@ -58,6 +58,12 @@ mapping, GNU coreutils, and synchronized time. Disable host core dumps and
 Ubuntu Apport. Provide dedicated, bounded filesystems or logical volumes for
 ``/var/lib/incus`` and ``/var/log/incus``.
 
+The privileged ``nova-compute-incus`` pod must mount the host ``/dev`` and
+the host ``/run/udev``. Mount ``/run/udev`` read-only; its control socket lets
+Ceph ``rbd map`` and ``rbd unmap`` wait for the host device manager. Omitting
+that hostPath can make a kernel RBD mapping succeed while os-brick observes a
+failed map, or let detach return before the device disappears from a guest.
+
 Create the persistent runtime paths before installing the Quadlets::
 
   install -d -m 0700 /var/lib/incus /var/log/incus

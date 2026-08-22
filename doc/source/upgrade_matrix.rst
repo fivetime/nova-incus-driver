@@ -451,10 +451,12 @@ processes rather than trusting files in this repository.
     externally registered inspectors without a downstream choices patch.
 
 ``0001-rbd-fallback-to-kernel-device-path``
-    Makes os-brick RBD map/unmap independent of udev links and returns the
-    exact kernel device discovered by ``rbd showmapped``. **Re-verify**: the
-    compute runtime preflight must find both ``noudev`` and
-    ``_find_root_device`` and a data-volume attach/detach must leave no map.
+    Returns the exact kernel device discovered by ``rbd showmapped`` when the
+    friendly udev link is absent. Map and unmap still wait for host udev so a
+    completed detach cannot remain visible briefly inside the guest.
+    **Re-verify**: the compute runtime preflight must find
+    ``_find_root_device``, reject ``noudev``, prove that ``/run/udev/control``
+    is the host socket, and a data-volume attach/detach must leave no map.
     **Remove when** the supported os-brick RBD connector can map and unmap by
     the authoritative kernel device without requiring udev-created symlinks.
 

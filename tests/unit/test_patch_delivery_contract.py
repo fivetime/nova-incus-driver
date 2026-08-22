@@ -118,13 +118,15 @@ class PatchDeliveryContractTest(unittest.TestCase):
         for role in ('api', 'compute', 'conductor'):
             self.assertIn(role, nova_gate)
         for symbol in (
-                'IncusLiveMigrateData', 'IterableWithLength', 'noudev',
+                'IncusLiveMigrateData', 'IterableWithLength',
                 '_find_root_device', 'image_size', '_UnixAdapter',
                 'ks_identity.V3Token(',
                 'load_session_from_conf_options(CONF,confgrp,auth=token_auth)',
                 'session=token_session', 'oslo_conf=CONF'):
             self.assertIn(symbol, nova_gate)
         self.assertIn('registered_migrate_versions', nova_gate)
+        self.assertIn('"noudev" not in rbd_source', nova_gate)
+        self.assertIn('/run/udev/control', nova_gate)
         self.assertIn('MIN_INCUS_MIGRATE_DATA_VERSION', nova_gate)
         self.assertIn('minimum_migrate_data_version_tuple', nova_gate)
         self.assertIn('max(registered_migrate_versions', nova_gate)

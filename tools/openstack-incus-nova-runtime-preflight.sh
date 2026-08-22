@@ -54,6 +54,8 @@ done
 read -r -d '' CONTRACT <<'PY' || true
 import inspect
 import json
+import os
+import stat
 import sys
 import types
 
@@ -228,7 +230,15 @@ elif role == "compute":
         "python-glanceclient preserves seekable upload length",
     )
     rbd_source = code_names(rbd.RBDConnector._local_attach_volume)
-    require("noudev" in rbd_source, "os-brick maps RBD without udev waits")
+    rbd_disconnect_source = code_names(rbd.RBDConnector.disconnect_volume)
+    require(
+        "noudev" not in rbd_source and "noudev" not in rbd_disconnect_source,
+        "os-brick waits for host udev to settle RBD map and unmap",
+    )
+    require(
+        stat.S_ISSOCK(os.stat("/run/udev/control").st_mode),
+        "Nova compute shares the host udev control socket",
+    )
     require(
         "_find_root_device" in rbd_source,
         "os-brick resolves the kernel RBD path without udev links",

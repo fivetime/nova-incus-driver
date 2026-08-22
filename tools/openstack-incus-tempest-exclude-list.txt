@@ -14,10 +14,10 @@
 ^tempest\.api\.compute\.servers\.test_server_actions\.ServerActionsTestJSON\.test_rebuild_server(?:\[|$)
 ^tempest\.api\.compute\.images\.test_images\.ImagesTestJSON\.test_create_image_from_suspended_server
 ^tempest\.api\.compute\.admin\.test_servers_negative\.ServersAdminNegativeTestJSON\.test_migrate_server_invalid_state
-^tempest\.api\.compute\.admin\.test_live_migration_negative\.LiveMigrationNegativeTest\.test_live_block_migration_suspended$
-^tempest\.api\.compute\.admin\.test_servers_on_multinodes\.UnshelveToHostMultiNodesTest\.test_unshelve_to_specific_host$
+^tempest\.api\.compute\.admin\.test_live_migration_negative\.LiveMigrationNegativeTest\.test_live_block_migration_suspended(?:\[|$)
+^tempest\.api\.compute\.admin\.test_servers_on_multinodes\.UnshelveToHostMultiNodesTest\.test_unshelve_to_specific_host(?:\[|$)
 ^tempest\.api\.compute\.servers\.test_server_actions\.ServerActionsTestJSON\.test_suspend_resume_server
-^tempest\.api\.compute\.servers\.test_server_actions\.ServerActionsTestOtherA\.test_resize_volume_backed_server_confirm$
+^tempest\.api\.compute\.servers\.test_server_actions\.ServerActionsTestOtherA\.test_resize_volume_backed_server_confirm(?:\[|$)
 ^tempest\.api\.compute\.servers\.test_server_actions\.ServerActionsV293TestJSON(?:\.|$)
 ^tempest\.api\.compute\.servers\.test_delete_server\.DeleteServersTestJSON\.test_delete_server_while_in_suspended_state
 ^tempest\.api\.compute\.servers\.test_servers_negative\.ServersNegativeTestJSON\.test_suspend_server_invalid_state

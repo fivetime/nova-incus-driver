@@ -2,16 +2,7 @@ diff --git a/os_brick/initiator/connectors/rbd.py b/os_brick/initiator/connector
 index eb2911c..ffa1d29 100644
 --- a/os_brick/initiator/connectors/rbd.py
 +++ b/os_brick/initiator/connectors/rbd.py
-@@ -216,5 +216,6 @@ class RBDConnector(base_rbd.RBDConnectorMixin, base.BaseLinuxConnector):
-                 # when we drop support earlier versions
-                 cmd = ['rbd', 'map', volume, '--pool', pool]
-+                cmd += ['--options', 'noudev']
-                 cmd += self._get_rbd_args(connection_properties, conf)
-                 self._execute(*cmd, root_helper=self._root_helper,
-                               run_as_root=True)
-@@ -229,13 +229,18 @@ class RBDConnector(base_rbd.RBDConnectorMixin, base.BaseLinuxConnector):
-                 not os.path.islink(rbd_dev_path) or
-                 not os.path.exists(os.path.realpath(rbd_dev_path))
+@@ -231,9 +231,14 @@ class RBDConnector(base_rbd.RBDConnectorMixin, base.BaseLinuxConnector):
              ):
 -                LOG.warning(
 -                    'Volume %(vol)s has not been mapped to local device '
@@ -33,13 +24,60 @@ index eb2911c..ffa1d29 100644
 +                        {'vol': volume, 'dev': rbd_dev_path},
 +                    )
          except Exception:
-             # Cleanup conf file on failure
-             with excutils.save_and_reraise_exception():
-@@ -357,6 +363,7 @@ class RBDConnector(base_rbd.RBDConnectorMixin, base.BaseLinuxConnector):
-                 # command introduced in ceph 13.0 (commit 6a57358add1157629a6d)
-                 # when we drop support earlier versions
-                 cmd = ['rbd', 'unmap', root_device]
-+                cmd += ['--options', 'noudev']
-                 cmd += self._get_rbd_args(connection_properties, conf)
-                 self._execute(*cmd, root_helper=self._root_helper,
-                               run_as_root=True)
+diff --git a/os_brick/tests/initiator/connectors/test_rbd.py b/os_brick/tests/initiator/connectors/test_rbd.py
+index 9c2783d..2ad8758 100644
+--- a/os_brick/tests/initiator/connectors/test_rbd.py
++++ b/os_brick/tests/initiator/connectors/test_rbd.py
+@@ -168,2 +168,5 @@ class RBDConnectorTestCase(test_base_rbd.RBDConnectorTestMixin,
+                 'ports': ['6789']}
++        showmapped = ('[{"id":"0","pool":"pool","device":'
++                      '"/dev/rbd0","name":"image"}]', None)
++        mock_execute.side_effect = [None, None, showmapped]
+         device_info = rbd_connector.connect_volume(conn)
+@@ -173,4 +176,9 @@ class RBDConnectorTestCase(test_base_rbd.RBDConnectorTestMixin,
+         execute_call2 = mock.call(*cmd, root_helper=None, run_as_root=True)
+-        mock_execute.assert_has_calls([execute_call1, execute_call2])
+-        expected_info = {'path': '/dev/rbd/pool/image',
++        show_cmd = mock.call(
++            'rbd', 'showmapped', '--format=json', '--id', 'fake_user',
++            '--mon_host', '192.168.10.2:6789', root_helper=None,
++            run_as_root=True)
++        mock_execute.assert_has_calls(
++            [execute_call1, execute_call2, show_cmd])
++        expected_info = {'path': '/dev/rbd0',
+                          'type': 'block'}
+@@ -208,2 +216,3 @@ class RBDConnectorTestCase(test_base_rbd.RBDConnectorTestMixin,
+                 'auth_username': 'fake_user'}
++        mock_execute.side_effect = [None, None, ('{}', None)]
+         device_info = rbd_connector.connect_volume(conn)
+@@ -212,3 +221,7 @@ class RBDConnectorTestCase(test_base_rbd.RBDConnectorTestMixin,
+         execute_call2 = mock.call(*cmd, root_helper=None, run_as_root=True)
+-        mock_execute.assert_has_calls([execute_call1, execute_call2])
++        show_call = mock.call(
++            'rbd', 'showmapped', '--format=json', '--id', 'fake_user',
++            root_helper=None, run_as_root=True)
++        mock_execute.assert_has_calls(
++            [execute_call1, execute_call2, show_call])
+         expected_info = {'path': '/dev/rbd/pool/image',
+@@ -232,2 +245,5 @@ class RBDConnectorTestCase(test_base_rbd.RBDConnectorTestMixin,
+
++        showmapped = ('[{"id":"0","pool":"fake_pool","device":'
++                      '"/dev/rbd0","name":"fake_volume"}]', None)
++        mock_execute.side_effect = [None, None, showmapped]
+         connector = rbd.RBDConnector(None, do_local_attach=True)
+@@ -236,5 +252,7 @@ class RBDConnectorTestCase(test_base_rbd.RBDConnectorTestMixin,
+         mock_rbd_cfg.assert_called_once_with(self.connection_properties)
+-        mock_args.assert_called_once_with(self.connection_properties,
+-                                          mock_rbd_cfg.return_value)
+-        self.assertEqual(2, mock_execute.call_count)
++        mock_args.assert_has_calls([
++            mock.call(self.connection_properties, mock_rbd_cfg.return_value),
++            mock.call(self.connection_properties, mock_rbd_cfg.return_value),
++        ])
++        self.assertEqual(3, mock_execute.call_count)
+         mock_execute.assert_has_calls([
+@@ -246,3 +264,3 @@ class RBDConnectorTestCase(test_base_rbd.RBDConnectorTestMixin,
+
+-        expected = {'path': '/dev/rbd/fake_pool/fake_volume',
++        expected = {'path': '/dev/rbd0',
+                     'type': 'block',
