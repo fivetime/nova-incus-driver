@@ -77,6 +77,26 @@ if [[ "$PREINSTALL_SSH" == "true" || -n "$PREINSTALL_PACKAGES" ]]; then
         fi
         if [[ "$PREINSTALL_SSH" == "true" ]]; then
             chroot "$rootfs" rc-update add sshd default
+            install -d -m 0755 "$rootfs/etc/ssh/sshd_config.d"
+            printf '%s\n' \
+                'PasswordAuthentication no' \
+                'KbdInteractiveAuthentication no' \
+                'PermitEmptyPasswords no' \
+                >"$rootfs/etc/ssh/sshd_config.d/99-openstack-incus.conf"
+
+            # Alpine's cloud user is normally created by cloud-init with a
+            # locked password. Without PAM, sshd then rejects even a valid
+            # injected public key. The empty password remains unusable because
+            # password and keyboard-interactive authentication are disabled.
+            sed -i \
+                '/^[[:space:]]*lock_passwd:/s/True/false/' \
+                "$rootfs/etc/cloud/cloud.cfg"
+            sed -i \
+                's/^\([[:space:]]*\)lock_passwd: false$/\1lock_passwd: false\n\1passwd: NP/' \
+                "$rootfs/etc/cloud/cloud.cfg"
+            if chroot "$rootfs" getent passwd alpine >/dev/null; then
+                chroot "$rootfs" passwd -d alpine
+            fi
         fi
         rm -f "$rootfs"/etc/ssh/ssh_host_*
         rm -f "$rootfs/etc/resolv.conf"

@@ -25,6 +25,8 @@ from tempest.lib.common.utils import test_utils
 from tempest.lib import decorators
 from tempest.scenario import manager
 
+from nova_incus_tempest_plugin.tests.scenario import guest
+
 CONF = config.CONF
 LOG = logging.getLogger(__name__)
 
@@ -66,14 +68,18 @@ class IncusVolumeScenario(manager.ScenarioTest):
         return server['OS-EXT-SRV-ATTR:host']
 
     def _mount_fuse_ext4(self, ssh, device, make_filesystem=False):
+        privilege = guest.privilege_command(ssh)
         if make_filesystem:
-            ssh.exec_command('sudo mke2fs -F -t ext4 %s' % device)
-        ssh.exec_command('sudo mkdir -p /mnt/cinder-tempest')
+            ssh.exec_command('%s mke2fs -F -t ext4 %s' %
+                             (privilege, device))
+        ssh.exec_command('%s mkdir -p /mnt/cinder-tempest' % privilege)
         ssh.exec_command(
-            'sudo fuse2fs -o allow_other %s /mnt/cinder-tempest' % device)
+            '%s fuse2fs -o allow_other %s /mnt/cinder-tempest' %
+            (privilege, device))
 
     def _unmount_fuse_ext4(self, ssh):
-        ssh.exec_command('sudo fusermount3 -u /mnt/cinder-tempest')
+        privilege = guest.privilege_command(ssh)
+        ssh.exec_command('%s fusermount3 -u /mnt/cinder-tempest' % privilege)
 
     @decorators.idempotent_id('44356d4b-3a74-44e0-9719-9e36c3acff50')
     @decorators.attr(type='smoke')
@@ -106,9 +112,10 @@ class IncusVolumeScenario(manager.ScenarioTest):
             self.nova_volume_detach, server, volume)
         device = self._wait_for_volume_available_on_the_system(ssh)
         self._mount_fuse_ext4(ssh, device, make_filesystem=True)
+        privilege = guest.privilege_command(ssh)
         ssh.exec_command(
-            'echo tempest-volume | sudo tee '
-            '/mnt/cinder-tempest/marker >/dev/null && sync')
+            'echo tempest-volume | %s tee '
+            '/mnt/cinder-tempest/marker >/dev/null && sync' % privilege)
         marker = ssh.exec_command(
             'cat /mnt/cinder-tempest/marker').strip()
         self._unmount_fuse_ext4(ssh)
@@ -152,15 +159,17 @@ class IncusVolumeScenario(manager.ScenarioTest):
             self.nova_volume_detach, server, volume)
         device = self._wait_for_volume_available_on_the_system(ssh)
         self._mount_fuse_ext4(ssh, device, make_filesystem=True)
+        privilege = guest.privilege_command(ssh)
         ssh.exec_command(
-            'echo tempest-migration | sudo tee '
-            '/mnt/cinder-tempest/marker >/dev/null && sync')
+            'echo tempest-migration | %s tee '
+            '/mnt/cinder-tempest/marker >/dev/null && sync' % privilege)
 
         self.volumes_client.extend_volume(volume['id'], new_size=2)
         waiters.wait_for_volume_resource_status(
             self.volumes_client, volume['id'], 'in-use')
         size_bytes = int(ssh.exec_command(
-            'sudo blockdev --getsize64 %s' % device).strip())
+            '%s blockdev --getsize64 %s' %
+            (privilege, device)).strip())
         self.assertGreaterEqual(size_bytes, 2 * 1024 ** 3)
         self._unmount_fuse_ext4(ssh)
 

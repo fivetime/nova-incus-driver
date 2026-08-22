@@ -123,8 +123,8 @@ Ubuntu Noble example::
     SOURCE=images:ubuntu/noble/cloud \
     IMAGE_NAME=ubuntu-noble-24.04-cloud-incus \
     PREINSTALL_SSH=true \
-    PREINSTALL_PACKAGES='fuse2fs jq' \
-    tools/publish-incus-image-to-glance.sh
+    PREINSTALL_PACKAGES='e2fsprogs-extra jq util-linux' \
+        tools/publish-incus-image-to-glance.sh
 
 Alpine example::
 
@@ -135,6 +135,15 @@ Alpine example::
     PREINSTALL_SSH=true \
     PREINSTALL_PACKAGES='fuse2fs jq' \
     tools/publish-incus-image-to-glance.sh
+
+For Alpine images the publisher also gives the ``alpine`` account a
+non-authenticating ``NP`` shadow value so OpenSSH treats it as unlocked for
+public-key authentication, while explicitly disabling password and
+keyboard-interactive authentication. This is required because Alpine's
+non-PAM ``sshd`` rejects public keys for a locked account. Tempest must use
+``image_ssh_user = alpine`` for these images.
+The ``util-linux`` package supplies ``lsblk``, which the standard Tempest
+volume attach/detach tests use to discover guest block devices.
 
 The exact upstream alias must exist in the configured Incus image remote.
 Package names differ by distribution, and distributions move binaries

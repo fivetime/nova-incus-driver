@@ -24,6 +24,8 @@ from tempest.lib import decorators
 from oslo_serialization import jsonutils
 from tempest.scenario import manager
 
+from nova_incus_tempest_plugin.tests.scenario import guest
+
 CONF = config.CONF
 
 
@@ -86,8 +88,9 @@ class TestServerBasicOps(manager.ScenarioTest):
             # The Incus driver exposes the unpacked, read-only config drive as
             # a directory. Do not depend on cloud-init copying it into its
             # distribution-specific cache.
-            cmd_md = (
-                'sudo cat /config-drive/openstack/latest/meta_data.json')
+            privilege = guest.privilege_command(self.ssh_client)
+            cmd_md = '%s cat /config-drive/openstack/latest/meta_data.json' % (
+                privilege)
             result = self.ssh_client.exec_command(cmd_md)
             result = jsonutils.loads(result)
             self.assertIn('meta', result)
@@ -97,8 +100,10 @@ class TestServerBasicOps(manager.ScenarioTest):
 
     def verify_networkdata_on_config_drive(self):
         if self.run_ssh and CONF.compute_feature_enabled.config_drive:
+            privilege = guest.privilege_command(self.ssh_client)
             cmd_md = (
-                'sudo cat /config-drive/openstack/latest/network_data.json')
+                '%s cat /config-drive/openstack/latest/network_data.json' %
+                privilege)
             result = self.ssh_client.exec_command(cmd_md)
             result = jsonutils.loads(result)
             self.assertIn('services', result)

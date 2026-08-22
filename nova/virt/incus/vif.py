@@ -278,7 +278,9 @@ class IncusGenericVifDriver(object):
 
     def unplug(self, instance, vif):
         vif_type = vif['type']
-        if vif_type == network_model.VIF_TYPE_BINDING_FAILED:
+        if vif_type in {
+                network_model.VIF_TYPE_BINDING_FAILED,
+                network_model.VIF_TYPE_UNBOUND}:
             # os-vif has nothing to undo for a port Neutron never bound,
             # and asking it would fail. This driver's own veth is a
             # different matter: it was created by plug() before anything
@@ -287,9 +289,9 @@ class IncusGenericVifDriver(object):
             # reports binding-failed. Leaving it stranded a host device
             # per failed binding, forever.
             LOG.warning(
-                'Skipping os-vif unplug for Neutron binding-failed VIF '
+                'Skipping os-vif unplug for Neutron %(type)s VIF '
                 '%(vif)s; removing the veth this driver created',
-                {'vif': vif.get('id')}, instance=instance)
+                {'type': vif_type, 'vif': vif.get('id')}, instance=instance)
             _post_unplug_wiring_delete_veth(instance, vif)
             return
         instance_info = os_vif_util.nova_to_osvif_instance(instance)

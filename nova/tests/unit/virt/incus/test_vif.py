@@ -271,6 +271,17 @@ class IncusGenericVifDriverTest(test.NoDBTestCase):
         os_vif.unplug.assert_not_called()
         delete_veth.assert_called_once_with(INSTANCE, failed_vif)
 
+    @mock.patch.object(vif, '_post_unplug_wiring_delete_veth')
+    @mock.patch('nova.virt.incus.vif.os_vif')
+    def test_unplug_unbound_is_idempotent(self, os_vif, delete_veth):
+        """A second destroy can receive an already-unbound Neutron port."""
+        unbound_vif = {'id': 'unbound-port', 'type': 'unbound'}
+
+        self.vif_driver.unplug(INSTANCE, unbound_vif)
+
+        os_vif.unplug.assert_not_called()
+        delete_veth.assert_called_once_with(INSTANCE, unbound_vif)
+
 
 class PostPlugTest(test.NoDBTestCase):
     """Tests for post plug operations"""

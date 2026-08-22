@@ -339,6 +339,14 @@ not create an Incus-managed OVN network. Ensure management/migration traffic,
 OVN Geneve traffic, provider traffic, and storage traffic follow the site's
 separate routing and firewall design.
 
+Floating-IP placement must match the provider-network topology. If Incus
+compute nodes expose only ``br-int`` and Geneve, set Neutron OVN
+``enable_distributed_floating_ip = false`` so gateway chassis own the FIP.
+Enabling distributed FIPs is valid only when every eligible Incus compute
+also has the declared provider bridge mapping and a working physical provider
+path. An ``ACTIVE`` Neutron port and an OVN-installed OVS interface do not
+prove this north-south path; verify SSH through a real FIP on every compute.
+
 For Manila NFS or CephFS, the **compute hosts** mount approved exports and
 expose those host staging mounts to the container. The guest does not receive
 Manila credentials or an NFS mount instruction and does not need an NFS
