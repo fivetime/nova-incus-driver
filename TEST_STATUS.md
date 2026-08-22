@@ -79,6 +79,56 @@ summary files are ``isolation.summary`` and ``final-residual-audit.log``.
 The supported full Tempest selection was not rerun by this entry, so its last
 recorded concurrency-4 snapshot timeout remains a separate release NO-GO.
 
+## 2026-08-22 Nova revision 98 udev-settled Tempest rerun
+
+The final production rerun used openstack-incus
+``51f307e0158f449f23013f5efca45c9ed694879b`` and Nova Helm revision 98.
+All three Incus computes ran
+``ghcr.io/fivetime/openstackhelm/nova-incus@sha256:6c54185cb65d36302169a89c92211de2238c4143784f87f4ed4ef48c96c31056``;
+Nova API and conductor ran
+``ghcr.io/fivetime/openstackhelm/nova-incus-control@sha256:d49593c25a22b6fdc6b4776840e60b5c39fc3cecf20441f2fe96a8984962baed``.
+GitHub image workflow ``32563749812`` completed successfully. Each compute
+runtime preflight proved the expected Nova object/hooks, the os-brick kernel
+RBD fallback, absence of ``noudev``, and a real host ``/run/udev/control``
+socket in the compute mount namespace.
+
+This revision corrects the RBD detach race found by the previous full run.
+The formal os-brick patch now preserves normal host-udev waiting for map and
+unmap while retaining ``rbd showmapped`` as the fallback when a friendly
+``/dev/rbd/<pool>/<image>`` link is absent. The upstream RBD connector unit
+suite passed 45/45. The production
+``AttachVolumeTestJSON.test_attach_detach_volume`` test passed three
+consecutive serial repetitions, then passed again under the final eight-way
+concurrent suite. ``test_list_get_volume_attachments``, shelved attach and
+detach, the project volume-attach scenario, and online extend plus cold
+migration also passed.
+
+The supported release selection (the repository include and exclude lists)
+completed 523 tests in 1,976.96 seconds: 475 passed, 48 capability skips and
+zero failures. The log and exit status are
+``/root/tempest-workspace/target-final-clean.log`` and
+``/root/tempest-workspace/target-final-clean.rc`` on ``control1``.
+
+An earlier command in this session accidentally started two unrestricted
+Tempest runs without the supported include list. Those runs covered services
+outside this release contract and were terminated after exposing unrelated
+testbed configuration gaps. Their interrupted admin tests left all three
+Incus compute services disabled, which caused a subsequent attempt to fail
+with ``No valid host``. The recovery explicitly terminated every orphaned
+Tempest/stestr worker, removed only ``tempest-*`` resources, restored all
+three compute services, and used the exact rootfs release proof to delete one
+stopped Incus orphan whose Nova row was absent. A clean single-scenario smoke
+then passed before the authoritative rerun above.
+
+The final audit found zero Nova servers, zero Incus instances, zero Tempest
+projects/networks/routers/floating IPs, zero RBD device mappings on all three
+computes, and all five Nova compute services ``enabled/up``. One available
+Tempest snapshot-source volume remained after successful test cleanup; it
+had no snapshot, backup or attachment and was deleted by exact UUID. The
+functional Tempest NO-GO is therefore closed. The independent 500-per-compute
+performance result remains NO-GO because its final create-to-ACTIVE
+throughput was 0.04448 instances/second against the 0.05 minimum.
+
 ## 2026-08-13 BFV public snapshot and RBD CoW rerun
 
 The two snapshot optimization failures recorded on 2026-08-12 are resolved
